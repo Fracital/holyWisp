@@ -1,0 +1,18 @@
+# Build trees (Makefile / CMakePresets)
+/build/
+/build-*/
+/cmake-build-*/
+/dist/
+
+# Editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.sw?
+.DS_Store
+
+# Tooling caches
+compile_commands.json
+.cache/
+*.log
