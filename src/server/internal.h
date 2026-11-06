@@ -62,6 +62,9 @@ struct hw_server {
 	hw_resolver *resolver;
 	hw_dns_cache *dns_cache;
 	hw_proxy_config proxy;
+	// The CONTINUE window actually advertised: buffer-remaining, capped so a full window of
+	// maximum-size DATA packets fits in half of stream-queue-max (server_ingress_window).
+	uint32_t window;
 	uint16_t port;
 	int started;
 	_Atomic int stopped;
@@ -179,6 +182,7 @@ typedef struct hw_stream {
 	int addr_idx;
 	char dest[HW_IP_STR_LEN + 8]; // "ip:port" of the address being tried
 	char host[256];
+	int literal_host; // host is an IP literal: a proxy gets the address, not a name
 	uint16_t port;
 	// Upstream proxy handshake.
 	enum proxy_phase proxy_phase;
@@ -229,7 +233,8 @@ void stream_adopt(hw_stream *s, int fd);
 hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port);
 
 // proxy.c
-// Parse "socks5://[user:pass@]host[:port]" / "http://..." into out. -1 with err on a bad URL.
+// Parse "socks5://[user:pass@]host[:port]" (socks5h:// is the same thing) / "http://..." into out.
+// -1 with err on a bad URL.
 int proxy_config_parse(const char *url, hw_proxy_config *out, char *err, size_t err_cap);
 // Resolve the proxy host once. -1 with errno when it cannot be resolved.
 int proxy_config_resolve(hw_proxy_config *p);

@@ -262,12 +262,22 @@ int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 
 int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
 	if (c->closing) return -1;
-	uint8_t *p = frame_begin(c, HW_WISP_HEADER_LEN + len);
-	if (!p) return -1;
-	hw_wisp_write_header(p, HW_WISP_DATA, stream_id);
-	memcpy(p + HW_WISP_HEADER_LEN, data, len);
-	atomic_fetch_add(&c->w->server->bytes_out, len);
-	conn_charge_bandwidth(c, len);
+	// One remote read may be larger than the negotiated message size: it goes out as several DATA
+	// packets, each within max-message-size, so a strict peer never sees an oversize frame.
+	size_t max = c->w->server->cfg.max_message_size - HW_WISP_HEADER_LEN;
+	if (max < 1) max = 1;
+	size_t total = len;
+	do {
+		size_t n = len < max ? len : max;
+		uint8_t *p = frame_begin(c, HW_WISP_HEADER_LEN + n);
+		if (!p) return -1;
+		hw_wisp_write_header(p, HW_WISP_DATA, stream_id);
+		memcpy(p + HW_WISP_HEADER_LEN, data, n);
+		data += n;
+		len -= n;
+	} while (len > 0);
+	atomic_fetch_add(&c->w->server->bytes_out, total);
+	conn_charge_bandwidth(c, total);
 	conn_flush(c);
 	return c->closing ? -1 : 0;
 }
@@ -411,7 +421,7 @@ static void handshake_done(hw_conn *c) {
 		hw_loop_cancel_timer(c->w->loop, c->handshake_timer);
 		c->handshake_timer = NULL;
 	}
-	conn_send_continue(c, 0, c->w->server->cfg.buffer_remaining);
+	conn_send_continue(c, 0, c->w->server->window);
 }
 
 // Returns 1 to keep parsing rbuf, 0 to wait for more bytes (or because the conn is closing).

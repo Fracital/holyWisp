@@ -5,6 +5,7 @@
  * client library.
  */
 #include "holywisp/client.h"
+#include "holywisp/filter.h"
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
 #include "holywisp/net.h"
@@ -17,8 +18,10 @@
 #include <crypt.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -27,6 +30,15 @@
 #include <netinet/in.h>
 
 static uint16_t g_echo_port;
+static uint16_t g_udp_echo_port;
+
+// What the toy SOCKS5 proxy last saw in a CONNECT request, and how many it has handled. The edge
+// deployments put a classifying SOCKS5 router upstream that needs the hostname (ATYP 3), so the
+// address type the server sends is part of the contract.
+static _Atomic int g_socks5_requests;
+static _Atomic int g_socks5_atyp;
+static char g_socks5_host[256];
+static _Atomic int g_socks5_reply_delay_ms; // sleep before the CONNECT reply (a slow upstream dial)
 
 // ---------------------------------------------------------------------------------- helpers
 
@@ -114,6 +126,32 @@ static void *echo_main(void *arg) {
 		pthread_attr_destroy(&attr);
 	}
 	return NULL;
+}
+
+static void *udp_echo_main(void *arg) {
+	int fd = (int)(intptr_t)arg;
+	uint8_t buf[65536];
+	for (;;) {
+		struct sockaddr_storage ss;
+		socklen_t sl = sizeof(ss);
+		ssize_t n = recvfrom(fd, buf, sizeof(buf), 0, (struct sockaddr *)&ss, &sl);
+		if (n < 0) continue;
+		sendto(fd, buf, (size_t)n, 0, (struct sockaddr *)&ss, sl);
+	}
+	return NULL;
+}
+
+static uint16_t start_udp_echo(void) {
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(fd >= 0, "udp socket: %s", strerror(errno));
+	struct sockaddr_in sin = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = 0};
+	CHECK_EQ(bind(fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
+	socklen_t sl = sizeof(sin);
+	getsockname(fd, (struct sockaddr *)&sin, &sl);
+	pthread_t th;
+	pthread_create(&th, NULL, udp_echo_main, (void *)(intptr_t)fd);
+	pthread_detach(th);
+	return ntohs(sin.sin_port);
 }
 
 static uint16_t start_listener(void (*fn)(void), int *out_fd) {
@@ -218,29 +256,53 @@ static void *socks5_proxy_conn(void *arg) {
 		close(fd);
 		return NULL;
 	}
-	char host[128];
+	char host[256];
 	uint16_t port = 0;
+	uint8_t p[2];
 	if (req[3] == 1) {
-		uint8_t a[4], p[2];
+		uint8_t a[4];
 		if (read_full(fd, a, 4) != 0 || read_full(fd, p, 2) != 0) {
 			close(fd);
 			return NULL;
 		}
 		snprintf(host, sizeof(host), "%u.%u.%u.%u", a[0], a[1], a[2], a[3]);
-		port = (uint16_t)(p[0] << 8 | p[1]);
 	} else if (req[3] == 4) {
-		uint8_t a[16], p[2];
+		uint8_t a[16];
 		if (read_full(fd, a, 16) != 0 || read_full(fd, p, 2) != 0) {
 			close(fd);
 			return NULL;
 		}
 		inet_ntop(AF_INET6, a, host, sizeof(host));
-		port = (uint16_t)(p[0] << 8 | p[1]);
+	} else if (req[3] == 3) {
+		uint8_t len;
+		if (read_full(fd, &len, 1) != 0 || read_full(fd, host, len) != 0 || read_full(fd, p, 2) != 0) {
+			close(fd);
+			return NULL;
+		}
+		host[len] = '\0';
 	} else {
 		close(fd);
 		return NULL;
 	}
-	int up = hw_connect_tcp(host, port, 2000);
+	port = (uint16_t)(p[0] << 8 | p[1]);
+	atomic_store(&g_socks5_atyp, req[3]);
+	snprintf(g_socks5_host, sizeof(g_socks5_host), "%s", host);
+	atomic_fetch_add(&g_socks5_requests, 1);
+	int delay = atomic_load(&g_socks5_reply_delay_ms);
+	if (delay > 0) usleep((useconds_t)delay * 1000);
+	// A hostname is resolved here, by the proxy, the way a socks5h proxy does.
+	int up = -1;
+	struct addrinfo hints = {.ai_socktype = SOCK_STREAM}, *res = NULL;
+	char service[8];
+	snprintf(service, sizeof(service), "%u", port);
+	if (getaddrinfo(host, service, &hints, &res) == 0) {
+		for (struct addrinfo *ai = res; ai && up < 0; ai = ai->ai_next) {
+			char ip[HW_IP_STR_LEN];
+			hw_addr_ip_str(ai->ai_addr, ip, sizeof(ip));
+			up = hw_connect_tcp(ip, port, 2000);
+		}
+		freeaddrinfo(res);
+	}
 	uint8_t reply[10] = {5, up < 0 ? 5 : 0, 0, 1, 0, 0, 0, 0, 0, 0};
 	r = write(fd, reply, sizeof(reply));
 	(void)r;
@@ -512,6 +574,137 @@ static void test_http_proxy(void) {
 
 static void test_socks5_proxy(void) {
 	proxy_echo_case("socks5", socks5_proxy_main);
+	CHECK_EQ(atomic_load(&g_socks5_atyp), 1); // a literal IP goes as ATYP 1, never as a domain
+}
+
+// The upstream SOCKS5 router classifies destinations by name, so a hostname must reach it as an
+// ATYP 3 domain, unresolved, and `socks5h://` (what the wispurr deployments use) must be accepted.
+// A literal IP still goes as ATYP 1, and the egress policy still runs on what the name resolves
+// to locally: a blocked destination never reaches the proxy at all.
+static void test_socks5_proxy_hostname(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	spawn(socks5_proxy_main, pfd);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5h://127.0.0.1:%u", pport);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server with socks5h://");
+	hw_server_start(s);
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	CHECK(echo_once(c, sid, "by-name-through-the-proxy"), "echo via proxy by hostname");
+	CHECK_EQ(atomic_load(&g_socks5_atyp), 3);
+	CHECK_STR(g_socks5_host, "localhost");
+	hw_client_free(c);
+	hw_server_free(s);
+
+	// Egress policy still applies before the proxy sees anything.
+	int before = atomic_load(&g_socks5_requests);
+	cfg.allow_loopback = 0;
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	c = connect_plain(s);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	uint8_t reason = 0;
+	CHECK_EQ(wait_close(c, sid, &reason), 1);
+	CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+	CHECK_EQ(atomic_load(&g_socks5_requests), before);
+	hw_client_free(c);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
+	close(pfd);
+}
+
+// wispurr 0001: DATA that arrives while the upstream dial is still in flight. The proxy sits on
+// its CONNECT reply, so the burst lands on a stream whose socket is not writable yet; all of it
+// must be queued and written in order once the tunnel is up.
+static void test_data_queued_during_proxy_connect(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	spawn(socks5_proxy_main, pfd);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.buffer_remaining = 64;
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5://127.0.0.1:%u", pport);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	atomic_store(&g_socks5_reply_delay_ms, 300);
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	enum {
+		N = 40
+	};
+	uint8_t data[N * 1500];
+	for (size_t i = 0; i < sizeof(data); i++) data[i] = (uint8_t)(i * 31 + 7);
+	size_t total = 0;
+	for (int i = 0; i < N; i++) {
+		size_t len = 1 + (size_t)(i * 53) % 1400;
+		CHECK_EQ(hw_client_send(c, sid, data + total, len), 0);
+		total += len;
+	}
+	uint8_t back[sizeof(data)];
+	CHECK_EQ(hw_client_read_exact(c, sid, back, total, 10000), (long)total);
+	CHECK(memcmp(data, back, total) == 0, "burst during the proxy handshake intact and in order");
+	atomic_store(&g_socks5_reply_delay_ms, 0);
+	hw_client_free(c);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
+	close(pfd);
+}
+
+// With a proxy configured, UDP is refused by default (the proxy cannot carry it) and relayed
+// directly when the operator asks for it with proxy-udp = direct.
+static void test_udp_with_proxy(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	spawn(socks5_proxy_main, pfd);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5://127.0.0.1:%u", pport);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", g_udp_echo_port, &sid), 0);
+	uint8_t reason = 0;
+	CHECK_EQ(wait_close(c, sid, &reason), 1);
+	CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+	hw_client_free(c);
+	hw_server_free(s);
+
+	cfg.proxy_udp_direct = 1;
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server with proxy-udp = direct");
+	hw_server_start(s);
+	c = connect_plain(s);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", g_udp_echo_port, &sid), 0);
+	const char dgram[] = "datagram around the proxy";
+	CHECK_EQ(hw_client_send(c, sid, dgram, sizeof(dgram)), 0);
+	hw_client_event ev;
+	int got = 0;
+	for (int i = 0; i < 20 && !got; i++) {
+		int r = hw_client_poll(c, 5000, &ev);
+		CHECK(r > 0, "poll: %d", r);
+		if (ev.stream_id == sid && ev.type == HW_CEV_DATA) {
+			CHECK_EQ(ev.len, sizeof(dgram));
+			CHECK(memcmp(ev.data, dgram, sizeof(dgram)) == 0, "datagram intact");
+			got = 1;
+		}
+	}
+	CHECK(got, "udp echo direct while tcp goes through the proxy");
+	hw_client_free(c);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
+	close(pfd);
 }
 
 static void test_twisp(void) {
@@ -569,6 +762,7 @@ int main(void) {
 	int echo_fd;
 	g_echo_port = start_listener(NULL, &echo_fd);
 	spawn(echo_main, echo_fd);
+	g_udp_echo_port = start_udp_echo();
 
 	RUN(test_port_filter);
 	RUN(test_host_filter);
@@ -578,6 +772,9 @@ int main(void) {
 	RUN(test_reputation_accrual);
 	RUN(test_http_proxy);
 	RUN(test_socks5_proxy);
+	RUN(test_socks5_proxy_hostname);
+	RUN(test_data_queued_during_proxy_connect);
+	RUN(test_udp_with_proxy);
 	RUN(test_twisp);
 	printf("ok all security cases\n");
 	return 0;

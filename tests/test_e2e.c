@@ -541,6 +541,7 @@ int main(void) {
 	cfg.allow_direct_ip = 1;
 	cfg.allow_loopback = 1;
 	cfg.buffer_remaining = 16;
+	cfg.stream_queue_max = 32u * 1024 * 1024; // 16 max-size packets must fit in half of it
 	strcpy(cfg.motd, "welcome to the test server");
 	cfg.log_level = HW_LOG_WARN;
 	g_server = hw_server_new(&cfg);

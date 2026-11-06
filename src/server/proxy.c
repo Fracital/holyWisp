@@ -1,7 +1,10 @@
 /*
  * Upstream proxy: SOCKS5 (RFC 1928, username/password RFC 1929) and HTTP CONNECT (RFC 7231
  * section 4.3.6), driven as a state machine on the stream's socket. The destination handed to the
- * proxy is the already-resolved, policy-checked ip:port, so the egress rules still apply.
+ * proxy is the hostname the client asked for (SOCKS5 ATYP 3, CONNECT host:port), the way a
+ * socks5h:// proxy expects it, so a classifying or geo-routing proxy can resolve the name itself.
+ * The name was still resolved and policy-checked locally before the dial, so the egress rules
+ * apply unchanged; only a literal IP in CONNECT is sent as an address.
  */
 #include "holywisp/base64.h"
 #include "holywisp/hw.h"
@@ -40,7 +43,7 @@ int proxy_config_parse(const char *url, hw_proxy_config *out, char *err, size_t 
 		snprintf(err, err_cap, "proxy: https:// proxies need TLS, which this server does not speak");
 		return -1;
 	} else {
-		snprintf(err, err_cap, "proxy: scheme must be socks5:// or http://");
+		snprintf(err, err_cap, "proxy: scheme must be socks5://, socks5h:// or http://");
 		return -1;
 	}
 	if (strchr(p, '/') || strchr(p, '?') || strchr(p, '#')) {
@@ -149,14 +152,29 @@ static const struct sockaddr *target_addr(const hw_stream *s) {
 	return (const struct sockaddr *)&s->addrs[s->addr_idx - 1];
 }
 
+// "host:port" for an HTTP CONNECT line: the name as the client gave it, or the literal address.
+static void target_str(const hw_stream *s, char *buf, size_t cap) {
+	if (s->literal_host) {
+		hw_addr_str(target_addr(s), buf, cap);
+	} else {
+		snprintf(buf, cap, "%s:%u", s->host, s->port);
+	}
+}
+
 static int socks5_send_connect(hw_stream *s) {
-	uint8_t req[22];
+	uint8_t req[4 + 1 + 255 + 2];
 	size_t n = 0;
 	req[n++] = 5;
 	req[n++] = 1; // CONNECT
 	req[n++] = 0;
 	const struct sockaddr *sa = target_addr(s);
-	if (sa->sa_family == AF_INET) {
+	if (!s->literal_host) {
+		size_t hl = strlen(s->host); // handle_connect capped it at 255
+		req[n++] = 3;
+		req[n++] = (uint8_t)hl;
+		memcpy(req + n, s->host, hl);
+		n += hl;
+	} else if (sa->sa_family == AF_INET) {
 		req[n++] = 1;
 		memcpy(req + n, &((const struct sockaddr_in *)sa)->sin_addr, 4);
 		n += 4;
@@ -185,9 +203,9 @@ int proxy_start(hw_stream *s) {
 		s->proxy_phase = PROXY_PHASE_GREETING;
 		return proxy_send(s, greet, n);
 	}
-	// HTTP CONNECT ip:port
-	char dest[HW_ADDR_STR_LEN];
-	hw_addr_str(target_addr(s), dest, sizeof(dest));
+	// HTTP CONNECT host:port
+	char dest[sizeof(s->host) + 8];
+	target_str(s, dest, sizeof(dest));
 	char auth[512] = "";
 	if (p->user[0]) {
 		char cred[260];

@@ -93,9 +93,13 @@ every test still passes, so each item has a test and a change to it needs a reas
   the client asks for it: a connected TCP stream gets `CONTINUE(id, buffer_remaining)`. Unknown
   extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
-  `buffer-remaining` each time it hits zero. The CONTINUE for a spent window is *held* while
-  bytes toward the remote are still queued (`continue_due` in `src/server/stream.c`). UDP streams
-  are never counted.
+  the advertised window each time it hits zero. That window is `buffer-remaining` capped so a full
+  window of `max-message-size` packets fits in half of `stream-queue-max` (`server_ingress_window`
+  in `src/server/server.c`): a client at full window speed into a stalled remote is slowed, never
+  closed `0x49`. The CONTINUE for a spent window is *held* while bytes toward the remote are still
+  queued (`continue_due` in `src/server/stream.c`). UDP streams are never counted. Toward the
+  client, one remote read is split into as many DATA packets as `max-message-size` requires
+  (`conn_send_data`); no frame ever exceeds the negotiated size.
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
   CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x48` blocked
   by egress policy, `0x49` throttled. A client's CLOSE for a stream gets no CLOSE back. A CONNECT
@@ -122,7 +126,9 @@ runs on. The defaults deny everything that is not public unicast and every chang
   alone.
 - The check runs on the *resolved* addresses, after DNS, address by address. A hostname that
   resolves to one public and one private address connects to the public one only. A literal IP in
-  CONNECT additionally needs `allow-direct-ip`.
+  CONNECT additionally needs `allow-direct-ip`. With an upstream `proxy`, the check still runs
+  here first, but the proxy is then handed the *hostname* (SOCKS5 ATYP 3, CONNECT `host:port`) so
+  a classifying router can resolve it itself; only a literal IP is sent as an address.
 - Hostnames are passed to the resolver as given, but a NUL inside the host, an empty host, a port
   of 0 or a host over 255 bytes is `0x41` before anything is looked up.
 
@@ -153,8 +159,10 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   `0640 root:wisp`.
 - **Bandwidth throttling pauses, never drops.** `conn_charge_bandwidth` suspends reads and arms a
   timer; it must never discard stream data. The upstream proxy and DNS client are in `proxy.c` and
-  `dns.c`; the proxy is given the already-resolved, policy-checked address, so egress still
-  applies through a proxy. UDP through a proxy is refused, not leaked.
+  `dns.c`; the destination is resolved and policy-checked before the proxy is dialled, so egress
+  still applies through a proxy, and the proxy then receives the hostname (see "Egress policy").
+  UDP through a proxy is refused unless the operator sets `proxy-udp = direct`, which relays UDP
+  around the proxy on purpose; it is never leaked by accident.
 
 ## Twisp / terminal streams (do not regress)
 

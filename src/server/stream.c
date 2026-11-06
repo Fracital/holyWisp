@@ -70,7 +70,6 @@ static int stream_update_events(hw_stream *s) {
 // ---------------------------------------------------------------------------------- lifecycle
 
 hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port) {
-	const hw_server_config *cfg = &c->w->server->cfg;
 	hw_stream *s = calloc(1, sizeof(*s));
 	if (!s) {
 		conn_send_close(c, id, HW_CLOSE_UNKNOWN);
@@ -82,7 +81,7 @@ hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, s
 	s->fd = -1;
 	s->pid = -1;
 	s->port = port;
-	s->remaining = cfg->buffer_remaining;
+	s->remaining = c->w->server->window;
 	hw_buf_init(&s->out);
 	hw_buf_init(&s->pin);
 	if (host_len >= sizeof(s->host)) host_len = sizeof(s->host) - 1;
@@ -410,8 +409,9 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 		conn_send_close(c, id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
-	if (type == HW_STREAM_UDP && c->w->server->proxy.kind != PROXY_NONE) {
-		// SOCKS5 UDP associate is not implemented; refuse rather than leak around the proxy.
+	if (type == HW_STREAM_UDP && c->w->server->proxy.kind != PROXY_NONE && !cfg->proxy_udp_direct) {
+		// SOCKS5 UDP associate is not implemented; refuse rather than leak around the proxy unless
+		// the operator asked for exactly that (proxy-udp = direct).
 		conn_send_close(c, id, HW_CLOSE_BLOCKED);
 		return;
 	}
@@ -431,6 +431,7 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 		stream_close(s, HW_CLOSE_INVALID_INFO, 1);
 		return;
 	}
+	s->literal_host = literal;
 	if (literal) {
 		enum hw_addr_class why;
 		if (!cfg->allow_direct_ip) {
@@ -543,7 +544,7 @@ void stream_on_data(hw_stream *s, const uint8_t *data, size_t len) {
 
 	// Flow control: one CONTINUE per window of packets, held back while the remote is slow.
 	if (s->type != HW_STREAM_UDP && --s->remaining == 0) {
-		s->remaining = cfg->buffer_remaining;
+		s->remaining = c->w->server->window;
 		if (hw_buf_avail(&s->out) == 0) {
 			conn_send_continue(c, s->id, s->remaining);
 		} else {

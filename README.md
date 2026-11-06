@@ -113,9 +113,10 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap, each direction |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |
 | `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence |
-| `proxy` | `""` | Upstream `socks5://` or `http://` proxy for outbound TCP |
+| `proxy` | `""` | Upstream `socks5://` (or `socks5h://`) / `http://` proxy for outbound TCP; it is given the destination hostname |
+| `proxy-udp` | `refuse` | With a proxy: `refuse` UDP streams, or relay them `direct`, bypassing the proxy |
 | `dns-server`, `dns-ttl-s`, `dns-order`, `dns-timeout-ms` | system, 120, ipv4first, 3000 | Built-in resolver and cache |
-| `buffer-remaining`, `max-message-size`, `ws-write-high-water`, `stream-queue-max` | 128, 1 MiB+5, 8 MiB, 16 MiB | Flow control and queue limits |
+| `buffer-remaining`, `max-message-size`, `ws-write-high-water`, `stream-queue-max` | 128, 1 MiB+5, 8 MiB, 16 MiB | Flow control and queue limits; the advertised window is capped so a full window of max-size packets fits in half of `stream-queue-max` |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 

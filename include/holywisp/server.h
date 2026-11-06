@@ -80,7 +80,8 @@ typedef struct hw_server_config {
 	hw_reputation_config reputation;
 
 	// Where streams go.
-	char proxy[256]; // socks5://[user:pass@]host:port or http://[user:pass@]host:port; "" = direct
+	char proxy[256];      // socks5://[user:pass@]host:port or http://[user:pass@]host:port; "" = direct
+	int proxy_udp_direct; // with a proxy: relay UDP directly (1) instead of refusing it (0)
 	char dns_servers[HW_MAX_DNS_SERVERS][64]; // "ip" or "ip:port"; empty = system resolver
 	int dns_server_count;
 	int dns_ttl_s;          // cache lifetime cap

@@ -116,7 +116,7 @@ if(HW_BUILD_TESTS)
     # The end-to-end suites run a whole server plus client, echo and proxy threads in one process.
     # Under a parallel `ctest -j`, CPU contention starves those threads and their internal timeouts
     # flake. RUN_SERIAL keeps them from competing with the rest of the suite.
-    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security)
+    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security OR ${name} STREQUAL test_flow)
       set_tests_properties(${name} PROPERTIES RUN_SERIAL ON)
     endif()
   endfunction()
@@ -134,6 +134,7 @@ if(HW_BUILD_TESTS)
   hw_test(test_reputation)
   hw_test(test_e2e)
   hw_test(test_security)
+  hw_test(test_flow)
 endif()
 
 install(TARGETS holywisp-bin holywisp-client-bin RUNTIME DESTINATION bin)

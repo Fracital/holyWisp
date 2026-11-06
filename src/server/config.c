@@ -141,6 +141,16 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		cfg->log_level = lvl;
 		return 0;
 	}
+	if (!strcmp(key, "proxy-udp")) {
+		if (!strcmp(value, "direct")) {
+			cfg->proxy_udp_direct = 1;
+		} else if (!strcmp(value, "refuse")) {
+			cfg->proxy_udp_direct = 0;
+		} else {
+			goto bad_value;
+		}
+		return 0;
+	}
 	if (!strcmp(key, "dns-order")) {
 		if (!strcmp(value, "ipv4first")) {
 			cfg->dns_order = HW_DNS_IPV4_FIRST;
@@ -318,7 +328,8 @@ void hw_config_usage(const char *argv0) {
 	    "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
 	    "  reputation-decay-per-hour, reputation-evict-after-days,\n"
 	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
-	    "  proxy URL                                 upstream socks5:// or http:// for outbound TCP\n"
+	    "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
+	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
 	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
 	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
 	    "  max-message-size, ws-write-high-water, stream-queue-max, socket-buffer-size\n"

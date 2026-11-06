@@ -9,6 +9,7 @@
  */
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
+#include "holywisp/wisp.h"
 
 #include "internal.h"
 
@@ -127,6 +128,17 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		return -1;
 	}
 	return 0;
+}
+
+// The window is counted in packets but the per-stream queue toward a slow remote is counted in
+// bytes. A client that spends a whole window of maximum-size packets into a remote that is not
+// draining must land inside stream-queue-max, or it is closed 0x49 before flow control ever slowed
+// it (wispurr patch 0004). Half the queue is the budget, so a trailing partial window still fits.
+static uint32_t server_ingress_window(const hw_server_config *cfg) {
+	size_t payload = cfg->max_message_size > HW_WISP_HEADER_LEN ? cfg->max_message_size - HW_WISP_HEADER_LEN : 1;
+	size_t by_mem = cfg->stream_queue_max / 2 / payload;
+	if (by_mem < 1) by_mem = 1;
+	return by_mem < cfg->buffer_remaining ? (uint32_t)by_mem : cfg->buffer_remaining;
 }
 
 // ---------------------------------------------------------------------------------- socket tuning
@@ -305,6 +317,11 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		goto fail;
 	}
 	if (build_limiters(s) != 0) goto fail;
+	s->window = server_ingress_window(cfg);
+	if (s->window < cfg->buffer_remaining) {
+		HW_INFO("server", "buffer-remaining %u capped to %u: %zu-byte packets must fit in half of stream-queue-max %zu",
+		        cfg->buffer_remaining, s->window, cfg->max_message_size - HW_WISP_HEADER_LEN, cfg->stream_queue_max);
+	}
 
 	s->dns_cache = hw_dns_cache_new((uint32_t)cfg->dns_ttl_s, (uint32_t)cfg->dns_negative_ttl_s, 0);
 
