@@ -73,7 +73,9 @@ format: ## rewrite every source file in the repo style
 check-format: ## fail when clang-format would change anything
 	$(CLANG_FORMAT) --dry-run -Werror $(SOURCES)
 
-tidy: $(DEBUG_DIR)/CMakeCache.txt ## clang-tidy with the debug compile database
+# Depends on the full build, not just the cache: conn.c includes a generated header (the embedded
+# web client), so the build must have run for clang-tidy to resolve the include.
+tidy: build ## clang-tidy with the debug compile database
 	$(CLANG_TIDY) -p $(DEBUG_DIR) --quiet $(filter %.c,$(SOURCES))
 
 # ---------------------------------------------------------------------------------- misc
