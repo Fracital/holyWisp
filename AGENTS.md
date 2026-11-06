@@ -117,8 +117,8 @@ every test still passes, so each item has a test and a change to it needs a reas
   counters, any other non-upgrade request gets `non-ws-response` (or 426 when it is empty), and a
   malformed head gets 400. All with `Connection: close`. With `serve-webclient`, `GET /` is the
   embedded client; `webclient-wisp-url` is spliced into it as `window.HOLYWISP_CONFIG.wisp`
-  (validated: `ws(s)://`, nothing that can escape a script string) so a page served from a name
-  whose root refuses WebSockets can still point at the keyed relay path.
+  (validated: `ws(s)://`, nothing that can escape a script string) for when the relay is not
+  the origin that served the page.
 
 ## Egress policy (do not regress)
 

@@ -105,8 +105,7 @@ typedef struct hw_server_config {
 	char non_ws_response[256]; // body for plain HTTP GETs that are not the web client
 	int serve_webclient;       // serve the built-in browser client on GET /
 	// ws:// or wss:// URL the web client offers as its default Wisp server. Empty: the client's own
-	// origin. Set it when the page is served from a name whose root refuses WebSockets and the relay
-	// lives on a keyed path, as behind the fracit.al edges. Spliced into the page as
+	// origin. For when the relay is not the origin that served the page. Spliced into the page as
 	// window.HOLYWISP_CONFIG.wisp; a value that cannot go into a script string is rejected.
 	char webclient_wisp_url[256];
 	int log_level;

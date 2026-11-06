@@ -508,15 +508,14 @@
 			$('showlog').onchange = (e) =>
 				$('logcard').classList.toggle('hidden', !e.target.checked);
 
-			// Resolve the Wisp endpoint the way stomp.fracit.al does. The host injects a config with a
-			// `wisp` URL (in production the gated edge relay, e.g. wss://host/pipe/<key>/) and the
-			// page uses it; otherwise it derives the endpoint from this origin as
-			// <origin with http->ws>/wisp/. The gate key only lives in the injected value, never in
-			// this committed file. As a local file, keep the ws://127.0.0.1:6001/ default.
+			// The server that served this page is the Wisp server: default to this origin with
+			// http->ws. The server can override that through window.HOLYWISP_CONFIG.wisp
+			// (webclient-wisp-url) when the relay lives somewhere else. As a local file, keep the
+			// ws://127.0.0.1:6001/ default.
 			if (location.protocol === 'http:' || location.protocol === 'https:') {
 				const cfg = window.HOLYWISP_CONFIG || {};
 				$('wisp').value =
-					cfg.wisp || `${location.origin.replace(/^http/, 'ws')}/wisp/`;
+					cfg.wisp || `${location.origin.replace(/^http/, 'ws')}/`;
 			}
 		</script>
 	</body>
