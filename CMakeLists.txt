@@ -99,6 +99,12 @@ if(HW_BUILD_TESTS)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ${name} COMMAND ${name})
     set_tests_properties(${name} PROPERTIES TIMEOUT 120)
+    # The end-to-end suites run a whole server plus client, echo and proxy threads in one process.
+    # Under a parallel `ctest -j`, CPU contention starves those threads and their internal timeouts
+    # flake. RUN_SERIAL keeps them from competing with the rest of the suite.
+    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security)
+      set_tests_properties(${name} PROPERTIES RUN_SERIAL ON)
+    endif()
   endfunction()
   hw_test(test_buf)
   hw_test(test_crypto)

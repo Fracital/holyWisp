@@ -287,7 +287,7 @@ static int wait_close(hw_client *c, uint32_t sid, uint8_t *reason) {
 static int echo_once(hw_client *c, uint32_t sid, const char *msg) {
 	if (hw_client_send(c, sid, msg, strlen(msg)) != 0) return 0;
 	uint8_t buf[64];
-	long n = hw_client_read_exact(c, sid, buf, strlen(msg), 5000);
+	long n = hw_client_read_exact(c, sid, buf, strlen(msg), 15000);
 	return n == (long)strlen(msg) && memcmp(buf, msg, strlen(msg)) == 0;
 }
 

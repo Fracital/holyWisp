@@ -30,8 +30,10 @@ int hw_buf_append(hw_buf *b, const void *data, size_t n);
 int hw_buf_append_u8(hw_buf *b, uint8_t v);
 
 // Direct write access: write up to hw_buf_room() bytes at hw_buf_tail(), then commit.
+// The NULL guards keep an empty, never-allocated buffer from forming NULL+0, which is undefined
+// behaviour even though it is harmless in practice (UBSan flags it).
 static inline uint8_t *hw_buf_tail(hw_buf *b) {
-	return b->data + b->len;
+	return b->data ? b->data + b->len : NULL;
 }
 static inline size_t hw_buf_room(const hw_buf *b) {
 	return b->cap - b->len;
@@ -42,7 +44,7 @@ static inline void hw_buf_commit(hw_buf *b, size_t n) {
 
 // Read access.
 static inline const uint8_t *hw_buf_head(const hw_buf *b) {
-	return b->data + b->off;
+	return b->data ? b->data + b->off : NULL;
 }
 static inline size_t hw_buf_avail(const hw_buf *b) {
 	return b->len - b->off;
