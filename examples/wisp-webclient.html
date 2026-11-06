@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>holyWisp web client</title>
+<!--
+  A dead-simple browser client for a Wisp server. No build step, no dependencies: open this file in
+  a browser (or serve it over http) and point it at a Wisp endpoint. It opens one TCP stream to a
+  destination host, sends a plain HTTP request, and prints the response plus a verbose packet trace.
+
+  It is deliberately small. The whole Wisp implementation is the WispClient class below, maybe 120
+  lines. Use it to confirm a server works, from this machine or an external Wisp domain.
+
+  Wisp URL: ws:// for a plain local server, wss:// for one behind TLS (an external domain). A page
+  loaded over https can only reach wss:// (browsers block mixed ws:// content).
+-->
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1419;
+    --panel: #1a222c;
+    --panel-2: #141b23;
+    --border: #2a3744;
+    --text: #d7e0e8;
+    --muted: #7f8ea0;
+    --accent: #4fd1c5;
+    --accent-fg: #06251f;
+    --ok: #68d391;
+    --warn: #f6ad55;
+    --err: #fc8181;
+    --rx: #63b3ed;
+    --tx: #b794f4;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  :root[data-theme="light"] {
+    color-scheme: light;
+    --bg: #f3f5f7;
+    --panel: #ffffff;
+    --panel-2: #eef1f4;
+    --border: #d4dbe2;
+    --text: #1a2430;
+    --muted: #5b6b7b;
+    --accent: #0d9488;
+    --accent-fg: #ffffff;
+    --ok: #2f855a;
+    --warn: #b7791f;
+    --err: #c53030;
+    --rx: #2b6cb0;
+    --tx: #6b46c1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  }
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: 0.2px; }
+  header h1 b { color: var(--accent); }
+  header .spacer { flex: 1; }
+  .main { max-width: 980px; margin: 0 auto; padding: 18px; }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin-bottom: 16px;
+  }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > .field { flex: 1 1 260px; }
+  input[type="text"] {
+    width: 100%;
+    padding: 9px 11px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--panel-2);
+    color: var(--text);
+    font: 13px var(--mono);
+  }
+  input[type="text"]:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
+  button {
+    padding: 9px 16px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--panel-2);
+    color: var(--text);
+    font: 600 13px system-ui;
+    cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: var(--accent-fg); border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  /* Toggle switch */
+  .toggle { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; font-size: 13px; }
+  .toggle input { position: absolute; opacity: 0; }
+  .track {
+    width: 38px; height: 22px; border-radius: 999px; background: var(--border);
+    position: relative; transition: background 0.15s;
+  }
+  .track::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: #fff; transition: transform 0.15s;
+  }
+  .toggle input:checked + .track { background: var(--accent); }
+  .toggle input:checked + .track::after { transform: translateX(16px); }
+  .status { display: flex; gap: 16px; flex-wrap: wrap; font: 12px var(--mono); color: var(--muted); margin-top: 12px; }
+  .status b { color: var(--text); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+  .dot.on { background: var(--ok); }
+  .dot.err { background: var(--err); }
+  .card h2 { font-size: 13px; margin: 0 0 10px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  .card h2 .count { color: var(--text); font-weight: 400; text-transform: none; letter-spacing: 0; }
+  textarea {
+    width: 100%; min-height: 160px; resize: vertical;
+    padding: 11px; border: 1px solid var(--border); border-radius: 7px;
+    background: var(--panel-2); color: var(--text); font: 12px/1.45 var(--mono);
+    white-space: pre; overflow: auto;
+  }
+  #log { min-height: 220px; white-space: pre-wrap; word-break: break-word; }
+  .log-line .t { color: var(--muted); }
+  .hidden { display: none; }
+  .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .hint code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-family: var(--mono); }
+</style>
+</head>
+<body>
+<header>
+  <h1>holy<b>Wisp</b> &nbsp;web client</h1>
+  <div class="spacer"></div>
+  <button id="theme" title="Toggle light / dark">◐ Theme</button>
+</header>
+
+<div class="main">
+  <div class="card">
+    <div class="row">
+      <div class="field" style="flex: 2 1 420px">
+        <label for="wisp">Wisp server URL &mdash; change this to use an external Wisp domain</label>
+        <input id="wisp" type="text" value="ws://127.0.0.1:6001/" spellcheck="false" />
+        <div class="hint">Local: <code>ws://127.0.0.1:6001/</code> &nbsp;&middot;&nbsp; External (TLS): <code>wss://wisp.example.com/</code></div>
+      </div>
+      <div class="field">
+        <label for="target">Target URL (plain HTTP)</label>
+        <input id="target" type="text" value="http://api.ipify.org/" spellcheck="false" />
+        <div class="hint">The server relays a raw <code>GET</code> to this host:port.</div>
+      </div>
+    </div>
+    <div class="controls">
+      <button id="go" class="primary">Connect &amp; request</button>
+      <button id="stop" disabled>Disconnect</button>
+      <button id="clear">Clear</button>
+      <label class="toggle" title="Negotiate the wisp-v2 subprotocol">
+        <input id="v2" type="checkbox" /><span class="track"></span> Wisp v2
+      </label>
+      <label class="toggle" title="Show the per-packet protocol trace">
+        <input id="showlog" type="checkbox" checked /><span class="track"></span> Protocol log
+      </label>
+    </div>
+    <div class="status">
+      <span><span id="dot" class="dot"></span><b id="state">idle</b></span>
+      <span>version: <b id="ver">&mdash;</b></span>
+      <span>window: <b id="win">&mdash;</b></span>
+      <span>bytes in/out: <b id="bytes">0 / 0</b></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Response <span class="count" id="respcount"></span></h2>
+    <textarea id="resp" readonly placeholder="The destination's HTTP response appears here."></textarea>
+  </div>
+
+  <div class="card" id="logcard">
+    <h2>Protocol log</h2>
+    <textarea id="log" readonly placeholder="Every Wisp packet sent and received is traced here."></textarea>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---- Minimal Wisp protocol. Packet = [type u8][streamId u32 LE][payload]. ----
+const PKT = { CONNECT: 0x01, DATA: 0x02, CONTINUE: 0x03, CLOSE: 0x04, INFO: 0x05 };
+const STREAM_TCP = 0x01;
+const CLOSE_REASONS = {
+  0x01: "unknown", 0x02: "voluntary (remote closed)", 0x03: "network error",
+  0x04: "incompatible extensions", 0x41: "invalid info", 0x42: "unreachable host",
+  0x43: "no response", 0x44: "connection refused", 0x47: "transfer timeout",
+  0x48: "host blocked by policy", 0x49: "throttled", 0x81: "client error",
+  0xc0: "bad password", 0xc1: "bad signature", 0xc2: "authentication required",
+};
+const typeName = t => ({ 1: "CONNECT", 2: "DATA", 3: "CONTINUE", 4: "CLOSE", 5: "INFO" }[t] || "0x" + t.toString(16));
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+class WispClient {
+  constructor(url, { v2 = false, onLog, onState, onData, onClose } = {}) {
+    this.url = url;
+    this.v2 = v2;
+    this.onLog = onLog || (() => {});
+    this.onState = onState || (() => {});
+    this.onData = onData || (() => {});
+    this.onClose = onClose || (() => {});
+    this.ready = false;        // handshake complete (server CONTINUE on stream 0 seen)
+    this.nextId = 1;
+    this.sentInfo = false;
+  }
+
+  connect() {
+    this.onLog("info", `connecting to ${this.url} (${this.v2 ? "wisp-v2" : "wisp-v1"})`);
+    this.ws = this.v2 ? new WebSocket(this.url, "wisp-v2") : new WebSocket(this.url);
+    this.ws.binaryType = "arraybuffer";
+    this.ws.onopen = () => this.onLog("info", "websocket open");
+    this.ws.onmessage = ev => this._onFrame(new Uint8Array(ev.data));
+    this.ws.onerror = () => this.onLog("err", "websocket error (is the Wisp URL reachable?)");
+    this.ws.onclose = ev => { this.ready = false; this.onState("closed"); this.onLog("info", `websocket closed (code ${ev.code})`); };
+  }
+
+  close() { if (this.ws && this.ws.readyState <= 1) this.ws.close(); }
+
+  // Build and send one packet.
+  _send(type, streamId, payload = new Uint8Array(0)) {
+    const buf = new Uint8Array(5 + payload.length);
+    const dv = new DataView(buf.buffer);
+    buf[0] = type;
+    dv.setUint32(1, streamId, true);
+    buf.set(payload, 5);
+    this.ws.send(buf);
+    this.onLog("tx", `${typeName(type)} stream=${streamId} len=${payload.length}`);
+  }
+
+  _onFrame(buf) {
+    if (buf.length < 5) return;
+    const type = buf[0];
+    const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+    const streamId = dv.getUint32(1, true);
+    const payload = buf.subarray(5);
+    this.onLog("rx", `${typeName(type)} stream=${streamId} len=${payload.length}` +
+      (type === PKT.CLOSE ? ` reason=${CLOSE_REASONS[payload[0]] || payload[0]}` : "") +
+      (type === PKT.CONTINUE ? ` window=${dv.getUint32(5, true)}` : ""));
+
+    if (type === PKT.INFO && streamId === 0) {
+      // v2: the server greets with INFO; reply with ours (major 2, minor 1, no extensions).
+      const major = payload[0], minor = payload[1];
+      this.onState("handshaking", { ver: `v2 (server ${major}.${minor})` });
+      if (!this.sentInfo) {
+        this.sentInfo = true;
+        this._send(PKT.INFO, 0, new Uint8Array([2, 1]));
+      }
+      return;
+    }
+    if (type === PKT.CONTINUE && streamId === 0) {
+      // Handshake complete (both v1 and v2 end here). The window is the per-stream packet budget.
+      this.window = dv.getUint32(5, true);
+      if (!this.ready) { this.ready = true; this.onState("ready", { ver: this.v2 ? "v2" : "v1", window: this.window }); }
+      return;
+    }
+    if (type === PKT.DATA) this.onData(streamId, payload);
+    if (type === PKT.CLOSE) this.onClose(streamId, payload[0]);
+  }
+
+  // Open a TCP stream to host:port. Returns the stream id.
+  openTCP(host, port) {
+    const id = this.nextId++;
+    const hostBytes = enc.encode(host);
+    const payload = new Uint8Array(3 + hostBytes.length);
+    const dv = new DataView(payload.buffer);
+    payload[0] = STREAM_TCP;
+    dv.setUint16(1, port, true);
+    payload.set(hostBytes, 3);
+    this._send(PKT.CONNECT, id, payload);
+    return id;
+  }
+
+  sendData(streamId, bytes) { this._send(PKT.DATA, streamId, bytes); }
+}
+
+// ---- UI glue ----
+const $ = id => document.getElementById(id);
+const resp = $("resp"), log = $("log");
+let client = null, inBytes = 0, outBytes = 0, respBytes = 0;
+
+function stamp() { return new Date().toLocaleTimeString("en-GB", { hour12: false }) + "." + String(Date.now() % 1000).padStart(3, "0"); }
+function logLine(kind, msg) {
+  const arrow = { tx: "→", rx: "←", info: "·", err: "✗" }[kind] || " ";
+  log.value += `${stamp()}  ${arrow} ${msg}\n`;
+  log.scrollTop = log.scrollHeight;
+}
+function setState(state, extra = {}) {
+  const dot = $("dot"), st = $("state");
+  dot.className = "dot" + (state === "ready" ? " on" : state === "error" || state === "closed" ? " err" : "");
+  st.textContent = state;
+  if (extra.ver) $("ver").textContent = extra.ver;
+  if (extra.window !== undefined) $("win").textContent = extra.window;
+}
+function bump(dIn, dOut) { inBytes += dIn; outBytes += dOut; $("bytes").textContent = `${inBytes} / ${outBytes}`; }
+
+function parseTarget(url) {
+  let u;
+  try { u = new URL(url); } catch { throw new Error("target is not a valid URL"); }
+  if (u.protocol !== "http:") throw new Error("target must be http:// (the server relays plain HTTP; use a reverse proxy for TLS)");
+  const port = u.port ? parseInt(u.port, 10) : 80;
+  return { host: u.hostname, port, path: (u.pathname || "/") + (u.search || "") };
+}
+
+function start() {
+  stop();
+  resp.value = ""; respBytes = 0; $("respcount").textContent = "";
+  inBytes = outBytes = 0; bump(0, 0);
+  setState("connecting", { ver: "—", window: "—" });
+
+  let target;
+  try { target = parseTarget($("target").value.trim()); }
+  catch (e) { logLine("err", e.message); setState("error"); return; }
+
+  const wispUrl = $("wisp").value.trim();
+  $("go").disabled = true; $("stop").disabled = false;
+
+  let streamId = null;
+  client = new WispClient(wispUrl, {
+    v2: $("v2").checked,
+    onLog: logLine,
+    onState: (s, extra) => {
+      setState(s, extra);
+      if (s === "ready" && streamId === null) {
+        // Handshake done: open the stream and fire the request.
+        streamId = client.openTCP(target.host, target.port);
+        const req = `GET ${target.path} HTTP/1.1\r\nHost: ${target.host}\r\nUser-Agent: holywisp-webclient\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
+        const bytes = enc.encode(req);
+        client.sendData(streamId, bytes);
+        bump(0, bytes.length);
+        logLine("info", `sent HTTP request to ${target.host}:${target.port} on stream ${streamId}`);
+      }
+    },
+    onData: (sid, payload) => {
+      if (sid !== streamId) return;
+      bump(payload.length, 0);
+      respBytes += payload.length;
+      resp.value += dec.decode(payload, { stream: true });
+      resp.scrollTop = resp.scrollHeight;
+      $("respcount").textContent = `(${respBytes} bytes)`;
+    },
+    onClose: (sid, reason) => {
+      if (sid !== streamId) return;
+      logLine("info", `stream ${sid} closed: ${CLOSE_REASONS[reason] || reason}`);
+      setState("done", {});
+      $("go").disabled = false; $("stop").disabled = true;
+    },
+  });
+  client.connect();
+}
+
+function stop() {
+  if (client) { client.close(); client = null; }
+  $("go").disabled = false; $("stop").disabled = true;
+}
+
+// Wiring.
+$("go").onclick = start;
+$("stop").onclick = () => { stop(); setState("closed"); };
+$("clear").onclick = () => { resp.value = ""; log.value = ""; $("respcount").textContent = ""; };
+$("showlog").onchange = e => $("logcard").classList.toggle("hidden", !e.target.checked);
+$("theme").onclick = () => {
+  const r = document.documentElement;
+  const next = r.getAttribute("data-theme") === "light" ? "dark" : "light";
+  r.setAttribute("data-theme", next);
+  try { localStorage.setItem("hw-theme", next); } catch {}
+};
+try {
+  const saved = localStorage.getItem("hw-theme");
+  if (saved) document.documentElement.setAttribute("data-theme", saved);
+} catch {}
+</script>
+</body>
+</html>

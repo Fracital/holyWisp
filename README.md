@@ -158,6 +158,15 @@ build/release/holywisp-client --bench 268435456 echo.example 7
 The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events.
 `tests/test_e2e.c` and `tests/test_security.c` are the reference for using it.
 
+## Browser demo
+
+`examples/wisp-webclient.html` is a dependency-free, single-file browser client. Open it directly
+(or serve it over http) to confirm a server works interactively: it does the Wisp handshake, opens
+one TCP stream to a destination, sends a plain HTTP request, and prints the response plus a
+per-packet trace. The **Wisp server URL** field is front-and-center so you can point it at a local
+`ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain; there are toggles for Wisp
+v2, the protocol log, and a light/dark theme. The default target is `http://api.ipify.org/`.
+
 ## Layout
 
 ```
@@ -168,6 +177,7 @@ src/server/         holywisp: config, workers, connections, streams, egress, ups
 src/client/         libholywisp-client and the holywisp-client CLI
 tests/              one binary per module plus the end-to-end and security suites, run by ctest
 deploy/             systemd unit, Debian + RPM packaging, the package builder
+examples/           wisp-webclient.html: a single-file browser client for interactive testing
 .github/workflows/  build, format, release (binaries), packages (.deb + .rpm)
 ```
 
