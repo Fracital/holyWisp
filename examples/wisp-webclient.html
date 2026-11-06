@@ -508,16 +508,15 @@
 			$('showlog').onchange = (e) =>
 				$('logcard').classList.toggle('hidden', !e.target.checked);
 
-			// Default the Wisp server field when the page is served over the network. Point at this
-			// same origin, honouring a relay path the host injects at runtime: Fracital serves the
-			// Wisp relay behind the WISP_GATE_KEY gate and exposes its path as window.__FRX_CFG__.relay
-			// (e.g. "/pipe/<key>/"), so the demo reaches the gated endpoint without the secret key
-			// ever living in this file. A plain holywisp server accepts Wisp at the root, so the
-			// fallback is "/". As a local file, keep the ws://127.0.0.1:6001/ default.
+			// Resolve the Wisp endpoint the way stomp.fracit.al does. The host injects a config with a
+			// `wisp` URL (in production the gated edge relay, e.g. wss://host/pipe/<key>/) and the
+			// page uses it; otherwise it derives the endpoint from this origin as
+			// <origin with http->ws>/wisp/. The gate key only lives in the injected value, never in
+			// this committed file. As a local file, keep the ws://127.0.0.1:6001/ default.
 			if (location.protocol === 'http:' || location.protocol === 'https:') {
-				const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-				const relay = (window.__FRX_CFG__ && window.__FRX_CFG__.relay) || '/';
-				$('wisp').value = `${scheme}://${location.host}${relay}`;
+				const cfg = window.HOLYWISP_CONFIG || {};
+				$('wisp').value =
+					cfg.wisp || `${location.origin.replace(/^http/, 'ws')}/wisp/`;
 			}
 		</script>
 	</body>
