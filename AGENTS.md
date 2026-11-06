@@ -53,8 +53,11 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 
 ### Deployments and servers
 
-- **The AI does not deploy, period.** There is no deploy workflow in this repository on purpose.
-  If one is added later, it will run from CI on a push the user made; the agent never triggers it.
+- **Deploys run from CI, not by hand.** `.github/workflows/deploy.yml` deploys master to terp
+  (`holywisp.fracit.al`) through an SSH forced-command gate (`deploy/terp-deploy-gate.sh`, pinned
+  to `TERP_DEPLOY_KEY`, installed on terp by hand; CI never updates it). The agent never SSHes to
+  terp directly and never edits the live `/etc/holywisp`. The deploy job skips (green) until the
+  secret is set.
 - Do not start, stop or reconfigure a `holywisp` process on a machine that is not the one you are
   developing on. Running `make run` locally against loopback is development; touching a host that
   serves users is deployment.

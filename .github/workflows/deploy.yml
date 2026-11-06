@@ -1,0 +1,63 @@
+# Build every push to master, then deploy it to terp (5.188.124.62) as https://holywisp.fracit.al/.
+#
+# TERP_DEPLOY_KEY is an SSH key that terp pins to /usr/local/sbin/holywisp-deploy-gate (source:
+# deploy/terp-deploy-gate.sh, installed by hand; CI never updates it). The only command it accepts
+# is `deploy <sha>`: terp fetches that commit from GitHub, runs `make release` in /opt/holywisp/stage,
+# swaps /opt/holywisp/repo and the binaries to it, restarts the holywisp systemd service, health-checks
+# :8082/health and rolls back on failure. /etc/holywisp is never touched by CI.
+#
+# Until TERP_DEPLOY_KEY is set on the repo the deploy job skips (green, not red), so this is safe to
+# land before terp is wired up.
+name: Deploy
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+concurrency:
+  group: terp-deploy
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  TERP_HOST: 5.188.124.62
+  TERP_HOST_KEY: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIObUWrM7CxDC8VuXpP9FGykhelefOxfFj+cthroe5/c8
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libcrypt-dev
+      - name: Build (Release) and smoke
+        run: |
+          make release
+          build/release/holywisp --version
+          test -x build/release/holywisp
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy ${{ github.sha }} to terp
+        env:
+          TERP_DEPLOY_KEY: ${{ secrets.TERP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$TERP_DEPLOY_KEY" ]; then
+            echo "::notice::TERP_DEPLOY_KEY is not set; skipping the terp deploy. Set the secret and"
+            echo "::notice::install deploy/terp-deploy-gate.sh on terp to activate holywisp.fracit.al."
+            exit 0
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$TERP_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          echo "$TERP_HOST $TERP_HOST_KEY" > ~/.ssh/known_hosts
+          ssh -o BatchMode=yes "root@$TERP_HOST" deploy "$GITHUB_SHA"
+          # The gate already health-checked :8082 locally; confirm the public site answers too.
+          curl -fsS -m 20 -o /dev/null -w 'site %{http_code}\n' https://holywisp.fracit.al/
