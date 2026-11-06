@@ -508,17 +508,16 @@
 			$('showlog').onchange = (e) =>
 				$('logcard').classList.toggle('hidden', !e.target.checked);
 
-			// Default the Wisp server field when the page is served over the network. The hosted demo
-			// at holywisp.fracit.al points at the public wss://anura.pro/ relay; any other origin
-			// defaults to itself, so a local holywisp server just works. As a local file, keep the
-			// ws://127.0.0.1:6001/ default.
+			// Default the Wisp server field when the page is served over the network. Point at this
+			// same origin, honouring a relay path the host injects at runtime: Fracital serves the
+			// Wisp relay behind the WISP_GATE_KEY gate and exposes its path as window.__FRX_CFG__.relay
+			// (e.g. "/pipe/<key>/"), so the demo reaches the gated endpoint without the secret key
+			// ever living in this file. A plain holywisp server accepts Wisp at the root, so the
+			// fallback is "/". As a local file, keep the ws://127.0.0.1:6001/ default.
 			if (location.protocol === 'http:' || location.protocol === 'https:') {
-				if (location.hostname === 'holywisp.fracit.al') {
-					$('wisp').value = 'wss://anura.pro/';
-				} else {
-					const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-					$('wisp').value = `${scheme}://${location.host}/`;
-				}
+				const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+				const relay = (window.__FRX_CFG__ && window.__FRX_CFG__.relay) || '/';
+				$('wisp').value = `${scheme}://${location.host}${relay}`;
 			}
 		</script>
 	</body>
