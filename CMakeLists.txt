@@ -65,6 +65,18 @@ target_include_directories(holywisp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(holywisp PUBLIC hw_flags Threads::Threads)
 
 # libholywisp-server: the server as a library (the binary and the e2e test both link it). ---
+# Embed the browser client (examples/wisp-webclient.html) into the server so it can be served on
+# GET / with no on-disk asset. Regenerated whenever the HTML changes.
+set(HW_WEBCLIENT_SRC ${CMAKE_CURRENT_SOURCE_DIR}/examples/wisp-webclient.html)
+set(HW_WEBCLIENT_HDR ${CMAKE_CURRENT_BINARY_DIR}/generated/holywisp_webclient.h)
+add_custom_command(
+  OUTPUT ${HW_WEBCLIENT_HDR}
+  COMMAND ${CMAKE_COMMAND} -DINPUT=${HW_WEBCLIENT_SRC} -DOUTPUT=${HW_WEBCLIENT_HDR}
+          -DSYMBOL=hw_webclient_html -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+  DEPENDS ${HW_WEBCLIENT_SRC} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_file.cmake
+  COMMENT "Embedding wisp-webclient.html"
+  VERBATIM)
+
 add_library(holywisp-server STATIC
   src/server/config.c
   src/server/conn.c
@@ -73,10 +85,12 @@ add_library(holywisp-server STATIC
   src/server/server.c
   src/server/stream.c
   src/server/twisp.c
+  ${HW_WEBCLIENT_HDR}
 )
 target_link_libraries(holywisp-server PUBLIC holywisp)
 # crypt(3) for password hashes; forkpty(3) for Twisp terminal streams.
 target_link_libraries(holywisp-server PUBLIC crypt util)
+target_include_directories(holywisp-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 add_executable(holywisp-bin src/server/main.c)
 set_target_properties(holywisp-bin PROPERTIES OUTPUT_NAME holywisp)

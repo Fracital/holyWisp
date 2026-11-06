@@ -116,6 +116,7 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `proxy` | `""` | Upstream `socks5://` or `http://` proxy for outbound TCP |
 | `dns-server`, `dns-ttl-s`, `dns-order`, `dns-timeout-ms` | system, 120, ipv4first, 3000 | Built-in resolver and cache |
 | `buffer-remaining`, `max-message-size`, `ws-write-high-water`, `stream-queue-max` | 128, 1 MiB+5, 8 MiB, 16 MiB | Flow control and queue limits |
+| `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,
@@ -160,8 +161,10 @@ The library behind it is `include/holywisp/client.h`: connect, open streams, sen
 
 ## Browser demo
 
-`examples/wisp-webclient.html` is a dependency-free, single-file browser client. Open it directly
-(or serve it over http) to confirm a server works interactively: it does the Wisp handshake, opens
+`examples/wisp-webclient.html` is a dependency-free, single-file browser client styled with the
+Holo theme. The server serves it on `GET /` by default (`serve-webclient`), so just open the
+server's URL in a browser; the page defaults its Wisp field to that same origin. You can also open
+the file directly. It confirms a server works interactively: it does the Wisp handshake, opens
 one TCP stream to a destination, sends a plain HTTP request, and prints the response plus a
 per-packet trace. The **Wisp server URL** field is front-and-center so you can point it at a local
 `ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain; there are toggles for Wisp

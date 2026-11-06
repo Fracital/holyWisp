@@ -13,6 +13,7 @@
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
+#include "holywisp_webclient.h" // generated: hw_webclient_html[], hw_webclient_html_len
 #include "internal.h"
 
 #include <crypt.h>
@@ -306,9 +307,8 @@ static void ws_fail(hw_conn *c, uint16_t code) {
 
 // ---------------------------------------------------------------------------------- HTTP
 
-static void http_reply(hw_conn *c, int status, const char *reason, const char *ctype, const char *body) {
+static void http_reply_n(hw_conn *c, int status, const char *reason, const char *ctype, const void *body, size_t blen) {
 	char head[512];
-	size_t blen = strlen(body);
 	int n = snprintf(head, sizeof(head),
 	                 "HTTP/1.1 %d %s\r\n"
 	                 "Content-Type: %s\r\n"
@@ -323,6 +323,10 @@ static void http_reply(hw_conn *c, int status, const char *reason, const char *c
 	}
 	c->state = CONN_HTTP_REPLY;
 	conn_flush(c);
+}
+
+static void http_reply(hw_conn *c, int status, const char *reason, const char *ctype, const char *body) {
+	http_reply_n(c, status, reason, ctype, body, strlen(body));
 }
 
 static void stats_json(hw_conn *c) {
@@ -428,6 +432,9 @@ static int http_process(hw_conn *c) {
 			http_reply(c, 200, "OK", "application/json", "{\"status\":\"ok\"}\n");
 		} else if (strcmp(req.path, "/stats") == 0) {
 			stats_json(c);
+		} else if (cfg->serve_webclient && strcmp(req.path, "/") == 0) {
+			// Visiting the server in a browser shows the built-in web client (serve-webclient).
+			http_reply_n(c, 200, "OK", "text/html; charset=utf-8", hw_webclient_html, hw_webclient_html_len);
 		} else if (cfg->non_ws_response[0]) {
 			http_reply(c, 200, "OK", "text/plain; charset=utf-8", cfg->non_ws_response);
 		} else {

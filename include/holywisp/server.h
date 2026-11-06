@@ -101,7 +101,8 @@ typedef struct hw_server_config {
 	int tcp_nodelay;
 	int tcp_quickack;
 	int listen_backlog;
-	char non_ws_response[256]; // body for plain HTTP GETs
+	char non_ws_response[256]; // body for plain HTTP GETs that are not the web client
+	int serve_webclient;       // serve the built-in browser client on GET /
 	int log_level;
 } hw_server_config;
 

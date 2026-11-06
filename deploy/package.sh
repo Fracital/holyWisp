@@ -91,7 +91,7 @@ build_rpm() {
 	rm -rf "$tardir"
 	mkdir -p "$tardir"
 	# From the working tree (not a git commit), so the package reflects exactly what is built.
-	cp -a "$root"/{CMakeLists.txt,CMakePresets.json,include,src,deploy,README.md,LICENSE} "$tardir/"
+	cp -a "$root"/{CMakeLists.txt,CMakePresets.json,cmake,include,src,examples,deploy,README.md,LICENSE} "$tardir/"
 	rm -rf "$tardir/deploy/out"
 	(cd "$out" && tar -czf "$top/SOURCES/holywisp-$version.tar.gz" "holywisp-$version")
 	rm -rf "$tardir"

@@ -129,6 +129,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	BOOL_KEY("tcp-quickack", tcp_quickack)
 	INT_KEY("listen-backlog", listen_backlog, 1, 65535)
 	STR_KEY("non-ws-response", non_ws_response)
+	BOOL_KEY("serve-webclient", serve_webclient)
 #undef BOOL_KEY
 #undef INT_KEY
 #undef STR_KEY
@@ -324,6 +325,7 @@ void hw_config_usage(const char *argv0) {
 	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
 	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
 	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
+	    "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
 	    "  log-level                                 debug|info|warn|error|none (info)\n"
 	    "\n"
 	    "  --version, --help\n",

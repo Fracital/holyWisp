@@ -71,6 +71,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 
 	static const char banner[] = "holyWisp: a Wisp server. Connect with a WebSocket client.\n";
 	memcpy(cfg->non_ws_response, banner, sizeof(banner));
+	cfg->serve_webclient = 1;
 	cfg->log_level = HW_LOG_INFO;
 }
 
