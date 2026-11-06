@@ -23,6 +23,9 @@ jobs:
     name: Debian package
     runs-on: ubuntu-latest
     container: debian:12
+    defaults:
+      run:
+        shell: bash # debian:12's /bin/sh is dash, which lacks `set -o pipefail`
     steps:
       - uses: actions/checkout@v5
       - name: Install build tools
@@ -52,6 +55,9 @@ jobs:
     name: Fedora package
     runs-on: ubuntu-latest
     container: fedora:41
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v5
       - name: Install build tools
