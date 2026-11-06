@@ -30,7 +30,7 @@ jobs:
           apt-get update
           apt-get install -y build-essential cmake ninja-build libcrypt-dev dpkg-dev fakeroot git
       - name: Build .deb
-        run: HW_VERSION="${GITHUB_REF_NAME#v}" bash deploy/package.sh deb
+        run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh deb
       - name: Install and smoke test the package
         run: |
           set -euo pipefail
@@ -57,7 +57,7 @@ jobs:
       - name: Install build tools
         run: dnf install -y gcc cmake ninja-build libxcrypt-devel rpm-build systemd-rpm-macros git
       - name: Build .rpm
-        run: HW_VERSION="${GITHUB_REF_NAME#v}" bash deploy/package.sh rpm
+        run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh rpm
       - name: Install and smoke test the package
         run: |
           set -euo pipefail

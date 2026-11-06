@@ -11,7 +11,15 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 out="$root/build/packages"
-version="${HW_VERSION:-0.1.0}"
+# Version: an explicit HW_VERSION wins, but only if it looks like a version (starts with a digit);
+# otherwise, and by default, read it from CMakeLists. This keeps an untagged "master" build from
+# producing an invalid package version.
+default_version="$(grep -oE 'project\(holyWisp VERSION [0-9.]+' "$root/CMakeLists.txt" | grep -oE '[0-9.]+' || echo 0.1.0)"
+version="${HW_VERSION:-}"
+case "$version" in
+	[0-9]*) ;;
+	*) version="$default_version" ;;
+esac
 arch_deb="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 want="${1:-all}"
 

@@ -210,10 +210,9 @@ static void *maint_main(void *arg) {
 		int stop = s->maint_stop;
 		pthread_mutex_unlock(&s->maint_lock);
 
-		static uint64_t last_slow;
 		uint64_t now = hw_now_ms();
-		if (now - last_slow >= 60000 || stop) {
-			last_slow = now;
+		if (now - s->maint_last_slow >= 60000 || stop) {
+			s->maint_last_slow = now;
 			hw_window_evict(s->conn_rate, 2 * (uint64_t)s->cfg.connection_window_s * 1000 + 120000);
 			hw_window_evict(s->per_source, 120000);
 			hw_window_evict(s->per_dest_sec, 120000);
@@ -227,9 +226,8 @@ static void *maint_main(void *arg) {
 		}
 		// Reputation save on its own cadence.
 		if (s->reputation && s->cfg.reputation.save_interval_s > 0) {
-			static uint64_t last_save;
-			if (now - last_save >= (uint64_t)s->cfg.reputation.save_interval_s * 1000 || stop) {
-				last_save = now;
+			if (now - s->maint_last_save >= (uint64_t)s->cfg.reputation.save_interval_s * 1000 || stop) {
+				s->maint_last_save = now;
 				if (hw_reputation_save(s->reputation) != 0) {
 					HW_WARN("reputation", "save to %s: %s", s->cfg.reputation.store_path, strerror(errno));
 				}

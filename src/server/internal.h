@@ -83,6 +83,8 @@ struct hw_server {
 	pthread_mutex_t maint_lock;
 	pthread_cond_t maint_cond;
 	int maint_stop;
+	uint64_t maint_last_slow; // last eviction/decay pass (ms)
+	uint64_t maint_last_save; // last reputation save (ms)
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
