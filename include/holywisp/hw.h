@@ -8,6 +8,9 @@
 #include <stdint.h>
 
 #define HW_VERSION "0.1.0"
+#ifndef HW_VERSION_SUFFIX
+#define HW_VERSION_SUFFIX "" // set at build time to a git commit, e.g. "+abc123"
+#endif
 
 #define HW_UNUSED                        __attribute__((unused))
 #define HW_PRINTF(fmt_index, args_index) __attribute__((format(printf, fmt_index, args_index)))

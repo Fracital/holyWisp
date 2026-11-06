@@ -1,0 +1,107 @@
+name: Packages
+
+# Build the Debian (.deb) and Fedora (.rpm) packages in their native containers and attach them to
+# the release. Mirrors release.yml's tagging: a push to master / dispatch refreshes the rolling
+# `latest` prerelease; a v* tag makes a kept release. The packages install the hardened systemd
+# unit and the dedicated `wisp` user (deploy/package.sh, deploy/systemd/, deploy/debian/,
+# deploy/rpm/).
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    container: debian:12
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build libcrypt-dev dpkg-dev fakeroot git
+      - name: Build .deb
+        run: HW_VERSION="${GITHUB_REF_NAME#v}" bash deploy/package.sh deb
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          apt-get install -y ./build/packages/holywisp_*.deb
+          command -v holywisp
+          holywisp --version
+          # The isolated user exists and cannot log in.
+          getent passwd wisp
+          test "$(getent passwd wisp | cut -d: -f7)" = /usr/sbin/nologin
+          # The config is not world-readable.
+          test "$(stat -c '%a' /etc/holywisp/holywisp.conf)" = 640
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-deb
+          path: build/packages/*.deb
+          if-no-files-found: error
+
+  rpm:
+    name: Fedora package
+    runs-on: ubuntu-latest
+    container: fedora:41
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build tools
+        run: dnf install -y gcc cmake ninja-build libxcrypt-devel rpm-build systemd-rpm-macros git
+      - name: Build .rpm
+        run: HW_VERSION="${GITHUB_REF_NAME#v}" bash deploy/package.sh rpm
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-*.rpm
+          holywisp --version
+          getent passwd wisp
+          # The unit is well-formed and heavily sandboxed.
+          systemd-analyze verify /usr/lib/systemd/system/holywisp.service || true
+      - name: Collect rpm
+        run: |
+          mkdir -p out
+          cp build/packages/rpmbuild/RPMS/*/holywisp-*.rpm out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-rpm
+          path: out/*.rpm
+          if-no-files-found: error
+
+  publish:
+    name: Attach to release
+    needs: [deb, rpm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          path: pkgs
+          merge-multiple: true
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.ref_type }}" = tag ]; then echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT";
+          else echo "tag=latest" >> "$GITHUB_OUTPUT"; fi
+      - name: Upload to the release
+        run: |
+          set -euo pipefail
+          tag="${{ steps.tag.outputs.tag }}"
+          # The release itself is created by release.yml; only attach packages if it exists.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" pkgs/*.deb pkgs/*.rpm --clobber
+          else
+            echo "release $tag not present yet; packages uploaded as workflow artifacts only"
+          fi

@@ -30,7 +30,7 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   (fd table with generation counters, timer heap, eventfd wakeup) and its Makefile-drives-CMake
   layout is the model for ours.
 - `~/src/Fracital` (TypeScript): `.github/workflows/format.yml` is the model for our format CI
-  (auto-fix commits on `main`, failing checks on PRs) and its `AGENTS.md` is the model for this
+  (auto-fix commits on `master`, failing checks on PRs) and its `AGENTS.md` is the model for this
   file.
 
 ## Hard rules (read first)
@@ -46,10 +46,10 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 - Authorization is **per-turn, never assumed**. A commit request in one turn does **not** carry
   over to any later turn, even within the same session.
 - When in doubt, **do not commit**. State what is uncommitted and stop.
-- Never rewrite or force-push `main`. Never rebase away commits that are already on the remote,
+- Never rewrite or force-push `master`. Never rebase away commits that are already on the remote,
   including the bot's `chore: auto-fix formatting with clang-format` commits.
 - Before any commit: `make check-format` and `make test` must pass locally. The format workflow
-  otherwise pushes a fix-up on `main` or fails the PR, and a red `Build` on `main` blocks everyone.
+  otherwise pushes a fix-up on `master` or fails the PR, and a red `Build` on `master` blocks everyone.
 
 ### Deployments and servers
 
@@ -126,6 +126,46 @@ runs on. The defaults deny everything that is not public unicast and every chang
 - Hostnames are passed to the resolver as given, but a NUL inside the host, an empty host, a port
   of 0 or a host over 255 bytes is `0x41` before anything is looked up.
 
+## Security suite (do not regress)
+
+The limiters, reputation and filters are the point of this server. They are process-wide, created
+in `hw_server_new` (`build_limiters`), lock internally, and are evicted and persisted by the one
+maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_reputation`,
+`test_filter`) and the whole path has `test_security`. Keep these invariants:
+
+- **Where each check runs.** Connection-level checks (real-IP resolution, per-IP connect rate,
+  reputation tier, the concurrent-connection semaphore) are in `http_process` at upgrade time.
+  Per-CONNECT checks (per-source connect rate, the Twisp gate) are in `handle_connect`.
+  Per-destination checks (host/port filters, per-dest rate, destination reputation, the in-flight
+  SYN cap, the SYN-flood signature) are in `stream.c` around the dial. Do not move a check to a
+  cheaper-but-wrong place; the per-destination ones must see the resolved address.
+- **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
+  lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
+  store format is parsed by a hand-rolled reader that must round-trip what the writer emits
+  (`test_reputation` covers it). The store is written atomically (temp + rename), mode 0600.
+- **Flow control vs. flood control are different things.** `buffer-remaining` is the Wisp CONTINUE
+  window (correctness); the `flood-*` limits are abuse control. Don't conflate them.
+- **Fail open on allocation failure, fail closed on policy.** A limiter that cannot allocate lets
+  the request through (`hw_window_allow` returns 1); a policy that denies always denies. Keep that
+  asymmetry: a transient OOM must not lock out every client, but a blocked address stays blocked.
+- **Passwords** are compared in constant time, and a `$`-prefixed stored value goes through
+  `crypt_r`, never a plain `strcmp`. The config that holds them is never logged and is installed
+  `0640 root:wisp`.
+- **Bandwidth throttling pauses, never drops.** `conn_charge_bandwidth` suspends reads and arms a
+  timer; it must never discard stream data. The upstream proxy and DNS client are in `proxy.c` and
+  `dns.c`; the proxy is given the already-resolved, policy-checked address, so egress still
+  applies through a proxy. UDP through a proxy is refused, not leaked.
+
+## Twisp / terminal streams (do not regress)
+
+`enable-twisp` runs an operator-chosen command on a PTY and relays it (`twisp.c`). It is a remote
+shell by design, so the gate in `handle_connect` is the whole access-control story and must stay
+intact: **`enable-twisp` on, the client on Wisp v2, and the client authenticated** with a
+configured password. Probing it unauthenticated is a reputation event. The config validator refuses
+`enable-twisp` without `enable-v2` and at least one `password-user`. The systemd sandbox
+(`NoNewPrivileges`, capability drop, read-only FS, syscall filter) is the backstop that keeps a
+spawned shell from escalating; do not weaken it to make Twisp "more useful".
+
 ## Concurrency model (do not regress)
 
 - One `hw_loop` per worker thread. Every `hw_conn` and `hw_stream` belongs to the loop that
@@ -162,10 +202,16 @@ runs on. The defaults deny everything that is not public unicast and every chang
   `build/release/holywisp --port 6001 --allow-loopback --allow-direct-ip` and
   `build/release/holywisp-client --bench 268435456 127.0.0.1 <echo port>` against any TCP echo
   service. Throughput on loopback should be hundreds of MiB/s; a drop to tens is a regression.
+- If you touched the proxy path, run `test_security` several times (it starts real SOCKS5 and HTTP
+  CONNECT proxies in-process): `for i in $(seq 1 20); do build/debug/test_security || break; done`.
 - If you added or renamed a config key or CLI flag: `src/server/config.c` (parser and `--help`
-  text), `README.md` (the table) and this file's protocol section if it changes behaviour.
+  text), `README.md` (the table), `holywisp.conf.example`, `deploy/holywisp.conf` and this file's
+  relevant section if it changes behaviour.
 - If you added a public function: it is declared in exactly one `include/holywisp/*.h`, has a
   contract comment, and a unit test exercises it.
+- If you touched packaging or the unit: `bash deploy/package.sh all` builds both packages, and
+  `systemd-analyze security --offline=true deploy/systemd/holywisp.service` must still rate "OK"
+  (~1.3). Never lower the sandbox to work around a bug; fix the bug.
 
 ## Repository layout
 
@@ -185,17 +231,29 @@ runs on. The defaults deny everything that is not public unicast and every chang
 | `src/server/server.c` | Config defaults, listeners, worker threads, lifecycle, stats. |
 | `src/server/conn.c` | One client: HTTP upgrade, WebSocket frames, Wisp dispatch, write queue, backpressure. |
 | `src/server/stream.c` | One relayed TCP/UDP stream: resolve, connect with fallback, both data directions. |
-| `src/server/egress.c` | The allow/deny decision for a remote address. |
-| `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`. |
+| `src/server/egress.c` | The allow/deny decision for a remote address (address class only). |
+| `src/server/proxy.c` | Upstream SOCKS5 / HTTP CONNECT handshake, driven on the stream socket. |
+| `src/server/twisp.c` | PTY terminal streams: shell-split the command, `forkpty`, relay the master. |
+| `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`, validation. |
 | `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM. |
+| `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, token-bucket bandwidth, SYN-signature ring. |
+| `include/holywisp/reputation.h`, `src/common/reputation.c` | Per-IP / per-dest scoring, tiers, decay, JSON persistence. |
+| `include/holywisp/filter.h`, `src/common/filter.c` | Host/port allow-block lists, CIDR match, real-client-IP from proxy headers. |
+| `include/holywisp/dns.h`, `src/common/dns.c` | Built-in A/AAAA DNS client and the shared result cache. |
+| `include/holywisp/smap.h`, `src/common/smap.c` | String-keyed open-addressing map used by the limiters, reputation and DNS cache. |
 | `include/holywisp/client.h`, `src/client/client.c` | Blocking client library: connect, open, send, poll, read_exact. |
 | `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
-| `tests/test_e2e.c` | Real server + real echo services + real client. The reference for using the client API. |
+| `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
+| `deploy/systemd/holywisp.service` | The hardened unit (the sandbox is load-bearing; see "Security suite"). |
+| `deploy/holywisp.conf` | The installed default config (loopback bind, reputation store under /var/lib). |
+| `deploy/debian/`, `deploy/rpm/holywisp.spec` | Debian maintainer scripts and the RPM spec. |
+| `deploy/package.sh` | Builds the `.deb` (dpkg-deb) and `.rpm` (rpmbuild) into `build/packages/`. |
 | `CMakeLists.txt`, `CMakePresets.json`, `Makefile` | CMake compiles; the Makefile is the one entry point (`make help`). |
 | `.clang-format`, `.clang-tidy`, `.editorconfig` | Enforcement of `STYLE.md`. |
 | `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke. |
-| `.github/workflows/format.yml` | clang-format drift: auto-fix commit on `main`, failing check on PRs. |
+| `.github/workflows/format.yml` | clang-format drift: auto-fix commit on `master`, failing check on PRs. |
+| `.github/workflows/release.yml`, `packages.yml` | Rolling `latest` release: prebuilt binaries, and the `.deb` + `.rpm`. |
 
 ## Hand-off
 

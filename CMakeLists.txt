@@ -5,6 +5,7 @@ project(holyWisp VERSION 0.1.0 LANGUAGES C)
 option(HW_WERROR "Treat warnings as errors" ON)
 option(HW_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 option(HW_BUILD_TESTS "Build the test binaries" ON)
+set(HW_VERSION_SUFFIX "" CACHE STRING "Appended to the reported version, e.g. +<commit>")
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -31,6 +32,9 @@ target_compile_options(hw_flags INTERFACE
 if(HW_WERROR)
   target_compile_options(hw_flags INTERFACE -Werror)
 endif()
+if(HW_VERSION_SUFFIX)
+  target_compile_definitions(hw_flags INTERFACE HW_VERSION_SUFFIX="${HW_VERSION_SUFFIX}")
+endif()
 if(HW_SANITIZE)
   target_compile_options(hw_flags INTERFACE -fsanitize=address,undefined -fno-omit-frame-pointer)
   target_link_options(hw_flags INTERFACE -fsanitize=address,undefined)
@@ -43,12 +47,17 @@ endif()
 add_library(holywisp STATIC
   src/common/base64.c
   src/common/buf.c
+  src/common/dns.c
+  src/common/filter.c
+  src/common/limits.c
   src/common/log.c
   src/common/loop.c
   src/common/map.c
   src/common/net.c
+  src/common/reputation.c
   src/common/resolver.c
   src/common/sha1.c
+  src/common/smap.c
   src/common/wisp.c
   src/common/ws.c
 )
@@ -60,10 +69,14 @@ add_library(holywisp-server STATIC
   src/server/config.c
   src/server/conn.c
   src/server/egress.c
+  src/server/proxy.c
   src/server/server.c
   src/server/stream.c
+  src/server/twisp.c
 )
 target_link_libraries(holywisp-server PUBLIC holywisp)
+# crypt(3) for password hashes; forkpty(3) for Twisp terminal streams.
+target_link_libraries(holywisp-server PUBLIC crypt util)
 
 add_executable(holywisp-bin src/server/main.c)
 set_target_properties(holywisp-bin PROPERTIES OUTPUT_NAME holywisp)
@@ -90,11 +103,17 @@ if(HW_BUILD_TESTS)
   hw_test(test_buf)
   hw_test(test_crypto)
   hw_test(test_map)
+  hw_test(test_smap)
   hw_test(test_net)
   hw_test(test_wisp)
   hw_test(test_ws)
   hw_test(test_loop)
+  hw_test(test_limits)
+  hw_test(test_filter)
+  hw_test(test_dns)
+  hw_test(test_reputation)
   hw_test(test_e2e)
+  hw_test(test_security)
 endif()
 
 install(TARGETS holywisp-bin holywisp-client-bin RUNTIME DESTINATION bin)

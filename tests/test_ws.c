@@ -109,7 +109,8 @@ static void test_http_request(void) {
 
 static void test_http_upgrade_roundtrip(void) {
 	char req[1024];
-	size_t n = hw_http_write_upgrade(req, sizeof(req), "localhost", 6001, "/", "dGhlIHNhbXBsZSBub25jZQ==", "wisp-v2");
+	size_t n = hw_http_write_upgrade(req, sizeof(req), "localhost", 6001, "/", "dGhlIHNhbXBsZSBub25jZQ==", "wisp-v2",
+	                                 NULL);
 	CHECK(n > 0, "wrote request");
 	hw_http_request r;
 	CHECK_EQ(hw_http_parse_request((const uint8_t *)req, n, &r), (int)n);

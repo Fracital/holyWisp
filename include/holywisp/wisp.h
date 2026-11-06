@@ -24,8 +24,12 @@ enum hw_wisp_type {
 
 enum hw_stream_type {
 	HW_STREAM_TCP = 0x01,
-	HW_STREAM_UDP = 0x02
+	HW_STREAM_UDP = 0x02,
+	HW_STREAM_TERM = 0x03 // Twisp: a PTY running the command named in the hostname field
 };
+
+// Twisp resize: payload rows(u16 LE) cols(u16 LE).
+#define HW_WISP_TWISP_RESIZE 0xF0
 
 enum hw_close_reason {
 	HW_CLOSE_UNKNOWN = 0x01,

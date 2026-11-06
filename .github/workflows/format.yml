@@ -1,12 +1,12 @@
 name: "clang-format Code Quality Assurance"
 
-# Modelled on Fracital's Biome workflow: pushes to main get an auto-fix commit from the bot,
+# Modelled on Fracital's Biome workflow: pushes to master get an auto-fix commit from the bot,
 # pull requests only get a failing check (a PR runs untrusted code, so a contents:write token
 # must never write back to it). Everyone else runs `make format` before pushing.
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
   workflow_dispatch:
 
@@ -45,8 +45,8 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # Push events on main: the bot commits the fix. No trailers: STYLE.md "Git".
-      - name: "Commit and push (main pushes only)"
+      # Push events on master: the bot commits the fix. No trailers: STYLE.md "Git".
+      - name: "Commit and push (master pushes only)"
         if: steps.verify-changed-files.outputs.changed == 'true' && github.event_name == 'push'
         run: |
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
@@ -57,7 +57,7 @@ jobs:
         if: steps.verify-changed-files.outputs.changed == 'true'
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "Formatting differs from main. Run 'make format' and push again."
+            echo "Formatting differs from master. Run 'make format' and push again."
           else
             echo "clang-format changes were needed; committed and pushed. Pull the latest changes."
           fi

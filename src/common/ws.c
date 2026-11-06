@@ -195,6 +195,11 @@ int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req)
 		size_t value_len = line_len - name_len - 1;
 		char val[512];
 		copy_trimmed(val, sizeof(val), value, value_len);
+		if (req->header_count < HW_HTTP_MAX_HEADERS) {
+			hw_http_header *h = &req->headers[req->header_count++];
+			copy_trimmed(h->name, sizeof(h->name), p, name_len);
+			memcpy(h->value, val, sizeof(val));
+		}
 
 		if (name_len == 4 && strncasecmp(p, "Host", 4) == 0) {
 			copy_trimmed(req->host, sizeof(req->host), val, strlen(val));
@@ -215,8 +220,15 @@ int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req)
 	return (int)head;
 }
 
+const char *hw_http_header_get(const hw_http_request *req, const char *name) {
+	for (int i = 0; i < req->header_count; i++) {
+		if (strcasecmp(req->headers[i].name, name) == 0) return req->headers[i].value;
+	}
+	return NULL;
+}
+
 size_t hw_http_write_upgrade(char *out, size_t cap, const char *host, uint16_t port, const char *path,
-                             const char key[25], const char *protocol) {
+                             const char key[25], const char *protocol, const char *extra) {
 	char proto_line[128] = "";
 	if (protocol && *protocol) snprintf(proto_line, sizeof(proto_line), "Sec-WebSocket-Protocol: %s\r\n", protocol);
 	int n = snprintf(out, cap,
@@ -226,9 +238,9 @@ size_t hw_http_write_upgrade(char *out, size_t cap, const char *host, uint16_t p
 	                 "Connection: Upgrade\r\n"
 	                 "Sec-WebSocket-Key: %s\r\n"
 	                 "Sec-WebSocket-Version: 13\r\n"
-	                 "%s"
+	                 "%s%s"
 	                 "\r\n",
-	                 path, host, port, key, proto_line);
+	                 path, host, port, key, proto_line, extra ? extra : "");
 	if (n < 0 || (size_t)n >= cap) return 0;
 	return (size_t)n;
 }

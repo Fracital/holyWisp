@@ -344,7 +344,7 @@ static int do_upgrade(hw_client *c, const hw_client_opts *o, char *err, size_t e
 	hw_base64_encode(raw, sizeof(raw), key, sizeof(key));
 	char req[1024];
 	size_t n = hw_http_write_upgrade(req, sizeof(req), o->host, o->port, o->path, key,
-	                                 o->v2 ? HW_WISP_V2_PROTOCOL : NULL);
+	                                 o->v2 ? HW_WISP_V2_PROTOCOL : NULL, NULL);
 	if (n == 0 || send_all(c, (const uint8_t *)req, n) != 0) {
 		snprintf(err, err_cap, "cannot send upgrade request: %s", strerror(errno));
 		return -1;

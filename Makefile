@@ -31,7 +31,7 @@ RELEASE_DIR := build/release
 # Every C file we own. Vendored code would be excluded here; there is none.
 SOURCES := $(shell find include src tests -name '*.c' -o -name '*.h' | sort)
 
-.PHONY: build release test test-release run run-release format check-format tidy clean help
+.PHONY: build release test test-release run run-release format check-format tidy deb rpm packages clean help
 
 # ---------------------------------------------------------------------------------- build
 
@@ -77,6 +77,15 @@ tidy: $(DEBUG_DIR)/CMakeCache.txt ## clang-tidy with the debug compile database
 	$(CLANG_TIDY) -p $(DEBUG_DIR) --quiet $(filter %.c,$(SOURCES))
 
 # ---------------------------------------------------------------------------------- misc
+
+deb: ## build a .deb into build/packages/
+	deploy/package.sh deb
+
+rpm: ## build an .rpm into build/packages/
+	deploy/package.sh rpm
+
+packages: ## build every package this host can (.deb and/or .rpm)
+	deploy/package.sh all
 
 clean: ## remove every build tree
 	rm -rf build

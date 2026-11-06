@@ -4,6 +4,7 @@
 #ifndef HOLYWISP_NET_H
 #define HOLYWISP_NET_H
 
+#include "holywisp/dns.h"
 #include "holywisp/loop.h"
 
 #include <netdb.h>
@@ -47,20 +48,31 @@ const char *hw_addr_class_str(enum hw_addr_class c);
 // Set TCP_NODELAY (and keepalive) on a connected TCP socket.
 void hw_tcp_tune(int fd, int nodelay);
 
-// Resolver: getaddrinfo on a small thread pool, completion delivered on the requesting loop's
-// thread. One resolver per process; it is shared by every worker.
+// Resolver: lookups on a small thread pool, completion delivered on the requesting loop's thread.
+// Behind it sits an hw_dns_cache and either the system resolver (getaddrinfo) or the built-in UDP
+// client when servers are configured. One resolver per process; every worker shares it.
 typedef struct hw_resolver hw_resolver;
 typedef struct hw_resolve_req hw_resolve_req;
-// gai_err is 0 and res is the (owned by the resolver, freed after the callback) addrinfo list on
-// success; otherwise gai_err is the getaddrinfo(3) error and res is NULL.
-typedef void (*hw_resolve_cb)(hw_loop *loop, int gai_err, struct addrinfo *res, void *ud);
 
-hw_resolver *hw_resolver_new(int threads);
+typedef struct hw_resolver_config {
+	int threads;
+	struct sockaddr_storage servers[HW_DNS_MAX_SERVERS];
+	socklen_t server_lens[HW_DNS_MAX_SERVERS];
+	int nservers; // 0 = getaddrinfo
+	int timeout_ms;
+	enum hw_dns_order order;
+	hw_dns_cache *cache; // optional, not owned
+} hw_resolver_config;
+
+// gai_err is 0 and res holds the addresses (with the requested port set) on success; otherwise
+// gai_err is a getaddrinfo(3) error and res is NULL. res is only valid during the callback.
+typedef void (*hw_resolve_cb)(hw_loop *loop, int gai_err, const hw_dns_result *res, void *ud);
+
+hw_resolver *hw_resolver_new(const hw_resolver_config *cfg);
 // Joins the workers. Any request not yet delivered is dropped without a callback.
 void hw_resolver_free(hw_resolver *r);
-// Queue a lookup. socktype is SOCK_STREAM or SOCK_DGRAM. NULL (ENOMEM) on failure.
-hw_resolve_req *hw_resolve(hw_resolver *r, hw_loop *loop, const char *host, uint16_t port, int socktype,
-                           hw_resolve_cb cb, void *ud);
+// Queue a lookup. NULL (ENOMEM) on failure.
+hw_resolve_req *hw_resolve(hw_resolver *r, hw_loop *loop, const char *host, uint16_t port, hw_resolve_cb cb, void *ud);
 // From the loop thread: the callback will not run. The request is released by the resolver.
 void hw_resolve_cancel(hw_resolve_req *req);
 

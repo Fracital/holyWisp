@@ -3,7 +3,9 @@
  */
 #include "config.h"
 
+#include "holywisp/dns.h"
 #include "holywisp/hw.h"
+#include "holywisp/limits.h"
 #include "holywisp/log.h"
 
 #include <errno.h>
@@ -60,6 +62,15 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		return 0;                                                                \
 	}
 
+#define DBL_KEY(name, field, lo, hi)                                          \
+	if (!strcmp(key, name)) {                                                 \
+		char *dend;                                                           \
+		double dv = strtod(value, &dend);                                     \
+		if (dend == value || *dend || dv < (lo) || dv > (hi)) goto bad_value; \
+		cfg->field = dv;                                                      \
+		return 0;                                                             \
+	}
+
 	STR_KEY("host", host)
 	INT_KEY("port", port, 0, 65535)
 	INT_KEY("workers", workers, 0, 1024)
@@ -70,27 +81,142 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	BOOL_KEY("allow-loopback", allow_loopback)
 	BOOL_KEY("allow-link-local", allow_link_local)
 	BOOL_KEY("enable-v2", enable_v2)
+	BOOL_KEY("enable-twisp", enable_twisp)
 	STR_KEY("motd", motd)
 	BOOL_KEY("password-required", password_required)
+	BOOL_KEY("parse-real-ip", parse_real_ip)
+	INT_KEY("connections-limit-per-ip", connections_limit_per_ip, 0, 1 << 24)
+	INT_KEY("connection-window-s", connection_window_s, 0, 86400)
+	INT_KEY("bandwidth-limit-kbps", bandwidth_limit_kbps, 0, 1000000000)
+	// Flood protection.
+	BOOL_KEY("flood-protection", flood.enabled)
+	INT_KEY("max-connects-per-source-per-second", flood.max_connects_per_source_per_second, 0, 1 << 24)
+	INT_KEY("max-connects-per-dest-per-second", flood.max_connects_per_dest_per_second, 0, 1 << 24)
+	INT_KEY("max-connects-per-dest-per-minute", flood.max_connects_per_dest_per_minute, 0, 1 << 24)
+	INT_KEY("max-in-flight-syns", flood.max_in_flight_syns, 0, 1 << 24)
+	INT_KEY("max-concurrent-connections", flood.max_concurrent_connections, 0, 1 << 24)
+	BOOL_KEY("syn-signature", flood.syn_signature_enabled)
+	INT_KEY("syn-signature-window-ms", flood.syn_signature_window_ms, 1, 600000)
+	INT_KEY("syn-signature-min-samples", flood.syn_signature_min_samples, 1, HW_SIGDET_RING)
+	DBL_KEY("syn-signature-failed-ratio", flood.syn_signature_failed_ratio, 0.0, 1.0)
+	INT_KEY("ws-close-after-violations", flood.ws_close_after_violations, 0, 1 << 24)
+	BOOL_KEY("log-blocked-dials", flood.log_blocked_dials)
+	// Reputation.
+	BOOL_KEY("reputation", reputation_enabled)
+	STR_KEY("reputation-store", reputation.store_path)
+	INT_KEY("reputation-save-interval-s", reputation.save_interval_s, 0, 86400)
+	INT_KEY("reputation-decay-per-hour", reputation.decay_per_hour, 0, 100)
+	INT_KEY("reputation-evict-after-days", reputation.evict_after_days, 0, 3650)
+	INT_KEY("reputation-warn", reputation.warn, 0, 100)
+	INT_KEY("reputation-throttle", reputation.throttle, 0, 100)
+	INT_KEY("reputation-strict", reputation.strict, 0, 100)
+	// DNS.
+	INT_KEY("dns-ttl-s", dns_ttl_s, 0, 604800)
+	INT_KEY("dns-negative-ttl-s", dns_negative_ttl_s, 0, 604800)
+	INT_KEY("dns-timeout-ms", dns_timeout_ms, 100, 60000)
+	// Where streams go.
+	STR_KEY("proxy", proxy)
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
 	INT_KEY("max-message-size", max_message_size, 1024, 1L << 30)
 	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1L << 31)
 	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1L << 31)
+	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1L << 30)
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
 	INT_KEY("connect-timeout-ms", connect_timeout_ms, 100, 600000)
 	INT_KEY("handshake-timeout-ms", handshake_timeout_ms, 100, 600000)
 	INT_KEY("resolver-threads", resolver_threads, 1, 256)
 	BOOL_KEY("tcp-nodelay", tcp_nodelay)
+	BOOL_KEY("tcp-quickack", tcp_quickack)
 	INT_KEY("listen-backlog", listen_backlog, 1, 65535)
 	STR_KEY("non-ws-response", non_ws_response)
 #undef BOOL_KEY
 #undef INT_KEY
 #undef STR_KEY
+#undef DBL_KEY
 
 	if (!strcmp(key, "log-level")) {
 		int lvl = hw_log_level_parse(value);
 		if (lvl < 0) goto bad_value;
 		cfg->log_level = lvl;
+		return 0;
+	}
+	if (!strcmp(key, "dns-order")) {
+		if (!strcmp(value, "ipv4first")) {
+			cfg->dns_order = HW_DNS_IPV4_FIRST;
+		} else if (!strcmp(value, "ipv6first")) {
+			cfg->dns_order = HW_DNS_IPV6_FIRST;
+		} else if (!strcmp(value, "verbatim")) {
+			cfg->dns_order = HW_DNS_VERBATIM;
+		} else {
+			goto bad_value;
+		}
+		return 0;
+	}
+	if (!strcmp(key, "allow-host") || !strcmp(key, "block-host")) {
+		hw_hostlist *l = key[0] == 'a' ? &cfg->allow_hosts : &cfg->block_hosts;
+		if (hw_hostlist_add(l, value) != 0) {
+			snprintf(err, err_cap, "%s: list full or invalid host '%s'", key, value);
+			return -1;
+		}
+		return 0;
+	}
+	if (!strcmp(key, "allow-port") || !strcmp(key, "block-port")) {
+		hw_portset *s = key[0] == 'a' ? &cfg->allow_ports : &cfg->block_ports;
+		if (hw_portset_add(s, value) != 0) goto bad_value;
+		return 0;
+	}
+	if (!strcmp(key, "trusted-proxy")) {
+		if (cfg->trusted_proxy_count >= HW_MAX_CIDRS) {
+			snprintf(err, err_cap, "too many trusted-proxy entries");
+			return -1;
+		}
+		if (hw_cidr_parse(value, &cfg->trusted_proxies[cfg->trusted_proxy_count]) != 0) goto bad_value;
+		cfg->trusted_proxy_count++;
+		return 0;
+	}
+	if (!strcmp(key, "trusted-header")) {
+		if (cfg->trusted_header_count >= HW_MAX_TRUSTED_HEADERS) {
+			snprintf(err, err_cap, "too many trusted-header entries");
+			return -1;
+		}
+		if (set_str(cfg->trusted_headers[cfg->trusted_header_count], 64, value) != 0) goto bad_value;
+		cfg->trusted_header_count++;
+		return 0;
+	}
+	if (!strcmp(key, "dns-server")) {
+		if (cfg->dns_server_count >= HW_MAX_DNS_SERVERS) {
+			snprintf(err, err_cap, "too many dns-server entries");
+			return -1;
+		}
+		if (set_str(cfg->dns_servers[cfg->dns_server_count], 64, value) != 0) goto bad_value;
+		cfg->dns_server_count++;
+		return 0;
+	}
+	if (!strcmp(key, "reputation-weight") || !strcmp(key, "reputation-dest-weight")) {
+		const char *colon = strrchr(value, ':');
+		if (!colon) goto bad_value;
+		char name[32];
+		size_t nl = (size_t)(colon - value);
+		if (nl >= sizeof(name)) goto bad_value;
+		memcpy(name, value, nl);
+		name[nl] = '\0';
+		int ev = hw_rep_event_parse(name);
+		if (ev < 0) {
+			snprintf(err, err_cap, "%s: unknown event '%s'", key, name);
+			return -1;
+		}
+		char *wend;
+		long w = strtol(colon + 1, &wend, 10);
+		if (wend == colon + 1 || *wend || w < -100 || w > 100) goto bad_value;
+		if (key[11] == 'd') {
+			cfg->reputation.dest_weights[ev] = (int)w;
+		} else {
+			cfg->reputation.source_weights[ev] = (int)w;
+		}
+		return 0;
+	}
+	if (!strcmp(key, "trusted-headers-reset")) {
+		cfg->trusted_header_count = 0;
 		return 0;
 	}
 	if (!strcmp(key, "password-user")) {
@@ -160,29 +286,48 @@ int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size
 }
 
 void hw_config_usage(const char *argv0) {
-	printf("usage: %s [--config FILE] [--KEY VALUE | --KEY=VALUE]...\n"
-	       "\n"
-	       "A Wisp v1/v2 server. Every KEY below is also a `KEY = VALUE` line in the config file.\n"
-	       "\n"
-	       "  host, port, workers                       bind address, port (6001), worker threads (0 = CPUs)\n"
-	       "  allow-tcp, allow-udp                      stream types (both on)\n"
-	       "  allow-direct-ip                           literal IPs in CONNECT (off)\n"
-	       "  allow-private, allow-loopback,            egress to RFC 1918 / 127.0.0.0/8 / 169.254.0.0/16 (all off)\n"
-	       "  allow-link-local\n"
-	       "  enable-v2, motd                           Wisp v2 handshake (on), message of the day\n"
-	       "  password-user USER:PASS                   add a v2 password-auth user (repeatable)\n"
-	       "  password-required                         refuse unauthenticated v2 clients (off)\n"
-	       "  buffer-remaining                          CONTINUE window in packets (128)\n"
-	       "  max-message-size                          largest WebSocket message (1 MiB + 5)\n"
-	       "  ws-write-high-water                       pause remote reads past this many queued bytes (8 MiB)\n"
-	       "  stream-queue-max                          bytes queued toward a remote before throttling (16 MiB)\n"
-	       "  max-streams-per-conn                      0 = unlimited (2048)\n"
-	       "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
-	       "  resolver-threads, tcp-nodelay, listen-backlog, non-ws-response\n"
-	       "  log-level                                 debug|info|warn|error|none (info)\n"
-	       "\n"
-	       "  --version, --help\n",
-	       argv0);
+	printf(
+	    "usage: %s [--config FILE] [--KEY VALUE | --KEY=VALUE]...\n"
+	    "\n"
+	    "A Wisp v1/v2 server. Every KEY below is also a `KEY = VALUE` line in the config file.\n"
+	    "\n"
+	    "  host, port, workers                       bind address, port (6001), worker threads (0 = CPUs)\n"
+	    "  allow-tcp, allow-udp                      stream types (both on)\n"
+	    "  allow-direct-ip                           literal IPs in CONNECT (off)\n"
+	    "  allow-private, allow-loopback,            egress to RFC 1918 / 127.0.0.0/8 / 169.254.0.0/16 (all off)\n"
+	    "  allow-link-local\n"
+	    "  allow-host, block-host                    hostname allow/block lists; '*.suffix' matches subdomains\n"
+	    "  allow-port, block-port                    port allow/block lists; 'N' or 'LO-HI' (repeatable)\n"
+	    "  enable-v2, motd                           Wisp v2 handshake (on), message of the day\n"
+	    "  enable-twisp                              PTY terminal streams; needs v2 + an authenticated client (off)\n"
+	    "  password-user USER:PASS                   v2 auth user; PASS may be a crypt(3) hash (repeatable)\n"
+	    "  password-required                         refuse unauthenticated v2 clients (off)\n"
+	    "  parse-real-ip, trusted-proxy CIDR,        honour proxy headers from trusted sources\n"
+	    "  trusted-header NAME\n"
+	    "  connections-limit-per-ip, connection-window-s   new WebSockets per IP per window (200 / 10s)\n"
+	    "  bandwidth-limit-kbps                      per-IP bandwidth cap, each direction (0 = off)\n"
+	    "  flood-protection                          master switch for the limits below (on)\n"
+	    "  max-connects-per-source-per-second        per client IP (500)\n"
+	    "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
+	    "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
+	    "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
+	    "  syn-signature-min-samples, syn-signature-failed-ratio\n"
+	    "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"
+	    "  reputation, reputation-store,             IP reputation scoring, persisted as JSON\n"
+	    "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
+	    "  reputation-decay-per-hour, reputation-evict-after-days,\n"
+	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
+	    "  proxy URL                                 upstream socks5:// or http:// for outbound TCP\n"
+	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
+	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
+	    "  max-message-size, ws-write-high-water, stream-queue-max, socket-buffer-size\n"
+	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
+	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
+	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
+	    "  log-level                                 debug|info|warn|error|none (info)\n"
+	    "\n"
+	    "  --version, --help\n",
+	    argv0);
 }
 
 int hw_config_parse_args(hw_server_config *cfg, int argc, char **argv, char *err, size_t err_cap) {
@@ -210,7 +355,7 @@ int hw_config_parse_args(hw_server_config *cfg, int argc, char **argv, char *err
 			return 1;
 		}
 		if (!strcmp(a, "--version") || !strcmp(a, "-V")) {
-			printf("holywisp %s\n", HW_VERSION);
+			printf("holywisp %s%s\n", HW_VERSION, HW_VERSION_SUFFIX);
 			return 1;
 		}
 		if (!strcmp(a, "--config") || !strcmp(a, "-c")) {

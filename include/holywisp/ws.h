@@ -46,8 +46,15 @@ size_t hw_ws_write_header(uint8_t out[HW_WS_MAX_HEADER], int fin, uint8_t opcode
 // Sec-WebSocket-Accept for a Sec-WebSocket-Key; out gets 28 chars + NUL.
 void hw_ws_accept_key(const char *key, char out[HW_WS_ACCEPT_LEN + 1]);
 
-// The subset of an HTTP/1.1 request the server cares about.
+// An HTTP/1.1 request head: the request line, the WebSocket fields, and every header (so the
+// server can look up whichever proxy headers it was told to trust).
 #define HW_HTTP_MAX_REQUEST 8192
+#define HW_HTTP_MAX_HEADERS 48
+typedef struct hw_http_header {
+	char name[64];
+	char value[512];
+} hw_http_header;
+
 typedef struct hw_http_request {
 	char method[8];
 	char path[512];
@@ -55,15 +62,21 @@ typedef struct hw_http_request {
 	char ws_key[64];
 	char ws_protocol[64]; // first Sec-WebSocket-Protocol token, lowercased
 	int is_websocket;     // Upgrade: websocket + Connection: upgrade + Sec-WebSocket-Version: 13 + key
+	hw_http_header headers[HW_HTTP_MAX_HEADERS];
+	int header_count; // headers beyond the table are parsed but not kept
 } hw_http_request;
+
+// Case-insensitive lookup; NULL when absent. Repeated headers: the first one.
+const char *hw_http_header_get(const hw_http_request *req, const char *name);
 
 // Parse a request head. Returns the bytes consumed (through the blank line) when complete,
 // HW_ERR_AGAIN when the head is not all there, HW_ERR_PROTOCOL when it is malformed.
 int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req);
 
-// Client side: write the upgrade request. Returns bytes written, 0 when cap is too small.
+// Client side: write the upgrade request. extra is NULL or raw "Name: value\r\n" lines appended
+// verbatim. Returns bytes written, 0 when cap is too small.
 size_t hw_http_write_upgrade(char *out, size_t cap, const char *host, uint16_t port, const char *path,
-                             const char key[25], const char *protocol);
+                             const char key[25], const char *protocol, const char *extra);
 // Client side: parse the 101 response. Returns bytes consumed, HW_ERR_AGAIN, or HW_ERR_PROTOCOL
 // (including a non-101 status or a wrong accept key). protocol receives the echoed subprotocol.
 int hw_http_parse_upgrade_response(const uint8_t *data, size_t len, const char *expected_accept, char *protocol,
