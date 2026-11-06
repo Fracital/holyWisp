@@ -150,11 +150,13 @@ static int token_list_has(const char *list, const char *want) {
 	return 0;
 }
 
-static void first_token_lower(char *dst, size_t cap, const char *list) {
+// The first token of a comma-separated header, verbatim. A subprotocol must be echoed exactly as
+// the client sent it (browsers compare byte for byte), so no case folding here.
+static void first_token(char *dst, size_t cap, const char *list) {
 	while (*list == ' ' || *list == '\t') list++;
 	size_t n = 0;
 	while (list[n] && list[n] != ',' && !isspace((unsigned char)list[n]) && n + 1 < cap) {
-		dst[n] = (char)tolower((unsigned char)list[n]);
+		dst[n] = list[n];
 		n++;
 	}
 	dst[n] = '\0';
@@ -212,7 +214,7 @@ int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req)
 		} else if (name_len == 21 && strncasecmp(p, "Sec-WebSocket-Version", 21) == 0) {
 			version13 = token_list_has(val, "13");
 		} else if (name_len == 22 && strncasecmp(p, "Sec-WebSocket-Protocol", 22) == 0) {
-			first_token_lower(req->ws_protocol, sizeof(req->ws_protocol), val);
+			first_token(req->ws_protocol, sizeof(req->ws_protocol), val);
 		}
 		p = eol + 1;
 	}
@@ -270,7 +272,7 @@ int hw_http_parse_upgrade_response(const uint8_t *data, size_t len, const char *
 			if (name_len == 20 && strncasecmp(p, "Sec-WebSocket-Accept", 20) == 0) {
 				accept_ok = strcmp(val, expected_accept) == 0;
 			} else if (name_len == 22 && strncasecmp(p, "Sec-WebSocket-Protocol", 22) == 0 && protocol_cap) {
-				first_token_lower(protocol, protocol_cap, val);
+				first_token(protocol, protocol_cap, val);
 			}
 		}
 		p = eol + 1;

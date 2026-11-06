@@ -60,7 +60,7 @@ typedef struct hw_http_request {
 	char path[512];
 	char host[256];
 	char ws_key[64];
-	char ws_protocol[64]; // first Sec-WebSocket-Protocol token, lowercased
+	char ws_protocol[64]; // first Sec-WebSocket-Protocol token, verbatim (it is echoed as sent)
 	int is_websocket;     // Upgrade: websocket + Connection: upgrade + Sec-WebSocket-Version: 13 + key
 	hw_http_header headers[HW_HTTP_MAX_HEADERS];
 	int header_count; // headers beyond the table are parsed but not kept

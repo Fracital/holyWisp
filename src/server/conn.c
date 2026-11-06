@@ -476,7 +476,11 @@ static int http_process(hw_conn *c) {
 	}
 	c->conn_slot = 1;
 
-	int v2 = cfg->enable_v2 && strcmp(req.ws_protocol, HW_WISP_V2_PROTOCOL) == 0;
+	// Wisp v2 is opted into by offering any Sec-WebSocket-Protocol at all, not a fixed name: the
+	// spec does not name one, wispurr treats a non-empty header as v2, and epoxy sends a random
+	// UUID as the subprotocol. Whatever was offered is echoed verbatim; a browser fails the
+	// handshake if the token it asked for does not come back.
+	int v2 = cfg->enable_v2 && req.ws_protocol[0] != '\0';
 	if (cfg->password_required && !v2) {
 		http_reply(c, 426, "Upgrade Required", "text/plain; charset=utf-8", "wisp-v2 with authentication required\n");
 		return 0;
@@ -489,9 +493,9 @@ static int http_process(hw_conn *c) {
 	                 "Upgrade: websocket\r\n"
 	                 "Connection: Upgrade\r\n"
 	                 "Sec-WebSocket-Accept: %s\r\n"
-	                 "%s"
+	                 "%s%s%s"
 	                 "\r\n",
-	                 accept, v2 ? "Sec-WebSocket-Protocol: " HW_WISP_V2_PROTOCOL "\r\n" : "");
+	                 accept, v2 ? "Sec-WebSocket-Protocol: " : "", v2 ? req.ws_protocol : "", v2 ? "\r\n" : "");
 	if (n < 0 || hw_buf_append(&c->wbuf, head, (size_t)n) != 0) {
 		conn_close(c);
 		return 0;

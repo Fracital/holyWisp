@@ -358,7 +358,7 @@ static int do_upgrade(hw_client *c, const hw_client_opts *o, char *err, size_t e
 		                                       sizeof(proto));
 		if (r > 0) {
 			hw_buf_consume(&c->rbuf, (size_t)r);
-			c->is_v2 = strcmp(proto, HW_WISP_V2_PROTOCOL) == 0;
+			c->is_v2 = strcasecmp(proto, HW_WISP_V2_PROTOCOL) == 0;
 			if (o->v2 && !c->is_v2) {
 				snprintf(err, err_cap, "server did not accept %s", HW_WISP_V2_PROTOCOL);
 				return -1;

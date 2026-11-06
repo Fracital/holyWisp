@@ -7,6 +7,7 @@
 #include "holywisp/net.h"
 #include "holywisp/server.h"
 #include "holywisp/wisp.h"
+#include "holywisp/ws.h"
 
 #include "test.h"
 
@@ -420,6 +421,55 @@ static void test_v2_handshake_and_confirm(void) {
 	wait_streams_idle(g_server);
 }
 
+// epoxy (the client behind scramjet and stomp) offers a random UUID as the subprotocol, not
+// "wisp-v2". Any offered token must negotiate v2 and come back verbatim: a browser fails the
+// WebSocket when the token it asked for is not echoed, which is how the whole relay went dark.
+static void test_v2_any_subprotocol(void) {
+	const char *uuid = "4f73350d-99e4-43d6-8986-5e8be4687c24";
+	int fd = socket(AF_INET, SOCK_STREAM, 0);
+	CHECK(fd >= 0, "socket");
+	struct sockaddr_in sin = {
+	    .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(hw_server_port(g_server))};
+	CHECK_EQ(connect(fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
+	char req[1024];
+	size_t n = hw_http_write_upgrade(req, sizeof(req), "127.0.0.1", hw_server_port(g_server), "/",
+	                                 "dGhlIHNhbXBsZSBub25jZQ==", uuid, NULL);
+	CHECK(n > 0 && write(fd, req, n) == (ssize_t)n, "send upgrade");
+	char accept[HW_WS_ACCEPT_LEN + 1];
+	hw_ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", accept);
+	uint8_t buf[2048];
+	size_t have = 0;
+	char proto[64] = "";
+	int head = HW_ERR_AGAIN;
+	uint64_t deadline = hw_now_ms() + 5000;
+	while (hw_now_ms() < deadline) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, 200) <= 0) continue;
+		ssize_t r = read(fd, buf + have, sizeof(buf) - have);
+		CHECK(r > 0, "read upgrade response");
+		have += (size_t)r;
+		head = hw_http_parse_upgrade_response(buf, have, accept, proto, sizeof(proto));
+		if (head != HW_ERR_AGAIN) break;
+	}
+	CHECK(head > 0, "101 with a valid accept key (%d)", head);
+	CHECK_STR(proto, uuid);
+	// v2 was negotiated: the first packet after the 101 is INFO, not the v1 CONTINUE.
+	while (have < (size_t)head + 7 && hw_now_ms() < deadline) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, 200) <= 0) continue;
+		ssize_t r = read(fd, buf + have, sizeof(buf) - have);
+		CHECK(r > 0, "read first frame");
+		have += (size_t)r;
+	}
+	hw_ws_frame f;
+	int hl = hw_ws_parse_header(buf + head, have - (size_t)head, &f);
+	CHECK(hl > 0, "frame header");
+	CHECK_EQ(f.opcode, HW_WS_BINARY);
+	CHECK(!f.masked, "server frames are never masked");
+	CHECK_EQ(buf[head + hl], HW_WISP_INFO);
+	close(fd);
+}
+
 static void test_v2_password_auth(void) {
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
@@ -559,6 +609,7 @@ int main(void) {
 	RUN(test_invalid_connect);
 	RUN(test_egress_blocked);
 	RUN(test_v2_handshake_and_confirm);
+	RUN(test_v2_any_subprotocol);
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
 	RUN(test_connection_counts);

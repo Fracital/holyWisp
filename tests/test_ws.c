@@ -91,7 +91,7 @@ static void test_http_request(void) {
 	CHECK_STR(r.path, "/wisp/");
 	CHECK_STR(r.host, "example.org:6001");
 	CHECK_STR(r.ws_key, "dGhlIHNhbXBsZSBub25jZQ==");
-	CHECK_STR(r.ws_protocol, "wisp-v2");
+	CHECK_STR(r.ws_protocol, "Wisp-V2"); // verbatim: the echo has to match what the client sent
 	CHECK_EQ(hw_http_parse_request((const uint8_t *)req, 20, &r), HW_ERR_AGAIN);
 	const char *plain = "GET /health HTTP/1.1\r\nHost: x\r\n\r\n";
 	CHECK_EQ(hw_http_parse_request((const uint8_t *)plain, strlen(plain), &r), (int)strlen(plain));

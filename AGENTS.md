@@ -87,9 +87,12 @@ every test still passes, so each item has a test and a change to it needs a reas
   `src/common/wisp.c`, pinned by `tests/test_wisp.c`.
 - **v1 opening.** Right after the 101 the server sends `CONTINUE(stream 0, buffer_remaining)`.
   Nothing else precedes it.
-- **v2 negotiation.** Only when the client offered `Sec-WebSocket-Protocol: wisp-v2` *and*
-  `enable-v2` is on. The server echoes the subprotocol, sends INFO first, waits for the client's
-  INFO, then sends the stream-0 CONTINUE. Until that CONTINUE, the only packets honoured are
+- **v2 negotiation.** Only when the client offered *any* `Sec-WebSocket-Protocol` token *and*
+  `enable-v2` is on. The spec names no subprotocol; wispurr treats a non-empty header as the v2
+  opt-in and epoxy (scramjet, stomp) sends a random UUID, so the rule is presence, not the string
+  `wisp-v2`. The server echoes the offered token *verbatim* (a browser fails the handshake if the
+  token it asked for does not come back), sends INFO first, waits for the client's INFO, then
+  sends the stream-0 CONTINUE. Until that CONTINUE, the only packets honoured are
   INFO and CLOSE on stream 0. Major version mismatch closes with `0x04`.
 - **Extensions advertised.** `0x01` UDP when `allow-udp`, `0x02` password (meta = required byte)
   when any `password-user` exists, `0x04` MOTD when set. Stream-confirm (`0x05`) is honoured when
