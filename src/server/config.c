@@ -279,11 +279,23 @@ int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size
 		*eq = '\0';
 		char *key = trim(s);
 		char *value = trim(eq + 1);
-		// Strip one layer of quotes so values may contain leading/trailing spaces.
-		size_t vl = strlen(value);
-		if (vl >= 2 && value[0] == '"' && value[vl - 1] == '"') {
-			value[vl - 1] = '\0';
-			value++;
+		if (value[0] == '"') {
+			// Quoted value: keep everything up to the closing quote (so it may hold '#' or spaces),
+			// then drop the quotes. Anything after the close quote (e.g. a comment) is ignored.
+			char *close = strchr(value + 1, '"');
+			if (close) {
+				*close = '\0';
+				value++;
+			}
+		} else {
+			// Strip an inline comment: the first '#' that starts the token or follows whitespace.
+			for (char *p = value; *p; p++) {
+				if (*p == '#' && (p == value || p[-1] == ' ' || p[-1] == '\t')) {
+					*p = '\0';
+					break;
+				}
+			}
+			value = trim(value);
 		}
 		char inner[256];
 		if (hw_config_set(cfg, key, value, inner, sizeof(inner)) != 0) {

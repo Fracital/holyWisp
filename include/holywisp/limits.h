@@ -42,7 +42,7 @@ void hw_bandwidth_evict(hw_bandwidth *b, uint64_t idle_ms);
 
 // SYN-flood signature: a ring of recent connect outcomes to one destination from one client.
 // Lives inside the connection (single-threaded), so no lock.
-#define HW_SIGDET_RING 64
+#define HW_SIGDET_RING 256
 typedef struct hw_sigdet {
 	uint64_t at[HW_SIGDET_RING];
 	uint8_t ok[HW_SIGDET_RING];
