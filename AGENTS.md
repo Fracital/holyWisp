@@ -115,7 +115,10 @@ every test still passes, so each item has a test and a change to it needs a reas
   pongs; a CLOSE is echoed. Server frames are never masked.
 - **Plain HTTP on the same port.** `GET /health` is `{"status":"ok"}`, `GET /stats` is the
   counters, any other non-upgrade request gets `non-ws-response` (or 426 when it is empty), and a
-  malformed head gets 400. All with `Connection: close`.
+  malformed head gets 400. All with `Connection: close`. With `serve-webclient`, `GET /` is the
+  embedded client; `webclient-wisp-url` is spliced into it as `window.HOLYWISP_CONFIG.wisp`
+  (validated: `ws(s)://`, nothing that can escape a script string) so a page served from a name
+  whose root refuses WebSockets can still point at the keyed relay path.
 
 ## Egress policy (do not regress)
 

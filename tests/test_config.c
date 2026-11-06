@@ -31,7 +31,8 @@ static void test_inline_comments_and_quotes(void) {
 	                 "\n"
 	                 "   # indented comment\n"
 	                 "non-ws-response = \"hello # world\"   # the body may contain a hash\n"
-	                 "motd =\n");
+	                 "motd =\n"
+	                 "webclient-wisp-url = wss://relay.example/pipe/k/\n");
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
 	char err[256];
@@ -42,6 +43,7 @@ static void test_inline_comments_and_quotes(void) {
 	CHECK_EQ(cfg.flood.syn_signature_min_samples, 128);
 	// A quoted value keeps its inner '#' and spaces; the trailing comment is dropped.
 	CHECK_STR(cfg.non_ws_response, "hello # world");
+	CHECK_STR(cfg.webclient_wisp_url, "wss://relay.example/pipe/k/");
 	unlink(path);
 }
 
@@ -56,6 +58,21 @@ static void test_bad_value_reports_line(void) {
 	CHECK(hw_config_load_file(&cfg, path, err, sizeof(err)) != 0, "bad value rejected");
 	CHECK(strstr(err, ":2:") != NULL, "error names the line: %s", err);
 	unlink(path);
+}
+
+// The web client URL goes into a <script> string: only ws(s):// and nothing that could escape it.
+static void test_webclient_url_validation(void) {
+	hw_server_config cfg;
+	char err[256];
+	const char *bad[] = {"https://relay.example/", "wss://relay.example/\"</script>", "wss://a b", "wss://x'y"};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		hw_server_config_defaults(&cfg);
+		snprintf(cfg.webclient_wisp_url, sizeof(cfg.webclient_wisp_url), "%s", bad[i]);
+		CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "rejected: %s", bad[i]);
+	}
+	hw_server_config_defaults(&cfg);
+	snprintf(cfg.webclient_wisp_url, sizeof(cfg.webclient_wisp_url), "%s", "wss://relay.example/pipe/k/");
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "accepted: %s", err);
 }
 
 // The configs we ship must load, or a fresh install will not start.
@@ -76,6 +93,7 @@ static void test_shipped_configs(void) {
 int main(void) {
 	RUN(test_inline_comments_and_quotes);
 	RUN(test_bad_value_reports_line);
+	RUN(test_webclient_url_validation);
 	RUN(test_shipped_configs);
 	return 0;
 }

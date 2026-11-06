@@ -118,6 +118,7 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `dns-server`, `dns-ttl-s`, `dns-order`, `dns-timeout-ms` | system, 120, ipv4first, 3000 | Built-in resolver and cache |
 | `buffer-remaining`, `max-message-size`, `ws-write-high-water`, `stream-queue-max` | 128, 1 MiB+5, 8 MiB, 16 MiB | Flow control and queue limits; the advertised window is capped so a full window of max-size packets fits in half of `stream-queue-max` |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
+| `webclient-wisp-url` | empty | `ws(s)://` URL the web client offers by default; empty means its own origin. Set it when the relay lives on a keyed path (`wss://host/pipe/<key>/`) |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,

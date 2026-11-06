@@ -551,6 +551,48 @@ static void test_plain_http(void) {
 	close(fd);
 }
 
+static size_t http_get_root(hw_server *s, char *buf, size_t cap) {
+	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
+	CHECK(fd >= 0, "connect");
+	const char *req = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+	CHECK_EQ(write(fd, req, strlen(req)), (ssize_t)strlen(req));
+	size_t n = 0;
+	for (;;) {
+		ssize_t r = read(fd, buf + n, cap - 1 - n);
+		if (r <= 0) break;
+		n += (size_t)r;
+	}
+	buf[n] = '\0';
+	close(fd);
+	return n;
+}
+
+// webclient-wisp-url is spliced into the served page before </head>; without it the page is as built.
+static void test_webclient_wisp_url(void) {
+	static char buf[65536];
+	http_get_root(g_server, buf, sizeof(buf));
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	CHECK(strstr(buf, "window.HOLYWISP_CONFIG = {") == NULL, "nothing injected by default");
+
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.log_level = HW_LOG_NONE;
+	strcpy(cfg.webclient_wisp_url, "wss://relay.example/pipe/k/");
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	http_get_root(s, buf, sizeof(buf));
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	const char *inj = strstr(buf, "window.HOLYWISP_CONFIG = { wisp: \"wss://relay.example/pipe/k/\" };");
+	const char *head_end = strstr(buf, "</head>");
+	CHECK(inj != NULL, "config injected");
+	CHECK(head_end != NULL && inj < head_end, "injected before </head>");
+	hw_server_free(s);
+}
+
 static void test_connection_counts(void) {
 	hw_server_stats before, after;
 	// Prior subtests close their connections asynchronously (deferred free on the worker loop), so
@@ -612,6 +654,7 @@ int main(void) {
 	RUN(test_v2_any_subprotocol);
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
+	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 
 	hw_server_stop(g_server);

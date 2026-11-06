@@ -66,6 +66,9 @@ struct hw_server {
 	// maximum-size DATA packets fits in half of stream-queue-max (server_ingress_window).
 	uint32_t window;
 	uint16_t port;
+	// The embedded web client with webclient-wisp-url spliced in; NULL serves the page as built.
+	uint8_t *webclient_page;
+	size_t webclient_page_len;
 	int started;
 	_Atomic int stopped;
 	uint64_t started_ms;
@@ -205,6 +208,9 @@ void conn_flush(hw_conn *c);
 void conn_close(hw_conn *c);
 // Shutdown only: tear down and free a connection synchronously (the loop is no longer running).
 void conn_shutdown_free(hw_conn *c);
+// Build s->webclient_page from the embedded client and cfg.webclient_wisp_url (no-op when the URL
+// is empty). Returns 0, or -1 with errno on allocation failure.
+int webclient_page_build(hw_server *s);
 // Flood-protection violation: counts toward ws-close-after-violations. Returns 1 if that closed
 // the connection.
 int conn_violation(hw_conn *c, const char *reason);

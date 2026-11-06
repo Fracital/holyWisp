@@ -122,6 +122,21 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		return -1;
 	}
 	char perr[256];
+	if (cfg->webclient_wisp_url[0]) {
+		const char *u = cfg->webclient_wisp_url;
+		if (strncmp(u, "ws://", 5) != 0 && strncmp(u, "wss://", 6) != 0) {
+			snprintf(err, err_cap, "webclient-wisp-url must start with ws:// or wss://");
+			return -1;
+		}
+		// It is spliced into a <script> string literal: nothing that could end the literal, the
+		// element, or be a control character.
+		for (const char *p = u; *p; p++) {
+			if ((unsigned char)*p <= ' ' || *p == '"' || *p == '\'' || *p == '\\' || *p == '<' || *p == '>') {
+				snprintf(err, err_cap, "webclient-wisp-url contains a character that cannot go into the page");
+				return -1;
+			}
+		}
+	}
 	hw_proxy_config pc;
 	if (proxy_config_parse(cfg->proxy, &pc, perr, sizeof(perr)) != 0) {
 		snprintf(err, err_cap, "%s", perr);
@@ -317,6 +332,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		goto fail;
 	}
 	if (build_limiters(s) != 0) goto fail;
+	if (webclient_page_build(s) != 0) goto fail;
 	s->window = server_ingress_window(cfg);
 	if (s->window < cfg->buffer_remaining) {
 		HW_INFO("server", "buffer-remaining %u capped to %u: %zu-byte packets must fit in half of stream-queue-max %zu",
@@ -384,6 +400,7 @@ fail: {
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
+	free(s->webclient_page);
 	free(s->workers);
 	free(s);
 	errno = saved ? saved : EINVAL;
@@ -466,6 +483,7 @@ void hw_server_free(hw_server *s) {
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
 	for (int i = 0; i < s->nworkers; i++) worker_destroy(&s->workers[i]);
+	free(s->webclient_page);
 	free(s->workers);
 	free(s);
 }
