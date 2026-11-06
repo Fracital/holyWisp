@@ -131,7 +131,13 @@
 			<!-- A direct <button> child of the action bar gets Holo's full-navbar-height styling. -->
 			<button
 				style="float: right"
-				onclick="window.open('https://github.com/Fracital/holyWisp', '_blank', 'noopener')"
+				onclick="
+					window.open(
+						'https://github.com/Fracital/holyWisp',
+						'_blank',
+						'noopener',
+					)
+				"
 			>
 				GitHub
 			</button>
@@ -502,11 +508,17 @@
 			$('showlog').onchange = (e) =>
 				$('logcard').classList.toggle('hidden', !e.target.checked);
 
-			// Served by the Wisp server itself: default the Wisp field to this same origin. As a local file,
-			// keep the ws://127.0.0.1:6001/ default.
+			// Default the Wisp server field when the page is served over the network. The hosted demo
+			// at holywisp.fracit.al points at the public wss://anura.pro/ relay; any other origin
+			// defaults to itself, so a local holywisp server just works. As a local file, keep the
+			// ws://127.0.0.1:6001/ default.
 			if (location.protocol === 'http:' || location.protocol === 'https:') {
-				const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
-				$('wisp').value = `${scheme}://${location.host}/`;
+				if (location.hostname === 'holywisp.fracit.al') {
+					$('wisp').value = 'wss://anura.pro/';
+				} else {
+					const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+					$('wisp').value = `${scheme}://${location.host}/`;
+				}
 			}
 		</script>
 	</body>
