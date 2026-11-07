@@ -31,7 +31,7 @@ RELEASE_DIR := build/release
 # Every C file we own. Vendored code would be excluded here; there is none.
 SOURCES := $(shell find include src tests -name '*.c' -o -name '*.h' | sort)
 
-.PHONY: build release test test-release run run-release format check-format tidy deb rpm packages clean help
+.PHONY: build release test test-release run run-release format check-format tidy bench deb rpm packages clean help
 
 # ---------------------------------------------------------------------------------- build
 
@@ -77,6 +77,16 @@ check-format: ## fail when clang-format would change anything
 # web client), so the build must have run for clang-tidy to resolve the include.
 tidy: build ## clang-tidy with the debug compile database
 	$(CLANG_TIDY) -p $(DEBUG_DIR) --quiet $(filter %.c,$(SOURCES))
+
+# ---------------------------------------------------------------------------------- bench
+
+BENCH_DIR := build/bench
+
+bench: release ## build the benchmark tools (bench/echo, bench/pump) into build/bench
+	mkdir -p $(BENCH_DIR)
+	$(CC) -O2 -Wall -Wextra -pthread -o $(BENCH_DIR)/echo bench/echo.c
+	$(CC) -O2 -Wall -Wextra -pthread -I include -o $(BENCH_DIR)/pump bench/pump.c \
+		$(RELEASE_DIR)/libholywisp-client.a $(RELEASE_DIR)/libholywisp.a
 
 # ---------------------------------------------------------------------------------- misc
 

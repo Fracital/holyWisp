@@ -16,3 +16,8 @@
 compile_commands.json
 .cache/
 *.log
+
+# Benchmark output (bench/run.py, bench/charts.py)
+/bench/results/
+__pycache__/
+*.pyc

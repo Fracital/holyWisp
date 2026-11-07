@@ -172,6 +172,44 @@ per-packet trace. The **Wisp server URL** field is front-and-center so you can p
 `ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain; there are toggles for Wisp
 v2, the protocol log, and a light/dark theme. The default target is `http://api.ipify.org/`.
 
+## Benchmarks
+
+`bench/` holds a wispmark-style harness that runs holyWisp, both wispurr implementations and
+wisp-server-python on the same host, through the same echo service, driven by the same clients.
+Full tables are in [bench/RESULTS.md](bench/RESULTS.md); the method and how to rerun it are in
+[bench/README.md](bench/README.md). These are the medians of three 10 s runs on a Ryzen 9 7950X,
+in MiB/s through the echo port.
+
+| scenario | holyWisp | wispurr C++23 | wispurr Go | wisp-server-python |
+| --- | --- | --- | --- | --- |
+| wisp-js, 10 streams | **1,156** | 1,065 | 929 | 685 |
+| wisp-js, 5 connections x 10 streams | **2,551** | 1,829 | 1,538 | 1,080 |
+| native client, 1 stream | 1,554 | **2,889** | 2,108 | 609 |
+| native client, 10 streams | 1,689 | **2,859** | 2,189 | 686 |
+| native client, 8 connections x 4 streams | **5,884** | 5,154 | 3,029 | 3,229 |
+| native client, 16 connections x 4 streams | **4,958** | 3,314 | 2,414 | 2,031 |
+| 64 B round trip, p50 / p99.9 | **28 / 77 us** | 29 / 89 us | 35 / 170 us | 46 / 236 us |
+| peak RSS under stream churn | **4 MiB** | 11 MiB | 404 MiB | 976 MiB |
+
+holyWisp is fastest in the wispmark-standard scenarios and whenever traffic is spread over several
+connections, and it does it on the least memory. The C++23 wispurr is faster when a single
+connection carries everything, because it splits one connection's two directions across two cores.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/charts/throughput-dark.png">
+  <img alt="Throughput through the echo port for each server and scenario" src="bench/charts/throughput.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/charts/efficiency-dark.png">
+  <img alt="MiB relayed per CPU-second for each server and scenario" src="bench/charts/efficiency.png">
+</picture>
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="bench/charts/latency-dark.png">
+  <img alt="Round-trip latency percentiles for each server" src="bench/charts/latency.png">
+</picture>
+
 ## Layout
 
 ```
@@ -183,6 +221,7 @@ src/client/         libholywisp-client and the holywisp-client CLI
 tests/              one binary per module plus the end-to-end and security suites, run by ctest
 deploy/             systemd unit, Debian + RPM packaging, the package builder
 examples/           wisp-webclient.html: a single-file browser client for interactive testing
+bench/              the comparison harness, its results and charts (make bench)
 .github/workflows/  build, format, release (binaries), packages (.deb + .rpm)
 ```
 
