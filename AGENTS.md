@@ -32,6 +32,10 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 - `~/src/Fracital` (TypeScript): `.github/workflows/format.yml` is the model for our format CI
   (auto-fix commits on `master`, failing checks on PRs) and its `AGENTS.md` is the model for this
   file.
+- `~/src/abulxt` (Ansible): production. `deploy/ansible/roles/edge_wisp` builds and installs
+  holyWisp on the edge fleet from a pinned commit and renders `/etc/abulxt/holywisp.conf`;
+  `roles/edge_relay` is the nginx in front of it. Not read-only: a config key or behaviour change
+  that the fleet needs lands there too (see "Deployments and servers").
 
 ## Hard rules (read first)
 
@@ -53,11 +57,16 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 
 ### Deployments and servers
 
-- **Deploys run from CI, not by hand.** `.github/workflows/deploy.yml` deploys master to terp
-  (`holywisp.fracit.al`) through an SSH forced-command gate (`deploy/terp-deploy-gate.sh`, pinned
-  to `TERP_DEPLOY_KEY`, installed on terp by hand; CI never updates it). The agent never SSHes to
-  terp directly and never edits the live `/etc/holywisp`. The deploy job skips (green) until the
-  secret is set.
+- **Where the public relay runs.** `https://holywisp.fracit.al/` (page on `GET /`, Wisp relay
+  on a WebSocket upgrade to the same `/`) is served by the abulxt edge fleet, not by this repo's
+  CI: each edge runs holyWisp built from the `holywisp_ref` pin in `~/src/abulxt`
+  (`deploy/ansible/roles/edge_wisp`), with the edge nginx route in `roles/edge_relay`. Shipping a
+  fix to the public relay means bumping that pin and running abulxt's `playbooks/edges.yml`;
+  pushing here does not change what the edges run. stomp.fracit.al uses the same public root
+  (`STOMP_WISP_URL` on terp, not managed by any repo).
+- **This repo deploys nothing.** Its CI ships artefacts only: the rolling `latest` release
+  (binaries, `.deb`, `.rpm`). There is no server this repo pushes to; a host that should run a new
+  build is updated by whoever operates it (the edges: abulxt's ansible pin).
 - Do not start, stop or reconfigure a `holywisp` process on a machine that is not the one you are
   developing on. Running `make run` locally against loopback is development; touching a host that
   serves users is deployment.
@@ -270,7 +279,7 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `.clang-format`, `.clang-tidy`, `.editorconfig` | Enforcement of `STYLE.md`. |
 | `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke. |
 | `.github/workflows/format.yml` | clang-format drift: auto-fix commit on `master`, failing check on PRs. |
-| `.github/workflows/release.yml`, `packages.yml` | Rolling `latest` release: prebuilt binaries, and the `.deb` + `.rpm`. |
+| `.github/workflows/release.yml` | Rolling `latest` release: prebuilt binaries plus the `.deb` and `.rpm`, one build per push. |
 
 ## Hand-off
 

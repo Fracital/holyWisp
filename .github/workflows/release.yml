@@ -5,7 +5,9 @@ name: Release
 #   push of a tag v*         -> release <tag>, kept
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
 # binaries run on glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 and newer), each archive flat
-# (holywisp, holywisp-client, README, LICENSE-less by design) plus SHA256SUMS. The stable URL
+# (holywisp, holywisp-client, README, LICENSE-less by design), the .deb and .rpm built in their
+# native containers (deploy/package.sh: hardened unit, dedicated `wisp` user), plus SHA256SUMS over
+# all of them. The stable URL
 #   https://github.com/<owner>/<repo>/releases/download/latest/holywisp-linux-x64.tar.gz
 # always points at the newest master build. `latest` only moves forward: a run for a commit that is
 # an ancestor of the published one builds but does not publish.
@@ -107,9 +109,74 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  deb:
+    name: Debian package
+    runs-on: ubuntu-latest
+    container: debian:12
+    defaults:
+      run:
+        shell: bash # debian:12's /bin/sh is dash, which lacks `set -o pipefail`
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build tools
+        run: |
+          apt-get update
+          apt-get install -y build-essential cmake ninja-build libcrypt-dev dpkg-dev fakeroot git
+      - name: Build .deb
+        run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh deb
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          apt-get install -y ./build/packages/holywisp_*.deb
+          command -v holywisp
+          holywisp --version
+          # The isolated user exists and cannot log in.
+          getent passwd wisp
+          test "$(getent passwd wisp | cut -d: -f7)" = /usr/sbin/nologin
+          # The config is not world-readable.
+          test "$(stat -c '%a' /etc/holywisp/holywisp.conf)" = 640
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-deb
+          path: build/packages/*.deb
+          if-no-files-found: error
+          retention-days: 7
+
+  rpm:
+    name: Fedora package
+    runs-on: ubuntu-latest
+    container: fedora:41
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install build tools
+        run: dnf install -y gcc cmake ninja-build libxcrypt-devel rpm-build systemd-rpm-macros git
+      - name: Build .rpm
+        run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh rpm
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-*.rpm
+          holywisp --version
+          getent passwd wisp
+          # The unit is well-formed and heavily sandboxed.
+          systemd-analyze verify /usr/lib/systemd/system/holywisp.service || true
+      - name: Collect rpm
+        run: |
+          mkdir -p out
+          cp build/packages/rpmbuild/RPMS/*/holywisp-*.rpm out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-rpm
+          path: out/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish ${{ needs.meta.outputs.tag }}
-    needs: [meta, build]
+    needs: [meta, build, deb, rpm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -130,7 +197,7 @@ jobs:
         run: |
           set -euo pipefail
           cd assets
-          sha256sum *.tar.gz | tee SHA256SUMS
+          sha256sum *.tar.gz *.deb *.rpm | tee SHA256SUMS
 
       # `latest` only moves forward. If the published commit is a descendant of this one (a
       # slower run of an older push), keep what is there.
@@ -162,6 +229,8 @@ jobs:
           | --- | --- |
           | \`holywisp-linux-x64.tar.gz\` | x86_64 Linux, glibc 2.35+ |
           | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, glibc 2.35+ |
+          | \`holywisp_<version>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: hardened systemd unit, \`wisp\` user |
+          | \`holywisp-<version>.fc41.x86_64.rpm\` | Fedora 41+: the same |
           | \`SHA256SUMS\` | checksums of the above |
 
           \`\`\`sh
