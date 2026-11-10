@@ -4,9 +4,9 @@ name: Nightly
 # whose Build passed is published, and only once: a night without a new commit publishes nothing.
 #
 # The version is node/package.json's with the UTC time and the commit as its prerelease, e.g.
-# 0.5.2-nightly.202611110643.g1a2b3c4 (node/scripts/nightly-version.mjs). Nothing here bumps the
+# 0.5.3-nightly.202611110643.g1a2b3c4 (node/scripts/nightly-version.mjs). Nothing here bumps the
 # number in package.json; a release does that by hand, to the next version right after tagging
-# (0.5.2-nightly.* sorts below 0.5.2, so nightlies of a released number would read as older than
+# (0.5.3-nightly.* sorts below 0.5.3, so nightlies of a released number would read as older than
 # the release). The binaries inside report the same string (`holywisp --version`), so a bug report
 # names the nightly it came from.
 #

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(holyWisp VERSION 0.5.2 LANGUAGES C)
+project(holyWisp VERSION 0.5.3 LANGUAGES C)
 
 # Options ------------------------------------------------------------------------------------
 option(HW_WERROR "Treat warnings as errors" ON)

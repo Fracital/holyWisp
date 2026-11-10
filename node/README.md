@@ -10,7 +10,7 @@ npm install holywisp
 ```
 
 That is the newest release. `npm install holywisp@nightly` is the newest commit of `master` that
-passed its tests, published once a night as a version like `0.5.2-nightly.202611110643.g1a2b3c4`
+passed its tests, published once a night as a version like `0.5.3-nightly.202611110643.g1a2b3c4`
 (the UTC time, then the commit); pin the exact one you tested with.
 
 ```ts
