@@ -215,6 +215,9 @@ static void fd_release(int fd) {
 }
 
 int hw_w32_adopt(SOCKET s, int nonblock) {
+	// No descriptor here is inherited by a child. A socket says so when it is made, but one that was
+	// accepted, or made from another by WSADuplicateSocket, comes inheritable whatever was asked.
+	SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
 	int fd = fd_new((uintptr_t)s, SLOT_SOCKET, nonblock);
 	if (fd < 0) {
 		int saved = errno;
@@ -276,7 +279,6 @@ int hw_w32_accept(int fd, struct sockaddr *addr, socklen_t *len) {
 	if (!ls) return -1;
 	SOCKET s = accept((SOCKET)ls->handle, addr, len);
 	if (s == INVALID_SOCKET) return hw_w32_fail();
-	SetHandleInformation((HANDLE)s, HANDLE_FLAG_INHERIT, 0);
 	socket_defaults(s, SOCK_STREAM);
 	// An accepted socket has its listener's blocking mode.
 	return hw_w32_adopt(s, ls->nonblock);

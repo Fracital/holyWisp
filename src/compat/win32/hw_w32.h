@@ -23,7 +23,8 @@ typedef struct hw_w32_obj {
 	void (*drop)(struct hw_w32_obj *self);
 } hw_w32_obj;
 
-// A descriptor for a socket, which is closed if none can be had. -1 with errno.
+// A descriptor for a socket, which is made non-inheritable, and closed if no descriptor can be had.
+// -1 with errno.
 int hw_w32_adopt(SOCKET s, int nonblock);
 // The socket behind a descriptor; INVALID_SOCKET with errno EBADF if it is not one.
 SOCKET hw_w32_sock(int fd);
