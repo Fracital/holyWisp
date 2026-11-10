@@ -484,7 +484,7 @@ window.</dd>
 wispurr Go {esc(v.get('wispurr_go_git', ''))} ({esc(v.get('go', ''))}); wispurr C++23 built with {esc(v.get('gcc', ''))};
 wisp-server-python {esc(v.get('wisp_python_git', ''))} on {esc(v.get('python', ''))}, default thread count.
 All run with flood protection, reputation and per-IP connection limits off, loopback and literal-IP egress
-allowed, error-level logging, default worker count.</dd>
+allowed, error-level logging, default worker count. The host was not idle during the run (a desktop session was using several cores), so compare servers within a row, not numbers across runs.</dd>
 <dt>Clients</dt><dd>wisp-js {esc(v.get('wisp-js', ''))} on Node {esc(v.get('node', ''))}, which is the client wispmark uses (50 KiB payloads),
 and the native pump from this repository, built on libholywisp-client (64 KiB packets unless stated, and it
 respects the server's CONTINUE window).</dd>
@@ -506,17 +506,19 @@ respects the server's CONTINUE window).</dd>
         + (f" Runs that still failed: {esc(', '.join(sorted(dnfs.get('wispurr-go', {}))))}." if dnfs.get("wispurr-go") else "")
         + "</li>")
     findings.append(
-        "<li><strong>holyWisp keeps its window small on purpose.</strong> The stock config caps the CONTINUE "
-        "window so that a full window of 1 MiB packets fits in half of the 16 MiB per-stream queue, which "
-        "works out to 8 packets, against the 32768 wispurr advertises. holyWisp also holds a CONTINUE back "
-        "while bytes are still queued toward the remote, so a client sending small packets is paced by how "
-        "fast the remote drains rather than by how much memory the server is willing to buffer.</li>")
+        "<li><strong>How holyWisp moves bulk data.</strong> Toward the client, a stream whose remote "
+        "delivers full reads gets its own pipe and is relayed with splice(), with pipe payloads queued in "
+        "order behind the frame bytes, so nothing is copied through user space. Toward the remote, "
+        "consecutive frames for a stream leave in one vectored write and frames of 128 KiB or more are "
+        "forwarded while they are still arriving. The advertised CONTINUE window is 128 packets; refills "
+        "share a per-connection budget between streams, and a CONTINUE is held back while bytes are still "
+        "queued toward the remote.</li>")
     findings.append(
-        "<li><strong>One connection or many.</strong> The C++23 wispurr splits each WebSocket's two "
-        "directions across two event loops and moves data with splice(), so a single busy connection can "
-        "use two cores. holyWisp keeps each connection on one loop and spreads connections across loops "
-        "with SO_REUSEPORT. That is why the single-connection scenarios go to wispurr and the 8 and 16 "
-        "connection scenarios go to holyWisp.</li>")
+        "<li><strong>One connection or many.</strong> Both holyWisp and the C++23 wispurr run a connection "
+        "on one event loop (wispurr can split a connection's two directions across loops, but its source "
+        "defaults to one and notes the split costs more CPU than it returns). They are close when a single "
+        "connection carries everything; holyWisp pulls ahead as traffic spreads over connections, where it "
+        "relays more bytes per CPU-second.</li>")
     if "wisp-python" in servers:
         findings.append(
             "<li><strong>wisp-server-python needed two install fixes.</strong> On this host's Python 3.14 it "

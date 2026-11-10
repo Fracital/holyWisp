@@ -179,23 +179,28 @@ v2, the protocol log, and a light/dark theme. The default target is `http://api.
 `bench/` holds a wispmark-style harness that runs holyWisp, both wispurr implementations and
 wisp-server-python on the same host, through the same echo service, driven by the same clients.
 Full tables are in [bench/RESULTS.md](bench/RESULTS.md); the method and how to rerun it are in
-[bench/README.md](bench/README.md). These are the medians of three 10 s runs on a Ryzen 9 7950X,
-in MiB/s through the echo port.
+[bench/README.md](bench/README.md). These are the medians of five 10 s runs on a Ryzen 9 7950X,
+in MiB/s through the echo port, with the fastest server in each row in bold.
 
 | scenario | holyWisp | wispurr C++23 | wispurr Go | wisp-server-python |
 | --- | --- | --- | --- | --- |
-| wisp-js, 10 streams | **1,156** | 1,065 | 929 | 685 |
-| wisp-js, 5 connections x 10 streams | **2,551** | 1,829 | 1,538 | 1,080 |
-| native client, 1 stream | 1,554 | **2,889** | 2,108 | 609 |
-| native client, 10 streams | 1,689 | **2,859** | 2,189 | 686 |
-| native client, 8 connections x 4 streams | **5,884** | 5,154 | 3,029 | 3,229 |
-| native client, 16 connections x 4 streams | **4,958** | 3,314 | 2,414 | 2,031 |
-| 64 B round trip, p50 / p99.9 | **28 / 77 us** | 29 / 89 us | 35 / 170 us | 46 / 236 us |
-| peak RSS under stream churn | **4 MiB** | 11 MiB | 404 MiB | 976 MiB |
+| wisp-js, 10 streams | **872** | 749 | 799 | 525 |
+| wisp-js, 5 connections x 10 streams | **1,553** | 1,143 | 1,202 | 878 |
+| native client, 1 stream | **2,465** | 2,461 | 1,540 | 566 |
+| native client, 10 streams | 2,078 | **2,170** | 1,528 | 568 |
+| native client, 10 streams, 1 MiB packets | 2,109 | **2,170** | 1,422 | did not finish |
+| native client, 8 connections x 4 streams | **3,621** | 2,993 | 1,879 | 2,025 |
+| native client, 16 connections x 4 streams | **3,693** | 2,720 | 1,922 | 1,767 |
+| 64 B round trip, p50 / p99 | 33 / 70 us | 33 / 66 us | 40 / 92 us | 55 / 155 us |
+| stream churn, lifecycles/s (server cores) | 15,386 (6.0) | 15,518 (6.8) | **18,328** (18.1) | 14,985 (6.4) |
+| peak RSS under stream churn | **4 MiB** | 11 MiB | 411 MiB | 972 MiB |
 
-holyWisp is fastest in the wispmark-standard scenarios and whenever traffic is spread over several
-connections, and it does it on the least memory. The C++23 wispurr is faster when a single
-connection carries everything, because it splits one connection's two directions across two cores.
+holyWisp is the fastest server in both wispmark-standard scenarios and whenever traffic is spread
+over several connections, by 16 to 36% over the next one, and it uses the least memory by a wide
+margin. With a single connection carrying everything it is level with the C++23 wispurr: the two
+are within 4% of each other in all three rows, which is inside the run-to-run noise of this host.
+The Go wispurr opens and closes streams fastest, at three times the CPU. The host was not idle
+during the run, so the absolute numbers are lower than a quiet machine would give.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench/charts/throughput-dark.png">

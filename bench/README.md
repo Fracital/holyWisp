@@ -36,7 +36,7 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
 ## The servers
 
 - `holywisp` is `build/release/holywisp` with the stock config plus the flags that allow loopback targets.
-- `holywisp-sockbuf` is the same with `--socket-buffer-size=33554432`, which matches wispurr's `socketBufferSize`.
+- `holywisp-sockbuf` is the same with `--socket-buffer-size=33554432`, which matches wispurr's `socketBufferSize`. It is an optional profile (`--only`), not part of the published run.
 - `wispurr-go` is `~/src/wispurr/wispurr`, built with `go build -o wispurr main.go`.
 - `wispurr-cpp` is `~/src/wispurr-cpp23/wispurr`, built with `make -C cpp -j LDFLAGS="-flto=auto -O3 -s"`.
   GCC 16 also needs `#include <cstdint>` added to `cpp/src/json.cpp`.
