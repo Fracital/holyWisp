@@ -6,8 +6,10 @@ name: Release
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
 # binaries run on glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 and newer), each archive flat
 # (holywisp, holywisp-client, README, LICENSE-less by design), the .deb and .rpm built in their
-# native containers (deploy/package.sh: hardened unit, dedicated `wisp` user), plus SHA256SUMS over
-# all of them. The stable URL
+# native containers (deploy/package.sh: hardened unit, dedicated `wisp` user), the npm package
+# holywisp-<version>.tgz (node/: the Node.js wrapper with a binary for Linux, macOS and Windows,
+# installable with `npm install <url>`), plus SHA256SUMS over all of them. A tag v<version> also
+# publishes that tarball to the npm registry (the `npm-publish` job). The stable URL
 #   https://github.com/<owner>/<repo>/releases/download/latest/holywisp-linux-x64.tar.gz
 # always points at the newest master build. `latest` only moves forward: a run for a commit that is
 # an ancestor of the published one builds but does not publish.
@@ -174,9 +176,46 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  npm:
+    name: npm package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install toolchain
+        env:
+          ZIG_VERSION: "0.17.1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          pipx install "ziglang==$ZIG_VERSION"
+      - name: Build and pack
+        run: |
+          set -euo pipefail
+          make npm
+          cd node && npm pack
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          dir=$(mktemp -d)
+          cp node/scripts/smoke-package.mjs node/holywisp-*.tgz "$dir/"
+          cd "$dir"
+          npm init -y > /dev/null
+          npm install ./holywisp-*.tgz --no-audit --no-fund
+          node smoke-package.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-npm
+          path: node/holywisp-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
   publish:
     name: Publish ${{ needs.meta.outputs.tag }}
-    needs: [meta, build, deb, rpm]
+    needs: [meta, build, deb, rpm, npm]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -197,7 +236,7 @@ jobs:
         run: |
           set -euo pipefail
           cd assets
-          sha256sum *.tar.gz *.deb *.rpm | tee SHA256SUMS
+          sha256sum *.tar.gz *.deb *.rpm *.tgz | tee SHA256SUMS
 
       # `latest` only moves forward. If the published commit is a descendant of this one (a
       # slower run of an older push), keep what is there.
@@ -231,6 +270,7 @@ jobs:
           | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, glibc 2.35+ |
           | \`holywisp_<version>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: hardened systemd unit, \`wisp\` user |
           | \`holywisp-<version>.fc41.x86_64.rpm\` | Fedora 41+: the same |
+          | \`holywisp-<version>.tgz\` | Node.js 20+ on Linux (x64/arm64, glibc or musl), macOS 13+ and Windows 10+ (x64/arm64): \`npm install <asset url>\` |
           | \`SHA256SUMS\` | checksums of the above |
 
           \`\`\`sh
@@ -254,3 +294,54 @@ jobs:
           else
             gh release create "$TAG" --title "$TAG" --notes "$notes" --verify-tag assets/*
           fi
+
+  # `npm publish`, for a tag only, of the very tarball the release carries (built and smoke-tested
+  # by the `npm` job above). Authentication is npm's trusted publishing: the registry accepts this
+  # workflow's OIDC identity once the package names this repository and `release.yml` as its
+  # publisher (npmjs.com -> package -> Settings -> Trusted publisher), so no token is stored. A
+  # package has to exist before it can have settings, so its first version needs a token: set the
+  # NPM_TOKEN secret for that one release (it is used when present) and delete it afterwards.
+  npm-publish:
+    name: npm publish ${{ needs.meta.outputs.tag }}
+    if: github.ref_type == 'tag'
+    needs: [meta, npm, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Trusted publishing needs npm 11.5.1 or newer.
+      - name: npm with trusted publishing
+        run: npm install --global npm@11 && npm --version
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: holywisp-npm
+
+      - name: Publish
+        env:
+          TAG: ${{ needs.meta.outputs.tag }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          tarball="holywisp-$version.tgz"
+          # The tag names a version; the package must be that version (node/package.json, which
+          # the wrapper's tests hold equal to the server's own).
+          if [ ! -f "$tarball" ]; then
+            echo "::error::tag $TAG, but the package built is $(ls holywisp-*.tgz)"
+            exit 1
+          fi
+          if npm view "holywisp@$version" version > /dev/null 2>&1; then
+            echo "holywisp@$version is already on the registry; nothing to publish"
+            exit 0
+          fi
+          if [ -n "$NPM_TOKEN" ]; then
+            npm config set //registry.npmjs.org/:_authToken "$NPM_TOKEN"
+          fi
+          npm publish "$tarball" --access public

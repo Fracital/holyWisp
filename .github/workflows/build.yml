@@ -1,7 +1,9 @@
 name: Build
 
 # Build and test on every push and PR: GCC and Clang, Debug (ASan + UBSan) and Release, plus
-# clang-tidy over the Debug compile database. Formatting is format.yml's job.
+# clang-tidy over the Debug compile database, the macOS port built and tested natively, and the npm
+# package (node/): its tests, then the packed tarball installed and run on Linux x64, arm64 and
+# Alpine and on macOS arm64 and x64. Formatting is format.yml's job.
 
 on:
   push:
@@ -69,3 +71,217 @@ jobs:
 
       - name: clang-tidy
         run: make tidy
+
+  # The development port (include/holywisp/sys.h). Nothing else executes the kqueue backend or
+  # sys_darwin.c: locally they are only cross-compiled. Allowed to fail until this job has been
+  # seen green once; then drop continue-on-error so it holds the port to the same bar as Linux.
+  macos:
+    name: macOS / ${{ matrix.build }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build: [debug, release]
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Build
+        run: make ${{ matrix.build == 'debug' && 'build' || 'release' }}
+
+      - name: Test
+        run: make ${{ matrix.build == 'debug' && 'test' || 'test-release' }}
+
+      - name: Smoke the binaries
+        run: |
+          set -euo pipefail
+          dir=build/${{ matrix.build }}
+          "$dir/holywisp" --version
+          "$dir/holywisp-client" --help
+
+      - name: Node wrapper against this build
+        if: matrix.build == 'release'
+        run: make npm-test
+
+  # Windows is built where every other npm binary is built: on Linux, with zig. This job makes the
+  # test binaries the same way and the next one runs them where they belong.
+  windows-build:
+    name: Windows / cross build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain
+        env:
+          ZIG_VERSION: "0.17.1"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+          pipx install "ziglang==$ZIG_VERSION"
+
+      - name: Build (x64, with tests)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/win -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/zig-toolchain.cmake -DHW_ZIG=python-zig -DHW_ZIG_TARGET=x86_64-windows-gnu
+          cmake --build build/win
+          file build/win/holywisp.exe
+
+      # arm64 has no runner that runs the C tests here; it has to at least compile and link.
+      - name: Build (arm64)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build/win-arm64 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/zig-toolchain.cmake -DHW_ZIG=python-zig -DHW_ZIG_TARGET=aarch64-windows-gnu
+          cmake --build build/win-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-windows-tests
+          path: build/win/*.exe
+          if-no-files-found: error
+          retention-days: 3
+
+  windows:
+    name: Windows / tests
+    needs: windows-build
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # For the shipped configs test_config loads from the repository root.
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: holywisp-windows-tests
+          path: build/win
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          for t in build/win/test_*.exe; do
+            echo "== $t"
+            "$t"
+          done
+
+      - name: Smoke the binary
+        run: |
+          set -euo pipefail
+          build/win/holywisp.exe --version
+          # It stops when its stdin closes: that is how the Node wrapper ends it on Windows.
+          (sleep 5 | build/win/holywisp.exe --port 6177 --host 127.0.0.1 --stop-on-stdin-eof) &
+          sleep 2
+          curl -fsS http://127.0.0.1:6177/health
+          wait
+
+  node:
+    name: Node wrapper
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build
+
+      - name: Test against the release build
+        run: make npm-test
+
+      # The same zig the binaries were last built with; a newer clang inside it may warn where
+      # this one does not, and -Werror stays on.
+      - name: Build the package
+        env:
+          ZIG_VERSION: "0.17.1"
+        run: |
+          set -euo pipefail
+          pipx install "ziglang==$ZIG_VERSION"
+          make npm
+          file node/bin/*/holywisp*
+          cd node && npm pack
+
+      - name: Test against the packaged binary
+        run: cd node && node --test --test-timeout=30000 tests/*.test.mjs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: holywisp-npm
+          path: node/holywisp-*.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  # What a user gets: the tarball installed into an empty project, no toolchain, no repo checkout
+  # beyond the tests. Alpine is the musl case; the binaries are static so it must not matter. The
+  # macOS and Windows entries run binaries that were cross-compiled on Linux, on the system they
+  # are for: this is the only place the darwin-x64 and win32-arm64 ones run at all.
+  node-smoke:
+    name: npm package on ${{ matrix.name }}
+    needs: node
+    runs-on: ${{ matrix.runner }}
+    container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell || 'sh' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            runner: ubuntu-latest
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+          - name: alpine
+            runner: ubuntu-latest
+            container: node:24-alpine
+          - name: darwin-arm64
+            runner: macos-latest
+          - name: darwin-x64
+            runner: macos-15-intel
+          - name: win32-x64
+            runner: windows-latest
+            shell: bash
+          - name: win32-arm64
+            runner: windows-11-arm
+            shell: bash
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v6
+        if: ${{ !matrix.container }}
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: holywisp-npm
+
+      - name: Install the tarball and run it
+        run: |
+          set -eu
+          dir=$(mktemp -d)
+          cp node/scripts/smoke-package.mjs holywisp-*.tgz "$dir/"
+          cd "$dir"
+          npm init -y > /dev/null
+          npm install ./holywisp-*.tgz --no-audit --no-fund
+          node smoke-package.mjs
+
+      # The whole suite too, with what the tarball carries: its compiled wrapper and its binary.
+      - name: The wrapper's tests against the packaged binary
+        run: |
+          set -eu
+          tar -xzf holywisp-*.tgz
+          cp -r package/dist package/bin node/
+          cd node
+          node --test --test-timeout=30000 tests/*.test.mjs

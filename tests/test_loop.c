@@ -106,10 +106,92 @@ static void test_fd_events(void) {
 	hw_loop_free(loop);
 }
 
+static int g_batch_ends;
+static int g_batch_seen_at_timer;
+
+static void batch_end_cb(hw_loop *loop, void *ud) {
+	g_batch_ends++;
+}
+
+static void batch_timer_cb(hw_loop *loop, void *ud) {
+	g_batch_seen_at_timer = g_batch_ends;
+	hw_loop_stop(loop);
+}
+
+static void batch_task_cb(hw_loop *loop, void *ud) {
+	*(int *)ud = g_batch_ends;
+}
+
+// The hook runs after the posted tasks and again after the events and timers of an iteration, so
+// nothing a callback queued is still waiting when the loop goes to sleep.
+static void test_batch_end_hook(void) {
+	hw_loop *loop = hw_loop_new();
+	g_batch_ends = 0;
+	g_batch_seen_at_timer = -1;
+	hw_loop_set_batch_end(loop, batch_end_cb, NULL);
+	int at_task = -1;
+	CHECK_EQ(hw_loop_post(loop, batch_task_cb, &at_task), 0);
+	CHECK_EQ(hw_loop_run_once(loop, 0), 0);
+	CHECK_EQ(at_task, 0);      // the task ran before any hook call
+	CHECK_EQ(g_batch_ends, 2); // once after the tasks, once after the (empty) dispatch
+	hw_loop_add_timer(loop, 5, 0, batch_timer_cb, NULL);
+	CHECK_EQ(hw_loop_run(loop), 0);
+	CHECK(g_batch_seen_at_timer >= 2, "hook count at timer: %d", g_batch_seen_at_timer);
+	CHECK(g_batch_ends > g_batch_seen_at_timer, "hook ran after the timer: %d", g_batch_ends);
+	int before = g_batch_ends;
+	hw_loop_set_batch_end(loop, NULL, NULL);
+	CHECK_EQ(hw_loop_run_once(loop, 0), 0);
+	CHECK_EQ(g_batch_ends, before);
+	hw_loop_free(loop);
+}
+
+static int g_poll_reads;
+
+static void poll_pipe_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
+	char c;
+	if (read(fd, &c, 1) == 1) g_poll_reads++;
+	if (g_poll_reads >= 3) hw_loop_stop(loop);
+}
+
+static void *slow_writer(void *arg) {
+	int fd = *(int *)arg;
+	for (int i = 0; i < 3; i++) {
+		usleep(2000);
+		ssize_t r = write(fd, "x", 1);
+		(void)r;
+	}
+	return NULL;
+}
+
+// Busy polling changes when the loop sleeps, never what it delivers: events that arrive while it
+// polls and events that arrive after it gave up and blocked are all dispatched, and timers fire.
+static void test_busy_poll(void) {
+	hw_loop *loop = hw_loop_new();
+	hw_loop_set_busy_poll(loop, 500);
+	int p[2];
+	CHECK_EQ(pipe(p), 0);
+	hw_set_nonblock(p[0]);
+	g_poll_reads = 0;
+	CHECK_EQ(hw_loop_add_fd(loop, p[0], HW_EV_READ, poll_pipe_cb, NULL), 0);
+	pthread_t th;
+	CHECK_EQ(pthread_create(&th, NULL, slow_writer, &p[1]), 0);
+	uint64_t start = hw_now_ms();
+	CHECK_EQ(hw_loop_run(loop), 0);
+	pthread_join(th, NULL);
+	CHECK_EQ(g_poll_reads, 3);
+	CHECK(hw_now_ms() - start < 2000, "took %llu ms", (unsigned long long)(hw_now_ms() - start));
+	hw_loop_del_fd(loop, p[0]);
+	close(p[0]);
+	close(p[1]);
+	hw_loop_free(loop);
+}
+
 int main(void) {
 	RUN(test_timers_fire_in_order);
 	RUN(test_repeating_timer_cancels_itself);
 	RUN(test_post_from_other_thread);
 	RUN(test_fd_events);
+	RUN(test_batch_end_hook);
+	RUN(test_busy_poll);
 	return 0;
 }

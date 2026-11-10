@@ -5,6 +5,7 @@
 
 #include "holywisp/hw.h"
 #include "holywisp/smap.h"
+#include "holywisp/sys.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -168,7 +169,7 @@ static int query_one(const struct sockaddr *server, socklen_t slen, const char *
 	uint16_t id = next_id();
 	size_t qlen = hw_dns_build_query(q, sizeof(q), id, host, qtype);
 	if (!qlen) return EAI_NONAME;
-	int fd = socket(server->sa_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	int fd = hw_sys_socket(server->sa_family, SOCK_DGRAM, 0, 0);
 	if (fd < 0) return EAI_SYSTEM;
 	if (connect(fd, server, slen) != 0 || send(fd, q, qlen, 0) != (ssize_t)qlen) {
 		close(fd);

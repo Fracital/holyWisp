@@ -11,6 +11,7 @@
  */
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 
 #include "internal.h"
@@ -55,7 +56,7 @@ static int stream_uses_proxy(const hw_stream *s) {
 // recv()/send(). Both ends are non-blocking, so the EAGAIN handling is identical.
 static ssize_t stream_send(hw_stream *s, const void *buf, size_t len) {
 	if (s->type == HW_STREAM_TERM) return write(s->fd, buf, len);
-	return send(s->fd, buf, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	return send(s->fd, buf, len, HW_MSG_NOSIGNAL | MSG_DONTWAIT);
 }
 
 static ssize_t stream_recv(hw_stream *s, void *buf, size_t len) {
@@ -223,7 +224,9 @@ void stream_connected(hw_stream *s) {
 	s->state = STREAM_OPEN;
 	if (s->type == HW_STREAM_TCP) server_tune_socket(c->w->server, s->fd, 1);
 	s->read_armed = !c->paused;
-	if (stream_update_events(s) != 0) {
+	// With client data already queued, stream_flush below sets the event mask once it knows what
+	// is left; setting it here as well would be a second epoll_ctl for every such stream.
+	if (hw_buf_avail(&s->out) == 0 && stream_update_events(s) != 0) {
 		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
 		return;
 	}
@@ -290,17 +293,10 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			last_errno = errno;
 			continue;
 		}
-		if (hw_loop_add_fd(c->w->loop, s->fd, 0, stream_io_cb, s) != 0) {
-			last_errno = errno;
-			close(s->fd);
-			s->fd = -1;
-			continue;
-		}
 		// In-flight SYN cap: held from here until the connect resolves (success, failure, timeout).
 		if (s->type == HW_STREAM_TCP && !s->syn_held) {
 			if (!hw_semaphore_try(&srv->in_flight_syns)) {
 				HW_STAT_INC(srv, throttled_syns);
-				hw_loop_del_fd(c->w->loop, s->fd);
 				close(s->fd);
 				s->fd = -1;
 				conn_violation(c, "in_flight_syns");
@@ -311,24 +307,27 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			s->syn_held = 1;
 		}
 		int r = connect(s->fd, sa, sl);
-		if (r == 0) {
-			if (signature_record(s, 1)) return;
-			connect_succeeded(s);
-			return;
+		last_errno = r == 0 ? 0 : errno;
+		if (r == 0 || last_errno == EINPROGRESS) {
+			// The socket joins the loop only now, with the interest it needs: one epoll_ctl where
+			// adding it first and arming it after the connect() would be two for every stream.
+			if (hw_loop_add_fd(c->w->loop, s->fd, r == 0 ? 0 : HW_EV_WRITE, stream_io_cb, s) == 0) {
+				if (r == 0) {
+					if (signature_record(s, 1)) return;
+					connect_succeeded(s);
+					return;
+				}
+				s->state = STREAM_CONNECTING;
+				s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)srv->cfg.connect_timeout_ms, 0,
+				                                     connect_timeout_cb, s);
+				return;
+			}
+			last_errno = errno;
 		}
-		if (errno == EINPROGRESS) {
-			s->state = STREAM_CONNECTING;
-			hw_loop_mod_fd(c->w->loop, s->fd, HW_EV_WRITE);
-			s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)srv->cfg.connect_timeout_ms, 0,
-			                                     connect_timeout_cb, s);
-			return;
-		}
-		last_errno = errno;
 		if (s->syn_held) {
 			hw_semaphore_release(&srv->in_flight_syns);
 			s->syn_held = 0;
 		}
-		hw_loop_del_fd(c->w->loop, s->fd);
 		close(s->fd);
 		s->fd = -1;
 	}
@@ -538,10 +537,10 @@ void stream_batch_flush(hw_worker *w) {
 
 	ssize_t n;
 	if (cnt == 1) {
-		n = send(s->fd, w->batch_iov[0].iov_base, w->batch_iov[0].iov_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+		n = send(s->fd, w->batch_iov[0].iov_base, w->batch_iov[0].iov_len, HW_MSG_NOSIGNAL | MSG_DONTWAIT);
 	} else {
 		struct msghdr mh = {.msg_iov = w->batch_iov, .msg_iovlen = (size_t)cnt};
-		n = sendmsg(s->fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+		n = sendmsg(s->fd, &mh, HW_MSG_NOSIGNAL | MSG_DONTWAIT);
 	}
 	if (n < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
@@ -756,7 +755,11 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		int err = 0;
 		socklen_t el = sizeof(err);
 		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
-		if (err == 0 && (events & (HW_EV_ERROR | HW_EV_HUP)) && !(events & HW_EV_WRITE)) err = ECONNREFUSED;
+		// An error event is a failed connect even when SO_ERROR reads clean: a backend may have
+		// collected the error to report it. So is a hang-up on a socket that never became writable.
+		if (err == 0 && ((events & HW_EV_ERROR) || ((events & HW_EV_HUP) && !(events & HW_EV_WRITE)))) {
+			err = ECONNREFUSED;
+		}
 		if (s->connect_timer) {
 			hw_loop_cancel_timer(loop, s->connect_timer);
 			s->connect_timer = NULL;

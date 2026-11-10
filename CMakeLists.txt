@@ -22,6 +22,29 @@ find_package(Threads REQUIRED)
 # Warnings: STYLE.md "Language and portability". -------------------------------------------
 add_library(hw_flags INTERFACE)
 target_compile_definitions(hw_flags INTERFACE _GNU_SOURCE)
+# Linux is the platform; macOS is a development port (include/holywisp/sys.h). Each has its own
+# loop backend and its own half of sys.h, chosen here and nowhere else.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(HW_PLATFORM_SOURCES src/common/loop_epoll.c src/common/sys_linux.c)
+  set(HW_PLATFORM_LIBS crypt util) # crypt(3) for password hashes, forkpty(3) for Twisp
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(HW_PLATFORM_SOURCES src/common/loop_kqueue.c src/common/sys_darwin.c)
+  set(HW_PLATFORM_LIBS "") # both are in libSystem
+  # Strict C11 hides everything that is not ISO C or POSIX unless this is defined.
+  target_compile_definitions(hw_flags INTERFACE _DARWIN_C_SOURCE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  # Windows has a third part: the POSIX socket calls themselves (src/compat/win32), as headers
+  # under the names POSIX gives them, so that no other source file knows it is not on POSIX.
+  # They have to come before the toolchain's own, which some of them wrap.
+  set(HW_PLATFORM_SOURCES src/common/loop_select.c src/common/sys_win32.c src/compat/win32/posix.c)
+  set(HW_PLATFORM_LIBS ws2_32)
+  set(HW_PLATFORM_INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/src/compat/win32) # hw_w32.h, for the three files above
+  target_include_directories(hw_flags BEFORE INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/src/compat/win32/include)
+  # gmtime_r and friends are declared only when asked for.
+  target_compile_definitions(hw_flags INTERFACE WIN32_LEAN_AND_MEAN NOMINMAX _POSIX_THREAD_SAFE_FUNCTIONS=200112L)
+else()
+  message(FATAL_ERROR "holyWisp builds on Linux, macOS and Windows; ${CMAKE_SYSTEM_NAME} has no loop backend or sys.h")
+endif()
 target_compile_options(hw_flags INTERFACE
   -Wall -Wextra -Wpedantic
   -Wshadow -Wvla -Wstrict-prototypes -Wmissing-prototypes
@@ -60,9 +83,11 @@ add_library(holywisp STATIC
   src/common/smap.c
   src/common/wisp.c
   src/common/ws.c
+  ${HW_PLATFORM_SOURCES}
 )
 target_include_directories(holywisp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-target_link_libraries(holywisp PUBLIC hw_flags Threads::Threads)
+target_include_directories(holywisp PRIVATE ${HW_PLATFORM_INCLUDES})
+target_link_libraries(holywisp PUBLIC hw_flags Threads::Threads ${HW_PLATFORM_LIBS})
 
 # libholywisp-server: the server as a library (the binary and the e2e test both link it). ---
 # Embed the browser client (examples/wisp-webclient.html) into the server so it can be served on
@@ -88,8 +113,6 @@ add_library(holywisp-server STATIC
   ${HW_WEBCLIENT_HDR}
 )
 target_link_libraries(holywisp-server PUBLIC holywisp)
-# crypt(3) for password hashes; forkpty(3) for Twisp terminal streams.
-target_link_libraries(holywisp-server PUBLIC crypt util)
 target_include_directories(holywisp-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 add_executable(holywisp-bin src/server/main.c)
@@ -100,9 +123,14 @@ target_link_libraries(holywisp-bin PRIVATE holywisp-server)
 add_library(holywisp-client STATIC src/client/client.c)
 target_link_libraries(holywisp-client PUBLIC holywisp)
 
-add_executable(holywisp-client-bin src/client/main.c)
-set_target_properties(holywisp-client-bin PROPERTIES OUTPUT_NAME holywisp-client)
-target_link_libraries(holywisp-client-bin PRIVATE holywisp-client)
+# The CLI relays stdin, and waits for it and the socket in one poll(2): not something a Windows
+# console can do. The library is built everywhere; the tests use it.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Windows")
+  add_executable(holywisp-client-bin src/client/main.c)
+  set_target_properties(holywisp-client-bin PROPERTIES OUTPUT_NAME holywisp-client)
+  target_link_libraries(holywisp-client-bin PRIVATE holywisp-client)
+  install(TARGETS holywisp-client-bin RUNTIME DESTINATION bin)
+endif()
 
 # Tests --------------------------------------------------------------------------------------
 if(HW_BUILD_TESTS)
@@ -128,6 +156,7 @@ if(HW_BUILD_TESTS)
   hw_test(test_wisp)
   hw_test(test_ws)
   hw_test(test_loop)
+  hw_test(test_sys)
   hw_test(test_config)
   # Loads the shipped configs, which live at the repo root.
   set_tests_properties(test_config PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
@@ -140,4 +169,4 @@ if(HW_BUILD_TESTS)
   hw_test(test_flow)
 endif()
 
-install(TARGETS holywisp-bin holywisp-client-bin RUNTIME DESTINATION bin)
+install(TARGETS holywisp-bin RUNTIME DESTINATION bin)

@@ -82,7 +82,8 @@ static int lookup_system(const char *host, hw_dns_result *res) {
 		if (ai->ai_addrlen > sizeof(res->addrs[0])) continue;
 		int dup = 0;
 		for (int i = 0; i < res->count && !dup; i++) {
-			dup = res->lens[i] == ai->ai_addrlen && memcmp(&res->addrs[i], ai->ai_addr, ai->ai_addrlen) == 0;
+			// ai_addrlen is a socklen_t in POSIX and a size_t in Winsock.
+			dup = res->lens[i] == (socklen_t)ai->ai_addrlen && memcmp(&res->addrs[i], ai->ai_addr, ai->ai_addrlen) == 0;
 		}
 		if (dup) continue;
 		memcpy(&res->addrs[res->count], ai->ai_addr, ai->ai_addrlen);

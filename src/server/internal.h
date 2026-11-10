@@ -65,8 +65,17 @@ typedef struct hw_worker {
 	// can move.
 	struct hw_stream *batch_stream;
 	struct iovec batch_iov[HW_BATCH_MAX];
+	// Payload bytes relayed by this worker. Per worker, not per server: they are bumped for every
+	// DATA packet, and one shared counter would bounce its cache line between all the workers.
+	// They sit between this worker's own fields so no other thread writes near them; the stats
+	// reader sums them.
+	_Atomic uint64_t bytes_in;
+	_Atomic uint64_t bytes_out;
 	int batch_n;
-	int batch_pkts;         // whole DATA packets completed inside the batch (a large one spans entries)
+	int batch_pkts; // whole DATA packets completed inside the batch (a large one spans entries)
+	// Connections holding small frames that have not been written yet (conn_kick). The loop's
+	// batch-end hook writes them, so frames queued by several callbacks leave in one send.
+	struct hw_conn *flush_head;
 	uint64_t pipe_retry_ms; // a relay pipe could not be had: do not ask the kernel again before this
 } hw_worker;
 
@@ -129,8 +138,6 @@ struct hw_server {
 	_Atomic uint64_t connections_active;
 	_Atomic uint64_t streams_total;
 	_Atomic uint64_t streams_active;
-	_Atomic uint64_t bytes_in;
-	_Atomic uint64_t bytes_out;
 	_Atomic uint64_t refused_connection_rate;
 	_Atomic uint64_t refused_connection_limit;
 	_Atomic uint64_t refused_reputation;
@@ -178,10 +185,12 @@ typedef struct hw_conn {
 	hw_timer *throttle_timer; // bandwidth pause
 	int throttled;            // reads suspended until throttle_timer fires
 	int write_armed;          // HW_EV_WRITE requested
-	int paused;               // remote reads suspended: wbuf past the high-water mark
-	size_t queued_out;        // bytes waiting in every stream's `out` toward its remote
-	size_t pkt_avg;           // running average DATA payload from this client, 0 until the first
-	size_t read_chunk;        // room offered to each recv: grows while reads fill it, decays when idle
+	int flush_queued;         // on the worker's flush list
+	struct hw_conn *flush_next;
+	int paused;        // remote reads suspended: wbuf past the high-water mark
+	size_t queued_out; // bytes waiting in every stream's `out` toward its remote
+	size_t pkt_avg;    // running average DATA payload from this client, 0 until the first
+	size_t read_chunk; // room offered to each recv: grows while reads fill it, decays when idle
 	// A large DATA frame being forwarded as it arrives (ws_frames): its stream, the payload bytes
 	// still to come, and the frame's mask with the position in its cycle.
 	size_t pt_left;
@@ -265,6 +274,8 @@ int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason);
 // Flush what can be written now; arms HW_EV_WRITE for the rest. Closes the conn on error.
 void conn_flush(hw_conn *c);
+// The loop's batch-end hook (ud is the hw_worker): write every connection's deferred frames.
+void conn_batch_end(hw_loop *loop, void *ud);
 // Tear down the client and all its streams; the memory is released on the next loop iteration.
 void conn_close(hw_conn *c);
 // Shutdown only: tear down and free a connection synchronously (the loop is no longer running).

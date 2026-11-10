@@ -50,7 +50,8 @@ static void test_decay(void) {
 }
 
 static void test_persistence(void) {
-	char path[] = "/tmp/hw-rep-XXXXXX";
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-rep");
 	int fd = mkstemp(path);
 	CHECK(fd >= 0, "tmp");
 	close(fd);

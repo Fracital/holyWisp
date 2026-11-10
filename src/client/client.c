@@ -7,6 +7,7 @@
 #include "holywisp/buf.h"
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
@@ -91,7 +92,7 @@ static void seed_rng(hw_client *c) {
 
 static int send_all(hw_client *c, const uint8_t *data, size_t len) {
 	while (len > 0) {
-		ssize_t n = send(c->fd, data, len, MSG_NOSIGNAL);
+		ssize_t n = send(c->fd, data, len, HW_MSG_NOSIGNAL);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			c->closed = 1;

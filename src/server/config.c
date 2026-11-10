@@ -25,10 +25,11 @@ static int parse_bool(const char *v, int *out) {
 	return -1;
 }
 
-static int parse_long(const char *v, long min, long max, long *out) {
+// long long, not long: the size limits below reach 2^31, which a 32-bit long (Windows) cannot hold.
+static int parse_long(const char *v, long long min, long long max, long long *out) {
 	char *end;
 	errno = 0;
-	long n = strtol(v, &end, 10);
+	long long n = strtoll(v, &end, 10);
 	if (errno || end == v || *end || n < min || n > max) return -1;
 	*out = n;
 	return 0;
@@ -42,7 +43,7 @@ static int set_str(char *dst, size_t cap, const char *v) {
 }
 
 int hw_config_set(hw_server_config *cfg, const char *key, const char *value, char *err, size_t err_cap) {
-	long n;
+	long long n;
 	int b;
 #define BOOL_KEY(name, field)                           \
 	if (!strcmp(key, name)) {                           \
@@ -117,22 +118,24 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	// Where streams go.
 	STR_KEY("proxy", proxy)
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
-	INT_KEY("max-message-size", max_message_size, 1024, 1L << 30)
-	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1L << 31)
-	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1L << 31)
-	INT_KEY("conn-queue-max", conn_queue_max, 4096, 1L << 31)
-	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1L << 30)
-	INT_KEY("client-recv-buffer", client_recv_buffer, 0, 1L << 30)
+	INT_KEY("max-message-size", max_message_size, 1024, 1LL << 30)
+	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1LL << 31)
+	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1LL << 31)
+	INT_KEY("conn-queue-max", conn_queue_max, 4096, 1LL << 31)
+	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1LL << 30)
+	INT_KEY("client-recv-buffer", client_recv_buffer, 0, 1LL << 30)
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
 	INT_KEY("connect-timeout-ms", connect_timeout_ms, 100, 600000)
 	INT_KEY("handshake-timeout-ms", handshake_timeout_ms, 100, 600000)
 	INT_KEY("resolver-threads", resolver_threads, 1, 256)
+	INT_KEY("busy-poll-us", busy_poll_us, 0, 10000)
 	BOOL_KEY("tcp-nodelay", tcp_nodelay)
 	BOOL_KEY("tcp-quickack", tcp_quickack)
 	INT_KEY("listen-backlog", listen_backlog, 1, 65535)
 	STR_KEY("non-ws-response", non_ws_response)
 	BOOL_KEY("serve-webclient", serve_webclient)
 	STR_KEY("webclient-wisp-url", webclient_wisp_url)
+	BOOL_KEY("stop-on-stdin-eof", stop_on_stdin_eof)
 #undef BOOL_KEY
 #undef INT_KEY
 #undef STR_KEY
@@ -354,10 +357,14 @@ void hw_config_usage(const char *argv0) {
 	    "                                            it (8 MiB; 0 = leave to the kernel)\n"
 	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
 	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
+	    "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
+	    "                                            before sleeping: lower latency, more CPU (0 = off)\n"
 	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
 	    "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
 	    "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
 	    "  log-level                                 debug|info|warn|error|none (info)\n"
+	    "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
+	    "                                            holds a pipe to it, never under a service manager (off)\n"
 	    "\n"
 	    "  --version, --help\n",
 	    argv0);

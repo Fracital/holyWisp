@@ -9,6 +9,7 @@
 #include "holywisp/base64.h"
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 
 #include "internal.h"
@@ -134,7 +135,7 @@ int proxy_config_resolve(hw_proxy_config *p) {
 static int proxy_send(hw_stream *s, const uint8_t *data, size_t len) {
 	// The handshake is a handful of bytes on a fresh socket: a short write here is an error, not
 	// something worth a queue.
-	ssize_t n = send(s->fd, data, len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	ssize_t n = send(s->fd, data, len, HW_MSG_NOSIGNAL | MSG_DONTWAIT);
 	if (n != (ssize_t)len) {
 		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
 		return -1;

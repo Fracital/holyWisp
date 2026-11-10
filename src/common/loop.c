@@ -1,14 +1,20 @@
 /*
  * holywisp/loop.h implementation.
  *
- * Fds live in a table indexed by fd with a generation counter: epoll events carry (fd, gen) so an
- * fd closed and reused inside the same dispatch batch is never handed to the wrong watcher. Timers
+ * Fds live in a table indexed by fd with a generation counter: events carry (fd, gen) so an fd
+ * closed and reused inside the same dispatch batch is never handed to the wrong watcher. Timers
  * are a binary min-heap of heap-allocated nodes that know their index, so cancel is O(log n).
- * Posted tasks sit on a mutex-protected queue and wake the loop through an eventfd.
+ * Posted tasks sit on a mutex-protected queue and wake the loop through a descriptor it watches.
+ *
+ * Waiting for readiness is the kernel's part and lives behind loop_backend.h (loop_epoll.c on
+ * Linux, loop_kqueue.c on macOS, loop_select.c on Windows); nothing in this file is specific to
+ * any of them.
  */
 #include "holywisp/loop.h"
 
 #include "holywisp/hw.h"
+
+#include "loop_backend.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,9 +24,6 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
-
-#include <sys/epoll.h>
-#include <sys/eventfd.h>
 
 #define LOOP_MAX_EVENTS 256
 
@@ -47,8 +50,9 @@ typedef struct task {
 } task;
 
 struct hw_loop {
-	int epfd;
-	int wakefd;
+	int poller;
+	int wake_rd; // watched; readable once something was written to wake_wr
+	int wake_wr; // may be the same descriptor
 	fd_watch *fds;
 	int fd_cap;
 
@@ -60,10 +64,21 @@ struct hw_loop {
 	task *task_head;
 	task *task_tail;
 
+	hw_batch_cb batch_cb;
+	void *batch_ud;
+	unsigned busy_poll_us;
+	int was_busy; // the previous iteration delivered events
+
 	_Atomic int stop;
 };
 
 // ---------------------------------------------------------------------------------- hw.h helpers
+
+static uint64_t now_us(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+}
 
 uint64_t hw_now_ms(void) {
 	struct timespec ts;
@@ -84,23 +99,36 @@ int hw_set_cloexec(int fd) {
 // ---------------------------------------------------------------------------------- lifecycle
 
 static void wake_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
-	uint64_t v;
-	ssize_t r = read(fd, &v, sizeof(v));
-	(void)r;
+	// Empty it: an eventfd in one read, a pipe in as many as it holds wakeups.
+	uint64_t v[8];
+	while (read(fd, v, sizeof(v)) == (ssize_t)sizeof(v)) {
+	}
+}
+
+static void wake(hw_loop *loop) {
+	uint64_t one = 1;
+	ssize_t r = write(loop->wake_wr, &one, sizeof(one));
+	(void)r; // full means a wakeup is already pending
 }
 
 hw_loop *hw_loop_new(void) {
 	hw_loop *loop = calloc(1, sizeof(*loop));
 	if (!loop) return NULL;
-	loop->epfd = epoll_create1(EPOLL_CLOEXEC);
-	loop->wakefd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
-	if (loop->epfd < 0 || loop->wakefd < 0) goto fail;
+	int wakefds[2] = {-1, -1};
+	loop->poller = hw_poller_open();
+	if (loop->poller < 0 || hw_poller_wake_open(wakefds) != 0) goto fail;
+	loop->wake_rd = wakefds[0];
+	loop->wake_wr = wakefds[1];
 	pthread_mutex_init(&loop->task_lock, NULL);
-	if (hw_loop_add_fd(loop, loop->wakefd, HW_EV_READ, wake_cb, NULL) != 0) goto fail;
+	if (hw_loop_add_fd(loop, loop->wake_rd, HW_EV_READ, wake_cb, NULL) != 0) {
+		pthread_mutex_destroy(&loop->task_lock);
+		goto fail;
+	}
 	return loop;
 fail:
-	if (loop->epfd >= 0) close(loop->epfd);
-	if (loop->wakefd >= 0) close(loop->wakefd);
+	if (loop->poller >= 0) close(loop->poller);
+	if (wakefds[0] >= 0) close(wakefds[0]);
+	if (wakefds[1] >= 0 && wakefds[1] != wakefds[0]) close(wakefds[1]);
 	free(loop->fds);
 	free(loop);
 	return NULL;
@@ -117,29 +145,14 @@ void hw_loop_free(hw_loop *loop) {
 		t = next;
 	}
 	pthread_mutex_destroy(&loop->task_lock);
-	close(loop->wakefd);
-	close(loop->epfd);
+	close(loop->wake_rd);
+	if (loop->wake_wr != loop->wake_rd) close(loop->wake_wr);
+	close(loop->poller);
 	free(loop->fds);
 	free(loop);
 }
 
 // ---------------------------------------------------------------------------------- fds
-
-static uint32_t to_epoll(unsigned ev) {
-	uint32_t e = EPOLLRDHUP;
-	if (ev & HW_EV_READ) e |= EPOLLIN;
-	if (ev & HW_EV_WRITE) e |= EPOLLOUT;
-	return e;
-}
-
-static unsigned from_epoll(uint32_t e) {
-	unsigned ev = 0;
-	if (e & (EPOLLIN | EPOLLRDHUP)) ev |= HW_EV_READ;
-	if (e & EPOLLOUT) ev |= HW_EV_WRITE;
-	if (e & EPOLLERR) ev |= HW_EV_ERROR;
-	if (e & EPOLLHUP) ev |= HW_EV_HUP;
-	return ev;
-}
 
 static int fd_table_grow(hw_loop *loop, int fd) {
 	if (fd < loop->fd_cap) return 0;
@@ -168,10 +181,7 @@ int hw_loop_add_fd(hw_loop *loop, int fd, unsigned events, hw_io_cb cb, void *ud
 	w->events = events;
 	w->gen++;
 	w->active = 1;
-	struct epoll_event ev;
-	ev.events = to_epoll(events);
-	ev.data.u64 = (uint64_t)fd << 32 | w->gen;
-	if (epoll_ctl(loop->epfd, EPOLL_CTL_ADD, fd, &ev) != 0) {
+	if (hw_poller_set(loop->poller, fd, 1, 0, events, w->gen) != 0) {
 		w->active = 0;
 		return -1;
 	}
@@ -185,10 +195,7 @@ int hw_loop_mod_fd(hw_loop *loop, int fd, unsigned events) {
 	}
 	fd_watch *w = &loop->fds[fd];
 	if (w->events == events) return 0;
-	struct epoll_event ev;
-	ev.events = to_epoll(events);
-	ev.data.u64 = (uint64_t)fd << 32 | w->gen;
-	if (epoll_ctl(loop->epfd, EPOLL_CTL_MOD, fd, &ev) != 0) return -1;
+	if (hw_poller_set(loop->poller, fd, 0, w->events, events, w->gen) != 0) return -1;
 	w->events = events;
 	return 0;
 }
@@ -197,7 +204,7 @@ void hw_loop_del_fd(hw_loop *loop, int fd) {
 	if (fd < 0 || fd >= loop->fd_cap || !loop->fds[fd].active) return;
 	loop->fds[fd].active = 0;
 	loop->fds[fd].cb = NULL;
-	epoll_ctl(loop->epfd, EPOLL_CTL_DEL, fd, NULL);
+	hw_poller_del(loop->poller, fd, loop->fds[fd].events);
 }
 
 // ---------------------------------------------------------------------------------- timers
@@ -316,11 +323,7 @@ int hw_loop_post(hw_loop *loop, hw_task_cb cb, void *ud) {
 	}
 	loop->task_tail = t;
 	pthread_mutex_unlock(&loop->task_lock);
-	if (was_empty) {
-		uint64_t one = 1;
-		ssize_t r = write(loop->wakefd, &one, sizeof(one));
-		(void)r;
-	}
+	if (was_empty) wake(loop);
 	return 0;
 }
 
@@ -347,27 +350,47 @@ static int tasks_pending(hw_loop *loop) {
 
 // ---------------------------------------------------------------------------------- run
 
+void hw_loop_set_batch_end(hw_loop *loop, hw_batch_cb cb, void *ud) {
+	loop->batch_cb = cb;
+	loop->batch_ud = ud;
+}
+
+void hw_loop_set_busy_poll(hw_loop *loop, unsigned us) {
+	loop->busy_poll_us = us;
+}
+
 int hw_loop_run_once(hw_loop *loop, int timeout_ms) {
 	tasks_run(loop);
+	if (loop->batch_cb) loop->batch_cb(loop, loop->batch_ud);
 	int next = timers_next_ms(loop);
 	if (next >= 0 && (timeout_ms < 0 || next < timeout_ms)) timeout_ms = next;
 	if (tasks_pending(loop) || atomic_load(&loop->stop)) timeout_ms = 0;
 
-	struct epoll_event events[LOOP_MAX_EVENTS];
-	int n = epoll_wait(loop->epfd, events, LOOP_MAX_EVENTS, timeout_ms);
+	hw_poll_event events[LOOP_MAX_EVENTS];
+	int n = 0;
+	if (loop->busy_poll_us > 0 && loop->was_busy && timeout_ms != 0) {
+		// The peer that was just served usually answers before a sleep and a wakeup would be over.
+		uint64_t until = now_us() + loop->busy_poll_us;
+		do {
+			n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, 0);
+		} while (n == 0 && now_us() < until && !atomic_load(&loop->stop));
+	}
+	if (n == 0) n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, timeout_ms);
 	if (n < 0) {
+		loop->was_busy = 0;
 		if (errno == EINTR) return 0;
 		return -1;
 	}
+	loop->was_busy = n > 0;
 	for (int i = 0; i < n; i++) {
-		int fd = (int)(events[i].data.u64 >> 32);
-		uint32_t gen = (uint32_t)events[i].data.u64;
+		int fd = events[i].fd;
 		if (fd < 0 || fd >= loop->fd_cap) continue;
 		fd_watch *w = &loop->fds[fd];
-		if (!w->active || w->gen != gen || !w->cb) continue;
-		w->cb(loop, fd, from_epoll(events[i].events), w->ud);
+		if (!w->active || w->gen != events[i].gen || !w->cb) continue;
+		w->cb(loop, fd, events[i].events, w->ud);
 	}
 	timers_run(loop);
+	if (loop->batch_cb) loop->batch_cb(loop, loop->batch_ud);
 	return 0;
 }
 
@@ -382,9 +405,7 @@ int hw_loop_run(hw_loop *loop) {
 
 void hw_loop_stop(hw_loop *loop) {
 	atomic_store(&loop->stop, 1);
-	uint64_t one = 1;
-	ssize_t r = write(loop->wakefd, &one, sizeof(one));
-	(void)r;
+	wake(loop);
 }
 
 int hw_loop_stopped(const hw_loop *loop) {

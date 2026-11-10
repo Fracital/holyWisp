@@ -52,12 +52,24 @@ Downloads and checksums for every release: **https://github.com/Fracital/holyWis
 Requires CMake 3.20+, a C11 compiler and Linux (epoll). Ninja is used when present. `crypt(3)` and
 `forkpty(3)` come from libc (`libcrypt-dev` / `libxcrypt-devel` on some distros).
 
+It also builds and runs on macOS (kqueue), as a port for development machines: the same server and
+the same tests, but payloads are copied where Linux splices them, the workers share one listening
+socket, and `crypt(3)` there knows no `$5$`/`$6$` hashes. Production is Linux.
+
+Windows is a third such port, and always a cross build (`make npm` makes it, with zig; `make
+test-windows` runs the test suite under Wine). It is the same source: `src/compat/win32` supplies
+the POSIX socket calls over Winsock and the loop waits in `select`. What Windows cannot do is
+refused when the server starts, not discovered later: Twisp (no pseudo-terminal a loop can watch)
+and hashed passwords (no `crypt(3)`). `holywisp-client` is not built there.
+
 ```sh
 make            # debug build with ASan/UBSan -> build/debug
 make test       # unit + end-to-end tests
 make release    # optimised build -> build/release
 make deb        # build a .deb        -> build/packages/
 make rpm        # build an .rpm       -> build/packages/
+make npm        # the npm package     -> node/bin, node/dist (needs zig)
+make test-windows  # the Windows build and its tests under Wine (needs zig and wine)
 make help
 ```
 
@@ -119,9 +131,11 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `buffer-remaining`, `max-message-size`, `ws-write-high-water` | 128, 1 MiB+5, 8 MiB | Flow control and the queue toward a slow client; the advertised window is capped so a full window of max-size packets fits in `stream-queue-max` |
 | `socket-buffer-size`, `client-recv-buffer` | 0, 8 MiB | `socket-buffer-size` sets `SO_RCVBUF`/`SO_SNDBUF` on every socket (0 leaves them to the kernel). Otherwise client sockets get a receive buffer of `client-recv-buffer`, but only when `net.core.rmem_max` grants at least 4 MiB (the kernel doubles the value, so `rmem_max` of 2 MiB or more); 0 turns that off |
 | `stream-queue-max`, `conn-queue-max` | 128 MiB, 256 MiB | Bytes queued toward slow remotes: per stream (the stream closes `0x49` beyond it) and per client (its reads pause beyond it and resume at half) |
+| `busy-poll-us` | 0 | After a loop iteration that had events, poll this many microseconds before sleeping: lower round-trip latency under load, more CPU spent waiting. 0 always sleeps |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `webclient-wisp-url` | empty | `ws(s)://` URL the web client offers by default; empty means the page's own origin |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
+| `stop-on-stdin-eof` | off | Shut down when standard input reaches end of file. For a program that runs `holywisp` as a child with a pipe on its stdin (the Node wrapper does): the server then never outlives its parent. Leave it off under systemd, where stdin is `/dev/null` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,
 streams, bytes, and every refusal/throttle/block tally), both on the same port.
@@ -174,6 +188,31 @@ per-packet trace. The **Wisp server URL** field is front-and-center so you can p
 `ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain; there are toggles for Wisp
 v2, the protocol log, and a light/dark theme. The default target is `http://api.ipify.org/`.
 
+## Node.js
+
+`node/` is an npm package, `holywisp`, that embeds the server in a Node.js application the way
+[wispurr](https://github.com/sylvieisnton/wispurr)'s wrapper does, with the same class shape and
+option names: it carries a binary for Linux (x64 and arm64, statically linked), macOS and Windows
+(x64 and arm64 each), starts it as a child process and routes the WebSocket upgrades of your own
+HTTP server to it. A server that dies is started again, and it never outlives the process that
+started it. A Vite plugin is included.
+
+```ts
+import { createServer } from "node:http";
+import { holywisp } from "holywisp";
+
+const wisp = new holywisp();
+await wisp.start(4); // four worker threads behind one port
+
+const server = createServer();
+server.on("upgrade", (req, socket, head) => wisp.route(req, socket, head));
+server.listen(8080);
+```
+
+`route()` passes the client's address on, so the per-client limits and the reputation table keep
+working behind it. [`node/README.md`](node/README.md) has the API, the option table and what
+differs from wispurr. `make npm` builds the package and `make npm-test` runs its tests.
+
 ## Benchmarks
 
 `bench/` holds a wispmark-style harness that runs holyWisp, both wispurr implementations and
@@ -225,13 +264,15 @@ host: an earlier run on a desktop Ryzen 9 7950X ranked several of these rows dif
 
 ```
 include/holywisp/   public headers
-src/common/         buffers, logging, epoll loop, resolver, DNS client+cache, rate limiters,
-                    reputation, string/int maps, filters, WebSocket + Wisp codecs
+src/common/         buffers, logging, event loop (epoll, kqueue, select), resolver, DNS client+cache, rate
+                    limiters, reputation, string/int maps, filters, WebSocket + Wisp codecs
+src/compat/win32/   Windows only: the POSIX socket calls over Winsock, under their POSIX names
 src/server/         holywisp: config, workers, connections, streams, egress, upstream proxy, twisp
 src/client/         libholywisp-client and the holywisp-client CLI
 tests/              one binary per module plus the end-to-end and security suites, run by ctest
 deploy/             systemd unit, Debian + RPM packaging, the package builder
 examples/           wisp-webclient.html: a single-file browser client for interactive testing
+node/               the npm package: the Node.js wrapper, its tests and build script
 bench/              the comparison harness, its results and charts (make bench)
 .github/workflows/  build, format, release (binaries), packages (.deb + .rpm)
 ```

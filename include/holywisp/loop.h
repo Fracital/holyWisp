@@ -1,9 +1,9 @@
 /*
- * holywisp/loop.h - single-threaded epoll event loop.
+ * holywisp/loop.h - single-threaded event loop (epoll on Linux, kqueue on macOS, select on Windows).
  *
  * Every worker thread owns one hw_loop and all the fds, timers and objects registered on it. Only
  * hw_loop_post() and hw_loop_stop() may be called from another thread; both wake the loop through
- * an eventfd. Callbacks may add, modify and remove fds and timers freely, including their own.
+ * a descriptor it watches. Callbacks may add, modify and remove fds and timers freely, including their own.
  *
  * Events are delivered with the fd's generation checked, so an fd closed and reused inside the
  * same dispatch batch is never handed to a stale watcher.
@@ -26,6 +26,7 @@ enum {
 typedef void (*hw_io_cb)(hw_loop *loop, int fd, unsigned events, void *ud);
 typedef void (*hw_timer_cb)(hw_loop *loop, void *ud);
 typedef void (*hw_task_cb)(hw_loop *loop, void *ud);
+typedef void (*hw_batch_cb)(hw_loop *loop, void *ud);
 
 hw_loop *hw_loop_new(void);
 // Does not close registered fds. Pending posted tasks are dropped, not run.
@@ -43,6 +44,20 @@ void hw_loop_cancel_timer(hw_loop *loop, hw_timer *t);
 
 // Run cb on the loop thread at the start of its next iteration. Thread-safe.
 int hw_loop_post(hw_loop *loop, hw_task_cb cb, void *ud);
+
+// One hook per loop, called on the loop thread each time a batch of callbacks is over: once after
+// the posted tasks of an iteration have run, and once after its fd events and timers. It is the
+// place for work that is cheaper done once per batch than once per callback, like writing what
+// several callbacks queued for the same socket. Nothing posted, armed or queued by the callbacks
+// of a batch is left waiting across a sleep: the hook always runs before the loop blocks. NULL
+// clears it.
+void hw_loop_set_batch_end(hw_loop *loop, hw_batch_cb cb, void *ud);
+
+// After an iteration that delivered events, poll without sleeping for up to `us` microseconds
+// before blocking. A relay between two busy peers is woken again within microseconds, and going to
+// sleep and being woken costs more than waiting that long; an idle loop never spins. 0 (the
+// default) always blocks.
+void hw_loop_set_busy_poll(hw_loop *loop, unsigned us);
 
 // Run until hw_loop_stop(). Returns 0, or -1 on a fatal backend error.
 int hw_loop_run(hw_loop *loop);

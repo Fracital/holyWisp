@@ -58,6 +58,12 @@ static int write_full(int fd, const uint8_t *buf, size_t n) {
 	return 0;
 }
 
+// Whether a socket from accept(2) has its listener's O_NONBLOCK depends on the kernel (Linux: no;
+// the BSDs and Windows: yes). A sink the test reads with read_full has to block either way.
+static void set_blocking(int fd) {
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) & ~O_NONBLOCK);
+}
+
 static int read_full(int fd, uint8_t *buf, size_t n) {
 	size_t got = 0;
 	while (got < n) {
@@ -339,6 +345,7 @@ static void test_ingress_window_stalled_upstream(void) {
 	CHECK_EQ(poll(&pfd, 1, 5000), 1);
 	int sink = accept(lfd, NULL, NULL);
 	CHECK(sink >= 0, "accept");
+	set_blocking(sink);
 
 	// Spend the whole window into a sink that reads nothing.
 	uint8_t *data = malloc((size_t)WINDOW * PKT);
@@ -437,6 +444,7 @@ static void test_conn_queue_pauses_reads(void) {
 		CHECK_EQ(poll(&pfd, 1, 5000), 1);
 		sinks[i] = accept(lfd, NULL, NULL);
 		CHECK(sinks[i] >= 0, "accept %d", i);
+		set_blocking(sinks[i]);
 	}
 
 	const size_t per_stream = (size_t)WINDOW * PKT;

@@ -21,6 +21,11 @@ It ships three things from one tree:
   with an echo benchmark (`src/client/`, API in `include/holywisp/client.h`).
 - The test suite (`tests/`): unit tests for every codec and container, and an end-to-end suite
   that starts the real server on an ephemeral port and drives it with the real client.
+- `holywisp` on npm (`node/`): a TypeScript wrapper that runs the server binary as a child process
+  and routes a Node HTTP server's WebSocket upgrades to it, shaped like wispurr's wrapper so a
+  user of that one changes an import. No runtime dependencies; TypeScript is its only build tool.
+  It carries a binary for Linux, macOS and Windows, starts a server that died again, and the server
+  stops when the process that started it is gone (`stop-on-stdin-eof`).
 
 Reference material that shaped the design. These are sibling checkouts, read-only, never vendored:
 
@@ -66,7 +71,8 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   pushing here does not change what the edges run. stomp.fracit.al uses the same public root
   (`STOMP_WISP_URL` on terp, not managed by any repo).
 - **This repo deploys nothing.** Its CI ships artefacts only: the rolling `latest` release
-  (binaries, `.deb`, `.rpm`). There is no server this repo pushes to; a host that should run a new
+  (binaries, `.deb`, `.rpm`, the npm tarball) and, for a `v*` tag, that tarball on the npm registry
+  (`npm-publish` in `release.yml`). There is no server this repo pushes to; a host that should run a new
   build is updated by whoever operates it (the edges: abulxt's ansible pin).
 - Do not start, stop or reconfigure a `holywisp` process on a machine that is not the one you are
   developing on. Running `make run` locally against loopback is development; touching a host that
@@ -80,8 +86,24 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   SHA-1 and Base64 exist in-tree only because the WebSocket handshake needs them; TLS does not
   exist in-tree because a reverse proxy does it better. If a change seems to need a library, it
   needs a design conversation first.
-- Linux only, by design. epoll, `accept4`, `eventfd`, `SO_REUSEPORT`. Do not sprinkle `#ifdef`s
-  for other platforms; a second backend goes behind `loop.h`/`net.h` as a separate file.
+- Linux is the platform, by design: epoll, `accept4`, `eventfd`, `SO_REUSEPORT`, `splice`. macOS
+  and Windows are ports for development machines (they are what lets the npm package run on a Mac
+  or a PC), not production targets and not tuned: both copy where Linux splices and have their
+  workers share one listener, and Windows has neither Twisp nor hashed passwords (the server
+  refuses a config that asks for either). A platform is two files: a loop backend behind
+  `src/common/loop_backend.h` (`loop_epoll.c`, `loop_kqueue.c`, `loop_select.c`) and a half of
+  `include/holywisp/sys.h` (`sys_linux.c`, `sys_darwin.c`, `sys_win32.c`), chosen in
+  `CMakeLists.txt`. Windows alone has a third part, because it lacks the POSIX socket calls
+  themselves: `src/compat/win32/` supplies them over Winsock under their POSIX names (headers in
+  `include/`, all of the code in `posix.c`), so no other file knows it is not on POSIX. The one
+  platform `#if` in the tree is the pair of `send` flags in `sys.h`. Do not add another, do not
+  write `_WIN32` or a Winsock call outside the three Windows files, and do not call a
+  kernel-specific function (`accept4`, `splice`, `pipe2`, `crypt_r`, `forkpty`, `MSG_NOSIGNAL`,
+  ...) outside the platform files: add it to `sys.h`, implement it three times, and test the
+  promise, not the mechanism, in `tests/test_sys.c`. What is plain POSIX but missing on Windows (a
+  libc call, a socket option) goes into the compat directory as what POSIX says it is, never into
+  an `#if`. `long` is 32 bits there: anything that can pass 2^31 is a `size_t`, a `uint64_t` or a
+  `long long`. Never make the Linux path slower to make another one simpler.
 - `-Werror` stays on. Do not weaken a warning flag in `CMakeLists.txt`, disable a sanitizer in the
   Debug preset, or add `// NOLINT` without a comment that says why the checker is wrong there.
 - Clang and GCC both build the tree in CI. Code that only one of them accepts is not done.
@@ -133,7 +155,8 @@ every test still passes, so each item has a test and a change to it needs a reas
   pongs; a CLOSE is echoed. Server frames are never masked.
 - **Plain HTTP on the same port.** `GET /health` is `{"status":"ok"}`, `GET /stats` is the
   counters, any other non-upgrade request gets `non-ws-response` (or 426 when it is empty), and a
-  malformed head gets 400. All with `Connection: close`. With `serve-webclient`, `GET /` is the
+  malformed head gets 400. An upgrade refused by `connections-limit-per-ip` is 429 with
+  `Retry-After: <connection-window-s>`. All with `Connection: close`. With `serve-webclient`, `GET /` is the
   embedded client; `webclient-wisp-url` is spliced into it as `window.HOLYWISP_CONFIG.wisp`
   (validated: `ws(s)://`, nothing that can escape a script string) for when the relay is not
   the origin that served the page.
@@ -182,7 +205,9 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   the request through (`hw_window_allow` returns 1); a policy that denies always denies. Keep that
   asymmetry: a transient OOM must not lock out every client, but a blocked address stays blocked.
 - **Passwords** are compared in constant time, and a `$`-prefixed stored value goes through
-  `crypt_r`, never a plain `strcmp`. The config that holds them is never logged and is installed
+  `hw_sys_crypt` (`crypt_r` on Linux), never a plain `strcmp`. Where there is no crypt(3) at all
+  (`hw_sys_has_crypt`: Windows) a config holding a hashed password is refused when the server is
+  made, not left to never match. The config that holds them is never logged and is installed
   `0640 root:wisp`.
 - **Bandwidth throttling pauses, never drops.** `conn_charge_bandwidth` suspends reads and arms a
   timer; it must never discard stream data. The upstream proxy and DNS client are in `proxy.c` and
@@ -197,7 +222,10 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 shell by design, so the gate in `handle_connect` is the whole access-control story and must stay
 intact: **`enable-twisp` on, the client on Wisp v2, and the client authenticated** with a
 configured password. Probing it unauthenticated is a reputation event. The config validator refuses
-`enable-twisp` without `enable-v2` and at least one `password-user`. The systemd sandbox
+`enable-twisp` without `enable-v2` and at least one `password-user`, and on a platform with no
+pseudo-terminal (`hw_sys_has_pty`: Windows) refuses it outright. The terminal and its process are
+the platform's (`hw_sys_pty_spawn`, `_resize`, `_end`); `twisp.c` holds the gate and the command
+line. The systemd sandbox
 (`NoNewPrivileges`, capability drop, read-only FS, syscall filter) is the backstop that keeps a
 spawned shell from escalating; do not weaken it to make Twisp "more useful".
 
@@ -206,7 +234,8 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 - One `hw_loop` per worker thread. Every `hw_conn` and `hw_stream` belongs to the loop that
   accepted it and is only ever touched from that thread. The only cross-thread paths are
   `hw_loop_post()` (resolver completions, eventfd-woken) and the `_Atomic` counters in
-  `hw_server`. Do not add a mutex to the data path; if a design needs one, it is the wrong design.
+  `hw_server` and `hw_worker` (the per-packet byte counters live in the worker so no cache line
+  is written by two threads; `hw_server_stats_get` sums them). Do not add a mutex to the data path; if a design needs one, it is the wrong design.
 - **Deferred free.** `conn_close()` tears the socket and streams down immediately but frees the
   `hw_conn` on the next loop iteration via `hw_loop_post`. Streams are freed immediately by
   `stream_close()`. The re-entrancy rules at the top of `src/server/conn.c` and
@@ -243,6 +272,21 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   Wisp header, then unmasks and forwards each piece as it comes (`pt_left`, `stream_on_data_part`),
   and only the last piece counts as a packet against the window. If the stream closes mid-frame
   the rest of the frame is read and dropped.
+- **Busy polling.** `busy-poll-us` (0 by default) makes a worker poll that long before it sleeps,
+  but only after an iteration that delivered events, so an idle server never spins
+  (`hw_loop_set_busy_poll`). It trades CPU for round-trip latency and changes nothing else.
+- **The flush batch.** Small frames toward a client are not written one by one. `conn_kick` writes
+  at once when the queue holds a pipe payload or has reached `CONN_DEFER_MAX` (16 KiB); otherwise
+  the connection goes on its worker's flush list and `conn_batch_end`, the loop's batch-end hook
+  (`hw_loop_set_batch_end`), writes it after the posted tasks of an iteration and again after its
+  events and timers, always before the loop can sleep. So the CLOSE and small DATA frames that
+  several streams produce in one pass leave in one send. Two things do not wait: a CONTINUE
+  (`conn_send_continue` flushes; the client is stalled until it arrives, and deferring it
+  measurably slowed a connection with ten busy streams) and anything sent right before `conn_close` (flush first, as
+  `handle_info` does, or the frame is lost with the socket). The list is emptied before any
+  `conn_free_task` can run, which is what makes it safe to hold `hw_conn` pointers in it. The
+  retries after a short write in `conn_flush` and `conn_splice_data` are deliberate: removing them
+  saved 11% of the syscalls and lost 3 to 4% of throughput.
 - **Backpressure.** When a client's send queue (`wbuf` plus the payloads queued in pipes) passes
   `ws-write-high-water`, every stream on that connection stops reading from its remote
   (`stream_pause`), and resumes at a quarter of the mark.
@@ -273,6 +317,34 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   relevant section if it changes behaviour.
 - If you added a public function: it is declared in exactly one `include/holywisp/*.h`, has a
   contract comment, and a unit test exercises it.
+- If you touched `node/`, or added, renamed or changed the meaning of a config key: `make npm-test`.
+  The wrapper turns its options into `holywisp` flags (`node/src/config.ts`) and passes its own
+  values for the real-IP keys, so a key that changes here changes there, in `node/README.md`'s
+  table and in `tests/config.test.mjs`. The wrapper's rule for client addresses is a security
+  invariant: `route()` drops every trusted header that arrives from a peer outside
+  `trustedProxies` and writes the socket's peer address itself. Do not forward them unfiltered.
+- If you touched `loop.c`, a loop backend, `sys.h` or any of its halves, or `src/compat/win32`:
+  nothing here runs macOS, so `make npm` is the local check that both macOS targets still compile
+  with `-Werror` (zig cross-builds them); the `macOS` job in `build.yml` is where that code
+  executes, under the sanitizers. Windows can be run here: `make test-windows` cross-builds the tree
+  with zig and runs every test under Wine (a real Winsock, but not Windows; the `Windows / tests`
+  job runs the same binaries on the real thing). The compat layer makes Winsock keep POSIX's
+  promises where the server's correctness rests on them, and those must stay: a non-blocking send
+  takes at most one send buffer and reports the rest unsent (Winsock would take all of it, and
+  the CONTINUE that is held while bytes are queued would never be held), a failed connect is an
+  error event (`select`'s third set; `WSAPoll` loses it on older Windows), and a descriptor is a
+  small int that `close` accepts. A backend must keep what `loop_backend.h` promises (level-triggered readiness,
+  the generation carried with every event) and report a failed connect as an error event:
+  `stream_io_cb` treats `HW_EV_ERROR` as failure even when `SO_ERROR` reads clean, because kqueue
+  carries the error in the event.
+- If you touched the release build flags or added a platform: `make npm` (needs zig) and run the
+  wrapper's tests with the packaged binary (`cd node && node --test tests/*.test.mjs`).
+- The wrapper's hold on its server is two things, and both are tested in `node/tests`: it starts a
+  server that exited unasked again (`autoRestart`, backing off from 100 ms to 5 s, cancelled by
+  `stop()` and `kill()`), and it gives the server a pipe as stdin with `stop-on-stdin-eof`, which
+  is what ends the server when Node is killed outright and what `stop()` uses on Windows, where
+  there is no SIGTERM. Never spawn it with an inherited or ignored stdin: `/dev/null` is at end of
+  file from the start, and the server would stop as soon as it was up.
 - If you touched packaging or the unit: `bash deploy/package.sh all` builds both packages, and
   `systemd-analyze security --offline=true deploy/systemd/holywisp.service` must still rate "OK"
   (~1.3). Never lower the sandbox to work around a bug; fix the bug.
@@ -283,7 +355,10 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | --- | --- |
 | `include/holywisp/hw.h` | Project macros, `HW_ERR_*`, `hw_now_ms`. Included by everything. |
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
-| `include/holywisp/loop.h`, `src/common/loop.c` | The epoll event loop: fds with generations, timer heap, thread-safe post. |
+| `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
+| `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, crypt, the pseudo-terminal. |
+| `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |
 | `include/holywisp/wisp.h`, `src/common/wisp.c` | Wisp packet codec and constants. The wire format lives here and nowhere else. |
@@ -297,9 +372,9 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `src/server/stream.c` | One relayed TCP/UDP stream: resolve, connect with fallback, both data directions. |
 | `src/server/egress.c` | The allow/deny decision for a remote address (address class only). |
 | `src/server/proxy.c` | Upstream SOCKS5 / HTTP CONNECT handshake, driven on the stream socket. |
-| `src/server/twisp.c` | PTY terminal streams: shell-split the command, `forkpty`, relay the master. |
+| `src/server/twisp.c` | PTY terminal streams: shell-split the command, `hw_sys_pty_spawn`, relay the master. |
 | `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`, validation. |
-| `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM. |
+| `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM, or (`stop-on-stdin-eof`) when stdin closes. |
 | `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, token-bucket bandwidth, SYN-signature ring. |
 | `include/holywisp/reputation.h`, `src/common/reputation.c` | Per-IP / per-dest scoring, tiers, decay, JSON persistence. |
 | `include/holywisp/filter.h`, `src/common/filter.c` | Host/port allow-block lists, CIDR match, real-client-IP from proxy headers. |
@@ -309,15 +384,21 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
+| `node/src/index.ts` | The npm package's `holywisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |
+| `node/src/config.ts` | wispurr-shaped options to `holywisp` flags; secrets go to a 0600 file, not argv. |
+| `node/src/vite.ts`, `logger.ts`, `path.ts` | Vite plugin, log relay, where the platform's binary lives. |
+| `node/scripts/build.mjs` | `make npm`: static binaries per platform via zig, `tsc`, licence copy. |
+| `node/tests/` | `node --test` suites: option mapping, and the wrapper against the real server. |
+| `cmake/zig-toolchain.cmake` | CMake toolchain for `zig cc` cross builds (Linux musl static, macOS, Windows). |
 | `deploy/systemd/holywisp.service` | The hardened unit (the sandbox is load-bearing; see "Security suite"). |
 | `deploy/holywisp.conf` | The installed default config (loopback bind, reputation store under /var/lib). |
 | `deploy/debian/`, `deploy/rpm/holywisp.spec` | Debian maintainer scripts and the RPM spec. |
 | `deploy/package.sh` | Builds the `.deb` (dpkg-deb) and `.rpm` (rpmbuild) into `build/packages/`. |
 | `CMakeLists.txt`, `CMakePresets.json`, `Makefile` | CMake compiles; the Makefile is the one entry point (`make help`). |
 | `.clang-format`, `.clang-tidy`, `.editorconfig` | Enforcement of `STYLE.md`. |
-| `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke. |
+| `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke; macOS; the Windows cross build and its tests on Windows; the npm package installed and tested on every platform it carries. |
 | `.github/workflows/format.yml` | clang-format drift: auto-fix commit on `master`, failing check on PRs. |
-| `.github/workflows/release.yml` | Rolling `latest` release: prebuilt binaries plus the `.deb` and `.rpm`, one build per push. |
+| `.github/workflows/release.yml` | Rolling `latest` release: prebuilt binaries plus the `.deb`, the `.rpm` and the npm tarball, one build per push; `npm publish` for a `v*` tag. |
 
 ## Hand-off
 

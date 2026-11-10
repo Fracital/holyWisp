@@ -4,6 +4,7 @@
 #include "holywisp/net.h"
 
 #include "holywisp/hw.h"
+#include "holywisp/sys.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -18,11 +19,11 @@
 #include <netinet/tcp.h>
 
 int hw_socket_nb(int domain, int type, int protocol) {
-	return socket(domain, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
+	return hw_sys_socket(domain, type, protocol, 1);
 }
 
 int hw_accept_nb(int listen_fd, struct sockaddr_storage *addr, socklen_t *addr_len) {
-	return accept4(listen_fd, (struct sockaddr *)addr, addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
+	return hw_sys_accept(listen_fd, (struct sockaddr *)addr, addr_len);
 }
 
 int hw_listen_tcp(const char *host, uint16_t port, int reuseport, int backlog, uint16_t *bound_port) {
@@ -282,8 +283,5 @@ void hw_tcp_tune(int fd, int nodelay) {
 	int one = 1;
 	if (nodelay) setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-	int idle = 60, interval = 15, count = 4;
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
-	setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+	hw_sys_keepalive(fd, 60, 15, 4);
 }

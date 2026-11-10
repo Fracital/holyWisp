@@ -101,6 +101,9 @@ typedef struct hw_server_config {
 	int connect_timeout_ms;     // remote TCP connect
 	int handshake_timeout_ms;   // HTTP upgrade + v2 INFO exchange
 	int resolver_threads;
+	// Microseconds a worker keeps polling after an iteration that had events before it sleeps.
+	// Lowers round-trip latency under load at the cost of CPU time spent waiting; 0 = always sleep.
+	int busy_poll_us;
 	int tcp_nodelay;
 	int tcp_quickack;
 	int listen_backlog;
@@ -111,6 +114,10 @@ typedef struct hw_server_config {
 	// window.HOLYWISP_CONFIG.wisp; a value that cannot go into a script string is rejected.
 	char webclient_wisp_url[256];
 	int log_level;
+	// For the `holywisp` binary when another program runs it: stop when standard input reaches end
+	// of file, which is what a child holding a pipe from its parent sees when the parent dies, however
+	// it dies. Not for a service manager, whose stdin is /dev/null and at end of file from the start.
+	int stop_on_stdin_eof;
 } hw_server_config;
 
 typedef struct hw_server_stats {

@@ -1,0 +1,52 @@
+{
+  "name": "holywisp",
+  "version": "0.1.0",
+  "description": "holyWisp, a Wisp v1/v2 server written in C, embedded in Node.js: spawn it, route WebSocket upgrades to it.",
+  "keywords": [
+    "wisp",
+    "websocket",
+    "proxy",
+    "relay",
+    "wisp-protocol"
+  ],
+  "license": "ISC",
+  "author": "David Reed",
+  "homepage": "https://github.com/Fracital/holyWisp/tree/master/node#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Fracital/holyWisp.git",
+    "directory": "node"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./vite": {
+      "types": "./dist/vite.d.ts",
+      "default": "./dist/vite.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "compile": "tsc",
+    "build": "node scripts/build.mjs",
+    "test": "npm run compile && node --test --test-timeout=30000 tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.2"
+  }
+}

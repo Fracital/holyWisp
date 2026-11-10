@@ -9,6 +9,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+// A mkstemp(3) template in the system's temporary directory: TMPDIR, else TEMP (Windows), else /tmp.
+static inline void hw_test_tmp(char *out, size_t cap, const char *name) {
+	const char *dir = getenv("TMPDIR");
+	if (!dir || !*dir) dir = getenv("TEMP");
+	if (!dir || !*dir) dir = "/tmp";
+	snprintf(out, cap, "%s/%s-XXXXXX", dir, name);
+}
+
 static int g_checks;
 
 #define CHECK(cond, ...)                                                    \

@@ -6,6 +6,7 @@
  */
 #include "holywisp/reputation.h"
 
+#include "holywisp/buf.h"
 #include "holywisp/hw.h"
 #include "holywisp/smap.h"
 
@@ -13,6 +14,7 @@
 #include <errno.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -266,83 +268,128 @@ void hw_reputation_counts(hw_reputation *r, size_t *sources, size_t *dests) {
 
 // ---------------------------------------------------------------------------------- JSON out
 
-static void json_string(FILE *f, const char *s) {
-	fputc('"', f);
+// The store is formatted into memory (see hw_reputation_save), so the writer is a buffer.
+typedef struct writer {
+	hw_buf buf;
+	int failed; // an append could not allocate
+} writer;
+
+static void out_put(writer *o, const char *data, size_t n) {
+	if (hw_buf_append(&o->buf, data, n) != 0) o->failed = 1;
+}
+
+static void out_str(writer *o, const char *s) {
+	out_put(o, s, strlen(s));
+}
+
+static void out_fmt(writer *o, const char *fmt, ...) HW_PRINTF(2, 3);
+static void out_fmt(writer *o, const char *fmt, ...) {
+	char tmp[256];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+	va_end(ap);
+	if (n < 0 || (size_t)n >= sizeof(tmp)) {
+		o->failed = 1;
+		return;
+	}
+	out_put(o, tmp, (size_t)n);
+}
+
+static void json_string(writer *o, const char *s) {
+	out_put(o, "\"", 1);
 	for (; *s; s++) {
 		unsigned char c = (unsigned char)*s;
 		if (c == '"' || c == '\\') {
-			fputc('\\', f);
-			fputc(c, f);
+			out_put(o, "\\", 1);
+			out_put(o, s, 1);
 		} else if (c < 0x20) {
-			fprintf(f, "\\u%04x", c);
+			out_fmt(o, "\\u%04x", c);
 		} else {
-			fputc(c, f);
+			out_put(o, s, 1);
 		}
 	}
-	fputc('"', f);
+	out_put(o, "\"", 1);
 }
 
 typedef struct write_ctx {
-	FILE *f;
+	writer *o;
 	int first;
 	int with_sources;
 } write_ctx;
 
 static int seen_visit(const char *key, void *value, void *ud) {
 	write_ctx *w = ud;
-	if (!w->first) fputc(',', w->f);
+	if (!w->first) out_put(w->o, ",", 1);
 	w->first = 0;
-	json_string(w->f, key);
+	json_string(w->o, key);
 	return 0;
 }
 
 static int entry_visit(const char *key, void *value, void *ud) {
 	write_ctx *w = ud;
 	rep_entry *e = value;
-	if (!w->first) fputs(",\n", w->f);
+	if (!w->first) out_str(w->o, ",\n");
 	w->first = 0;
-	fputs("    ", w->f);
-	json_string(w->f, key);
-	fprintf(w->f, ": {\"score\": %d, \"firstSeen\": %lld, \"lastSeen\": %lld, \"events\": {", e->score,
+	out_str(w->o, "    ");
+	json_string(w->o, key);
+	out_fmt(w->o, ": {\"score\": %d, \"firstSeen\": %lld, \"lastSeen\": %lld, \"events\": {", e->score,
 	        (long long)e->first_seen, (long long)e->last_seen);
 	int first = 1;
 	for (int i = 0; i < HW_REP_EVENT_COUNT; i++) {
 		if (!e->events[i]) continue;
-		fprintf(w->f, "%s\"%s\": %u", first ? "" : ", ", EVENT_NAMES[i], e->events[i]);
+		out_fmt(w->o, "%s\"%s\": %u", first ? "" : ", ", EVENT_NAMES[i], e->events[i]);
 		first = 0;
 	}
-	fputc('}', w->f);
+	out_put(w->o, "}", 1);
 	if (w->with_sources) {
-		fprintf(w->f, ", \"distinctSources\": %d, \"seenSources\": [", e->distinct_sources);
-		write_ctx inner = {.f = w->f, .first = 1};
+		out_fmt(w->o, ", \"distinctSources\": %d, \"seenSources\": [", e->distinct_sources);
+		write_ctx inner = {.o = w->o, .first = 1};
 		hw_smap_each(&e->seen_sources, seen_visit, &inner);
-		fputc(']', w->f);
+		out_put(w->o, "]", 1);
 	}
-	fputc('}', w->f);
+	out_put(w->o, "}", 1);
 	return 0;
 }
 
+// The table is formatted into memory under the lock and written to disk after it is released: every
+// worker takes this lock when a stream opens, and a slow or stalled disk must not stop them all.
 int hw_reputation_save(hw_reputation *r) {
 	if (!r || !r->cfg.store_path[0]) return 0;
 	char dir[512];
 	snprintf(dir, sizeof(dir), "%s", r->cfg.store_path);
 	char *d = dirname(dir);
 	if (d && strcmp(d, ".") != 0 && mkdir(d, 0755) != 0 && errno != EEXIST) return -1;
+
+	writer o = {.failed = 0};
+	hw_buf_init(&o.buf);
+	pthread_mutex_lock(&r->lock);
+	out_str(&o, "{\n  \"sources\": {\n");
+	write_ctx w = {.o = &o, .first = 1, .with_sources = 0};
+	hw_smap_each(&r->sources, entry_visit, &w);
+	out_str(&o, "\n  },\n  \"destinations\": {\n");
+	write_ctx wd = {.o = &o, .first = 1, .with_sources = 1};
+	hw_smap_each(&r->dests, entry_visit, &wd);
+	out_str(&o, "\n  }\n}\n");
+	pthread_mutex_unlock(&r->lock);
+	if (o.failed) {
+		hw_buf_free(&o.buf);
+		errno = ENOMEM;
+		return -1;
+	}
+
 	char tmp[600];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", r->cfg.store_path);
 	FILE *f = fopen(tmp, "w");
-	if (!f) return -1;
+	if (!f) {
+		hw_buf_free(&o.buf);
+		return -1;
+	}
 	chmod(tmp, 0600);
-	pthread_mutex_lock(&r->lock);
-	fputs("{\n  \"sources\": {\n", f);
-	write_ctx w = {.f = f, .first = 1, .with_sources = 0};
-	hw_smap_each(&r->sources, entry_visit, &w);
-	fputs("\n  },\n  \"destinations\": {\n", f);
-	write_ctx wd = {.f = f, .first = 1, .with_sources = 1};
-	hw_smap_each(&r->dests, entry_visit, &wd);
-	fputs("\n  }\n}\n", f);
-	pthread_mutex_unlock(&r->lock);
-	if (fclose(f) != 0) {
+	size_t len = hw_buf_avail(&o.buf);
+	size_t wrote = fwrite(hw_buf_head(&o.buf), 1, len, f);
+	hw_buf_free(&o.buf);
+	if (fclose(f) != 0 || wrote != len) {
 		unlink(tmp);
 		return -1;
 	}

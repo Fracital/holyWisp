@@ -8,6 +8,7 @@
 #include "test.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -19,7 +20,8 @@ static void write_file(const char *path, const char *content) {
 }
 
 static void test_inline_comments_and_quotes(void) {
-	char path[] = "/tmp/hw-cfg-XXXXXX";
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
 	int fd = mkstemp(path);
 	CHECK(fd >= 0, "tmp");
 	close(fd);
@@ -48,7 +50,8 @@ static void test_inline_comments_and_quotes(void) {
 }
 
 static void test_bad_value_reports_line(void) {
-	char path[] = "/tmp/hw-cfg-XXXXXX";
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
 	int fd = mkstemp(path);
 	close(fd);
 	write_file(path, "port = 6001\nworkers = notanumber\n");
@@ -84,6 +87,33 @@ static void load_shipped(const char *path) {
 	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "%s validate: %s", path, err);
 }
 
+static void test_busy_poll_key(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	CHECK_EQ(cfg.busy_poll_us, 0);
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "mkstemp");
+	const char *text = "busy-poll-us = 50\n";
+	CHECK_EQ(write(fd, text, strlen(text)), (ssize_t)strlen(text));
+	close(fd);
+	char err[256] = "";
+	CHECK(hw_config_load_file(&cfg, path, err, sizeof(err)) == 0, "load: %s", err);
+	CHECK_EQ(cfg.busy_poll_us, 50);
+	unlink(path);
+}
+
+static void test_stop_on_stdin_eof_key(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(cfg.stop_on_stdin_eof, 0);
+	CHECK_EQ(hw_config_set(&cfg, "stop-on-stdin-eof", "on", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.stop_on_stdin_eof, 1);
+	CHECK(hw_config_set(&cfg, "stop-on-stdin-eof", "maybe", err, sizeof(err)) != 0, "rejects a non-boolean");
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -94,6 +124,8 @@ int main(void) {
 	RUN(test_inline_comments_and_quotes);
 	RUN(test_bad_value_reports_line);
 	RUN(test_webclient_url_validation);
+	RUN(test_busy_poll_key);
+	RUN(test_stop_on_stdin_eof_key);
 	RUN(test_shipped_configs);
 	return 0;
 }

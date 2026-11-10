@@ -9,6 +9,7 @@
  */
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 
 #include "internal.h"
@@ -24,7 +25,6 @@
 
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <sys/sysinfo.h>
 
 void hw_server_config_defaults(hw_server_config *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
@@ -112,8 +112,19 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "password-required needs at least one password-user");
 		return -1;
 	}
+	for (int i = 0; i < cfg->password_user_count && !hw_sys_has_crypt(); i++) {
+		if (cfg->password_users[i].pass[0] != '$') continue;
+		// Never the value: the config that holds passwords is not logged.
+		snprintf(err, err_cap, "password-user '%s': this platform has no crypt(3) to check a hashed password with",
+		         cfg->password_users[i].user);
+		return -1;
+	}
 	if (cfg->enable_twisp && cfg->password_user_count == 0) {
 		snprintf(err, err_cap, "enable-twisp needs password auth: add a password-user");
+		return -1;
+	}
+	if (cfg->enable_twisp && !hw_sys_has_pty()) {
+		snprintf(err, err_cap, "enable-twisp: this platform has no pseudo-terminals");
 		return -1;
 	}
 	if (cfg->enable_twisp && !cfg->enable_v2) {
@@ -263,7 +274,11 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	w->loop = hw_loop_new();
 	w->scratch = malloc(HW_READ_CHUNK);
 	if (!w->loop || !w->scratch) return -1;
-	w->listen_fd = hw_listen_tcp(s->cfg.host, port, 1, s->cfg.listen_backlog, &s->port);
+	hw_loop_set_batch_end(w->loop, conn_batch_end, w);
+	hw_loop_set_busy_poll(w->loop, (unsigned)s->cfg.busy_poll_us);
+	// The first worker binds the address; the rest get a listener of their own for it.
+	w->listen_fd = index == 0 ? hw_listen_tcp(s->cfg.host, port, 1, s->cfg.listen_backlog, &s->port)
+	                          : hw_sys_listen_more(s->workers[0].listen_fd, s->cfg.host, port, s->cfg.listen_backlog);
 	if (w->listen_fd < 0) return -1;
 	if (hw_loop_add_fd(w->loop, w->listen_fd, HW_EV_READ, accept_cb, w) != 0) return -1;
 	return 0;
@@ -373,7 +388,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	pthread_mutex_init(&s->maint_lock, NULL);
 	pthread_cond_init(&s->maint_cond, NULL);
 	hw_log_set_level(cfg->log_level);
-	s->nworkers = cfg->workers > 0 ? cfg->workers : get_nprocs();
+	s->nworkers = cfg->workers > 0 ? cfg->workers : (int)sysconf(_SC_NPROCESSORS_ONLN);
 	if (s->nworkers < 1) s->nworkers = 1;
 	s->workers = calloc((size_t)s->nworkers, sizeof(*s->workers));
 	if (!s->workers) goto fail;
@@ -550,8 +565,10 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->connections_active = atomic_load(&s->connections_active);
 	out->streams_total = atomic_load(&s->streams_total);
 	out->streams_active = atomic_load(&s->streams_active);
-	out->bytes_in = atomic_load(&s->bytes_in);
-	out->bytes_out = atomic_load(&s->bytes_out);
+	for (int i = 0; i < s->nworkers; i++) {
+		out->bytes_in += atomic_load(&s->workers[i].bytes_in);
+		out->bytes_out += atomic_load(&s->workers[i].bytes_out);
+	}
 	out->refused_connection_rate = atomic_load(&s->refused_connection_rate);
 	out->refused_connection_limit = atomic_load(&s->refused_connection_limit);
 	out->refused_reputation = atomic_load(&s->refused_reputation);

@@ -11,11 +11,11 @@
 #include "holywisp/net.h"
 #include "holywisp/reputation.h"
 #include "holywisp/server.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 
 #include "test.h"
 
-#include <crypt.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -467,15 +467,53 @@ static void test_concurrent_cap(void) {
 	hw_server_free(s);
 }
 
+// Past connections-limit-per-ip the upgrade is refused with 429 and says when to come back.
+static void test_connection_rate_retry_after(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.connections_limit_per_ip = 1;
+	cfg.connection_window_s = 7;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	hw_client *c = connect_plain(s);
+	CHECK(c != NULL, "first connection is inside the limit");
+
+	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
+	CHECK(fd >= 0, "connect");
+	const char *req = "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+	                  "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+	CHECK_EQ(write(fd, req, strlen(req)), (ssize_t)strlen(req));
+	char buf[1024];
+	size_t n = 0;
+	for (;;) {
+		ssize_t r = read(fd, buf + n, sizeof(buf) - 1 - n);
+		if (r <= 0) break;
+		n += (size_t)r;
+	}
+	buf[n] = '\0';
+	CHECK(strncmp(buf, "HTTP/1.1 429", 12) == 0, "status: %.20s", buf);
+	CHECK(strstr(buf, "\r\nRetry-After: 7\r\n") != NULL, "head: %s", buf);
+	CHECK(strstr(buf, "\r\n\r\nrate limit\n") != NULL, "body: %s", buf);
+	close(fd);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
 static void test_password_crypt(void) {
 	hw_server_config cfg;
 	base_config(&cfg);
 	cfg.password_required = 1;
+	if (!hw_sys_has_crypt()) {
+		// A hash that nothing can check is refused when the server is made, not left to never match.
+		CHECK_EQ(hw_server_config_add_user(&cfg, "alice", "$6$holywispsalt$not-a-real-hash"), 0);
+		CHECK(hw_server_new(&cfg) == NULL, "a hashed password was accepted without crypt(3)");
+		return;
+	}
 	// A real crypt(3) SHA-512 hash of "hunter2".
-	struct crypt_data data;
-	memset(&data, 0, sizeof(data));
-	const char *hash = crypt_r("hunter2", "$6$holywispsalt$", &data);
-	CHECK(hash && hash[0] == '$', "made a hash");
+	char hash[128];
+	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", hash, sizeof(hash)), 0);
+	CHECK(hash[0] == '$', "made a hash");
 	CHECK_EQ(hw_server_config_add_user(&cfg, "alice", hash), 0);
 	hw_server *s = hw_server_new(&cfg);
 	CHECK(s != NULL, "server");
@@ -712,6 +750,11 @@ static void test_twisp(void) {
 	base_config(&cfg);
 	cfg.enable_twisp = 1;
 	CHECK_EQ(hw_server_config_add_user(&cfg, "op", "pw"), 0);
+	if (!hw_sys_has_pty()) {
+		// Nothing to run a terminal on: said when the server is made, not once per stream.
+		CHECK(hw_server_new(&cfg) == NULL, "twisp was accepted on a platform with no pty");
+		return;
+	}
 	hw_server *s = hw_server_new(&cfg);
 	CHECK(s != NULL, "server");
 	hw_server_start(s);
@@ -768,6 +811,7 @@ int main(void) {
 	RUN(test_host_filter);
 	RUN(test_per_source_throttle);
 	RUN(test_concurrent_cap);
+	RUN(test_connection_rate_retry_after);
 	RUN(test_password_crypt);
 	RUN(test_reputation_accrual);
 	RUN(test_http_proxy);

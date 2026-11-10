@@ -1,0 +1,7 @@
+# Compiled wrapper, the prebuilt server binaries and the licence copied in for `npm pack`:
+# all produced by `make npm` (scripts/build.mjs).
+/dist/
+/bin/
+/LICENSE
+/node_modules/
+*.tgz
