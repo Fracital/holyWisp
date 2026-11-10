@@ -90,8 +90,9 @@ static void test_listen_and_connect(void) {
 	close(afd);
 	close(cfd);
 	close(lfd);
-	// Nothing listens here any more: connect must fail fast with ECONNREFUSED.
-	CHECK(hw_connect_tcp("127.0.0.1", port, 2000) < 0, "refused");
+	// Nothing listens here any more: connect must fail with ECONNREFUSED. At once on most systems;
+	// Windows sends the SYN twice more first, which takes it two seconds, so the timeout is longer.
+	CHECK(hw_connect_tcp("127.0.0.1", port, 10000) < 0, "refused");
 	CHECK_EQ(errno, ECONNREFUSED);
 }
 

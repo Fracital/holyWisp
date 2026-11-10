@@ -372,6 +372,14 @@ static int send_limit(slot *s) {
 	return (int)s->sndbuf;
 }
 
+// Winsock has two words for a send on a connection that is gone: reset, when the peer said so, and
+// aborted, when its own stack gave the connection up (which is what follows data sent to a peer
+// that had closed). POSIX has one for the second, and it is the one a writer checks for.
+static int send_error(void) {
+	int err = WSAGetLastError();
+	return err == WSAECONNABORTED ? EPIPE : hw_w32_error(err);
+}
+
 static int send_blocks(const slot *s, int flags) {
 	return s->stream && !s->nonblock && !(flags & MSG_DONTWAIT);
 }
@@ -385,7 +393,7 @@ static ssize_t send_all(slot *s, const char *buf, size_t n, int flags) {
 		int r = send((SOCKET)s->handle, buf + done, (int)(n - done > piece ? piece : n - done), flags);
 		if (r == SOCKET_ERROR) {
 			if (done > 0) break;
-			errno = hw_w32_error(WSAGetLastError());
+			errno = send_error();
 			return -1;
 		}
 		done += (size_t)r;
@@ -400,10 +408,10 @@ ssize_t hw_w32_send(int fd, const void *buf, size_t n, int flags) {
 	int limit = send_limit(s);
 	int restore = dontwait_begin(s, flags);
 	int r = send((SOCKET)s->handle, buf, n > (size_t)limit ? limit : (int)n, flags & ~MSG_DONTWAIT);
-	int err = r == SOCKET_ERROR ? WSAGetLastError() : 0;
+	int err = r == SOCKET_ERROR ? send_error() : 0;
 	if (restore) dontwait_end(s);
 	if (r == SOCKET_ERROR) {
-		errno = hw_w32_error(err);
+		errno = err;
 		return -1;
 	}
 	return r;
@@ -479,10 +487,10 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
 	int restore = dontwait_begin(s, flags);
 	DWORD sent = 0;
 	int r = WSASend((SOCKET)s->handle, bufs, count, &sent, (DWORD)(flags & ~MSG_DONTWAIT), NULL, NULL);
-	int err = r == SOCKET_ERROR ? WSAGetLastError() : 0;
+	int err = r == SOCKET_ERROR ? send_error() : 0;
 	if (restore) dontwait_end(s);
 	if (r == SOCKET_ERROR) {
-		errno = hw_w32_error(err);
+		errno = err;
 		return -1;
 	}
 	return (ssize_t)sent;
