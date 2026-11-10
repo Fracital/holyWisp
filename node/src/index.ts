@@ -1,7 +1,7 @@
 /*
  * holyWisp for Node.js: run the server as a child process and hand it WebSocket upgrades.
  *
- *   const wisp = new holywisp({ port: 6001 });
+ *   const wisp = new holyWisp({ port: 6001 });
  *   await wisp.start(4);
  *   httpServer.on("upgrade", (req, socket, head) => wisp.route(req, socket, head));
  *
@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import type { Duplex } from "node:stream";
-import { trustedHeaders, workerArgs, type holywispConfig, type holywispOptions } from "./config.js";
+import { trustedHeaders, workerArgs, type holyWispConfig, type holyWispOptions } from "./config.js";
 import { Logger } from "./logger.js";
 import { bundledBinary, platformKey } from "./path.js";
 
@@ -29,12 +29,12 @@ export type {
 	PortEntry,
 	ReputationConfig,
 	ReputationEvent,
-	holywispConfig,
-	holywispOptions,
+	holyWispConfig,
+	holyWispOptions,
 } from "./config.js";
 
 /** `GET /stats` of the running server. */
-export type holywispStats = {
+export type holyWispStats = {
 	uptimeSeconds: number;
 	connections: { total: number; active: number };
 	streams: { total: number; active: number };
@@ -122,7 +122,7 @@ function blockList(entries: readonly string[]): net.BlockList {
 	for (const entry of entries) {
 		const [address = "", prefix, ...rest] = entry.split("/");
 		if (!net.isIP(address) || rest.length > 0) {
-			throw new TypeError(`holywisp: trustedProxies: '${entry}' is not an address or CIDR`);
+			throw new TypeError(`holyWisp: trustedProxies: '${entry}' is not an address or CIDR`);
 		}
 		if (prefix === undefined) {
 			set.addAddress(address, family(address));
@@ -130,7 +130,7 @@ function blockList(entries: readonly string[]): net.BlockList {
 		}
 		const bits = Number(prefix);
 		if (!/^\d+$/.test(prefix) || bits > (net.isIPv6(address) ? 128 : 32)) {
-			throw new TypeError(`holywisp: trustedProxies: '${entry}' is not an address or CIDR`);
+			throw new TypeError(`holyWisp: trustedProxies: '${entry}' is not an address or CIDR`);
 		}
 		set.addSubnet(address, bits, family(address));
 	}
@@ -161,7 +161,7 @@ async function freePort(from: number, host: string | undefined): Promise<number>
 			if (port !== undefined) return port;
 		}
 	}
-	throw new Error(`holywisp: no available port at or above ${from}`);
+	throw new Error(`holyWisp: no available port at or above ${from}`);
 }
 
 function httpGet(host: string, port: number, path: string, timeoutMs: number): Promise<{ status: number; body: string }> {
@@ -193,9 +193,9 @@ function finish(stream: Duplex, hadError: boolean): void {
 	});
 }
 
-export class holywisp {
+export class holyWisp {
 	/** The options this instance was built with, plus the wrapper's own defaults. */
-	readonly config: holywispConfig;
+	readonly config: holyWispConfig;
 	private child: ChildProcess | undefined;
 	private boundPort: number | undefined;
 	private starting = false;
@@ -217,7 +217,7 @@ export class holywisp {
 	/** The caller's reverse proxies: peers whose forwarding headers are passed on, not replaced. */
 	private readonly trusted: net.BlockList;
 
-	constructor(options: holywispOptions = {}) {
+	constructor(options: holyWispOptions = {}) {
 		this.config = { host: "127.0.0.1", ...structuredClone(options) };
 		this.logger = new Logger(this.config.logLevel ?? "warn");
 		this.headers = trustedHeaders(this.config);
@@ -262,7 +262,7 @@ export class holywisp {
 		const port = Array.isArray(this.config.port) ? this.config.port[0] : this.config.port;
 		const base = port ?? 6001;
 		if (!Number.isInteger(base) || base < 0 || base > 65535) {
-			throw new RangeError("holywisp: port must be an integer between 0 and 65535");
+			throw new RangeError("holyWisp: port must be an integer between 0 and 65535");
 		}
 		return base;
 	}
@@ -271,9 +271,9 @@ export class holywisp {
 		const chosen = this.config.binary ?? process.env["HOLYWISP_BIN"];
 		const binary = chosen ?? bundledBinary;
 		if (fs.existsSync(binary)) return binary;
-		if (chosen) throw new Error(`holywisp: no binary at ${chosen}`);
+		if (chosen) throw new Error(`holyWisp: no binary at ${chosen}`);
 		throw new Error(
-			`holywisp: this package has no prebuilt server for ${platformKey}. ` +
+			`holyWisp: this package has no prebuilt server for ${platformKey}. ` +
 				"Build holyWisp from source and point the `binary` option (or HOLYWISP_BIN) at it.",
 		);
 	}
@@ -284,10 +284,10 @@ export class holywisp {
 	 */
 	async start(workers: number = 1): Promise<this> {
 		if (!Number.isInteger(workers) || workers < 0 || workers > MAX_WORKERS) {
-			throw new RangeError(`holywisp: worker count must be an integer from 0 (one per CPU) to ${MAX_WORKERS}`);
+			throw new RangeError(`holyWisp: worker count must be an integer from 0 (one per CPU) to ${MAX_WORKERS}`);
 		}
 		if (this.child || this.starting || this.wanted) {
-			throw new Error("holywisp: already running; stop it before starting again");
+			throw new Error("holyWisp: already running; stop it before starting again");
 		}
 		this.starting = true;
 		this.wanted = true;
@@ -335,7 +335,7 @@ export class holywisp {
 			child.stdin!.on("error", () => {});
 			if (!this.wanted) {
 				child.kill("SIGKILL");
-				throw new Error("holywisp: stopped while starting");
+				throw new Error("holyWisp: stopped while starting");
 			}
 			track(child);
 
@@ -422,13 +422,13 @@ export class holywisp {
 	private async waitReady(child: ChildProcess, port: number, recent: readonly string[]): Promise<void> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
 		while (Date.now() < deadline) {
-			if (!this.wanted) throw new Error("holywisp: stopped while starting");
+			if (!this.wanted) throw new Error("holyWisp: stopped while starting");
 			if (child.exitCode !== null || child.signalCode !== null) {
 				// Let the last stderr lines arrive before quoting them.
 				await new Promise((resolve) => setImmediate(resolve));
 				const said = recent.length > 0 ? `: ${recent.join("\n")}` : "";
 				throw new Error(
-					`holywisp: server exited before becoming ready (code ${child.exitCode}, ` +
+					`holyWisp: server exited before becoming ready (code ${child.exitCode}, ` +
 						`signal ${child.signalCode ?? "none"})${said}`,
 				);
 			}
@@ -439,7 +439,7 @@ export class holywisp {
 			if (healthy) return;
 			await new Promise((resolve) => setTimeout(resolve, 20));
 		}
-		throw new Error(`holywisp: server on port ${port} did not become ready within ${READY_TIMEOUT_MS / 1000} seconds`);
+		throw new Error(`holyWisp: server on port ${port} did not become ready within ${READY_TIMEOUT_MS / 1000} seconds`);
 	}
 
 	/**
@@ -534,11 +534,11 @@ export class holywisp {
 	}
 
 	/** The server's counters (`GET /stats`). */
-	async stats(): Promise<holywispStats> {
-		if (this.boundPort === undefined) throw new Error("holywisp: not running");
+	async stats(): Promise<holyWispStats> {
+		if (this.boundPort === undefined) throw new Error("holyWisp: not running");
 		const res = await httpGet(this.workerHost, this.boundPort, "/stats", 5000);
-		if (res.status !== 200) throw new Error(`holywisp: /stats answered ${res.status}`);
-		return JSON.parse(res.body) as holywispStats;
+		if (res.status !== 200) throw new Error(`holyWisp: /stats answered ${res.status}`);
+		return JSON.parse(res.body) as holyWispStats;
 	}
 
 	/**
@@ -547,7 +547,7 @@ export class holywisp {
 	 */
 	async stop(timeoutMs = 10_000): Promise<void> {
 		if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
-			throw new RangeError("holywisp: stop timeout must be a non-negative number");
+			throw new RangeError("holyWisp: stop timeout must be a non-negative number");
 		}
 		const pending = this.cancelRestart();
 		// A restart that has already spawned its server: let it settle, then stop what it left.
@@ -594,5 +594,4 @@ export class holywisp {
 	}
 }
 
-export { holywisp as HolyWisp };
-export default holywisp;
+export default holyWisp;

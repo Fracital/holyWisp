@@ -1,4 +1,4 @@
-# holywisp configuration. Every key is also a --key command-line flag; flags win.
+# holyWisp configuration. Every key is also a --key command-line flag; flags win.
 # Values are plain words or "quoted strings"; booleans are on/off, true/false, 1/0.
 # Lines starting with # are comments. Lists are built by repeating the key.
 

@@ -4,9 +4,9 @@
 import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createServer } from "node:http";
-import { holywisp } from "holywisp";
+import { holyWisp } from "holywisp";
 
-const wisp = new holywisp({ port: 0, logLevel: "error" });
+const wisp = new holyWisp({ port: 0, logLevel: "error" });
 const front = createServer();
 front.on("upgrade", (req, socket, head) => wisp.route(req, socket, head));
 

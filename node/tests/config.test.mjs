@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { configLine, workerArgs } from "../dist/config.js";
-import { holywisp } from "../dist/index.js";
+import { holyWisp } from "../dist/index.js";
 
 const run = { port: 6001, workers: 2 };
 
@@ -23,7 +23,7 @@ test("an empty config passes only what the wrapper decides", () => {
 	assert.deepEqual(ignored, []);
 });
 
-test("a wispurr config maps onto holywisp flags", () => {
+test("a wispurr config maps onto the server's flags", () => {
 	const { args, ignored } = workerArgs(
 		{
 			host: "0.0.0.0",
@@ -135,16 +135,16 @@ test("parseRealIP: false trusts only route() itself", () => {
 });
 
 test("the constructor rejects options of the wrong shape", () => {
-	assert.throws(() => new holywisp({ allowUDP: "yes" }), /allowUDP must be a boolean/);
-	assert.throws(() => new holywisp({ port: 70000 }), RangeError);
-	assert.throws(() => new holywisp({ connectionsLimitPerIP: 1.5 }), /must be an integer/);
-	assert.throws(() => new holywisp({ trustedProxies: ["not-an-address"] }), /trustedProxies/);
-	assert.throws(() => new holywisp({ trustedHeaders: ["Bad Header"] }), /not a header name/);
-	assert.throws(() => new holywisp({ floodProtection: { synFloodSignature: { failedHandshakeRatio: 2 } } }), /between 0 and 1/);
+	assert.throws(() => new holyWisp({ allowUDP: "yes" }), /allowUDP must be a boolean/);
+	assert.throws(() => new holyWisp({ port: 70000 }), RangeError);
+	assert.throws(() => new holyWisp({ connectionsLimitPerIP: 1.5 }), /must be an integer/);
+	assert.throws(() => new holyWisp({ trustedProxies: ["not-an-address"] }), /trustedProxies/);
+	assert.throws(() => new holyWisp({ trustedHeaders: ["Bad Header"] }), /not a header name/);
+	assert.throws(() => new holyWisp({ floodProtection: { synFloodSignature: { failedHandshakeRatio: 2 } } }), /between 0 and 1/);
 });
 
 test("the wrapper binds loopback unless told otherwise, and uses the first port of a list", () => {
-	assert.equal(new holywisp().config.host, "127.0.0.1");
-	assert.equal(new holywisp({ host: "0.0.0.0" }).config.host, "0.0.0.0");
-	assert.deepEqual(new holywisp({ port: [7001, 7002] }).ports, []);
+	assert.equal(new holyWisp().config.host, "127.0.0.1");
+	assert.equal(new holyWisp({ host: "0.0.0.0" }).config.host, "0.0.0.0");
+	assert.deepEqual(new holyWisp({ port: [7001, 7002] }).ports, []);
 });

@@ -127,7 +127,7 @@ every test still passes, so each item has a test and a change to it needs a reas
   Nothing else precedes it.
 - **v2 negotiation.** Only when the client offered *any* `Sec-WebSocket-Protocol` token *and*
   `enable-v2` is on. The spec names no subprotocol; wispurr treats a non-empty header as the v2
-  opt-in and epoxy (scramjet, stomp) sends a random UUID, so the rule is presence, not the string
+  opt-in and epoxy (scramjet, STomp) sends a random UUID, so the rule is presence, not the string
   `wisp-v2`. The server echoes the offered token *verbatim* (a browser fails the handshake if the
   token it asked for does not come back), sends INFO first, waits for the client's INFO, then
   sends the stream-0 CONTINUE. Until that CONTINUE, the only packets honoured are
@@ -394,7 +394,7 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
-| `node/src/index.ts` | The npm package's `holywisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |
+| `node/src/index.ts` | The npm package's `holyWisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |
 | `node/src/config.ts` | wispurr-shaped options to `holywisp` flags; secrets go to a 0600 file, not argv. |
 | `node/src/vite.ts`, `logger.ts`, `path.ts` | Vite plugin, log relay, where the platform's binary lives. |
 | `node/scripts/build.mjs` | `make npm`: static binaries per platform via zig, `tsc`, licence copy. A prerelease in `package.json`'s version becomes the suffix `holywisp --version` prints. |

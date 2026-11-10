@@ -1,8 +1,9 @@
-# holywisp for Node.js
+# holyWisp for Node.js
 
 [holyWisp](https://github.com/Fracital/holyWisp) is a Wisp v1/v2 server written in C. This package
 embeds it in a Node.js application: it carries a prebuilt server binary, starts it as a child
-process and hands it the WebSocket upgrades your HTTP server receives.
+process and hands it the WebSocket upgrades your HTTP server receives. It powers
+[STomp](https://github.com/Fracital/powerMouse)'s demo server.
 
 ```sh
 npm install holywisp
@@ -14,9 +15,9 @@ passed its tests, published once a night as a version like `0.1.0-nightly.202611
 
 ```ts
 import { createServer } from "node:http";
-import { holywisp } from "holywisp";
+import { holyWisp } from "holywisp";
 
-const wisp = new holywisp({ logLevel: "info" });
+const wisp = new holyWisp({ logLevel: "info" });
 await wisp.start(4); // four worker threads; 0 = one per CPU
 
 const server = createServer();
@@ -31,7 +32,7 @@ No dependencies, no install script, nothing compiled on your machine. Node 20 or
 
 ## API
 
-- `new holywisp(options?)`: validates the options; nothing is started yet.
+- `new holyWisp(options?)`: validates the options; nothing is started yet.
 - `start(workers = 1)`: start the server with that many worker threads (`0` = one per CPU) and
   resolve once it answers. Rejects with the server's own message if it refuses the config.
 - `route(req, socket, head)`: the handler for an HTTP server's `upgrade` event.
@@ -60,7 +61,7 @@ stdin, the kernel closes it with the process, and the server shuts down (`stop-o
 The class, its methods and the option names are wispurr's, so the change is the import and the
 class name. What differs:
 
-| | wispurr | holywisp |
+| | wispurr | holyWisp |
 | --- | --- | --- |
 | `start(n)` | n processes on n ports, upgrades dealt round-robin | one process, n threads, one port; the kernel balances accepts |
 | Limits and reputation | per process, so n workers allow n times the configured rate | one set for the whole server |
@@ -84,7 +85,7 @@ If your Node server is itself behind a reverse proxy (nginx, a CDN), list that p
 them as usual to the right-most address that is not a trusted hop.
 
 ```ts
-new holywisp({ trustedProxies: ["127.0.0.1", "10.0.0.0/8"] });
+new holyWisp({ trustedProxies: ["127.0.0.1", "10.0.0.0/8"] });
 ```
 
 `parseRealIP: false` ignores `trustedProxies`: the client is always the socket's peer.
@@ -127,10 +128,10 @@ unless that is the point.
 ## Vite
 
 ```ts
-import { holywispVite } from "holywisp/vite";
+import { holyWispVite } from "holywisp/vite";
 
 export default {
-	plugins: [holywispVite({ path: "/wisp/", config: { logLevel: "info" } })],
+	plugins: [holyWispVite({ path: "/wisp/", config: { logLevel: "info" } })],
 };
 ```
 

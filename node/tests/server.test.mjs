@@ -7,21 +7,21 @@ import { createServer } from "node:http";
 import { createServer as createTcpServer, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { test } from "node:test";
-import { holywisp } from "../dist/index.js";
-import { holywispVite } from "../dist/vite.js";
+import { holyWisp } from "../dist/index.js";
+import { holyWispVite } from "../dist/vite.js";
 import { binary, connectPacket, CONTINUE, DATA, echo, front, INFO, packet, upgrade, wsClient } from "./helpers.mjs";
 
 const base = { binary, port: 0, logLevel: "none" };
 
 async function started(t, options = {}, workers = 1) {
-	const wisp = new holywisp({ ...base, ...options });
+	const wisp = new holyWisp({ ...base, ...options });
 	await wisp.start(workers);
 	t.after(() => wisp.stop());
 	return wisp;
 }
 
 test("start, health, stats, stop, start again", async (t) => {
-	const wisp = new holywisp(base);
+	const wisp = new holyWisp(base);
 	assert.equal(wisp.isRunning, false);
 	assert.deepEqual(wisp.ports, []);
 	assert.equal(await wisp.start(2), wisp);
@@ -85,12 +85,12 @@ test("kill() ends the process", async (t) => {
 });
 
 test("a missing binary and a config the server refuses both fail start() with the reason", async () => {
-	await assert.rejects(new holywisp({ ...base, binary: "/nonexistent/holywisp" }).start(), /no binary at/);
+	await assert.rejects(new holyWisp({ ...base, binary: "/nonexistent/holywisp" }).start(), /no binary at/);
 	// Twisp without a password user is refused by the server's own validator.
-	const refused = new holywisp({ ...base, enableTwisp: true });
+	const refused = new holyWisp({ ...base, enableTwisp: true });
 	await assert.rejects(refused.start(), /exited before becoming ready[\s\S]*enable-twisp/);
 	assert.equal(refused.isRunning, false);
-	await assert.rejects(new holywisp(base).start(1.5), RangeError);
+	await assert.rejects(new holyWisp(base).start(1.5), RangeError);
 });
 
 test("route() relays a Wisp v1 session to a TCP echo service", async (t) => {
@@ -174,7 +174,7 @@ test("a request that is not a WebSocket upgrade gets the server's own answer bac
 });
 
 test("route() answers 503 when the server is not running", async (t) => {
-	const wisp = new holywisp(base);
+	const wisp = new holyWisp(base);
 	const port = await front(t, wisp);
 	const { status, socket } = await upgrade(port);
 	socket.destroy();
@@ -335,8 +335,8 @@ test("a server that keeps dying is retried with a growing delay, and stop() ends
 async function orphanCheck(t, ending) {
 	const { spawn } = await import("node:child_process");
 	const script = `
-		import { holywisp } from ${JSON.stringify(new URL("../dist/index.js", import.meta.url).href)};
-		const wisp = new holywisp({ binary: ${JSON.stringify(binary)}, port: 0, logLevel: "none" });
+		import { holyWisp } from ${JSON.stringify(new URL("../dist/index.js", import.meta.url).href)};
+		const wisp = new holyWisp({ binary: ${JSON.stringify(binary)}, port: 0, logLevel: "none" });
 		await wisp.start();
 		console.log(wisp.pid);
 		${ending}
@@ -415,14 +415,14 @@ test("an application's own signal handler is left in charge", { skip: process.pl
 	assert.ok(await gone(serverPid));
 });
 
-// The two below stand a plain HTTP server in for holywisp, to watch route()'s upstream socket.
+// The two below stand a plain HTTP server in for holyWisp, to watch route()'s upstream socket.
 async function standIn(t, onUpgrade) {
 	const server = createServer();
 	server.on("upgrade", onUpgrade);
 	server.listen(0, "127.0.0.1");
 	await once(server, "listening");
 	t.after(() => new Promise((resolve) => server.close(resolve)));
-	const wisp = new holywisp(base);
+	const wisp = new holyWisp(base);
 	wisp.child = {};
 	wisp.boundPort = server.address().port;
 	return wisp;
@@ -475,7 +475,7 @@ test("the Vite plugin starts a server and routes only its path", async (t) => {
 	const warnings = [];
 	const vite = { httpServer, config: { logger: { warn: (message) => warnings.push(message) } } };
 
-	const plugin = holywispVite({ path: "/wisp/", config: base, apply: "serve" });
+	const plugin = holyWispVite({ path: "/wisp/", config: base, apply: "serve" });
 	assert.equal(plugin.name, "holywisp");
 	await plugin.configurePreviewServer(vite);
 	assert.equal(httpServer.listenerCount("upgrade"), 1, "apply: serve must not attach to preview");

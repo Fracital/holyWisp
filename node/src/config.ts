@@ -1,5 +1,5 @@
 /*
- * The options the wrapper accepts and how they become holywisp flags.
+ * The options the wrapper accepts and how they become `holywisp` flags.
  *
  * The names are wispurr's (camelCase, the same nesting) so a config written for it can be passed
  * as it is; holyWisp's own knobs are added at the top level. Nothing here carries a default: an
@@ -58,7 +58,7 @@ export type ReputationConfig = {
 
 export type LogLevel = "debug" | "info" | "warn" | "error" | "none";
 
-export type holywispConfig = {
+export type holyWispConfig = {
 	/**
 	 * Port the server listens on (default 6001). If it is taken, the next free one above it is
 	 * used; 0 asks the OS for any free port. An array is accepted for wispurr compatibility and
@@ -70,7 +70,7 @@ export type holywispConfig = {
 	 * way in; set `0.0.0.0` (or `::`) to expose the port itself as well.
 	 */
 	host?: string;
-	/** Path to a holywisp binary to run instead of the one shipped for this platform. */
+	/** Path to a `holywisp` binary to run instead of the one shipped for this platform. */
 	binary?: string;
 	/**
 	 * Start the server again when it exits without `stop()` or `kill()` having been called
@@ -162,7 +162,7 @@ export type holywispConfig = {
 };
 
 /** Everything is optional, so the options are the config. Kept as a name for wispurr parity. */
-export type holywispOptions = holywispConfig;
+export type holyWispOptions = holyWispConfig;
 
 /** Headers the server reads a client address from when none are configured (server.c). */
 export const DEFAULT_TRUSTED_HEADERS: readonly string[] = ["CF-Connecting-IP", "X-Forwarded-For"];
@@ -180,7 +180,7 @@ export type WorkerArgs = {
 };
 
 function fail(message: string): never {
-	throw new TypeError(`holywisp: ${message}`);
+	throw new TypeError(`holyWisp: ${message}`);
 }
 
 function integer(name: string, value: unknown): number {
@@ -232,8 +232,8 @@ export function configLine(key: string, value: string): string {
 	return line;
 }
 
-/** Translate a config into what one holywisp process is started with. */
-export function workerArgs(config: holywispConfig, run: { port: number; workers: number }): WorkerArgs {
+/** Translate a config into what one `holywisp` process is started with. */
+export function workerArgs(config: holyWispConfig, run: { port: number; workers: number }): WorkerArgs {
 	const args: string[] = [];
 	const secrets: string[] = [];
 	const ignored: string[] = [];
@@ -401,7 +401,7 @@ export function workerArgs(config: holywispConfig, run: { port: number; workers:
 }
 
 /** The headers the server is told to read, in order. Never empty: route() needs one to write to. */
-export function trustedHeaders(config: holywispConfig): string[] {
+export function trustedHeaders(config: holyWispConfig): string[] {
 	const headers = list("trustedHeaders", config.trustedHeaders ?? [...DEFAULT_TRUSTED_HEADERS]);
 	for (const header of headers) {
 		if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(header)) fail(`trustedHeaders: '${header}' is not a header name`);

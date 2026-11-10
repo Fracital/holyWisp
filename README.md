@@ -11,6 +11,10 @@ UDP relay, and the full wispurr-style security suite: flood protection, per-IP r
 limits, IP reputation, a default-deny egress policy, host and port filters, an optional upstream
 proxy, and optional PTY terminal streams.
 
+Powering [STomp](https://github.com/Fracital/powerMouse): its demo server embeds holyWisp through
+the [npm package](node/README.md), and the public relay at `wss://holywisp.fracit.al/` is this
+server.
+
 ## Quickstart
 
 **Install the package** (Debian/Ubuntu or Fedora/RHEL). This creates the isolated `wisp` user and
@@ -216,9 +220,9 @@ an application was tested with.
 
 ```ts
 import { createServer } from "node:http";
-import { holywisp } from "holywisp";
+import { holyWisp } from "holywisp";
 
-const wisp = new holywisp();
+const wisp = new holyWisp();
 await wisp.start(4); // four worker threads behind one port
 
 const server = createServer();

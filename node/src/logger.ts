@@ -26,7 +26,7 @@ export class Logger {
 
 	log(level: Exclude<LogLevel, "none">, message: string): void {
 		if (priority[level] < priority[this.level]) return;
-		const line = `[holywisp]: ${message}`;
+		const line = `[holyWisp]: ${message}`;
 		console.log(this.colour ? `${colours[level]}${line}\x1b[0m` : line);
 	}
 

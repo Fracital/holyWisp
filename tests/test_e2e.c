@@ -506,7 +506,7 @@ static void test_v2_handshake_and_confirm(void) {
 	wait_streams_idle(g_server);
 }
 
-// epoxy (the client behind scramjet and stomp) offers a random UUID as the subprotocol, not
+// epoxy (the client behind scramjet and STomp) offers a random UUID as the subprotocol, not
 // "wisp-v2". Any offered token must negotiate v2 and come back verbatim: a browser fails the
 // WebSocket when the token it asked for is not echoed, which is how the whole relay went dark.
 static void test_v2_any_subprotocol(void) {
