@@ -1,5 +1,10 @@
 # holyWisp
 
+[![npm nightly version](https://img.shields.io/npm/v/holywisp/nightly.svg?maxAge=3600&label=npm%20nightly)](https://www.npmjs.com/package/holywisp)
+[![Build](https://github.com/Fracital/holyWisp/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/Fracital/holyWisp/actions/workflows/build.yml)
+[![GitHub issues](https://img.shields.io/github/issues/Fracital/holyWisp?style=flat&color=orange)](https://github.com/Fracital/holyWisp/issues)
+[![GitHub stars](https://img.shields.io/github/stars/Fracital/holyWisp?style=flat&color=orange)](https://github.com/Fracital/holyWisp/stargazers)
+
 A [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) server in C11 with no dependencies
 beyond libc and pthreads, plus a C client library and CLI. Wisp v1 and v2 over WebSocket, TCP and
 UDP relay, and the full wispurr-style security suite: flood protection, per-IP rate and bandwidth
@@ -196,6 +201,18 @@ option names: it carries a binary for Linux (x64 and arm64, statically linked), 
 (x64 and arm64 each), starts it as a child process and routes the WebSocket upgrades of your own
 HTTP server to it. A server that dies is started again, and it never outlives the process that
 started it. A Vite plugin is included.
+
+Master is published to npm every night as `holywisp@nightly`. A version reads
+`0.1.0-nightly.202611100643.g9f75cc4`: the version in `node/package.json`, the UTC time, the
+commit, and `holywisp --version` inside it says the same. A commit is published once, only after
+`Build` passed on it and the tarball was installed and run on every platform it carries, without a
+stored token (npm trusted publishing) and with provenance:
+
+```sh
+npm install holywisp@nightly
+```
+
+Pin the exact version an application was tested with.
 
 ```ts
 import { createServer } from "node:http";

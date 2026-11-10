@@ -71,9 +71,15 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   pushing here does not change what the edges run. stomp.fracit.al uses the same public root
   (`STOMP_WISP_URL` on terp, not managed by any repo).
 - **This repo deploys nothing.** Its CI ships artefacts only: the rolling `latest` release
-  (binaries, `.deb`, `.rpm`, the npm tarball) and, for a `v*` tag, that tarball on the npm registry
-  (`npm-publish` in `release.yml`). There is no server this repo pushes to; a host that should run a new
-  build is updated by whoever operates it (the edges: abulxt's ansible pin).
+  (binaries, `.deb`, `.rpm`, the npm tarball), for a `v*` tag that tarball on the npm registry
+  (`npm-publish` in `release.yml`), and once a night the head of `master` on the npm registry as
+  `holywisp@nightly` (`nightly.yml`: only a commit whose `Build` passed, only once, version
+  `<node/package.json version>-nightly.<UTC time>.g<commit>`, which the binaries inside report
+  too). Both publish through npm trusted publishing, so no token is stored.
+  Nothing bumps the number in `node/package.json` but a person, and after a `v*` tag it goes to the
+  next version at once, or the nightlies sort below the release. There is no server this repo
+  pushes to; a host that should run a new build is updated by whoever operates it (the edges:
+  abulxt's ansible pin).
 - Do not start, stop or reconfigure a `holywisp` process on a machine that is not the one you are
   developing on. Running `make run` locally against loopback is development; touching a host that
   serves users is deployment.
@@ -391,7 +397,8 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `node/src/index.ts` | The npm package's `holywisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |
 | `node/src/config.ts` | wispurr-shaped options to `holywisp` flags; secrets go to a 0600 file, not argv. |
 | `node/src/vite.ts`, `logger.ts`, `path.ts` | Vite plugin, log relay, where the platform's binary lives. |
-| `node/scripts/build.mjs` | `make npm`: static binaries per platform via zig, `tsc`, licence copy. |
+| `node/scripts/build.mjs` | `make npm`: static binaries per platform via zig, `tsc`, licence copy. A prerelease in `package.json`'s version becomes the suffix `holywisp --version` prints. |
+| `node/scripts/nightly-version.mjs` | The version a nightly of HEAD publishes as. |
 | `node/tests/` | `node --test` suites: option mapping, and the wrapper against the real server. |
 | `cmake/zig-toolchain.cmake` | CMake toolchain for `zig cc` cross builds (Linux musl static, macOS, Windows). |
 | `deploy/systemd/holywisp.service` | The hardened unit (the sandbox is load-bearing; see "Security suite"). |
@@ -403,6 +410,7 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke; macOS; the Windows cross build and its tests on Windows; the npm package installed and tested on every platform it carries. |
 | `.github/workflows/format.yml` | clang-format drift: auto-fix commit on `master`, failing check on PRs. |
 | `.github/workflows/release.yml` | Rolling `latest` release: prebuilt binaries plus the `.deb`, the `.rpm` and the npm tarball, one build per push; `npm publish` for a `v*` tag. |
+| `.github/workflows/nightly.yml` | `holywisp@nightly` on npm, nightly and on dispatch: waits for `Build` on the commit, builds the tarball once, runs it on every platform it carries, publishes that file. Only its `publish` job holds the OIDC identity, and it runs nothing from the tree. |
 
 ## Hand-off
 

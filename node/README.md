@@ -5,8 +5,12 @@ embeds it in a Node.js application: it carries a prebuilt server binary, starts 
 process and hands it the WebSocket upgrades your HTTP server receives.
 
 ```sh
-npm install holywisp
+npm install holywisp@nightly
 ```
+
+`nightly` is the newest commit of `master` that passed its tests, published once a night as a
+version like `0.1.0-nightly.202611100643.g9f75cc4` (the UTC time, then the commit). Pin the exact
+version you tested with.
 
 ```ts
 import { createServer } from "node:http";
@@ -172,7 +176,10 @@ cd node && npm pack
 ```
 
 A `v<version>` tag publishes the tarball to the npm registry from CI (`release.yml`), after the
-same tarball has been installed and tested on every platform it carries a binary for.
+same tarball has been installed and tested on every platform it carries a binary for. `nightly.yml`
+does the same for `master` once a night, under the dist-tag `nightly`:
+`scripts/nightly-version.mjs` prints the version, and `scripts/build.mjs` gives the binaries
+whatever follows the number in `package.json`'s version, so `holywisp --version` names the nightly.
 
 `make npm` needs [zig](https://ziglang.org) on the PATH (`pip install ziglang` provides it as
 `python-zig`). `scripts/smoke-package.mjs` checks an installed tarball.

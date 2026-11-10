@@ -9,7 +9,7 @@
 // (cmake/zig-toolchain.cmake), so one machine produces all of them. ZIG names the executable;
 // otherwise `zig`, then `python-zig` (what `pip install ziglang` provides), is used.
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -31,6 +31,13 @@ const TARGETS = {
 
 const pkg = fileURLToPath(new URL("../", import.meta.url));
 const repo = fileURLToPath(new URL("../../", import.meta.url));
+
+// The binaries report the package's version. The server has its own number (CMakeLists.txt, held
+// equal to package.json's by the wrapper's tests); what a prerelease adds to it, as a nightly's
+// "-nightly.<time>.g<commit>" does, is handed to the C build as the suffix `--version` prints.
+const { version } = JSON.parse(readFileSync(join(pkg, "package.json"), "utf8"));
+const dash = version.indexOf("-");
+const versionSuffix = dash < 0 ? "" : version.slice(dash);
 
 function run(command, args, options = {}) {
 	const result = spawnSync(command, args, { stdio: "inherit", ...options });
@@ -76,6 +83,8 @@ if (!argv.includes("--no-binaries")) {
 			`-DHW_ZIG=${zig}`,
 			`-DHW_ZIG_TARGET=${TARGETS[key]}`,
 			"-DCMAKE_EXE_LINKER_FLAGS=-s",
+			// Always passed: an empty one clears what an earlier nightly build left in the cache.
+			`-DHW_VERSION_SUFFIX=${versionSuffix}`,
 		]);
 		run("cmake", ["--build", tree, "--target", "holywisp-bin"]);
 		const exe = key.startsWith("win32") ? "holywisp.exe" : "holywisp";
