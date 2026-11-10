@@ -4,7 +4,7 @@
 %global debug_package %{nil}
 
 Name:           holywisp
-Version:        %{?hw_version}%{!?hw_version:0.1.0}
+Version:        %{?hw_version}%{!?hw_version:0.5.2}
 Release:        1%{?dist}
 Summary:        A Wisp v1/v2 server in C with no runtime dependencies
 

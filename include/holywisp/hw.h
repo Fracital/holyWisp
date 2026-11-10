@@ -7,7 +7,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define HW_VERSION "0.1.0"
+#define HW_VERSION "0.5.2"
 #ifndef HW_VERSION_SUFFIX
 #define HW_VERSION_SUFFIX "" // set at build time to a git commit, e.g. "+abc123"
 #endif

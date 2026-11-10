@@ -1,5 +1,5 @@
 // The version a nightly build of HEAD publishes as: package.json's version with a prerelease of
-// the UTC time and the commit, e.g. 0.1.0-nightly.202611100643.g9f75cc4. Nightlies of one version
+// the UTC time and the commit, e.g. 0.5.2-nightly.202611110643.g1a2b3c4. Nightlies of one version
 // sort by time, and the g keeps a commit made of digits from reading as a number. The version in
 // package.json is the prefix as it stands: nothing here, and nothing in nightly.yml, bumps it.
 //

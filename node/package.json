@@ -1,6 +1,6 @@
 {
   "name": "holywisp",
-  "version": "0.1.0",
+  "version": "0.5.2",
   "description": "holyWisp, a Wisp v1/v2 server written in C, embedded in Node.js: spawn it, route WebSocket upgrades to it.",
   "keywords": [
     "wisp",

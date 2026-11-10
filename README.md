@@ -22,11 +22,11 @@ starts a hardened systemd service listening on `127.0.0.1:6001`:
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.1.0_amd64.deb
-sudo apt install ./holywisp_0.1.0_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.2_amd64.deb
+sudo apt install ./holywisp_0.5.2_amd64.deb
 
 # Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.1.0-1.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.2-1.fc41.x86_64.rpm
 
 sudo systemctl status holywisp            # running as user "wisp", sandboxed
 sudoedit /etc/holywisp/holywisp.conf      # then: sudo systemctl restart holywisp
@@ -212,7 +212,7 @@ npm install holywisp@nightly    # the newest commit of master that passed its te
 ```
 
 A release is a `v<version>` tag. Master is published every night as `holywisp@nightly`: a version
-reads `0.1.0-nightly.202611100643.g9f75cc4` (the version in `node/package.json`, the UTC time, the
+reads `0.5.2-nightly.202611110643.g1a2b3c4` (the version in `node/package.json`, the UTC time, the
 commit), and `holywisp --version` inside it says the same. A commit is published once, only after
 `Build` passed on it and the tarball was installed and run on every platform it carries. Both come
 from CI without a stored token (npm trusted publishing) and with provenance. Pin the exact nightly
