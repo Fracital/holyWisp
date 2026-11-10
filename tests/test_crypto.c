@@ -5,7 +5,7 @@
 #include "test.h"
 
 static void hex(const uint8_t *d, size_t n, char *out) {
-	for (size_t i = 0; i < n; i++) sprintf(out + i * 2, "%02x", d[i]);
+	for (size_t i = 0; i < n; i++) snprintf(out + i * 2, 3, "%02x", d[i]);
 }
 
 static void check_sha1(const char *msg, const char *want) {

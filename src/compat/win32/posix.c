@@ -11,7 +11,10 @@
  * that has any room at all takes the whole buffer, however large, and only the next call is
  * refused; POSIX takes what fits. The server's flow control rests on the POSIX behaviour (what the
  * kernel did not take is what it counts as queued), so a non-blocking send here hands the kernel
- * at most one send buffer's worth and reports a short write for the rest.
+ * at most one send buffer's worth and reports a short write for the rest. A blocking send has the
+ * same habit: with room in the buffer it returns at once, the whole of a large write held by the
+ * kernel. Here it goes out a send buffer at a time, so it returns when the peer has taken all but
+ * that much, which is what a sender that waits for its peer is relying on.
  */
 #define HW_W32_NO_MACROS
 
@@ -358,10 +361,9 @@ static void dontwait_end(const slot *s) {
 	ioctlsocket((SOCKET)s->handle, FIONBIO, &off);
 }
 
-// The most one send call may hand the kernel: see the top of this file. A blocking send is not
-// limited; it returns when everything is sent, here as in POSIX.
-static int send_limit(slot *s, int flags) {
-	if (!s->stream || !(s->nonblock || (flags & MSG_DONTWAIT))) return INT_MAX;
+// The most one send call may hand the kernel: see the top of this file.
+static int send_limit(slot *s) {
+	if (!s->stream) return INT_MAX;
 	if (s->sndbuf == 0) {
 		int size = 0, len = sizeof(size);
 		if (getsockopt((SOCKET)s->handle, SOL_SOCKET, SO_SNDBUF, (char *)&size, &len) != 0 || size <= 0) size = INT_MAX;
@@ -370,10 +372,32 @@ static int send_limit(slot *s, int flags) {
 	return (int)s->sndbuf;
 }
 
+static int send_blocks(const slot *s, int flags) {
+	return s->stream && !s->nonblock && !(flags & MSG_DONTWAIT);
+}
+
+// A blocking send of all of `n`, a send buffer at a time. Returns what went out, or -1 when that is
+// nothing.
+static ssize_t send_all(slot *s, const char *buf, size_t n, int flags) {
+	size_t piece = (size_t)send_limit(s);
+	size_t done = 0;
+	while (done < n) {
+		int r = send((SOCKET)s->handle, buf + done, (int)(n - done > piece ? piece : n - done), flags);
+		if (r == SOCKET_ERROR) {
+			if (done > 0) break;
+			errno = hw_w32_error(WSAGetLastError());
+			return -1;
+		}
+		done += (size_t)r;
+	}
+	return (ssize_t)done;
+}
+
 ssize_t hw_w32_send(int fd, const void *buf, size_t n, int flags) {
 	slot *s = fd_slot(fd, SLOT_SOCKET);
 	if (!s) return -1;
-	int limit = send_limit(s, flags);
+	if (send_blocks(s, flags)) return send_all(s, buf, n, flags);
+	int limit = send_limit(s);
 	int restore = dontwait_begin(s, flags);
 	int r = send((SOCKET)s->handle, buf, n > (size_t)limit ? limit : (int)n, flags & ~MSG_DONTWAIT);
 	int err = r == SOCKET_ERROR ? WSAGetLastError() : 0;
@@ -430,10 +454,20 @@ ssize_t hw_w32_recvfrom(int fd, void *buf, size_t n, int flags, struct sockaddr 
 ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
 	slot *s = fd_slot(fd, SLOT_SOCKET);
 	if (!s) return -1;
+	if (send_blocks(s, flags)) {
+		ssize_t total = 0;
+		for (size_t i = 0; i < (size_t)msg->msg_iovlen; i++) {
+			ssize_t r = send_all(s, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len, flags);
+			if (r < 0) return total > 0 ? total : -1;
+			total += r;
+			if ((size_t)r < msg->msg_iov[i].iov_len) break;
+		}
+		return total;
+	}
 	// More buffers than this go out as a short write, which every caller has to handle anyway.
 	WSABUF bufs[64];
 	DWORD count = 0;
-	size_t room = (size_t)send_limit(s, flags);
+	size_t room = (size_t)send_limit(s);
 	for (size_t i = 0; i < msg->msg_iovlen && count < 64 && room > 0; i++) {
 		size_t len = msg->msg_iov[i].iov_len;
 		if (len > room) len = room;

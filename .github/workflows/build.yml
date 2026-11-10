@@ -73,8 +73,7 @@ jobs:
         run: make tidy
 
   # The development port (include/holywisp/sys.h). Nothing else executes the kqueue backend or
-  # sys_darwin.c: locally they are only cross-compiled. Allowed to fail until this job has been
-  # seen green once; then drop continue-on-error so it holds the port to the same bar as Linux.
+  # sys_darwin.c: locally they are only cross-compiled. It gates like every other job.
   macos:
     name: macOS / ${{ matrix.build }}
     runs-on: macos-latest
@@ -96,7 +95,9 @@ jobs:
       - name: Test
         run: make ${{ matrix.build == 'debug' && 'test' || 'test-release' }}
 
+      # The two steps below run after a failed test too: a red job should say everything it knows.
       - name: Smoke the binaries
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           dir=build/${{ matrix.build }}
@@ -104,7 +105,7 @@ jobs:
           "$dir/holywisp-client" --help
 
       - name: Node wrapper against this build
-        if: matrix.build == 'release'
+        if: ${{ !cancelled() && matrix.build == 'release' }}
         run: make npm-test
 
   # Windows is built where every other npm binary is built: on Linux, with zig. This job makes the
@@ -164,13 +165,18 @@ jobs:
 
       - name: Test
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          # Every binary runs even after one fails: a test stops at its first failure, and one
+          # failure per push is a slow way to learn what Windows thinks of the rest.
+          failed=""
           for t in build/win/test_*.exe; do
             echo "== $t"
-            "$t"
+            "$t" || failed="$failed $t"
           done
+          if [ -n "$failed" ]; then echo "FAILED:$failed"; exit 1; fi
 
       - name: Smoke the binary
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           build/win/holywisp.exe --version

@@ -331,7 +331,9 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   job runs the same binaries on the real thing). The compat layer makes Winsock keep POSIX's
   promises where the server's correctness rests on them, and those must stay: a non-blocking send
   takes at most one send buffer and reports the rest unsent (Winsock would take all of it, and
-  the CONTINUE that is held while bytes are queued would never be held), a failed connect is an
+  the CONTINUE that is held while bytes are queued would never be held), a blocking send returns
+  when the peer has taken all but a send buffer (Winsock returns at once with the whole write
+  buffered, and nothing that waits for its peer would wait), a failed connect is an
   error event (`select`'s third set; `WSAPoll` loses it on older Windows), and a descriptor is a
   small int that `close` accepts. A backend must keep what `loop_backend.h` promises (level-triggered readiness,
   the generation carried with every event) and report a failed connect as an error event:

@@ -272,7 +272,10 @@ static void test_slow_client_backpressure(void) {
 	// Do not read. The origins cannot have finished: the relay must have stopped reading them.
 	usleep(400 * 1000);
 	int done = atomic_load(&g_blast_done);
-	CHECK(done < N, "origins blocked on a slow client: %d of %d finished", done, N);
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK(done < N, "origins blocked on a slow client: %d of %d finished, %llu bytes relayed", done, N,
+	      (unsigned long long)st.bytes_out);
 
 	uint8_t *expect = malloc(BLAST_BYTES);
 	fill_pattern(expect, BLAST_BYTES, BLAST_SEED);
@@ -415,15 +418,19 @@ static void *drain_main(void *arg) {
 static void test_conn_queue_pauses_reads(void) {
 	enum {
 		PKT = 64 * 1024,
-		QUEUE = 1024 * 1024,
-		WINDOW = QUEUE / PKT, // 16
+		QUEUE = 4 * 1024 * 1024,
+		WINDOW = QUEUE / PKT, // 64
 		STREAMS = 3
 	};
 	hw_server_config cfg;
 	base_config(&cfg);
 	cfg.max_message_size = PKT + HW_WISP_HEADER_LEN;
 	cfg.stream_queue_max = QUEUE;
-	cfg.conn_queue_max = 2 * QUEUE; // three full windows do not fit
+	// One window fits and three do not, by 8 MiB: far more than the socket buffers between the
+	// client and the sinks hold on any kernel, whatever it makes of the 64 KiB asked for below.
+	cfg.conn_queue_max = QUEUE;
+	// A stream's share of the in-flight budget is more than a window, so a refill carries all of it.
+	cfg.ws_write_high_water = 2 * STREAMS * QUEUE;
 	cfg.socket_buffer_size = 64 * 1024;
 	hw_server *s = start_server(&cfg);
 
@@ -460,11 +467,13 @@ static void test_conn_queue_pauses_reads(void) {
 	pthread_t sender;
 	CHECK_EQ(pthread_create(&sender, NULL, sender_main, NULL), 0);
 
-	// The budget is 2 MiB of 3 MiB: the server must have stopped reading before the sender is done.
+	// The budget is 4 MiB of 12 MiB: the server must have stopped reading before the sender is done.
 	usleep(500 * 1000);
 	int sent = atomic_load(&g_sender.sent);
-	CHECK(sent < WINDOW * STREAMS, "client blocked by the paused server: %d of %d packets sent", sent,
-	      WINDOW * STREAMS);
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK(sent < WINDOW * STREAMS, "client blocked by the paused server: %d of %d packets sent, %llu bytes relayed",
+	      sent, WINDOW * STREAMS, (unsigned long long)st.bytes_in);
 
 	// Drain all sinks at once (draining one alone cannot free enough to resume the client).
 	pthread_t drains[STREAMS];

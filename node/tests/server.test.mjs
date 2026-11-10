@@ -349,13 +349,27 @@ async function orphanCheck(t, ending) {
 	return { parent, serverPid };
 }
 
+// Signal 0 probes for a pid, and a process that has exited keeps its pid until something waits for
+// it. Its parent is dead here, so that is init's job, and in a container whose init does not do it
+// (a GitHub Actions job container) the pid stays for ever: a zombie, which holds no port and runs
+// no code. Linux says so in /proc; elsewhere the probe is the whole answer.
+function alive(pid) {
+	try {
+		process.kill(pid, 0);
+	} catch {
+		return false;
+	}
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		return stat.slice(stat.lastIndexOf(") ") + 2, stat.lastIndexOf(") ") + 3) !== "Z";
+	} catch {
+		return true;
+	}
+}
+
 async function gone(pid) {
 	for (let i = 0; i < 150; i++) {
-		try {
-			process.kill(pid, 0);
-		} catch {
-			return true;
-		}
+		if (!alive(pid)) return true;
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 	return false;

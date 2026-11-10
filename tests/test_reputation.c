@@ -37,12 +37,14 @@ static void test_scoring_and_tiers(void) {
 static void test_decay(void) {
 	hw_reputation_config cfg;
 	hw_reputation_config_defaults(&cfg);
-	cfg.decay_per_hour = 3600000; // 1000 points per second, so a short sleep decays visibly
+	// 100 points per second: a short sleep decays visibly, and one that overruns by half a second (a
+	// loaded CI machine) still leaves some of the 80.
+	cfg.decay_per_hour = 360000;
 	hw_reputation *r = hw_reputation_new(&cfg);
 	hw_reputation_add_source(r, "1.2.3.4", HW_REP_TWISP_NO_AUTH);
 	hw_reputation_add_source(r, "1.2.3.4", HW_REP_TWISP_NO_AUTH); // 80
 	CHECK(hw_reputation_source_score(r, "1.2.3.4") >= 80, "before decay");
-	usleep(60000); // ~60 points
+	usleep(100000); // 10 points, or more
 	hw_reputation_decay(r);
 	int after = hw_reputation_source_score(r, "1.2.3.4");
 	CHECK(after < 80 && after > 0, "decayed partially: %d", after);
