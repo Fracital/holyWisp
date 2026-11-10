@@ -10,12 +10,21 @@
     "wisp-protocol"
   ],
   "license": "ISC",
-  "author": "David Reed",
+  "author": {
+    "name": "David Reed",
+    "url": "https://github.com/Fracital"
+  },
   "homepage": "https://github.com/Fracital/holyWisp/tree/master/node#readme",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Fracital/holyWisp.git",
     "directory": "node"
+  },
+  "bugs": {
+    "url": "https://github.com/Fracital/holyWisp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "type": "module",
   "main": "dist/index.js",

@@ -5,12 +5,12 @@ embeds it in a Node.js application: it carries a prebuilt server binary, starts 
 process and hands it the WebSocket upgrades your HTTP server receives.
 
 ```sh
-npm install holywisp@nightly
+npm install holywisp
 ```
 
-`nightly` is the newest commit of `master` that passed its tests, published once a night as a
-version like `0.1.0-nightly.202611100643.g9f75cc4` (the UTC time, then the commit). Pin the exact
-version you tested with.
+That is the newest release. `npm install holywisp@nightly` is the newest commit of `master` that
+passed its tests, published once a night as a version like `0.1.0-nightly.202611100643.g9f75cc4`
+(the UTC time, then the commit); pin the exact one you tested with.
 
 ```ts
 import { createServer } from "node:http";
