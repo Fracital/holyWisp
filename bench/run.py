@@ -53,6 +53,11 @@ SERVERS = {
         "label": "holyWisp (C11, 32 MiB socket buffers)",
         "cmd": [str(ROOT / "build/release/holywisp")] + HW_COMMON + ["--socket-buffer-size=33554432"],
     },
+    "holywisp-exp": {
+        # A/B slot: the binary named by HW_EXP_BIN (an experimental build), same flags as holywisp.
+        "label": "holyWisp (experimental build)",
+        "cmd": [os.environ.get("HW_EXP_BIN", str(ROOT / "build/exp/holywisp"))] + HW_COMMON,
+    },
     "wispurr-go": {
         "label": "wispurr (Go)",
         "cmd": [str(SRC / "wispurr/wispurr"), "-config", str(ROOT / "bench/configs/wispurr-go-bench.json"),
@@ -446,7 +451,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--duration", type=int, default=10)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--only", default=",".join(SERVERS))
+    ap.add_argument("--only", default=",".join(k for k in SERVERS if k != "holywisp-exp"))
     ap.add_argument("--scenarios", default=",".join(SCENARIOS))
     ap.add_argument("--out", default=None)
     ap.add_argument("--replace", action="store_true",

@@ -116,7 +116,9 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `proxy` | `""` | Upstream `socks5://` (or `socks5h://`) / `http://` proxy for outbound TCP; it is given the destination hostname |
 | `proxy-udp` | `refuse` | With a proxy: `refuse` UDP streams, or relay them `direct`, bypassing the proxy |
 | `dns-server`, `dns-ttl-s`, `dns-order`, `dns-timeout-ms` | system, 120, ipv4first, 3000 | Built-in resolver and cache |
-| `buffer-remaining`, `max-message-size`, `ws-write-high-water`, `stream-queue-max` | 128, 1 MiB+5, 8 MiB, 16 MiB | Flow control and queue limits; the advertised window is capped so a full window of max-size packets fits in half of `stream-queue-max` |
+| `buffer-remaining`, `max-message-size`, `ws-write-high-water` | 128, 1 MiB+5, 8 MiB | Flow control and the queue toward a slow client; the advertised window is capped so a full window of max-size packets fits in `stream-queue-max` |
+| `socket-buffer-size`, `client-recv-buffer` | 0, 8 MiB | `socket-buffer-size` sets `SO_RCVBUF`/`SO_SNDBUF` on every socket (0 leaves them to the kernel). Otherwise client sockets get a receive buffer of `client-recv-buffer`, but only when `net.core.rmem_max` grants at least 4 MiB (the kernel doubles the value, so `rmem_max` of 2 MiB or more); 0 turns that off |
+| `stream-queue-max`, `conn-queue-max` | 128 MiB, 256 MiB | Bytes queued toward slow remotes: per stream (the stream closes `0x49` beyond it) and per client (its reads pause beyond it and resume at half) |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `webclient-wisp-url` | empty | `ws(s)://` URL the web client offers by default; empty means the page's own origin |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |

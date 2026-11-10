@@ -14,6 +14,7 @@
 #include "internal.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -41,7 +42,9 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->buffer_remaining = 128;
 	cfg->max_message_size = 1024 * 1024 + 5; // one max DATA payload plus its Wisp header
 	cfg->ws_write_high_water = 8u * 1024 * 1024;
-	cfg->stream_queue_max = 16u * 1024 * 1024;
+	cfg->stream_queue_max = 128u * 1024 * 1024;
+	cfg->conn_queue_max = 256u * 1024 * 1024;
+	cfg->client_recv_buffer = 8u * 1024 * 1024;
 	cfg->max_streams_per_conn = 2048;
 	cfg->connect_timeout_ms = 15000;
 	cfg->handshake_timeout_ms = 10000;
@@ -101,6 +104,10 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "max-message-size must be at least 5");
 		return -1;
 	}
+	if (cfg->conn_queue_max < cfg->stream_queue_max) {
+		snprintf(err, err_cap, "conn-queue-max must be at least stream-queue-max");
+		return -1;
+	}
 	if (cfg->password_required && cfg->password_user_count == 0) {
 		snprintf(err, err_cap, "password-required needs at least one password-user");
 		return -1;
@@ -148,15 +155,60 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 // The window is counted in packets but the per-stream queue toward a slow remote is counted in
 // bytes. A client that spends a whole window of maximum-size packets into a remote that is not
 // draining must land inside stream-queue-max, or it is closed 0x49 before flow control ever slowed
-// it (wispurr patch 0004). Half the queue is the budget, so a trailing partial window still fits.
+// it (wispurr patch 0004). A CONTINUE is only handed out once the queue is empty (continue_due), so
+// the queue never holds more than one window: the whole of stream-queue-max is the budget.
 static uint32_t server_ingress_window(const hw_server_config *cfg) {
 	size_t payload = cfg->max_message_size > HW_WISP_HEADER_LEN ? cfg->max_message_size - HW_WISP_HEADER_LEN : 1;
-	size_t by_mem = cfg->stream_queue_max / 2 / payload;
+	size_t by_mem = cfg->stream_queue_max / payload;
 	if (by_mem < 1) by_mem = 1;
 	return by_mem < cfg->buffer_remaining ? (uint32_t)by_mem : cfg->buffer_remaining;
 }
 
 // ---------------------------------------------------------------------------------- socket tuning
+
+// The `field`-th whitespace-separated integer of a /proc/sys file, or -1.
+static long read_sysctl_long(const char *path, int field) {
+	char line[128];
+	FILE *f = fopen(path, "r");
+	if (!f) return -1;
+	char *got = fgets(line, sizeof(line), f);
+	fclose(f);
+	if (!got) return -1;
+	char *p = line;
+	long v = -1;
+	for (int i = 0; i <= field; i++) {
+		char *end;
+		errno = 0;
+		v = strtol(p, &end, 10);
+		if (end == p || errno != 0) return -1;
+		p = end;
+	}
+	return v;
+}
+
+// A client that uploads in bursts is served best by a receive window that is large from the first
+// byte: the bytes wait in the kernel, arrive here in big reads and leave in few writes. Autotuning
+// gets there too, but slowly and per connection. An explicit SO_RCVBUF is capped by
+// net.core.rmem_max (and doubled by the kernel), and it switches autotuning off for the socket, so
+// on a host with the stock 208 KiB cap it would pin the window small. It is applied only when the
+// buffer the kernel will really grant is at least CLIENT_RCVBUF_FLOOR, and never when
+// socket-buffer-size already sets both buffers.
+#define CLIENT_RCVBUF_FLOOR (4L * 1024 * 1024)
+
+// `want` capped by the sysctl at `cap_path`, or 0 when the kernel would grant under the floor.
+static int server_fixed_buffer(const hw_server_config *cfg, size_t want_cfg, const char *cap_path, const char *key) {
+	if (cfg->socket_buffer_size > 0 || want_cfg == 0) return 0;
+	long cap = read_sysctl_long(cap_path, 0);
+	if (cap <= 0) return 0;
+	long want = (long)want_cfg < cap ? (long)want_cfg : cap;
+	if (want > INT32_MAX / 2) want = INT32_MAX / 2;
+	if (want * 2 < CLIENT_RCVBUF_FLOOR) {
+		HW_INFO("server", "%s not applied: %s is %ld, which grants under %ld bytes", key, cap_path, cap,
+		        CLIENT_RCVBUF_FLOOR);
+		return 0;
+	}
+	return (int)want;
+}
 
 void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
 	if (is_tcp) {
@@ -334,8 +386,11 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	if (build_limiters(s) != 0) goto fail;
 	if (webclient_page_build(s) != 0) goto fail;
 	s->window = server_ingress_window(cfg);
+	s->client_rcvbuf = server_fixed_buffer(cfg, cfg->client_recv_buffer, "/proc/sys/net/core/rmem_max",
+	                                       "client-recv-buffer");
 	if (s->window < cfg->buffer_remaining) {
-		HW_INFO("server", "buffer-remaining %u capped to %u: %zu-byte packets must fit in half of stream-queue-max %zu",
+		HW_INFO("server",
+		        "buffer-remaining %u capped to %u: a window of %zu-byte packets must fit in stream-queue-max %zu",
 		        cfg->buffer_remaining, s->window, cfg->max_message_size - HW_WISP_HEADER_LEN, cfg->stream_queue_max);
 	}
 

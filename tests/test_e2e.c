@@ -218,6 +218,91 @@ static void test_v1_tcp_echo_large(void) {
 	wait_streams_idle(g_server);
 }
 
+// Three streams push a window's worth of large packets each while the client reads nothing, so
+// the server's socket toward the client fills and spliced payloads have to wait in the worker's
+// pipe behind their headers. Every byte must still come back on the right stream, in order.
+static void test_slow_reader_keeps_order(void) {
+	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
+	enum {
+		SLOW_STREAMS = 3,
+		SLOW_CHUNK = 512 * 1024,
+		SLOW_CHUNKS = 16
+	};
+	const size_t per_stream = (size_t)SLOW_CHUNK * SLOW_CHUNKS;
+	uint32_t sid[SLOW_STREAMS];
+	uint8_t *data[SLOW_STREAMS];
+	for (int i = 0; i < SLOW_STREAMS; i++) {
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid[i]), 0);
+		data[i] = malloc(per_stream);
+		fill_pattern(data[i], per_stream, 100 + i);
+	}
+	for (int k = 0; k < SLOW_CHUNKS; k++) {
+		for (int i = 0; i < SLOW_STREAMS; i++) {
+			CHECK_EQ(hw_client_send(c, sid[i], data[i] + (size_t)k * SLOW_CHUNK, SLOW_CHUNK), 0);
+		}
+	}
+	usleep(300 * 1000); // let the server fill its send buffer toward us
+	uint8_t *back = malloc(per_stream);
+	for (int i = 0; i < SLOW_STREAMS; i++) {
+		CHECK_EQ(hw_client_read_exact(c, sid[i], back, per_stream, 10000), (long)per_stream);
+		CHECK(memcmp(data[i], back, per_stream) == 0, "stream %d intact", i);
+		free(data[i]);
+	}
+	free(back);
+	hw_client_free(c);
+	wait_streams_idle(g_server);
+}
+
+// DATA frames far larger than one read are forwarded while they arrive. Every byte must come back
+// in order, and each frame must count as exactly one packet against the window: 40 packets through
+// the 16-packet window is two CONTINUEs, not one per piece.
+static void test_large_frames_streamed(void) {
+	enum {
+		BIG_CHUNK = 300 * 1024 + 7,
+		BIG_CHUNKS = 40
+	};
+	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
+	const size_t total = (size_t)BIG_CHUNK * BIG_CHUNKS;
+	uint8_t *data = malloc(total);
+	uint8_t *back = malloc(total);
+	fill_pattern(data, total, 77);
+	size_t sent = 0, got = 0;
+	int continues = 0;
+	while (got < total) {
+		if (sent < total) {
+			CHECK_EQ(hw_client_send(c, sid, data + sent, BIG_CHUNK), 0);
+			sent += BIG_CHUNK;
+		}
+		hw_client_event ev;
+		int r;
+		while ((r = hw_client_poll(c, sent < total ? 0 : 5000, &ev)) > 0) {
+			if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
+				CHECK(got + ev.len <= total, "overflow");
+				memcpy(back + got, ev.data, ev.len);
+				got += ev.len;
+			} else if (ev.type == HW_CEV_CONTINUE) {
+				continues++;
+			} else {
+				CHECK(0, "unexpected event %d (reason %u)", ev.type, ev.reason);
+			}
+			if (sent < total || got >= total) break;
+		}
+		CHECK(r >= 0, "poll: %d", r);
+		if (r == 0 && sent >= total) {
+			CHECK(0, "timed out with %zu/%zu bytes", got, total);
+			break;
+		}
+	}
+	CHECK(memcmp(data, back, total) == 0, "large frames intact");
+	CHECK_EQ(continues, BIG_CHUNKS / 16);
+	free(data);
+	free(back);
+	hw_client_free(c);
+	wait_streams_idle(g_server);
+}
+
 static void test_udp_echo(void) {
 	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
 	uint32_t sid;
@@ -633,7 +718,7 @@ int main(void) {
 	cfg.allow_direct_ip = 1;
 	cfg.allow_loopback = 1;
 	cfg.buffer_remaining = 16;
-	cfg.stream_queue_max = 32u * 1024 * 1024; // 16 max-size packets must fit in half of it
+	cfg.stream_queue_max = 32u * 1024 * 1024; // 16 max-size packets fit, so the window stays 16
 	strcpy(cfg.motd, "welcome to the test server");
 	cfg.log_level = HW_LOG_WARN;
 	g_server = hw_server_new(&cfg);
@@ -643,6 +728,8 @@ int main(void) {
 
 	RUN(test_v1_tcp_echo_small);
 	RUN(test_v1_tcp_echo_large);
+	RUN(test_slow_reader_keeps_order);
+	RUN(test_large_frames_streamed);
 	RUN(test_udp_echo);
 	RUN(test_many_streams_interleaved);
 	RUN(test_remote_eof_closes_stream);

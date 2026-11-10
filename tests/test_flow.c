@@ -316,7 +316,7 @@ static void test_ingress_window_stalled_upstream(void) {
 	enum {
 		PKT = 64 * 1024,
 		QUEUE = 1024 * 1024,
-		WINDOW = QUEUE / 2 / PKT // 8: half the queue in max-size packets
+		WINDOW = QUEUE / PKT // 16: the queue in max-size packets
 	};
 	hw_server_config cfg;
 	base_config(&cfg);
@@ -366,6 +366,140 @@ static void test_ingress_window_stalled_upstream(void) {
 	hw_server_free(s);
 }
 
+// A sender thread for the connection-budget test: hw_client_send blocks once the server stops
+// reading, which is exactly what the test wants to observe, so it cannot run on the test thread.
+static struct {
+	hw_client *c;
+	uint32_t *sids;
+	int streams;
+	int window;
+	size_t pkt;
+	uint8_t *data;
+	_Atomic int sent; // packets handed to hw_client_send that returned
+} g_sender;
+
+static void *sender_main(void *arg) {
+	for (int k = 0; k < g_sender.window; k++) {
+		for (int i = 0; i < g_sender.streams; i++) {
+			const uint8_t *p = g_sender.data + ((size_t)i * g_sender.window + k) * g_sender.pkt;
+			if (hw_client_send(g_sender.c, g_sender.sids[i], p, g_sender.pkt) != 0) return NULL;
+			atomic_fetch_add(&g_sender.sent, 1);
+		}
+	}
+	return NULL;
+}
+
+static struct {
+	uint8_t *buf;
+	size_t len;
+	int fd;
+	int ok;
+} g_drain[4];
+
+static void *drain_main(void *arg) {
+	int i = (int)(intptr_t)arg;
+	g_drain[i].ok = read_full(g_drain[i].fd, g_drain[i].buf, g_drain[i].len) == 0;
+	return NULL;
+}
+
+// Several streams, each inside its own window, into remotes that read nothing. Their queues add
+// up past conn-queue-max, so the server stops reading the client (its sends block) and closes
+// nothing. Once the remotes drain, reads resume and every byte is there, in order, per stream.
+static void test_conn_queue_pauses_reads(void) {
+	enum {
+		PKT = 64 * 1024,
+		QUEUE = 1024 * 1024,
+		WINDOW = QUEUE / PKT, // 16
+		STREAMS = 3
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.max_message_size = PKT + HW_WISP_HEADER_LEN;
+	cfg.stream_queue_max = QUEUE;
+	cfg.conn_queue_max = 2 * QUEUE; // three full windows do not fit
+	cfg.socket_buffer_size = 64 * 1024;
+	hw_server *s = start_server(&cfg);
+
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "sink listen");
+	int small = 64 * 1024;
+	setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+
+	hw_client *c = connect_plain(s, 0);
+	setsockopt(hw_client_fd(c), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+	CHECK_EQ(hw_client_buffer_size(c), WINDOW);
+	uint32_t sids[STREAMS];
+	int sinks[STREAMS];
+	for (int i = 0; i < STREAMS; i++) {
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sids[i]), 0);
+		struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+		CHECK_EQ(poll(&pfd, 1, 5000), 1);
+		sinks[i] = accept(lfd, NULL, NULL);
+		CHECK(sinks[i] >= 0, "accept %d", i);
+	}
+
+	const size_t per_stream = (size_t)WINDOW * PKT;
+	uint8_t *data = malloc(per_stream * STREAMS);
+	fill_pattern(data, per_stream * STREAMS, 9);
+	g_sender.c = c;
+	g_sender.sids = sids;
+	g_sender.streams = STREAMS;
+	g_sender.window = WINDOW;
+	g_sender.pkt = PKT;
+	g_sender.data = data;
+	atomic_store(&g_sender.sent, 0);
+	pthread_t sender;
+	CHECK_EQ(pthread_create(&sender, NULL, sender_main, NULL), 0);
+
+	// The budget is 2 MiB of 3 MiB: the server must have stopped reading before the sender is done.
+	usleep(500 * 1000);
+	int sent = atomic_load(&g_sender.sent);
+	CHECK(sent < WINDOW * STREAMS, "client blocked by the paused server: %d of %d packets sent", sent,
+	      WINDOW * STREAMS);
+
+	// Drain all sinks at once (draining one alone cannot free enough to resume the client).
+	pthread_t drains[STREAMS];
+	for (int i = 0; i < STREAMS; i++) {
+		g_drain[i].fd = sinks[i];
+		g_drain[i].buf = malloc(per_stream);
+		g_drain[i].len = per_stream;
+		CHECK_EQ(pthread_create(&drains[i], NULL, drain_main, (void *)(intptr_t)i), 0);
+	}
+	for (int i = 0; i < STREAMS; i++) pthread_join(drains[i], NULL);
+	pthread_join(sender, NULL);
+	CHECK_EQ(atomic_load(&g_sender.sent), WINDOW * STREAMS);
+	for (int i = 0; i < STREAMS; i++) {
+		CHECK(g_drain[i].ok, "sink %d drained", i);
+		CHECK(memcmp(data + per_stream * (size_t)i, g_drain[i].buf, per_stream) == 0, "stream %d intact", i);
+		free(g_drain[i].buf);
+	}
+	// Nothing was closed and the windows come back: every stream gets its CONTINUE (in whatever
+	// order the remotes drained) and still relays.
+	int continued = 0;
+	uint64_t deadline = hw_now_ms() + 5000;
+	while (continued < STREAMS && hw_now_ms() < deadline) {
+		hw_client_event ev;
+		int r = hw_client_poll(c, 200, &ev);
+		CHECK(r >= 0, "poll: %d", r);
+		if (r <= 0) continue;
+		CHECK(ev.type != HW_CEV_CLOSE, "unexpected CLOSE on stream %u (reason %u)", ev.stream_id, ev.reason);
+		if (ev.type != HW_CEV_CONTINUE) continue;
+		CHECK_EQ(ev.buffer_remaining, WINDOW);
+		continued++;
+	}
+	CHECK_EQ(continued, STREAMS);
+	CHECK_EQ(hw_client_send(c, sids[0], data, 100), 0);
+	uint8_t back[100];
+	CHECK_EQ(read_full(sinks[0], back, sizeof(back)), 0);
+	CHECK(memcmp(data, back, sizeof(back)) == 0, "relays after the pause");
+	free(data);
+	for (int i = 0; i < STREAMS; i++) close(sinks[i]);
+	close(lfd);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
 int main(void) {
 	hw_log_set_level(HW_LOG_ERROR);
 	start_service(echo_main, &g_echo_port);
@@ -374,5 +508,6 @@ int main(void) {
 	RUN(test_egress_frames_within_max_message);
 	RUN(test_slow_client_backpressure);
 	RUN(test_ingress_window_stalled_upstream);
+	RUN(test_conn_queue_pauses_reads);
 	return 0;
 }

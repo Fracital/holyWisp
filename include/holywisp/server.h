@@ -94,7 +94,9 @@ typedef struct hw_server_config {
 	size_t max_message_size;    // largest WebSocket message accepted
 	size_t ws_write_high_water; // pause remote reads when a client's send queue grows past this
 	size_t stream_queue_max;    // bytes queued toward a remote before the stream is throttled
+	size_t conn_queue_max;      // bytes queued toward remotes across one client before its reads pause
 	size_t socket_buffer_size;  // SO_RCVBUF/SO_SNDBUF; 0 = kernel default
+	size_t client_recv_buffer;  // SO_RCVBUF on client sockets when socket_buffer_size is 0; 0 = kernel
 	int max_streams_per_conn;   // 0 = unlimited
 	int connect_timeout_ms;     // remote TCP connect
 	int handshake_timeout_ms;   // HTTP upgrade + v2 INFO exchange

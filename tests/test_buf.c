@@ -76,10 +76,37 @@ static void test_clear(void) {
 	hw_buf_free(&b);
 }
 
+static void test_shrink(void) {
+	hw_buf b;
+	hw_buf_init(&b);
+	CHECK_EQ(hw_buf_reserve(&b, 1 << 20), 0);
+	CHECK(b.cap >= 1 << 20, "grew");
+	CHECK_EQ(hw_buf_append(&b, "abc", 3), 0);
+	size_t cap = b.cap;
+	hw_buf_shrink(&b, 4096);
+	CHECK_EQ(b.cap, cap); // not empty: untouched
+	CHECK(memcmp(hw_buf_head(&b), "abc", 3) == 0, "data kept");
+	hw_buf_consume(&b, 3);
+	CHECK_EQ(b.cap, cap); // consume alone never reallocates
+	hw_buf_shrink(&b, 4096);
+	CHECK_EQ(b.cap, 4096);
+	hw_buf_shrink(&b, 8192); // already at or below keep: no-op
+	CHECK_EQ(b.cap, 4096);
+	CHECK_EQ(hw_buf_append(&b, "xyz", 3), 0);
+	CHECK(memcmp(hw_buf_head(&b), "xyz", 3) == 0, "usable after shrink");
+	hw_buf_consume(&b, 3);
+	hw_buf_shrink(&b, 0);
+	CHECK_EQ(b.cap, 0);
+	CHECK(b.data == NULL, "freed");
+	CHECK_EQ(hw_buf_append(&b, "q", 1), 0);
+	hw_buf_free(&b);
+}
+
 int main(void) {
 	RUN(test_append_consume);
 	RUN(test_reserve_and_tail);
 	RUN(test_compaction_keeps_data);
+	RUN(test_shrink);
 	RUN(test_clear);
 	return 0;
 }

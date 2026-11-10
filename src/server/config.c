@@ -120,7 +120,9 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("max-message-size", max_message_size, 1024, 1L << 30)
 	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1L << 31)
 	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1L << 31)
+	INT_KEY("conn-queue-max", conn_queue_max, 4096, 1L << 31)
 	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1L << 30)
+	INT_KEY("client-recv-buffer", client_recv_buffer, 0, 1L << 30)
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
 	INT_KEY("connect-timeout-ms", connect_timeout_ms, 100, 600000)
 	INT_KEY("handshake-timeout-ms", handshake_timeout_ms, 100, 600000)
@@ -345,7 +347,11 @@ void hw_config_usage(const char *argv0) {
 	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
 	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
 	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
-	    "  max-message-size, ws-write-high-water, stream-queue-max, socket-buffer-size\n"
+	    "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
+	    "                                            0x49), per client (256 MiB, pauses its reads)\n"
+	    "  max-message-size, ws-write-high-water, socket-buffer-size\n"
+	    "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
+	    "                                            it (8 MiB; 0 = leave to the kernel)\n"
 	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
 	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
 	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"

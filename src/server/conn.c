@@ -18,14 +18,28 @@
 
 #include <crypt.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
+#ifndef CONN_MAX_READ_PER_EVENT
 #define CONN_MAX_READ_PER_EVENT (1024 * 1024)
+#endif
+#define CONN_WINDOW_MIN 4 // packets granted per CONTINUE however many streams share a client
+// A busy client's recv room grows from HW_READ_CHUNK to about two of its frames: 128 KiB for
+// ordinary packets, more only for a client that sends very large ones. A big room on every
+// connection costs throughput as soon as many connections are busy at once.
+#define CONN_READ_CHUNK_BASE (128 * 1024)
+#define CONN_READ_CHUNK_MAX  (2 * 1024 * 1024)
+// A DATA frame at least this large is forwarded piece by piece while it arrives instead of being
+// reassembled first: the stream sees the same bytes sooner and they stay cache-warm.
+#define CONN_PT_MIN    (128 * 1024)
+#define CONN_WBUF_KEEP (4 * 1024 * 1024) // a drained write queue keeps at most this much allocated
 
 static void conn_io_cb(hw_loop *loop, int fd, unsigned events, void *ud);
+static void marks_free(hw_conn *c);
 
 // ---------------------------------------------------------------------------------- lifecycle
 
@@ -47,6 +61,7 @@ static void conn_unlink(hw_conn *c) {
 static void conn_release(hw_conn *c) {
 	hw_buf_free(&c->rbuf);
 	hw_buf_free(&c->wbuf);
+	free(c->marks);
 	hw_buf_free(&c->frag);
 	hw_map_free(&c->streams);
 	hw_smap_each(&c->sigdets, free_sigdet_visit, NULL);
@@ -85,6 +100,7 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	c->fd = fd;
 	c->state = CONN_HTTP;
 	c->stream_cap = w->server->cfg.max_streams_per_conn;
+	c->read_chunk = HW_READ_CHUNK;
 	hw_buf_init(&c->rbuf);
 	hw_buf_init(&c->wbuf);
 	hw_buf_init(&c->frag);
@@ -95,6 +111,9 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	// Policy IP defaults to the socket peer; the upgrade may replace it from a trusted header.
 	hw_addr_ip_str(peer, c->ip, sizeof(c->ip));
 	server_tune_socket(w->server, fd, 1);
+	if (w->server->client_rcvbuf > 0) {
+		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &w->server->client_rcvbuf, sizeof(w->server->client_rcvbuf));
+	}
 	if (hw_loop_add_fd(w->loop, fd, HW_EV_READ, conn_io_cb, c) != 0) {
 		HW_WARN("conn", "%s: cannot watch fd: %s", c->peer, strerror(errno));
 		close(fd);
@@ -132,6 +151,7 @@ void conn_close(hw_conn *c) {
 	close(c->fd);
 	c->fd = -1;
 	hw_map_each(&c->streams, close_stream_visit, NULL);
+	marks_free(c); // after the streams: every pipe still queued is an orphan now
 	if (c->conn_slot) {
 		hw_semaphore_release(&c->w->server->connections);
 		c->conn_slot = 0;
@@ -164,11 +184,21 @@ int conn_violation(hw_conn *c, const char *reason) {
 	return 0;
 }
 
+// The client socket's event mask follows three bits of state: reads stop while the bandwidth
+// throttle or the queue budget says so, writes are wanted while wbuf (or the pipe) has bytes.
+static void conn_apply_events(hw_conn *c) {
+	if (c->closing || c->fd < 0) return;
+	unsigned ev = 0;
+	if (!c->throttled && !c->read_paused) ev |= HW_EV_READ;
+	if (c->write_armed) ev |= HW_EV_WRITE;
+	hw_loop_mod_fd(c->w->loop, c->fd, ev);
+}
+
 static void throttle_wake_cb(hw_loop *loop, void *ud) {
 	hw_conn *c = ud;
 	c->throttle_timer = NULL;
 	c->throttled = 0;
-	if (!c->closing) hw_loop_mod_fd(loop, c->fd, c->write_armed ? HW_EV_READ | HW_EV_WRITE : HW_EV_READ);
+	conn_apply_events(c);
 }
 
 void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
@@ -178,9 +208,40 @@ void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
 	// Stop reading from the client until the virtual clock catches up; remote-side reads are
 	// paused with it through the loop's event mask.
 	c->throttled = 1;
-	hw_loop_mod_fd(c->w->loop, c->fd, c->write_armed ? HW_EV_WRITE : 0);
+	conn_apply_events(c);
 	if (c->throttle_timer) hw_loop_cancel_timer(c->w->loop, c->throttle_timer);
 	c->throttle_timer = hw_loop_add_timer(c->w->loop, wait, 0, throttle_wake_cb, c);
+}
+
+// One stream on a connection may have the whole advertised window in flight; ten streams with
+// the whole window each would make the server buffer tens of megabytes toward slow remotes and
+// pay for it in copies. The budget keeps the sum near the client's own send-queue mark, which is
+// plenty of pipeline for one stream and keeps many streams on the fast path.
+uint32_t conn_window(const hw_conn *c) {
+	const hw_server *srv = c->w->server;
+	size_t streams = hw_map_count(&c->streams);
+	size_t pkt = c->pkt_avg ? c->pkt_avg : 64 * 1024;
+	size_t w = srv->cfg.ws_write_high_water / (streams ? streams : 1) / pkt;
+	if (w < CONN_WINDOW_MIN) w = CONN_WINDOW_MIN;
+	if (w > srv->window) w = srv->window;
+	return (uint32_t)w;
+}
+
+void conn_queue_add(hw_conn *c, size_t n) {
+	c->queued_out += n;
+	if (!c->read_paused && c->queued_out > c->w->server->cfg.conn_queue_max) {
+		HW_DEBUG("conn", "%s: %zu bytes queued toward remotes, pausing reads", c->peer, c->queued_out);
+		c->read_paused = 1;
+		conn_apply_events(c);
+	}
+}
+
+void conn_queue_sub(hw_conn *c, size_t n) {
+	c->queued_out -= n < c->queued_out ? n : c->queued_out;
+	if (c->read_paused && c->queued_out < c->w->server->cfg.conn_queue_max / 2) {
+		c->read_paused = 0;
+		conn_apply_events(c);
+	}
 }
 
 // ---------------------------------------------------------------------------------- writing
@@ -188,8 +249,8 @@ void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
 static int arm_write(hw_conn *c, int on) {
 	if (c->write_armed == on) return 0;
 	c->write_armed = on;
-	if (c->throttled) return 0; // the throttle timer owns the event mask until it fires
-	return hw_loop_mod_fd(c->w->loop, c->fd, on ? HW_EV_READ | HW_EV_WRITE : HW_EV_READ);
+	conn_apply_events(c);
+	return 0;
 }
 
 static int pause_visit(uint32_t key, void *value, void *ud) {
@@ -202,8 +263,109 @@ static int resume_visit(uint32_t key, void *value, void *ud) {
 	return 0;
 }
 
+// ---- relay pipes
+//
+// The kernel charges pipe memory to the user and, past fs.pipe-user-pages-soft, hands out pipes of
+// two pages that cannot be enlarged. A pipe that small turns every splice into an 8 KiB relay, far
+// slower than copying, so anything under PIPE_MIN is refused and the stream copies instead (and
+// the worker waits a while before asking again: the pressure may come from other processes of
+// the same user, or from this server's own bulk streams). A pipe costs two descriptors and is
+// opened only when a stream first goes bulk.
+#define PIPE_WANT     (1024 * 1024)
+#define PIPE_MIN      (256 * 1024)
+#define PIPE_RETRY_MS 2000
+#define PIPE_FILLS    4 // splices per frame: a socket hands a large backlog over in pieces
+
+static hw_spipe *spipe_open(hw_worker *w, hw_stream *s) {
+	uint64_t now = hw_now_ms();
+	if (now < w->pipe_retry_ms) return NULL;
+	hw_spipe *p = calloc(1, sizeof(*p));
+	if (!p) return NULL;
+	if (pipe2(p->fd, O_NONBLOCK | O_CLOEXEC) != 0) {
+		w->pipe_retry_ms = now + PIPE_RETRY_MS;
+		free(p);
+		return NULL;
+	}
+	long sz = fcntl(p->fd[1], F_SETPIPE_SZ, PIPE_WANT);
+	if (sz < PIPE_MIN) sz = fcntl(p->fd[1], F_SETPIPE_SZ, PIPE_MIN);
+	if (sz < PIPE_MIN) {
+		HW_DEBUG("server", "worker %d: no relay pipe of %d bytes (%s); copying", w->index, PIPE_MIN,
+		         sz < 0 ? strerror(errno) : "pipe memory limit");
+		close(p->fd[0]);
+		close(p->fd[1]);
+		free(p);
+		w->pipe_retry_ms = now + PIPE_RETRY_MS;
+		return NULL;
+	}
+	p->size = (size_t)sz;
+	p->stream = s;
+	return p;
+}
+
+static void spipe_free(hw_spipe *p) {
+	close(p->fd[0]);
+	close(p->fd[1]);
+	free(p);
+}
+
+void conn_pipe_drop(hw_stream *s) {
+	hw_spipe *p = s->pipe;
+	if (!p) return;
+	s->pipe = NULL;
+	if (p->pending > 0) {
+		p->stream = NULL; // its payload is already framed on the wire: the queue finishes and frees it
+	} else {
+		spipe_free(p);
+	}
+}
+
+static int mark_push(hw_conn *c, hw_spipe *p, size_t n) {
+	if (c->mark_count == c->mark_cap) {
+		size_t cap = c->mark_cap ? c->mark_cap * 2 : 8;
+		hw_pipe_mark *m = malloc(cap * sizeof(*m));
+		if (!m) return -1;
+		for (size_t i = 0; i < c->mark_count; i++) m[i] = c->marks[(c->mark_head + i) % c->mark_cap];
+		free(c->marks);
+		c->marks = m;
+		c->mark_head = 0;
+		c->mark_cap = cap;
+	}
+	hw_pipe_mark *m = &c->marks[(c->mark_head + c->mark_count) % c->mark_cap];
+	m->at = c->wsent + hw_buf_avail(&c->wbuf);
+	m->n = n;
+	m->p = p;
+	c->mark_count++;
+	c->pipe_bytes += n;
+	p->pending = n;
+	return 0;
+}
+
+// The head mark's payload is on the wire (or the connection is going away).
+static void mark_pop(hw_conn *c) {
+	hw_pipe_mark *m = &c->marks[c->mark_head];
+	hw_spipe *p = m->p;
+	c->pipe_bytes -= m->n;
+	c->mark_head = (c->mark_head + 1) % c->mark_cap;
+	c->mark_count--;
+	p->pending = 0;
+	if (!p->stream) {
+		spipe_free(p);
+	} else if (!c->closing) {
+		stream_unpark(p->stream);
+	}
+}
+
+static void marks_free(hw_conn *c) {
+	while (c->mark_count > 0) mark_pop(c);
+}
+
+// Everything queued toward the client: the write buffer plus the payloads still in pipes.
+static size_t conn_queued(const hw_conn *c) {
+	return hw_buf_avail(&c->wbuf) + c->pipe_bytes;
+}
+
 static void conn_backpressure(hw_conn *c) {
-	size_t queued = hw_buf_avail(&c->wbuf);
+	size_t queued = conn_queued(c);
 	size_t high = c->w->server->cfg.ws_write_high_water;
 	if (!c->paused && queued > high) {
 		c->paused = 1;
@@ -214,13 +376,46 @@ static void conn_backpressure(hw_conn *c) {
 	}
 }
 
+// The queue is wbuf with pipe payloads spliced in at the marks: bytes are sent from wbuf until
+// the head mark's position, then that pipe is emptied into the socket, and so on. A frame header
+// is always the last thing in wbuf before its mark, so frames never interleave.
 void conn_flush(hw_conn *c) {
 	if (c->closing) return;
-	while (hw_buf_avail(&c->wbuf) > 0) {
-		ssize_t n = send(c->fd, hw_buf_head(&c->wbuf), hw_buf_avail(&c->wbuf), MSG_NOSIGNAL | MSG_DONTWAIT);
-		if (n > 0) {
-			hw_buf_consume(&c->wbuf, (size_t)n);
-			continue;
+	for (;;) {
+		size_t avail = hw_buf_avail(&c->wbuf);
+		hw_pipe_mark *m = c->mark_count ? &c->marks[c->mark_head] : NULL;
+		ssize_t n;
+		if (m && m->at == c->wsent) {
+			n = splice(m->p->fd[0], NULL, c->fd, NULL, m->n, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+			if (n > 0) {
+				m->n -= (size_t)n;
+				m->p->pending -= (size_t)n;
+				c->pipe_bytes -= (size_t)n;
+				if (m->n == 0) mark_pop(c);
+				continue;
+			}
+			if (n == 0) {
+				// The pipe holds less than was promised in the frame header. That cannot be
+				// repaired on the wire.
+				HW_WARN("conn", "%s: relay pipe ran dry with %zu bytes owed", c->peer, m->n);
+				conn_close(c);
+				return;
+			}
+		} else if (avail > 0) {
+			size_t want = avail;
+			int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
+			if (m && m->at - c->wsent <= want) {
+				want = (size_t)(m->at - c->wsent);
+				flags |= MSG_MORE; // a payload follows from its pipe
+			}
+			n = send(c->fd, hw_buf_head(&c->wbuf), want, flags);
+			if (n > 0) {
+				hw_buf_consume(&c->wbuf, (size_t)n);
+				c->wsent += (uint64_t)n;
+				continue;
+			}
+		} else {
+			break;
 		}
 		if (n < 0 && errno == EINTR) continue;
 		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -233,8 +428,47 @@ void conn_flush(hw_conn *c) {
 		return;
 	}
 	arm_write(c, 0);
+	hw_buf_shrink(&c->wbuf, CONN_WBUF_KEEP);
 	conn_backpressure(c);
 	if (c->state == CONN_HTTP_REPLY) conn_close(c);
+}
+
+ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
+	if (c->throttled) return -2;
+	hw_spipe *p = s->pipe;
+	if (!p) {
+		p = s->pipe = spipe_open(c->w, s);
+		if (!p) return -2;
+	}
+	if (p->pending > 0) return -3;
+	size_t max = c->w->server->cfg.max_message_size - HW_WISP_HEADER_LEN;
+	size_t cap = p->size < max ? p->size : max;
+	size_t got = 0;
+	for (int i = 0; i < PIPE_FILLS && got < cap; i++) {
+		ssize_t n = splice(s->fd, NULL, p->fd[1], NULL, cap - got, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+		if (n > 0) {
+			got += (size_t)n;
+			if ((size_t)n < HW_READ_CHUNK) break; // a small piece: the socket is drained
+			continue;
+		}
+		if (got > 0) break; // EOF or an error after some bytes: the next call reports it
+		if (n < 0 && (errno == EINVAL || errno == ENOSYS)) return -2; // not spliceable: copy instead
+		return n;
+	}
+
+	uint8_t hdr[HW_WS_MAX_HEADER + HW_WISP_HEADER_LEN];
+	size_t hlen = hw_ws_write_header(hdr, 1, HW_WS_BINARY, HW_WISP_HEADER_LEN + (uint64_t)got, NULL);
+	hw_wisp_write_header(hdr + hlen, HW_WISP_DATA, s->id);
+	hlen += HW_WISP_HEADER_LEN;
+	if (hw_buf_append(&c->wbuf, hdr, hlen) != 0 || mark_push(c, p, got) != 0) {
+		// The payload is in the pipe but cannot be framed: nothing sane can follow on this stream.
+		conn_close(c);
+		return (ssize_t)got;
+	}
+	atomic_fetch_add(&c->w->server->bytes_out, (uint64_t)got);
+	conn_charge_bandwidth(c, got);
+	conn_flush(c);
+	return (ssize_t)got;
 }
 
 // Reserve room for a frame header + payload of `len` and write the header. Returns the payload
@@ -689,12 +923,18 @@ static void handle_message(hw_conn *c, const uint8_t *data, size_t len) {
 		return;
 	}
 
+	if (p.type != HW_WISP_DATA) {
+		// Anything else may open, close or resize a stream: batched DATA goes out first, in order.
+		stream_batch_flush(c->w);
+		if (c->closing) return;
+	}
 	switch (p.type) {
 	case HW_WISP_DATA: {
 		hw_stream *s = hw_map_get(&c->streams, p.stream_id);
 		if (!s) return; // raced with our CLOSE
 		atomic_fetch_add(&c->w->server->bytes_in, p.payload_len);
 		conn_charge_bandwidth(c, p.payload_len);
+		c->pkt_avg = c->pkt_avg ? (c->pkt_avg * 7 + p.payload_len) / 8 : p.payload_len;
 		stream_on_data(s, p.payload, p.payload_len);
 		break;
 	}
@@ -722,10 +962,28 @@ static void handle_message(hw_conn *c, const uint8_t *data, size_t len) {
 
 // ---------------------------------------------------------------------------------- WebSocket
 
-static int ws_process(hw_conn *c) {
+static int ws_frames(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
 	while (!c->closing) {
 		size_t avail = hw_buf_avail(&c->rbuf);
+		if (c->pt_left > 0) {
+			// The rest of a large DATA frame: unmask what is here and hand it on.
+			if (avail == 0) return 0;
+			size_t n = avail < c->pt_left ? avail : c->pt_left;
+			uint8_t *p = c->rbuf.data + c->rbuf.off;
+			hw_ws_mask(p, n, c->pt_mask, c->pt_off);
+			c->pt_off = (c->pt_off + n) & 3;
+			c->pt_left -= n;
+			hw_stream *s = hw_map_get(&c->streams, c->pt_stream);
+			if (s) { // otherwise it closed mid-frame and the rest is dropped, like a late packet
+				atomic_fetch_add(&c->w->server->bytes_in, n);
+				conn_charge_bandwidth(c, n);
+				stream_on_data_part(s, p, n, c->pt_left == 0);
+				if (c->closing) return 0;
+			}
+			hw_buf_consume(&c->rbuf, n);
+			continue;
+		}
 		hw_ws_frame f;
 		int r = hw_ws_parse_header(hw_buf_head(&c->rbuf), avail, &f);
 		if (r == HW_ERR_AGAIN) return 0;
@@ -738,7 +996,24 @@ static int ws_process(hw_conn *c) {
 			return 0;
 		}
 		size_t total = f.header_len + (size_t)f.payload_len;
+		if (avail < total && f.opcode == HW_WS_BINARY && f.fin && !c->frag_active && f.payload_len >= CONN_PT_MIN &&
+		    avail >= f.header_len + HW_WISP_HEADER_LEN && (!c->is_v2 || c->handshake_done)) {
+			uint8_t wh[HW_WISP_HEADER_LEN];
+			memcpy(wh, c->rbuf.data + c->rbuf.off + f.header_len, sizeof(wh));
+			hw_ws_mask(wh, sizeof(wh), f.mask, 0);
+			if (wh[0] == HW_WISP_DATA) {
+				c->pt_stream = hw_le32(wh + 1);
+				c->pt_left = (size_t)f.payload_len - HW_WISP_HEADER_LEN;
+				memcpy(c->pt_mask, f.mask, sizeof(c->pt_mask));
+				c->pt_off = HW_WISP_HEADER_LEN & 3;
+				c->pkt_avg = c->pkt_avg ? (c->pkt_avg * 7 + c->pt_left) / 8 : c->pt_left;
+				hw_buf_consume(&c->rbuf, f.header_len + HW_WISP_HEADER_LEN);
+				continue;
+			}
+		}
 		if (avail < total) {
+			stream_batch_flush(c->w);
+			if (c->closing) return 0;
 			if (hw_buf_reserve(&c->rbuf, total - avail) != 0) conn_close(c);
 			return 0;
 		}
@@ -775,6 +1050,7 @@ static int ws_process(hw_conn *c) {
 			if (f.fin) {
 				c->frag_active = 0;
 				handle_message(c, hw_buf_head(&c->frag), hw_buf_avail(&c->frag));
+				stream_batch_flush(c->w); // the payload lives in frag, which is about to be reused
 				hw_buf_clear(&c->frag);
 			}
 			break;
@@ -806,6 +1082,14 @@ static int ws_process(hw_conn *c) {
 	return 0;
 }
 
+// DATA payloads are handed to their streams as pointers into rbuf (stream_on_data batches them),
+// so the batch is flushed before rbuf can be compacted or grown, and before returning.
+static int ws_process(hw_conn *c) {
+	int r = ws_frames(c);
+	stream_batch_flush(c->w);
+	return r;
+}
+
 static void conn_process(hw_conn *c) {
 	for (;;) {
 		if (c->closing) return;
@@ -821,12 +1105,13 @@ static void conn_process(hw_conn *c) {
 
 static void conn_read(hw_conn *c) {
 	size_t total = 0;
-	while (!c->closing && !c->throttled && total < CONN_MAX_READ_PER_EVENT) {
-		if (hw_buf_reserve(&c->rbuf, HW_READ_CHUNK) != 0) {
+	while (!c->closing && !c->throttled && !c->read_paused && total < CONN_MAX_READ_PER_EVENT) {
+		if (hw_buf_reserve(&c->rbuf, c->read_chunk) != 0) {
 			conn_close(c);
 			return;
 		}
-		ssize_t n = recv(c->fd, hw_buf_tail(&c->rbuf), hw_buf_room(&c->rbuf), MSG_DONTWAIT);
+		size_t room = hw_buf_room(&c->rbuf);
+		ssize_t n = recv(c->fd, hw_buf_tail(&c->rbuf), room, MSG_DONTWAIT);
 		if (n == 0) {
 			conn_close(c);
 			return;
@@ -839,11 +1124,24 @@ static void conn_read(hw_conn *c) {
 			}
 			return;
 		}
-		size_t room = hw_buf_room(&c->rbuf);
 		hw_buf_commit(&c->rbuf, (size_t)n);
 		total += (size_t)n;
 		conn_process(c);
-		if ((size_t)n < room) return; // drained
+		if (c->closing) return;
+		if ((size_t)n == room) {
+			// The client is sending faster than one read takes: offer more room next time, so a
+			// burst of frames arrives in one recv and leaves in one write per stream.
+			size_t limit = 2 * c->pkt_avg;
+			if (limit < CONN_READ_CHUNK_BASE) limit = CONN_READ_CHUNK_BASE;
+			if (limit > CONN_READ_CHUNK_MAX) limit = CONN_READ_CHUNK_MAX;
+			if (c->read_chunk < limit) c->read_chunk *= 2;
+			continue;
+		}
+		if ((size_t)n < c->read_chunk / 4 && c->read_chunk > HW_READ_CHUNK) {
+			c->read_chunk /= 2;
+			hw_buf_shrink(&c->rbuf, c->read_chunk); // no-op unless the buffer is empty
+		}
+		return; // drained
 	}
 }
 
@@ -852,5 +1150,5 @@ static void conn_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 	if (c->closing) return;
 	if (events & HW_EV_WRITE) conn_flush(c);
 	if (c->closing) return;
-	if ((events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR)) && !c->throttled) conn_read(c);
+	if ((events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR)) && !c->throttled && !c->read_paused) conn_read(c);
 }

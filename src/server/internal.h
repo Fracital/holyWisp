@@ -24,9 +24,31 @@
 #include <stdatomic.h>
 
 #include <sys/types.h>
+#include <sys/uio.h>
 
-#define HW_READ_CHUNK       (64 * 1024) // one recv(2) from a remote or a client
-#define HW_STREAM_MAX_ADDRS 8           // addresses tried per CONNECT, in resolver order
+#ifndef HW_READ_CHUNK
+#define HW_READ_CHUNK (64 * 1024) // one recv(2) from a remote or a client
+#endif
+#define HW_STREAM_MAX_ADDRS 8  // addresses tried per CONNECT, in resolver order
+#define HW_BATCH_MAX        64 // DATA payloads written to one remote with a single sendmsg
+
+// A stream's relay pipe (conn.c). Remote bytes are spliced into it and from it into the client
+// socket, never through user space. `pending` bytes of one DATA payload are still in it, waiting
+// for their turn in the connection's queue; the stream may not refill it before that is zero. A
+// pipe whose stream closed with bytes pending (`stream` NULL) lives until the queue reaches it.
+typedef struct hw_spipe {
+	int fd[2];
+	size_t size;
+	size_t pending;
+	struct hw_stream *stream;
+} hw_spipe;
+
+// "After `at` bytes of the write queue have gone out, splice `n` bytes from pipe `p`."
+typedef struct hw_pipe_mark {
+	uint64_t at;
+	size_t n;
+	hw_spipe *p;
+} hw_pipe_mark;
 
 typedef struct hw_worker {
 	hw_server *server;
@@ -37,6 +59,15 @@ typedef struct hw_worker {
 	int thread_started;
 	uint8_t *scratch;      // HW_READ_CHUNK bytes for remote reads
 	struct hw_conn *conns; // every live connection on this worker, for shutdown cleanup
+	// Ingress batch (stream_on_data / stream_batch_flush): DATA payloads for one idle TCP stream,
+	// still sitting in the connection's read buffer, waiting to go out in one vectored write. It
+	// only ever exists inside a single pass over that buffer; conn.c flushes it before the buffer
+	// can move.
+	struct hw_stream *batch_stream;
+	struct iovec batch_iov[HW_BATCH_MAX];
+	int batch_n;
+	int batch_pkts;         // whole DATA packets completed inside the batch (a large one spans entries)
+	uint64_t pipe_retry_ms; // a relay pipe could not be had: do not ask the kernel again before this
 } hw_worker;
 
 enum proxy_kind {
@@ -65,6 +96,8 @@ struct hw_server {
 	// The CONTINUE window actually advertised: buffer-remaining, capped so a full window of
 	// maximum-size DATA packets fits in half of stream-queue-max (server_ingress_window).
 	uint32_t window;
+	// SO_RCVBUF applied to accepted client sockets, 0 for none (server_client_rcvbuf decides).
+	int client_rcvbuf;
 	uint16_t port;
 	// The embedded web client with webclient-wisp-url spliced in; NULL serves the page as built.
 	uint8_t *webclient_page;
@@ -127,7 +160,13 @@ typedef struct hw_conn {
 	enum conn_state state;
 	hw_buf rbuf; // bytes from the client not yet parsed
 	hw_buf wbuf; // frames to the client not yet written
-	hw_buf frag; // reassembly of a fragmented binary message
+	// Payloads waiting in stream pipes, in queue order. The wire order is wbuf up to marks[0].at
+	// (counted in bytes ever taken from wbuf, `wsent`), then that pipe's payload, then on.
+	hw_pipe_mark *marks;
+	size_t mark_head, mark_count, mark_cap;
+	uint64_t wsent;
+	size_t pipe_bytes; // sum of the marks' n: what backpressure counts besides wbuf
+	hw_buf frag;       // reassembly of a fragmented binary message
 	int frag_active;
 	hw_map streams;  // stream_id -> hw_stream
 	hw_smap sigdets; // "ip:port" -> hw_sigdet (SYN-flood signature per destination)
@@ -140,6 +179,16 @@ typedef struct hw_conn {
 	int throttled;            // reads suspended until throttle_timer fires
 	int write_armed;          // HW_EV_WRITE requested
 	int paused;               // remote reads suspended: wbuf past the high-water mark
+	size_t queued_out;        // bytes waiting in every stream's `out` toward its remote
+	size_t pkt_avg;           // running average DATA payload from this client, 0 until the first
+	size_t read_chunk;        // room offered to each recv: grows while reads fill it, decays when idle
+	// A large DATA frame being forwarded as it arrives (ws_frames): its stream, the payload bytes
+	// still to come, and the frame's mask with the position in its cycle.
+	size_t pt_left;
+	uint32_t pt_stream;
+	uint8_t pt_mask[4];
+	size_t pt_off;
+	int read_paused; // client reads suspended: queued_out past conn-queue-max
 	int closing;
 	int violations;
 	int conn_slot;  // holds one of server->connections
@@ -175,6 +224,10 @@ typedef struct hw_stream {
 	hw_buf out;         // toward the remote; UDP entries are [u32 len][datagram]
 	uint32_t remaining; // DATA packets left before we owe the client a CONTINUE
 	int continue_due;   // the window closed while `out` still had bytes queued
+	int bulk;           // the remote delivers full reads: relay through the pipe (conn_splice_data)
+	int bulk_miss;      // consecutive small splices; enough of them end bulk mode
+	int parked;         // reads stopped until the stream's own pipe has drained into the client
+	hw_spipe *pipe;     // opened when the stream first goes bulk
 	int read_armed;
 	int syn_held; // holds one of server->in_flight_syns
 	hw_resolve_req *resolve;
@@ -200,6 +253,14 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer);
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len);
 // Queue a DATA packet for stream_id with `len` payload bytes copied from `data`.
 int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len);
+// Relay what the stream's remote has to read as one DATA packet without copying it through user
+// space. Returns the bytes relayed (> 0), 0 on remote EOF, -1 with errno from the remote read
+// (EAGAIN: nothing to read), -2 when the copying path (recv into scratch + conn_send_data) must be
+// used instead, or -3 when the stream's previous payload is still in its pipe: the caller waits
+// for it (stream_park). A failure toward the client closes the connection: check c->closing.
+ssize_t conn_splice_data(hw_conn *c, hw_stream *s);
+// The stream is closing: free its pipe, or leave it to the queue when a payload is still in it.
+void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason);
 // Flush what can be written now; arms HW_EV_WRITE for the rest. Closes the conn on error.
@@ -216,19 +277,39 @@ int webclient_page_build(hw_server *s);
 int conn_violation(hw_conn *c, const char *reason);
 // Bandwidth accounting for `bytes` in either direction; pauses the connection when over budget.
 void conn_charge_bandwidth(hw_conn *c, size_t bytes);
+// The window to hand a TCP stream on its next CONTINUE: the connection's in-flight byte budget
+// (ws-write-high-water) shared between its streams, in packets of the size this client sends,
+// never above the advertised maximum (server->window) and never below a few packets.
+uint32_t conn_window(const hw_conn *c);
+// Bytes entered or left a stream's queue toward its remote. Past conn-queue-max the connection
+// stops reading the client (never closes anything) and resumes at half the mark.
+void conn_queue_add(hw_conn *c, size_t n);
+void conn_queue_sub(hw_conn *c, size_t n);
 // Reputation shortcuts (no-ops when disabled).
 void conn_rep_source(hw_conn *c, enum hw_rep_event e);
 void conn_rep_dest(hw_conn *c, const char *dest, enum hw_rep_event e);
 
 // stream.c
 void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port);
-// DATA from the client. Takes care of flow control and queuing.
+// DATA from the client. Takes care of flow control and queuing. For an idle TCP stream the bytes
+// are not written yet: `data` joins the worker's batch and must stay valid until
+// stream_batch_flush(), which the caller runs before the memory behind it can change.
 void stream_on_data(hw_stream *s, const uint8_t *data, size_t len);
+// The same for one piece of a DATA packet that is forwarded while it is still arriving; only the
+// piece with `final` set counts against the flow-control window.
+void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int final);
+// Write the worker's pending batch to its stream (one sendmsg), queue what the socket did not
+// take and settle flow control for the packets in it. May close the stream or the connection.
+void stream_batch_flush(hw_worker *w);
 // Close the remote side, tell the client when send_close, remove from the connection, free.
 void stream_close(hw_stream *s, uint8_t reason, int send_close);
 // Stop/resume reading from the remote (connection-level backpressure).
 void stream_pause(hw_stream *s);
 void stream_resume(hw_stream *s);
+// A bulk stream's pipe still holds its previous payload: stop reading the remote until the queue
+// has written it (stream_unpark, from conn_flush).
+void stream_park(hw_stream *s);
+void stream_unpark(hw_stream *s);
 // The remote (or proxy handshake) is up: finish opening the stream toward the client.
 void stream_connected(hw_stream *s);
 // Adopt an already-connected fd (a PTY master for Twisp): register it on the loop and open the

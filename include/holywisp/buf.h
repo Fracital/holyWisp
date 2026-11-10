@@ -3,9 +3,10 @@
  *
  * [0, off) has been consumed, [off, len) is readable, [len, cap) is free. Producers either
  * hw_buf_append() or write straight into hw_buf_tail() and hw_buf_commit(). Consumers read from
- * hw_buf_head() for hw_buf_avail() bytes and hw_buf_consume(). Compaction happens inside consume
- * when the consumed prefix is larger than what is left, so steady-state streaming does not copy
- * on every read.
+ * hw_buf_head() for hw_buf_avail() bytes and hw_buf_consume(). Compaction happens only when room
+ * is needed and at least as much has been consumed as is left, so draining a large backlog in
+ * small pieces never shuffles it once per piece. Consuming never moves or reallocates, so
+ * pointers into the readable part stay valid until the next reserve, append or shrink.
  */
 #ifndef HOLYWISP_BUF_H
 #define HOLYWISP_BUF_H
@@ -50,5 +51,8 @@ static inline size_t hw_buf_avail(const hw_buf *b) {
 	return b->len - b->off;
 }
 void hw_buf_consume(hw_buf *b, size_t n);
+// Give memory back after a burst: when the buffer is empty and its capacity is above `keep`,
+// reduce the allocation to `keep` bytes (0 frees it). A buffer that still holds data is left alone.
+void hw_buf_shrink(hw_buf *b, size_t keep);
 
 #endif

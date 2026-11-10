@@ -21,7 +21,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifndef STREAM_MAX_READS_PER_EVENT
 #define STREAM_MAX_READS_PER_EVENT 4
+#define STREAM_OUT_KEEP            (256 * 1024)
+#endif
 
 static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud);
 static void stream_connect_next(hw_stream *s, int last_errno);
@@ -124,6 +127,13 @@ void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	hw_map_remove(&c->streams, s->id);
 	atomic_fetch_sub(&c->w->server->streams_active, 1);
 	HW_DEBUG("stream", "%s: stream %u closed: %s", c->peer, s->id, hw_close_reason_str(reason));
+	conn_queue_sub(c, hw_buf_avail(&s->out));
+	conn_pipe_drop(s);
+	if (c->w->batch_stream == s) { // bytes batched for a stream that is going away are dropped
+		c->w->batch_stream = NULL;
+		c->w->batch_n = 0;
+		c->w->batch_pkts = 0;
+	}
 	hw_buf_free(&s->out);
 	hw_buf_free(&s->pin);
 	uint32_t id = s->id;
@@ -138,9 +148,23 @@ void stream_pause(hw_stream *s) {
 }
 
 void stream_resume(hw_stream *s) {
+	if (s->parked) return; // its pipe is still busy: stream_unpark resumes it
 	if (s->state != STREAM_OPEN || s->read_armed) return;
 	s->read_armed = 1;
 	stream_update_events(s);
+}
+
+void stream_park(hw_stream *s) {
+	s->parked = 1;
+	if (s->state != STREAM_OPEN || !s->read_armed) return;
+	s->read_armed = 0;
+	stream_update_events(s);
+}
+
+void stream_unpark(hw_stream *s) {
+	if (!s->parked) return;
+	s->parked = 0;
+	if (!s->conn->paused) stream_resume(s);
 }
 
 // ---------------------------------------------------------------------------------- SYN signature
@@ -477,7 +501,9 @@ static int stream_flush(hw_stream *s) {
 		}
 		ssize_t n = stream_send(s, head + prefix, chunk);
 		if (n >= 0) {
-			hw_buf_consume(&s->out, s->type == HW_STREAM_UDP ? prefix + chunk : (size_t)n);
+			size_t took = s->type == HW_STREAM_UDP ? prefix + chunk : (size_t)n;
+			hw_buf_consume(&s->out, took);
+			conn_queue_sub(c, took);
 			continue;
 		}
 		if (errno == EINTR) continue;
@@ -489,6 +515,7 @@ static int stream_flush(hw_stream *s) {
 		return -1;
 	}
 	stream_update_events(s);
+	hw_buf_shrink(&s->out, STREAM_OUT_KEEP); // drained: a burst's allocation is not kept for the stream's life
 	if (s->continue_due) {
 		s->continue_due = 0;
 		conn_send_continue(c, s->id, s->remaining);
@@ -497,10 +524,97 @@ static int stream_flush(hw_stream *s) {
 	return 0;
 }
 
-void stream_on_data(hw_stream *s, const uint8_t *data, size_t len) {
+void stream_batch_flush(hw_worker *w) {
+	int cnt = w->batch_n;
+	if (cnt == 0) return;
+	hw_stream *s = w->batch_stream;
+	int pkts = w->batch_pkts;
+	w->batch_n = 0;
+	w->batch_pkts = 0;
+	w->batch_stream = NULL;
 	hw_conn *c = s->conn;
-	const hw_server_config *cfg = &c->w->server->cfg;
+	size_t total = 0;
+	for (int i = 0; i < cnt; i++) total += w->batch_iov[i].iov_len;
+
+	ssize_t n;
+	if (cnt == 1) {
+		n = send(s->fd, w->batch_iov[0].iov_base, w->batch_iov[0].iov_len, MSG_NOSIGNAL | MSG_DONTWAIT);
+	} else {
+		struct msghdr mh = {.msg_iov = w->batch_iov, .msg_iovlen = (size_t)cnt};
+		n = sendmsg(s->fd, &mh, MSG_NOSIGNAL | MSG_DONTWAIT);
+	}
+	if (n < 0) {
+		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+			stream_close(s, map_errno(errno), 1);
+			return;
+		}
+		n = 0;
+	}
+	if ((size_t)n < total) {
+		// The socket is full: the rest waits in s->out, which was empty when the batch began.
+		size_t rest = total - (size_t)n;
+		if (rest + 4 > c->w->server->cfg.stream_queue_max) {
+			HW_DEBUG("stream", "%s: stream %u throttled (%zu bytes to queue)", c->peer, s->id, rest);
+			stream_close(s, HW_CLOSE_THROTTLED, 1);
+			return;
+		}
+		size_t skip = (size_t)n;
+		for (int i = 0; i < cnt; i++) {
+			const uint8_t *base = w->batch_iov[i].iov_base;
+			size_t len = w->batch_iov[i].iov_len;
+			if (skip >= len) {
+				skip -= len;
+				continue;
+			}
+			if (hw_buf_append(&s->out, base + skip, len - skip) != 0) {
+				stream_close(s, HW_CLOSE_UNKNOWN, 1);
+				return;
+			}
+			skip = 0;
+		}
+		conn_queue_add(c, rest);
+		stream_update_events(s);
+	}
+	// Flow control, one count per packet: a CONTINUE once the window is spent, held back while
+	// the remote is slow.
+	int spent = 0;
+	for (int i = 0; i < pkts; i++) {
+		if (--s->remaining == 0) {
+			s->remaining = conn_window(c);
+			spent = 1;
+		}
+	}
+	if (!spent) return;
+	if (hw_buf_avail(&s->out) == 0) {
+		conn_send_continue(c, s->id, s->remaining);
+	} else {
+		s->continue_due = 1;
+	}
+}
+
+void stream_on_data(hw_stream *s, const uint8_t *data, size_t len) {
+	stream_on_data_part(s, data, len, 1);
+}
+
+void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int final) {
+	hw_conn *c = s->conn;
+	hw_worker *w = c->w;
+	const hw_server_config *cfg = &w->server->cfg;
 	if (s->state == STREAM_CLOSED) return;
+
+	if (w->batch_n > 0 && w->batch_stream != s) {
+		stream_batch_flush(w);
+		if (c->closing) return;
+	}
+	if (s->type == HW_STREAM_TCP && s->state == STREAM_OPEN && hw_buf_avail(&s->out) == 0) {
+		// The common case: an idle socket. Consecutive packets for it go out in one write.
+		w->batch_stream = s;
+		w->batch_iov[w->batch_n].iov_base = (void *)(uintptr_t)data;
+		w->batch_iov[w->batch_n].iov_len = len;
+		w->batch_pkts += final;
+		if (++w->batch_n == HW_BATCH_MAX) stream_batch_flush(w);
+		return;
+	}
 
 	int queued = hw_buf_avail(&s->out) > 0 || s->state != STREAM_OPEN;
 	if (!queued) {
@@ -539,12 +653,13 @@ void stream_on_data(hw_stream *s, const uint8_t *data, size_t len) {
 			stream_close(s, HW_CLOSE_UNKNOWN, 1);
 			return;
 		}
+		conn_queue_add(c, s->type == HW_STREAM_UDP ? len + 4 : len);
 		if (s->state == STREAM_OPEN) stream_update_events(s);
 	}
 
 	// Flow control: one CONTINUE per window of packets, held back while the remote is slow.
-	if (s->type != HW_STREAM_UDP && --s->remaining == 0) {
-		s->remaining = c->w->server->window;
+	if (s->type != HW_STREAM_UDP && final && --s->remaining == 0) {
+		s->remaining = conn_window(c);
 		if (hw_buf_avail(&s->out) == 0) {
 			conn_send_continue(c, s->id, s->remaining);
 		} else {
@@ -555,8 +670,54 @@ void stream_on_data(hw_stream *s, const uint8_t *data, size_t len) {
 
 // ---------------------------------------------------------------------------------- remote -> client
 
+// Two ways to move remote bytes to the client. Copying (recv into scratch, frame into wbuf) costs
+// two syscalls and one copy per read and suits small or sporadic reads. Splicing through the
+// worker's pipe costs three syscalls and no copy, which only pays off when every read is large,
+// so a stream switches to it after a full read and back after a small one.
+#define STREAM_BULK_ON     HW_READ_CHUNK
+#define STREAM_BULK_OFF    (16 * 1024)
+#define STREAM_BULK_MISSES 16
+
 static void stream_read(hw_stream *s) {
 	hw_conn *c = s->conn;
+	if (s->type == HW_STREAM_TCP && s->bulk) {
+		int copy = 0; // finish this event on the copying path
+		for (int i = 0; i < STREAM_MAX_READS_PER_EVENT && s->read_armed && !copy; i++) {
+			ssize_t n = conn_splice_data(c, s);
+			if (n == -3) {
+				// The previous payload is still in the pipe, so the client is not keeping up.
+				// The bytes stay in the kernel until the queue has written it.
+				stream_park(s);
+				return;
+			}
+			if (n == -2) { // no pipe to be had: copy
+				copy = 1;
+				break;
+			}
+			if (c->closing) return;
+			if (n == 0) {
+				stream_close(s, HW_CLOSE_VOLUNTARY, 1);
+				return;
+			}
+			if (n < 0) {
+				if (errno == EINTR) continue;
+				if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+				stream_close(s, map_errno(errno), 1);
+				return;
+			}
+			// One small splice does not end bulk mode: right after a switch the remote's data is
+			// still arriving in pieces, and leaving on the first of them would flap between the
+			// two paths for the rest of the transfer. A run of them does.
+			if ((size_t)n >= STREAM_BULK_OFF) {
+				s->bulk_miss = 0;
+			} else if (++s->bulk_miss >= STREAM_BULK_MISSES) {
+				s->bulk = 0;
+				s->bulk_miss = 0;
+			}
+			if ((size_t)n < HW_READ_CHUNK) return; // drained
+		}
+		if (!copy || !s->read_armed) return;
+	}
 	uint8_t *scratch = c->w->scratch;
 	for (int i = 0; i < STREAM_MAX_READS_PER_EVENT && s->read_armed; i++) {
 		ssize_t n = stream_recv(s, scratch, HW_READ_CHUNK);
@@ -581,6 +742,7 @@ static void stream_read(hw_stream *s) {
 		}
 		conn_send_data(c, s->id, scratch, (size_t)n);
 		if (c->closing) return;
+		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP) s->bulk = 1;
 		if ((size_t)n < HW_READ_CHUNK && s->type != HW_STREAM_UDP) return; // drained
 	}
 }

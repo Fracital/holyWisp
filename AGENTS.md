@@ -9,9 +9,10 @@ for how the C is written; this one is about how the repository is worked on.
 holyWisp is a [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) server written in C11 with
 no dependencies beyond libc and pthreads. It accepts WebSocket connections, speaks Wisp v1 and v2,
 and relays TCP and UDP streams to the hosts its clients ask for. It is built for throughput: one
-epoll loop per worker thread, `SO_REUSEPORT` listeners so the kernel load-balances accepts, a
-single copy per direction on the data path, and flow control that is tied to whether the remote is
-actually draining.
+epoll loop per worker thread, `SO_REUSEPORT` listeners so the kernel load-balances accepts, at most
+one copy per direction on the data path (none toward the client for a bulk TCP stream, which goes
+remote socket to its own pipe to client socket with `splice`), and flow control that is tied to whether the
+remote is actually draining.
 
 It ships three things from one tree:
 
@@ -109,10 +110,18 @@ every test still passes, so each item has a test and a change to it needs a reas
   extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
   the advertised window each time it hits zero. That window is `buffer-remaining` capped so a full
-  window of `max-message-size` packets fits in half of `stream-queue-max` (`server_ingress_window`
-  in `src/server/server.c`): a client at full window speed into a stalled remote is slowed, never
+  window of `max-message-size` packets fits in `stream-queue-max` (`server_ingress_window` in
+  `src/server/server.c`): a client at full window speed into a stalled remote is slowed, never
   closed `0x49`. The CONTINUE for a spent window is *held* while bytes toward the remote are still
-  queued (`continue_due` in `src/server/stream.c`). UDP streams are never counted. Toward the
+  queued (`continue_due` in `src/server/stream.c`), which is why the whole queue, not half of it,
+  is the budget: it never holds more than one window. Across a connection, `conn-queue-max` bounds
+  the sum of those queues; past it the client's reads pause (`conn_queue_add`) and resume at half
+  the mark. Nothing is closed for staying inside its window. The value a *refill* CONTINUE carries
+  is dynamic (`conn_window`): the connection's in-flight budget (`ws-write-high-water`) shared by
+  its live streams in packets of the size that client actually sends, clamped to [4, the advertised
+  maximum], so one stream gets the whole window and ten streams do not make the server buffer ten
+  windows. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
+  never counted. Toward the
   client, one remote read is split into as many DATA packets as `max-message-size` requires
   (`conn_send_data`); no frame ever exceeds the negotiated size.
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
@@ -207,9 +216,38 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 - **fd generations.** The loop delivers an event only when the fd's generation matches the one it
   was registered with, so a close-and-reuse inside a dispatch batch is safe. Do not cache fds
   across callbacks.
-- **Backpressure.** When a client's send queue passes `ws-write-high-water`, every stream on that
-  connection stops reading from its remote (`stream_pause`), and resumes at a quarter of the mark.
-  Toward a slow remote, bytes queue in `s->out` up to `stream-queue-max`, then the stream closes
+- **Relay pipes.** A TCP stream whose remote delivers full reads (`s->bulk`) gets its own pipe
+  (`hw_spipe`, opened on first use) and relays remote to client through it without a copy
+  (`conn_splice_data`): the frame header is appended to `wbuf`, the payload is spliced into the
+  pipe, and a mark (`hw_pipe_mark`) records "after this many queue bytes, splice n from this
+  pipe". `conn_flush` sends `wbuf` up to the head mark (with `MSG_MORE`), empties that pipe into
+  the socket, and goes on, so frames never interleave and any number of streams can have a
+  payload queued at once. A stream may not refill its pipe while its previous payload is still in
+  it: it parks (`stream_park`) and `mark_pop` unparks it; it never copies behind its own pipe. A
+  stream that closes with a payload queued leaves its pipe to the queue (`conn_pipe_drop`), which
+  frees it when the payload is out or the connection closes (`marks_free`). The kernel charges
+  pipe memory per user and, past `fs.pipe-user-pages-soft`, hands out 8 KiB pipes that make
+  every splice tiny: a pipe under 256 KiB is refused and that stream copies, and the worker waits
+  before asking again. A pipe costs two descriptors per bulk stream. A bulk stream stays bulk
+  through isolated small splices (`bulk_miss`); it takes a run of them to leave. Small reads, UDP
+  and PTY streams never use a pipe: three syscalls for a tiny frame cost more than one copy.
+- **The ingress batch.** DATA for an idle TCP stream is not written packet by packet.
+  `stream_on_data` records a pointer into the connection's read buffer in the worker's batch
+  (`batch_iov`, one stream at a time) and `stream_batch_flush` sends up to `HW_BATCH_MAX` payloads
+  with one `sendmsg`, queues what the socket did not take and then counts the packets against the
+  window. The pointers are only valid while the read buffer does not move, so `conn.c` flushes
+  before `hw_buf_reserve`, before any non-DATA packet (a CLOSE must not overtake its stream's
+  data), before reusing the fragment buffer and before `ws_process` returns; `hw_buf_consume`
+  never moves or reallocates. `stream_close` drops a batch that belongs to the stream it frees.
+  A DATA frame of 128 KiB or more that is still arriving is not reassembled: `ws_frames` reads its
+  Wisp header, then unmasks and forwards each piece as it comes (`pt_left`, `stream_on_data_part`),
+  and only the last piece counts as a packet against the window. If the stream closes mid-frame
+  the rest of the frame is read and dropped.
+- **Backpressure.** When a client's send queue (`wbuf` plus the payloads queued in pipes) passes
+  `ws-write-high-water`, every stream on that connection stops reading from its remote
+  (`stream_pause`), and resumes at a quarter of the mark.
+  Toward a slow remote, bytes queue in `s->out` up to `stream-queue-max` (and `conn-queue-max`
+  across the connection, which pauses the client's reads instead), then the stream closes
   `0x49`. Both limits are configuration; neither may become unbounded.
 - The resolver owns `hw_resolve_req` from `hw_resolve()` until its delivery task runs or
   `hw_resolver_free` drops it. Cancellation is a flag read on the loop thread. Do not free a
