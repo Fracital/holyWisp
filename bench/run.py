@@ -30,6 +30,7 @@ SRC = ROOT.parent
 BENCH_BIN = ROOT / "build" / "bench"
 WISP_PORT = 16401
 ECHO_PORT = 16402
+ECHO_PORTS = 8  # the echo service listens on this many consecutive ports (see the churn scenario)
 
 # ------------------------------------------------------------------------------------- servers
 # Every server gets its "speed" profile: loopback + literal-IP egress allowed (the echo is at
@@ -112,8 +113,13 @@ SCENARIOS = {
     "native-16x4": {"label": "native, 16 conns x 4 streams", "kind": "tp", "group": "native",
                     "client": pump("tp", 16, streams=4)},
     "rtt-64": {"label": "round trip, 64 B", "kind": "rtt", "group": "latency", "client": pump("rtt", 1, chunk=64)},
+    # Each connection churns against its own echo port. Against a single one every server tops out
+    # near the same 15-18 thousand streams a second with almost all of its CPU time inside
+    # connect(): the kernel is hunting for a free local port to that one destination, and the row
+    # says nothing about the server (measured: 15.6k/s and 380 us of CPU per stream against one
+    # port, 80k/s and 49 us against eight, same binary).
     "churn-8x32": {"label": "stream churn, 8 conns x 32 in flight", "kind": "churn", "group": "churn",
-                   "client": pump("churn", 8, inflight=32)},
+                   "client": {**pump("churn", 8, inflight=32), "spread_ports": True}},
 }
 
 
@@ -207,7 +213,7 @@ class Echo:
     """The counting echo service; keeps the latest (ts_ns, bytes, conns) line it printed."""
 
     def __init__(self):
-        self.p = subprocess.Popen([str(BENCH_BIN / "echo"), str(ECHO_PORT)], stdout=subprocess.PIPE, text=True,
+        self.p = subprocess.Popen([str(BENCH_BIN / "echo"), str(ECHO_PORT), str(ECHO_PORTS)], stdout=subprocess.PIPE, text=True,
                                   start_new_session=True)
         self.latest = (0, 0, 0)
         self.lock = threading.Lock()
@@ -313,7 +319,10 @@ def run_once(server_key, scen_key, duration, echo, log_dir):
             cpu0 = proc_cpu_seconds(sp.pid)
             t0 = time.monotonic()
             for i in range(client["procs"]):
-                clients.append(subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                pcmd = list(cmd)
+                if client.get("spread_ports"):
+                    pcmd[pcmd.index(str(ECHO_PORT))] = str(ECHO_PORT + i % ECHO_PORTS)
+                clients.append(subprocess.Popen(pcmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                                 start_new_session=True))
             outs = [c.communicate(timeout=duration + 30) for c in clients]
             el = time.monotonic() - t0
@@ -447,6 +456,23 @@ def versions():
     return v
 
 
+def run_order(servers, rep):
+    """The order the servers run in for one repeat.
+
+    The slot a server runs in is not neutral: the first run of a scenario inherits whatever the
+    previous scenario left the host in (measured on a 16-vCPU VM: the first slot after a light
+    scenario is 6-10% slower for 8 connections, the first slot after a saturating one has 40% lower
+    round-trip latency). So the order rotates by one each repeat, and reverses after every full
+    rotation so a server does not always follow the same neighbour. Every server takes every slot
+    equally often when the repeat count is a multiple of the server count; twice that also
+    balances the neighbours.
+    """
+    n = len(servers)
+    base = servers if (rep // n) % 2 == 0 else list(reversed(servers))
+    k = rep % n
+    return base[k:] + base[:k]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--duration", type=int, default=10)
@@ -485,11 +511,12 @@ def main():
         servers_all = servers
     try:
         for rep in range(a.repeats):
-            order = servers if rep % 2 == 0 else list(reversed(servers))  # alternate to spread drift
+            order = run_order(servers, rep)
             for scen in scenarios:
-                for sv in order:
+                for slot, sv in enumerate(order):
                     r = run_once(sv, scen, a.duration, echo, log_dir)
                     r["repeat"] = rep
+                    r["slot"] = slot
                     runs.append(r)
                     msg = (f"{r['mib_s']:8.0f} MiB/s  {r['server_cpu_cores']:.2f} cores" if r["ok"] and r["kind"] == "tp"
                            else f"p50 {r['p50_us']} us p99 {r['p99_us']} us" if r["ok"] and r["kind"] == "rtt"

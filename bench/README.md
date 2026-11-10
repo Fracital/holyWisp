@@ -27,7 +27,7 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
 
 | File | Purpose |
 | --- | --- |
-| `echo.c` | The counting echo service. One thread per connection; prints `ns bytes conns` every 100 ms. |
+| `echo.c` | The counting echo service. One thread per connection; prints `ns bytes conns` every 100 ms. It listens on eight consecutive ports, which only the churn scenario uses (see below). |
 | `pump.c` | The native load generator, built on `libholywisp-client`. `tp` keeps N streams full while respecting CONTINUE, `rtt` measures latency with one message in flight, `churn` opens a stream, echoes one byte and closes it, over and over. Prints one JSON line when it finishes. |
 | `run.py` | Starts servers and clients, takes the measurements, and writes `results.json`, `runs.jsonl`, `results.csv` and `results.md`. |
 | `charts.py` | Reads a results directory and produces `charts/*.svg` (add `--png` for PNGs too) and `report.html`. |
@@ -56,14 +56,31 @@ and run `npm install` in `client/js`.
 
 ```sh
 make bench                                  # release build plus build/bench/{echo,pump}
-python3 -I bench/run.py --duration 10 --repeats 3 --out bench/results/full
+python3 -I bench/run.py --duration 10 --repeats 8 --out bench/results/full
 python3 -I bench/charts.py bench/results/full --png
 ```
+
+Within a scenario the servers run one after another, and the order rotates by one each repeat
+(reversing after every full rotation). That matters more than it sounds: the first run of a
+scenario inherits the state the previous scenario left the host in. On the 16-vCPU VM the
+published numbers come from, the server that ran first after a light scenario was 6 to 10% slower
+with 8 connections for most of its window, and the one that ran first after the saturating
+16-connection scenario measured a 47 us median round trip against 75 to 87 us for the same server
+one slot later. So use a repeat count that is a multiple of the number of servers (4 gives every
+server every slot once, 8 also balances which server it follows); with any other count the
+medians favour or penalise whoever held the first slot more often.
 
 Use `--only holywisp,wispurr-cpp` or `--scenarios native-10,rtt-64` to run part of the matrix,
 and `--replace` with `--only` to re-measure one server and splice it into an existing results
 directory. The exact command line for every server and scenario is stored in `results.json`
 under `meta`.
+
+The churn scenario gives each of its eight connections its own echo port. Against a single port
+every server measured the same 15 to 18 thousand streams a second, Python included, with nearly
+all of the server's CPU time inside `connect()`: a server that dials one address and port that
+often leaves the kernel hunting for a free local port to that destination, and the row measured
+the hunt. On the desktop the same holyWisp binary did 15,600 streams/s at 380 us of CPU per
+stream against one port and 80,300 at 49 us against eight.
 
 ## Reading the results
 

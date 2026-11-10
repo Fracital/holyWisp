@@ -6,7 +6,12 @@
  * number of bytes that crossed the echo port in a window, independent of which client produced
  * them (the same idea as wispmark's iftop counter, without needing root).
  *
- *   echo PORT
+ *   echo PORT [COUNT]
+ *
+ * With COUNT it listens on PORT .. PORT+COUNT-1 and counts them together. The churn scenario needs
+ * that: a server that dials one address and port tens of thousands of times a second runs the
+ * kernel out of local ports for that destination, and the test then measures connect()'s search
+ * for a free one instead of the server.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -72,30 +77,15 @@ static void *reporter(void *arg) {
 	return NULL;
 }
 
-int main(int argc, char **argv) {
-	if (argc < 2) {
-		fprintf(stderr, "usage: echo PORT\n");
-		return 2;
-	}
-	signal(SIGPIPE, SIG_IGN);
-	int ls = socket(AF_INET, SOCK_STREAM, 0);
+static void *acceptor(void *arg) {
+	int ls = (int)(intptr_t)arg;
 	int one = 1;
-	setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
-	struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)atoi(argv[1]))};
-	sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-	if (bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 4096) != 0) {
-		perror("bind/listen");
-		return 1;
-	}
-	pthread_t rt;
-	pthread_create(&rt, NULL, reporter, NULL);
-	pthread_detach(rt);
 	for (;;) {
 		int fd = accept4(ls, NULL, NULL, SOCK_CLOEXEC);
 		if (fd < 0) {
 			if (errno == EINTR) continue;
 			perror("accept");
-			return 1;
+			exit(1);
 		}
 		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 		atomic_fetch_add_explicit(&g_conns, 1, memory_order_relaxed);
@@ -107,4 +97,46 @@ int main(int argc, char **argv) {
 		if (pthread_create(&t, &at, serve, (void *)(intptr_t)fd) != 0) close(fd);
 		pthread_attr_destroy(&at);
 	}
+	return NULL;
+}
+
+int main(int argc, char **argv) {
+	if (argc < 2) {
+		fprintf(stderr, "usage: echo PORT [COUNT]\n");
+		return 2;
+	}
+	int port = atoi(argv[1]);
+	int count = argc > 2 ? atoi(argv[2]) : 1;
+	if (count < 1 || port < 1 || port + count > 65536) {
+		fprintf(stderr, "echo: bad port range\n");
+		return 2;
+	}
+	signal(SIGPIPE, SIG_IGN);
+	pthread_t rt;
+	pthread_create(&rt, NULL, reporter, NULL);
+	pthread_detach(rt);
+	int last = -1;
+	for (int i = 0; i < count; i++) {
+		int ls = socket(AF_INET, SOCK_STREAM, 0);
+		int one = 1;
+		setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+		struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)(port + i))};
+		sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+		if (ls < 0 || bind(ls, (struct sockaddr *)&sa, sizeof sa) != 0 || listen(ls, 4096) != 0) {
+			perror("bind/listen");
+			return 1;
+		}
+		if (i + 1 < count) {
+			pthread_t t;
+			if (pthread_create(&t, NULL, acceptor, (void *)(intptr_t)ls) != 0) {
+				perror("pthread_create");
+				return 1;
+			}
+			pthread_detach(t);
+		} else {
+			last = ls;
+		}
+	}
+	acceptor((void *)(intptr_t)last);
+	return 0;
 }

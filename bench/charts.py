@@ -471,6 +471,8 @@ def report_html(meta, summary, runs, servers, labels, scen, charts):
             dnfs.setdefault(r["server"], {}).setdefault(r["scenario"], []).append(r.get("error", "?"))
 
     v = meta.get("versions", {})
+    order_note = ("rotated by one each repeat so every server takes every slot" if any("slot" in r for r in runs)
+                  else "reversed on alternate repeats")
     setup = f"""
 <dl class="setup">
 <dt>Host</dt><dd>{esc(meta['cpu'])}, Linux {esc(v.get('kernel', ''))}</dd>
@@ -478,13 +480,13 @@ def report_html(meta, summary, runs, servers, labels, scen, charts):
 through Wisp streams to the echo port, and the figure we report is how many bytes per second crossed that port in
 one direction, counted by the echo service itself (wispmark reads the same figure from iftop). Every cell is the
 median of {meta['repeats']} runs of {meta['duration']} s, each after a 1.5 s warm-up, with the server order
-reversed on alternate repeats. CPU time and peak RSS are read from /proc for the server process over the same
+{order_note}. CPU time and peak RSS are read from /proc for the server process over the same
 window.</dd>
 <dt>Servers</dt><dd>holyWisp {esc(v.get('holywisp', ''))} ({esc(v.get('holywisp_git', ''))}, release build, {esc(v.get('gcc', '').split(' ')[0])});
 wispurr Go {esc(v.get('wispurr_go_git', ''))} ({esc(v.get('go', ''))}); wispurr C++23 built with {esc(v.get('gcc', ''))};
 wisp-server-python {esc(v.get('wisp_python_git', ''))} on {esc(v.get('python', ''))}, default thread count.
 All run with flood protection, reputation and per-IP connection limits off, loopback and literal-IP egress
-allowed, error-level logging, default worker count. The host was not idle during the run (a desktop session was using several cores), so compare servers within a row, not numbers across runs.</dd>
+allowed, error-level logging, default worker count. Compare servers within a row, not numbers across runs or hosts.</dd>
 <dt>Clients</dt><dd>wisp-js {esc(v.get('wisp-js', ''))} on Node {esc(v.get('node', ''))}, which is the client wispmark uses (50 KiB payloads),
 and the native pump from this repository, built on libholywisp-client (64 KiB packets unless stated, and it
 respects the server's CONTINUE window).</dd>
