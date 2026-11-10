@@ -10,6 +10,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <unistd.h>
 
 #include <netinet/in.h>
@@ -127,6 +130,74 @@ static void test_listen_more(void) {
 	CHECK(late >= 0, "connect after the first listener closed");
 	close(late);
 	close(second);
+}
+
+// The server's workers: one thread per listener, each accepting when its own is readable.
+enum {
+	SHARE_THREADS = 4,
+	SHARE_CONNS = 200
+};
+
+static struct {
+	int fds[SHARE_THREADS];
+	_Atomic int accepted;
+	_Atomic int exited;
+	_Atomic int done;
+} g_share;
+
+static void *share_main(void *arg) {
+	int fd = g_share.fds[(int)(intptr_t)arg];
+	while (!atomic_load(&g_share.done)) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, 20) <= 0) continue;
+		struct sockaddr_storage ss;
+		socklen_t sl = sizeof(ss);
+		int c = hw_sys_accept(fd, (struct sockaddr *)&ss, &sl);
+		if (c < 0) continue;
+		close(c);
+		atomic_fetch_add(&g_share.accepted, 1);
+	}
+	atomic_fetch_add(&g_share.exited, 1);
+	return NULL;
+}
+
+static int share_wait(_Atomic int *counter, int want, int timeout_ms) {
+	for (int waited = 0; atomic_load(counter) < want && waited < timeout_ms; waited += 5) usleep(5000);
+	return atomic_load(counter);
+}
+
+// Where the listeners are one socket, every thread is woken for a connection only one of them
+// gets. The rest must be told there is nothing, at once: a thread that waits in accept for the
+// next connection is deaf to everything else its loop watches.
+static void test_shared_accept_never_blocks(void) {
+	uint16_t port = 0;
+	g_share.fds[0] = hw_listen_tcp("127.0.0.1", 0, 1, 64, &port);
+	CHECK(g_share.fds[0] >= 0, "first listener");
+	for (int i = 1; i < SHARE_THREADS; i++) {
+		g_share.fds[i] = hw_sys_listen_more(g_share.fds[0], "127.0.0.1", port, 64);
+		CHECK(g_share.fds[i] >= 0, "listener %d", i);
+	}
+	atomic_store(&g_share.accepted, 0);
+	atomic_store(&g_share.exited, 0);
+	atomic_store(&g_share.done, 0);
+	pthread_t threads[SHARE_THREADS];
+	for (int i = 0; i < SHARE_THREADS; i++) {
+		CHECK_EQ(pthread_create(&threads[i], NULL, share_main, (void *)(intptr_t)i), 0);
+	}
+	for (int i = 0; i < SHARE_CONNS; i++) {
+		int c = hw_connect_tcp("127.0.0.1", port, 10000);
+		CHECK(c >= 0, "connect %d", i);
+		close(c);
+	}
+	CHECK_EQ(share_wait(&g_share.accepted, SHARE_CONNS, 10000), SHARE_CONNS);
+	// Nothing is left to accept, so every thread is back in its poll and sees the flag.
+	atomic_store(&g_share.done, 1);
+	int exited = share_wait(&g_share.exited, SHARE_THREADS, 3000);
+	CHECK(exited == SHARE_THREADS, "%d of %d threads are still inside accept", SHARE_THREADS - exited, SHARE_THREADS);
+	for (int i = 0; i < SHARE_THREADS; i++) {
+		pthread_join(threads[i], NULL);
+		close(g_share.fds[i]);
+	}
 }
 
 static void test_relay_pipe(void) {
@@ -267,6 +338,7 @@ int main(void) {
 	RUN(test_accept_flags_and_no_sigpipe);
 	RUN(test_keepalive);
 	RUN(test_listen_more);
+	RUN(test_shared_accept_never_blocks);
 	RUN(test_relay_pipe);
 	RUN(test_crypt);
 	RUN(test_pty);

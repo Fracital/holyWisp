@@ -144,7 +144,9 @@ typedef struct slot {
 	uint32_t sndbuf;  // SO_SNDBUF of a stream socket once it has been asked for; 0 before
 	uint8_t kind;
 	uint8_t nonblock;
-	uint8_t stream; // SOCK_STREAM
+	uint8_t stream;        // SOCK_STREAM
+	int listener;          // index of the slot whose `accepting` this socket's accepts take: see hw_w32_accept
+	_Atomic int accepting; // a non-blocking accept is in progress
 } slot;
 
 #define CHUNK_BITS 10
@@ -188,6 +190,8 @@ static int fd_new(uintptr_t handle, uint8_t kind, int nonblock) {
 	s->sndbuf = 0;
 	s->nonblock = nonblock ? 1 : 0;
 	s->stream = 0;
+	s->listener = index;
+	atomic_store(&s->accepting, 0);
 	s->kind = kind;
 	ReleaseSRWLockExclusive(&g_lock);
 	return index + HW_W32_FD_BASE;
@@ -274,11 +278,35 @@ int hw_w32_socket(int domain, int type, int protocol) {
 	return hw_w32_adopt(s, 0);
 }
 
+// Non-blocking accepts on one socket go one at a time. Threads that share a listening socket (the
+// server's workers do, each through a descriptor of its own) are all woken for one connection, and
+// on Windows Server 2025 a server with four of them was seen to stop answering afterwards: a
+// worker that lost the connection sat in accept, non-blocking socket or not, until the next one
+// came. Winsock looks for a connection and then takes it, and the look is stale once another
+// thread has taken it. A thread that finds an accept in progress is told to try again, which is
+// the truth: readiness is a level, and it will be asked.
+void hw_w32_same_socket(int fd, int of) {
+	slot *s = fd_slot(fd, SLOT_SOCKET);
+	const slot *o = fd_slot(of, SLOT_SOCKET);
+	if (s && o) s->listener = o->listener;
+}
+
 int hw_w32_accept(int fd, struct sockaddr *addr, socklen_t *len) {
 	slot *ls = fd_slot(fd, SLOT_SOCKET);
 	if (!ls) return -1;
+	_Atomic int *accepting = &slot_at(ls->listener)->accepting;
+	int alone = ls->nonblock;
+	if (alone && atomic_exchange(accepting, 1)) {
+		errno = EAGAIN;
+		return -1;
+	}
 	SOCKET s = accept((SOCKET)ls->handle, addr, len);
-	if (s == INVALID_SOCKET) return hw_w32_fail();
+	int err = s == INVALID_SOCKET ? WSAGetLastError() : 0;
+	if (alone) atomic_store(accepting, 0);
+	if (s == INVALID_SOCKET) {
+		errno = hw_w32_error(err);
+		return -1;
+	}
 	socket_defaults(s, SOCK_STREAM);
 	// An accepted socket has its listener's blocking mode.
 	return hw_w32_adopt(s, ls->nonblock);

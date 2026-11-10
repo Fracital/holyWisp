@@ -262,7 +262,8 @@ static void accept_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 static void *worker_main(void *arg) {
 	hw_worker *w = arg;
 	HW_DEBUG("worker", "worker %d running", w->index);
-	hw_loop_run(w->loop);
+	// A loop that gives up takes its connections with it; never silently.
+	if (hw_loop_run(w->loop) != 0) HW_ERROR("worker", "worker %d: event loop failed: %s", w->index, strerror(errno));
 	HW_DEBUG("worker", "worker %d stopped", w->index);
 	return NULL;
 }

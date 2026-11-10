@@ -22,6 +22,7 @@ jobs:
   test:
     name: ${{ matrix.cc }} / ${{ matrix.build }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +54,7 @@ jobs:
   tidy:
     name: clang-tidy
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -77,6 +79,7 @@ jobs:
   macos:
     name: macOS / ${{ matrix.build }}
     runs-on: macos-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -113,6 +116,7 @@ jobs:
   windows-build:
     name: Windows / cross build
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -151,6 +155,7 @@ jobs:
     name: Windows / tests
     needs: windows-build
     runs-on: windows-latest
+    timeout-minutes: 15
     defaults:
       run:
         shell: bash
@@ -178,17 +183,38 @@ jobs:
       - name: Smoke the binary
         if: ${{ !cancelled() }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           build/win/holywisp.exe --version
-          # It stops when its stdin closes: that is how the Node wrapper ends it on Windows.
-          (sleep 5 | build/win/holywisp.exe --port 6177 --host 127.0.0.1 --stop-on-stdin-eof) &
-          sleep 2
-          curl -fsS http://127.0.0.1:6177/health
-          wait
+          # It stops when its stdin closes: that is how the Node wrapper ends it on Windows. Several
+          # times, with one worker and with four (which share a listening socket here), and never
+          # waiting for ever: a server that does not stop is shown, thread by thread, and killed.
+          bad=0
+          i=0
+          for workers in 4 1 4 4 1 4; do
+            i=$((i + 1))
+            port=$((6176 + i))
+            (sleep 4 | build/win/holywisp.exe --port $port --host 127.0.0.1 --workers $workers \
+              --stop-on-stdin-eof --log-level debug) > smoke-$i.log 2>&1 &
+            pid=$!
+            sleep 2
+            curl -fsS -m 5 http://127.0.0.1:$port/health || { echo "run $i: no answer from /health"; bad=1; }
+            echo
+            for _ in $(seq 1 15); do kill -0 $pid 2>/dev/null || break; sleep 1; done
+            if kill -0 $pid 2>/dev/null; then
+              echo "run $i ($workers workers): the server did not stop"
+              bad=1
+              powershell -NoProfile -Command '(Get-Process holywisp).Threads | Format-Table Id,ThreadState,WaitReason,TotalProcessorTime'
+              cat smoke-$i.log
+              taskkill //F //IM holywisp.exe
+            fi
+            wait $pid || { echo "run $i ($workers workers): exit status $?"; bad=1; cat smoke-$i.log; }
+          done
+          exit $bad
 
   node:
     name: Node wrapper
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
 
@@ -235,6 +261,7 @@ jobs:
     name: npm package on ${{ matrix.name }}
     needs: node
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
     container: ${{ matrix.container }}
     defaults:
       run:

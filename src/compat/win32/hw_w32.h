@@ -26,6 +26,9 @@ typedef struct hw_w32_obj {
 // A descriptor for a socket, which is made non-inheritable, and closed if no descriptor can be had.
 // -1 with errno.
 int hw_w32_adopt(SOCKET s, int nonblock);
+// `fd` is a second descriptor of the socket that `of` is a descriptor of (WSADuplicateSocket), so
+// accepts through the two must not overlap: see hw_w32_accept.
+void hw_w32_same_socket(int fd, int of);
 // The socket behind a descriptor; INVALID_SOCKET with errno EBADF if it is not one.
 SOCKET hw_w32_sock(int fd);
 // A descriptor for an object, and the object behind one (NULL with errno EBADF).

@@ -69,7 +69,9 @@ int hw_sys_listen_more(int first, const char *host, uint16_t port, int backlog) 
 	                        WSA_FLAG_OVERLAPPED | WSA_FLAG_NO_HANDLE_INHERIT);
 	if (dup == INVALID_SOCKET) return hw_w32_fail();
 	// Blocking or not is a property of the socket, not of the handle: it is what `first` is.
-	return hw_w32_adopt(dup, (fcntl(first, F_GETFL, 0) & O_NONBLOCK) != 0);
+	int fd = hw_w32_adopt(dup, (fcntl(first, F_GETFL, 0) & O_NONBLOCK) != 0);
+	if (fd >= 0) hw_w32_same_socket(fd, first);
+	return fd;
 }
 
 int hw_sys_relay_pipe(int fds[2], size_t want, size_t min, size_t *size) {
