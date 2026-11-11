@@ -13,6 +13,13 @@ name: Release
 #   https://github.com/<owner>/<repo>/releases/download/latest/holywisp-linux-x64.tar.gz
 # always points at the newest master build. `latest` only moves forward: a run for a commit that is
 # an ancestor of the published one builds but does not publish.
+#
+# A dispatch is for master only: from any other branch it would put that branch's build under
+# `latest` (the `meta` job refuses it, and every other job waits for `meta`).
+#
+# The actions are pinned to commits, the same ones as nightly.yml: a tag can be moved to other
+# code, and the last job here publishes to npm under this workflow's identity. Bump them in both
+# files together.
 on:
   push:
     branches: [master]
@@ -36,9 +43,21 @@ jobs:
       commit12: ${{ steps.meta.outputs.commit12 }}
       build_time: ${{ steps.meta.outputs.build_time }}
     steps:
-      - uses: actions/checkout@v5
+      # A push only starts this for master or a v* tag (`on:` above); a dispatch can name any ref.
+      - name: Only master is released by hand
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] && [ "$REF" != refs/heads/master ]; then
+            echo "::error::a dispatched release is built from master, not $REF"
+            exit 1
+          fi
+
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Version metadata
         id: meta
@@ -72,7 +91,9 @@ jobs:
           - platform: linux-arm64
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
       - name: Install toolchain
         run: |
@@ -82,7 +103,24 @@ jobs:
       - name: Build (Release)
         env:
           HW_DESCRIBE: ${{ needs.meta.outputs.describe }}
-        run: make release CMAKE_FLAGS="-DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX=+${{ needs.meta.outputs.commit12 }}"
+          COMMIT12: ${{ needs.meta.outputs.commit12 }}
+        run: make release CMAKE_FLAGS="-DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX=+$COMMIT12"
+
+      # What CMakeLists.txt's hardening block promises of a release binary: position-independent,
+      # relocations bound at start, a stack canary and glibc's checked calls.
+      - name: Exploit mitigations are in the binary
+        run: |
+          set -euo pipefail
+          # Into a file first: a grep that stops at its first match would end readelf with
+          # SIGPIPE, which `pipefail` reports as a failure.
+          for bin in build/release/holywisp build/release/holywisp-client; do
+            readelf -h -lW -d -sW "$bin" > readelf.txt
+            grep -E 'Type:[[:space:]]+DYN' readelf.txt
+            grep -E 'GNU_RELRO' readelf.txt
+            grep -E 'BIND_NOW' readelf.txt
+            grep -E -m1 '__stack_chk_fail' readelf.txt
+            grep -E -m1 '__[a-z]+_chk@' readelf.txt
+          done
 
       - name: Smoke test
         run: |
@@ -104,7 +142,7 @@ jobs:
           rm -r "$stage"
           ls -l out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: holywisp-${{ matrix.platform }}
           path: out/*.tar.gz
@@ -113,13 +151,16 @@ jobs:
 
   deb:
     name: Debian package
+    needs: meta
     runs-on: ubuntu-latest
     container: debian:12
     defaults:
       run:
         shell: bash # debian:12's /bin/sh is dash, which lacks `set -o pipefail`
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Install build tools
         run: |
           apt-get update
@@ -135,9 +176,16 @@ jobs:
           # The isolated user exists and cannot log in.
           getent passwd wisp
           test "$(getent passwd wisp | cut -d: -f7)" = /usr/sbin/nologin
-          # The config is not world-readable.
-          test "$(stat -c '%a' /etc/holywisp/holywisp.conf)" = 640
-      - uses: actions/upload-artifact@v4
+          # The config is not world-readable, and it and its directory are root's: the service
+          # user reads them through its group and can change neither.
+          test "$(stat -c '%a %U:%G' /etc/holywisp/holywisp.conf)" = "640 root:wisp"
+          test "$(stat -c '%a %U:%G' /etc/holywisp)" = "750 root:wisp"
+          # Built with the distribution's flags (dpkg-buildflags) on top of the project's own.
+          readelf -h -d -sW /usr/bin/holywisp > readelf.txt
+          grep -E 'Type:[[:space:]]+DYN' readelf.txt
+          grep -E 'BIND_NOW' readelf.txt
+          grep -E -m1 '__stack_chk_fail' readelf.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: holywisp-deb
           path: build/packages/*.deb
@@ -146,13 +194,16 @@ jobs:
 
   rpm:
     name: Fedora package
+    needs: meta
     runs-on: ubuntu-latest
     container: fedora:41
     defaults:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: Install build tools
         run: dnf install -y gcc cmake ninja-build libxcrypt-devel rpm-build systemd-rpm-macros git
       - name: Build .rpm
@@ -163,13 +214,16 @@ jobs:
           dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-*.rpm
           holywisp --version
           getent passwd wisp
+          # As in the .deb: root owns the config and its directory, the service user only reads.
+          test "$(stat -c '%a %U:%G' /etc/holywisp/holywisp.conf)" = "640 root:wisp"
+          test "$(stat -c '%a %U:%G' /etc/holywisp)" = "750 root:wisp"
           # The unit is well-formed and heavily sandboxed.
           systemd-analyze verify /usr/lib/systemd/system/holywisp.service || true
       - name: Collect rpm
         run: |
           mkdir -p out
           cp build/packages/rpmbuild/RPMS/*/holywisp-*.rpm out/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: holywisp-rpm
           path: out/*.rpm
@@ -178,10 +232,15 @@ jobs:
 
   npm:
     name: npm package
+    needs: meta
     runs-on: ubuntu-latest
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "24"
           package-manager-cache: false
@@ -206,7 +265,21 @@ jobs:
           npm init -y > /dev/null
           npm install ./holywisp-*.tgz --no-audit --no-fund
           node smoke-package.mjs
-      - uses: actions/upload-artifact@v4
+      # Of the file as it is uploaded below. `npm-publish` gets this through the run, not through
+      # the artifact store, and publishes nothing that does not match it.
+      - name: Digest of the tarball
+        id: digest
+        working-directory: node
+        run: |
+          set -euo pipefail
+          set -- holywisp-*.tgz
+          if [ "$#" -ne 1 ] || [ ! -f "$1" ]; then
+            echo "::error::expected one tarball, found: $*"
+            exit 1
+          fi
+          sha256sum "$1"
+          echo "sha256=$(sha256sum "$1" | cut -d ' ' -f 1)" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: holywisp-npm
           path: node/holywisp-*.tgz
@@ -223,11 +296,12 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ needs.meta.outputs.tag }}
     steps:
-      - uses: actions/checkout@v5
+      # The credentials stay in this checkout: moving the `latest` tag below is a `git push`.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: assets
           merge-multiple: true
@@ -310,22 +384,23 @@ jobs:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: "24"
           package-manager-cache: false
 
-      # Trusted publishing needs npm 11.5.1 or newer.
+      # Trusted publishing needs npm 11.5.1 or newer. The same one as nightly.yml.
       - name: npm with trusted publishing
-        run: npm install --global npm@11 && npm --version
+        run: npm install --global npm@11.13.0 && npm --version
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: holywisp-npm
 
       - name: Publish
         env:
           TAG: ${{ needs.meta.outputs.tag }}
+          SHA256: ${{ needs.npm.outputs.sha256 }}
           NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -euo pipefail
@@ -337,6 +412,13 @@ jobs:
             echo "::error::tag $TAG, but the package built is $(ls holywisp-*.tgz)"
             exit 1
           fi
+          # And it must be the file the `npm` job built and tested: an artifact that was replaced
+          # after it was uploaded, or a digest that never arrived, stops here.
+          if ! printf '%s' "$SHA256" | grep -Eqx '[0-9a-f]{64}'; then
+            echo "::error::no SHA-256 from the npm job; refusing to publish an unchecked tarball"
+            exit 1
+          fi
+          echo "$SHA256  $tarball" | sha256sum --check --strict
           if npm view "holywisp@$version" version > /dev/null 2>&1; then
             echo "holywisp@$version is already on the registry; nothing to publish"
             exit 0

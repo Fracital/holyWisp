@@ -18,6 +18,11 @@ name: Nightly
 # (`smoke`, the same matrix as build.yml's), and that very file is what `publish` uploads. It goes
 # out under the dist-tag `nightly`; `latest` belongs to tagged releases (release.yml).
 #
+# "That very file" is checked, not assumed. The tarball travels from `pack` to `publish` as an
+# artifact, found by its name, and seven smoke jobs run in between on as many systems. So `pack`
+# hands its SHA-256 on as a job output, which goes through the run itself and not through the
+# artifact store, and `publish` refuses a file that does not match it.
+#
 # No secret: npm trusted publishing authenticates the `publish` job by its OIDC identity (the
 # package's trusted publishers on npmjs.com name this repository and `nightly.yml`), and the
 # package carries provenance. Only that job can ask for the identity, and it runs nothing from the
@@ -156,6 +161,8 @@ jobs:
     if: needs.gate.outputs.publish == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      sha256: ${{ steps.digest.outputs.sha256 }}
     env:
       VERSION: ${{ needs.gate.outputs.version }}
     steps:
@@ -194,6 +201,15 @@ jobs:
       - name: Test against the packaged binary
         working-directory: node
         run: node --test --test-timeout=30000 tests/*.test.mjs
+
+      # Of the file as it is uploaded below; `publish` holds what it downloads to this.
+      - name: Digest of the tarball
+        id: digest
+        working-directory: node
+        run: |
+          set -euo pipefail
+          sha256sum "holywisp-$VERSION.tgz"
+          echo "sha256=$(sha256sum "holywisp-$VERSION.tgz" | cut -d ' ' -f 1)" | tee -a "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -284,6 +300,7 @@ jobs:
       id-token: write
     env:
       VERSION: ${{ needs.gate.outputs.version }}
+      SHA256: ${{ needs.pack.outputs.sha256 }}
     steps:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
@@ -298,6 +315,17 @@ jobs:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: holywisp-nightly
+
+      # Before anything is published: an artifact that was replaced after `pack` uploaded it, or
+      # a digest that never arrived, stops here.
+      - name: The tarball is the one `pack` built
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SHA256" | grep -Eqx '[0-9a-f]{64}'; then
+            echo "::error::no SHA-256 from the pack job; refusing to publish an unchecked tarball"
+            exit 1
+          fi
+          echo "$SHA256  holywisp-$VERSION.tgz" | sha256sum --check --strict
 
       - name: Publish
         run: |
