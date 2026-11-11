@@ -17,12 +17,16 @@ import sys
 
 # ------------------------------------------------------------------------------ palette (dataviz)
 # Categorical slots in fixed order; the two primary rivals and the Go port take the three
-# all-pairs-safe slots, the holyWisp variant takes slot 4.
-SERVER_ORDER = ["holywisp", "wispurr-cpp", "wispurr-go", "holywisp-sockbuf", "wisp-python"]
-LIGHT = {"s1": "#2a78d6", "s2": "#eb6834", "s3": "#1baf7a", "s4": "#eda100", "s5": "#e87ba4", "surface": "#fcfcfb",
-         "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#898781", "grid": "#e1e0d9", "axis": "#c3c2b7"}
-DARK = {"s1": "#3987e5", "s2": "#d95926", "s3": "#199e70", "s4": "#c98500", "s5": "#d55181", "surface": "#1a1a19",
-        "ink": "#f0efec", "ink2": "#c3c2b7", "muted": "#898781", "grid": "#2c2c2a", "axis": "#383835"}
+# all-pairs-safe slots, the holyWisp variant takes slot 4. finalwisp came later and wears violet
+# (slot 7), placed between the Go port and the Python server: the only spare hue and position
+# that the palette validator passes next to its neighbours in both themes.
+SERVER_ORDER = ["holywisp", "wispurr-cpp", "wispurr-go", "holywisp-sockbuf", "finalwisp", "wisp-python"]
+SERVER_SLOT = {"holywisp": "s1", "wispurr-cpp": "s2", "wispurr-go": "s3", "holywisp-sockbuf": "s4", "wisp-python": "s5",
+               "finalwisp": "s7"}
+LIGHT = {"s1": "#2a78d6", "s2": "#eb6834", "s3": "#1baf7a", "s4": "#eda100", "s5": "#e87ba4", "s7": "#6250d6",
+         "surface": "#fcfcfb", "ink": "#0b0b0b", "ink2": "#52514e", "muted": "#898781", "grid": "#e1e0d9", "axis": "#c3c2b7"}
+DARK = {"s1": "#3987e5", "s2": "#d95926", "s3": "#199e70", "s4": "#c98500", "s5": "#d55181", "s7": "#9085e9",
+        "surface": "#1a1a19", "ink": "#f0efec", "ink2": "#c3c2b7", "muted": "#898781", "grid": "#2c2c2a", "axis": "#383835"}
 FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif'
 
 THEMES = {"light": LIGHT, "dark": DARK}
@@ -114,7 +118,7 @@ class SVG:
 
 
 def color_of(server_key):
-    return f"var(--s{SERVER_ORDER.index(server_key) + 1})"
+    return f"var(--{SERVER_SLOT[server_key]})"
 
 
 # -------------------------------------------------------------------------------------- charts

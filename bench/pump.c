@@ -165,7 +165,7 @@ static int run_rtt(hw_client *c, const char *host, uint16_t port, int duration_s
 		uint64_t t0 = now_us();
 		if (hw_client_send(c, sid, buf, chunk) != 0) die("send failed", NULL);
 		credits--;
-		long got = hw_client_read_exact(c, sid, in, chunk, 5000);
+		long long got = hw_client_read_exact(c, sid, in, chunk, 5000);
 		if (got != (long)chunk) die("echo failed", NULL);
 		samples[n++] = now_us() - t0;
 		// read_exact queues CONTINUE events it skipped past; drain them without blocking.

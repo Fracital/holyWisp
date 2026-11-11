@@ -48,6 +48,10 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
   'websockets<14'`): with the current release its WebSocket reader blocks on a full per-stream queue
   and the connection deadlocks as soon as more than a couple of streams are busy, which drops it to
   a few MiB/s. With 13.1 it behaves the way wispmark's published results show.
+- `finalwisp` is [finalwisp](https://github.com/theogbob/finalwisp) cloned to `~/src/finalwisp` and
+  built with its own `bench/release.sh` (a static release build with its pinned nightly toolchain),
+  run as `finalwisp --allow-loopback --allow-private --log-level error`, the way its own harness
+  starts it. Its limits are off by default.
 
 The wisp-js client is wispmark's own `client/js/client.mjs`. Clone wispmark to `~/src/wispmark`
 and run `npm install` in `client/js`.

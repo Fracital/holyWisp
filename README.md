@@ -252,35 +252,40 @@ differs from wispurr. `make npm` builds the package and `make npm-test` runs its
 
 ## Benchmarks
 
-`bench/` holds a wispmark-style harness that runs holyWisp, both wispurr implementations and
-wisp-server-python on the same host, through the same echo service, driven by the same clients.
+`bench/` holds a wispmark-style harness that runs holyWisp, finalwisp, both wispurr implementations
+and wisp-server-python on the same host, through the same echo service, driven by the same clients.
 Full tables are in [bench/RESULTS.md](bench/RESULTS.md); the method and how to rerun it are in
-[bench/README.md](bench/README.md). These are the medians of eight 10 s runs on a 16-vCPU Xeon
+[bench/README.md](bench/README.md). These are the medians of ten 10 s runs on a 16-vCPU Xeon
 Gold 6348 VM that ran nothing else, in MiB/s through the echo port, with the best server in each
 row in bold.
 
-| scenario | holyWisp | wispurr C++23 | wispurr Go | wisp-server-python |
-| --- | --- | --- | --- | --- |
-| wisp-js, 10 streams | 480 | **529** | 523 | 315 |
-| wisp-js, 5 connections x 10 streams | **2,702** | 2,438 | 2,682 | 1,272 |
-| native client, 1 stream | 2,329 | **2,590** | 1,583 | 438 |
-| native client, 10 streams | **1,522** | 1,519 | 984 | 248 |
-| native client, 10 streams, 1 MiB packets | 1,712 | **1,946** | 939 | did not finish |
-| native client, 8 connections x 4 streams | 8,354 | **8,402** | 5,095 | 2,555 |
-| native client, 16 connections x 4 streams | **8,173** | 6,829 | 4,627 | 3,104 |
-| 64 B round trip, p50 / p99 | **68.5 / 124 us** | 79 / 138 us | 127 / 377 us | 181 / 519.5 us |
-| stream churn, lifecycles/s (server cores) | **100,404** (3.2) | 92,965 (3.0) | 73,278 (5.5) | 38,531 (5.8) |
-| peak RSS under stream churn | **3 MiB** | 32 MiB | 894 MiB | 505 MiB |
+| scenario | holyWisp | finalwisp | wispurr C++23 | wispurr Go | wisp-server-python |
+| --- | --- | --- | --- | --- | --- |
+| wisp-js, 10 streams | 525 | 587 | 579 | **649** | 321 |
+| wisp-js, 5 connections x 10 streams | **3,141** | 3,102 | 2,592 | 3,045 | 1,443 |
+| native client, 1 stream | 2,281 | 2,418 | **2,763** | 1,611 | 398 |
+| native client, 10 streams | 1,476 | 1,719 | **1,796** | 1,047 | 281 |
+| native client, 10 streams, 1 MiB packets | 1,831 | 1,809 | **1,933** | 995 | did not finish |
+| native client, 8 connections x 4 streams | **9,592** | 9,155 | 8,399 | 5,035 | 2,962 |
+| native client, 16 connections x 4 streams | 8,200 | **8,876** | 6,689 | 4,635 | 3,133 |
+| 64 B round trip, p50 / p99 | 70 / 125 us | **69.5 / 123 us** | 79 / 132 us | 122 / 356 us | 170 / 432 us |
+| stream churn, lifecycles/s (server cores) | **253,298** (6.9) | 216,112 (5.8) | 228,157 (6.7) | 127,003 (9.5) | 36,568 (6.0) |
+| peak RSS under stream churn | 3.8 MiB | **3.4 MiB** | 46 MiB | 916 MiB | 503 MiB |
 
-holyWisp and the C++23 wispurr are the two fastest servers here, and they trade rows. holyWisp
-leads by 20% with 16 connections, where all 16 cores are busy and it spends the least CPU per byte,
-and by 8% at opening and closing streams, and it uses the least memory by a wide margin. The C++23
-wispurr leads by 11% with one stream and by 14% with 1 MiB packets. The two are level with 10
-streams on one connection and with 8 connections. Behind wisp-js the three compiled servers are
-within 11% of each other, which is less than the spread between repeats of the same server. The
-round-trip figure depends on where in the run order a server was measured more than on which of
-the two served it; [bench/RESULTS.md](bench/RESULTS.md) breaks that down. Results move with the
-host: an earlier run on a desktop Ryzen 9 7950X ranked several of these rows differently.
+holyWisp, finalwisp and the C++23 wispurr are the three fastest servers here, and each leads
+somewhere. holyWisp leads with 8 connections by 5% and at opening and closing streams by 11%.
+finalwisp leads with 16 connections by 8%, where all 16 cores are busy; holyWisp and finalwisp
+relay about 1,700 MiB per CPU-second there, the C++23 wispurr 1,119. The two are level on the round
+trip, and both stay under 4 MiB of memory under churn. The C++23 wispurr leads on one connection:
+by 14% over finalwisp and 21% over holyWisp with one stream. Those rows are the noisiest on this
+host (holyWisp's 10-stream runs span 1,418 to 2,359 MiB/s), and with 10 streams or 1 MiB packets
+the three are within each other's spread. Behind wisp-js the row with 10 streams does not separate
+the four compiled servers: their medians differ by up to 24%, but every one of them has runs from
+under 500 to over 700 MiB/s. With five connections holyWisp, finalwisp and the Go wispurr are within
+3% of each other.
+The round-trip figure depends on where in the run order a server was measured;
+[bench/RESULTS.md](bench/RESULTS.md) breaks that down. Results move with the host: an earlier run
+on a desktop Ryzen 9 7950X ranked several of these rows differently.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench/charts/throughput-dark.png">

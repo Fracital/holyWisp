@@ -72,6 +72,15 @@ SERVERS = {
                 "--allow-loopback", "--log-level", "error"],
         "cwd": str(SRC / "wisp-server-python"),
     },
+    "finalwisp": {
+        # https://github.com/theogbob/finalwisp, built with its own bench/release.sh (static, its
+        # pinned toolchain). Started the way its own harness starts it (bench/servers.json), with
+        # error-level logging like every server here. Its limits are off by default.
+        "label": "finalwisp (Rust)",
+        "cmd": [str(SRC / "finalwisp/server/target/x86_64-unknown-linux-gnu/release/finalwisp"), "--port", str(WISP_PORT),
+                "--allow-loopback", "--allow-private", "--log-level", "error"],
+        "cwd": str(SRC / "finalwisp"),
+    },
     "wispurr-cpp": {
         "label": "wispurr (C++23)",
         "cmd": [str(SRC / "wispurr-cpp23/wispurr"), "-config", str(ROOT / "bench/configs/wispurr-bench.json"),
@@ -451,6 +460,12 @@ def versions():
         v["go"] = subprocess.run(["go", "version"], capture_output=True, text=True).stdout.strip()
         v["gcc"] = subprocess.run(["g++", "--version"], capture_output=True, text=True).stdout.splitlines()[0]
         v["kernel"] = os.uname().release
+        if (SRC / "finalwisp").is_dir():
+            # It has no --version; its release build writes what it is next to the binary.
+            info = pathlib.Path(SERVERS["finalwisp"]["cmd"][0]).with_name("BUILDINFO").read_text()
+            v["finalwisp"] = "; ".join(line for line in info.splitlines() if line.startswith(("rustc:", "target:", "allocator:")))
+            v["finalwisp_git"] = subprocess.run(["git", "-C", str(SRC / "finalwisp"), "rev-parse", "--short", "HEAD"],
+                                                capture_output=True, text=True).stdout.strip()
     except Exception as e:  # noqa: BLE001 - versions are informational
         v["error"] = str(e)
     return v
