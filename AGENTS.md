@@ -215,7 +215,10 @@ runs on. The defaults deny everything that is not public unicast and every chang
   outside `[A-Za-z0-9._:\[\]-]` and `_` (`host_chars_ok` in `conn.c`), and a name whose last
   label is a number (`0x7f.1`, `2130706433`, `1.2.3`): a resolver's `inet_aton` turns those into
   an address without asking the DNS, so only the canonical dotted quad is an IPv4 literal
-  (`hw_addr_parse_literal`) and nothing else numeric reaches a resolver.
+  (`hw_addr_parse` in `net.c`) and nothing else numeric reaches a resolver. That function does not
+  take `inet_pton`'s word for it: macOS's accepts `0177.0.0.1` and `fe80::1%eth0`, glibc's
+  neither, so an IPv4 literal must be what `inet_ntop` writes back and an IPv6 one holds only hex
+  digits, colons and dots. Never trust a libc parser to be as strict as Linux's.
 - IPv6 is public only inside `2000::/3`. The translation and tunnel forms that wrap a *public*
   IPv4 address (NAT64, 6to4, IPv4-compatible, IPv4-translated, an ISATAP interface id) are
   reserved, not public: this host has no business being someone's translator. Only IPv4-mapped
@@ -446,6 +449,9 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   A fix for an abuse case is not done until this file fails without it.
 - If you touched the proxy path, run `test_security` several times (it starts real SOCKS5 and HTTP
   CONNECT proxies in-process): `for i in $(seq 1 20); do build/debug/test_security || break; done`.
+  A service a test runs on a thread of its own closes its listener on that thread (`accept_loop`):
+  closed from the case, the descriptor's number went to the next case's server while the thread
+  was still between two accepts, and it took that case's connections, about one run in 260.
 - If you added or renamed a config key or CLI flag: `src/server/config.c` (parser and `--help`
   text), `README.md` (the table), `holywisp.conf.example`, `deploy/holywisp.conf` and this file's
   relevant section if it changes behaviour.
