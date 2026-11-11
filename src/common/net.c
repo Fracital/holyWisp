@@ -167,6 +167,20 @@ static int ends_in_number(const char *host) {
 	return 1;
 }
 
+// Whether host is the dotted quad inet_ntop writes for addr: no leading zeros, nothing around it.
+static int v4_canonical(const char *host, const struct in_addr *addr) {
+	char back[INET_ADDRSTRLEN];
+	return inet_ntop(AF_INET, addr, back, sizeof(back)) && strcmp(back, host) == 0;
+}
+
+// Whether host holds only what an IPv6 address is written with: no zone ("%eth0"), no spaces.
+static int v6_chars_only(const char *host) {
+	for (const char *c = host; *c; c++) {
+		if (!isxdigit((unsigned char)*c) && *c != ':' && *c != '.') return 0;
+	}
+	return 1;
+}
+
 int hw_addr_parse(const char *host, uint16_t port, struct sockaddr_storage *out, socklen_t *out_len) {
 	char tmp[INET6_ADDRSTRLEN + 2];
 	size_t n = strlen(host);
@@ -181,13 +195,15 @@ int hw_addr_parse(const char *host, uint16_t port, struct sockaddr_storage *out,
 	struct sockaddr_in *v4 = (struct sockaddr_in *)out;
 	struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)out;
 	memset(out, 0, sizeof(*out));
-	if (inet_pton(AF_INET, host, &v4->sin_addr) == 1) {
+	// inet_pton is not equally strict everywhere: macOS's takes "0177.0.0.1" and "fe80::1%eth0",
+	// glibc's neither. So a literal is only what every one of them agrees on.
+	if (inet_pton(AF_INET, host, &v4->sin_addr) == 1 && v4_canonical(host, &v4->sin_addr)) {
 		v4->sin_family = AF_INET;
 		v4->sin_port = htons(port);
 		*out_len = sizeof(*v4);
 		return 1;
 	}
-	if (inet_pton(AF_INET6, host, &v6->sin6_addr) == 1) {
+	if (v6_chars_only(host) && inet_pton(AF_INET6, host, &v6->sin6_addr) == 1) {
 		v6->sin6_family = AF_INET6;
 		v6->sin6_port = htons(port);
 		*out_len = sizeof(*v6);
