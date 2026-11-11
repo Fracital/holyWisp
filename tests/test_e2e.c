@@ -6,6 +6,7 @@
 #include "holywisp/log.h"
 #include "holywisp/net.h"
 #include "holywisp/server.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
@@ -396,6 +397,75 @@ static void test_remote_eof_closes_stream(void) {
 	hw_client_free(c);
 }
 
+// One read from a destination the test holds the other end of, waiting up to five seconds: the
+// count, 0 at the end of the stream, -1 with errno.
+static ssize_t witness_read(int fd, void *buf, size_t cap) {
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	if (poll(&pfd, 1, 5000) <= 0) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+	return read(fd, buf, cap);
+}
+
+// A stream to the listener, taken through one exchange in which the destination speaks last.
+static int witness_stream(hw_client *c, int lfd, uint16_t port, uint32_t *sid) {
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, sid), 0);
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 5000), 1);
+	int fd = accept(lfd, NULL, NULL);
+	CHECK(fd >= 0, "accept");
+	uint8_t buf[8];
+	CHECK_EQ(hw_client_send(c, *sid, "ping", 4), 0);
+	CHECK_EQ(witness_read(fd, buf, sizeof(buf)), 4);
+	CHECK_EQ(write(fd, "pong", 4), 4);
+	CHECK_EQ(hw_client_read_exact(c, *sid, buf, 4, 5000), 4);
+	return fd;
+}
+
+static void witness_ends(int fd, int reset, const char *what) {
+	uint8_t buf[8];
+	ssize_t n = witness_read(fd, buf, sizeof(buf));
+	if (reset) {
+		CHECK(n < 0 && errno == ECONNRESET, "%s: a reset, got %zd errno %d", what, n, errno);
+	} else {
+		CHECK(n == 0, "%s: the end of the stream, got %zd errno %d", what, n, errno);
+	}
+	close(fd);
+}
+
+static void test_close_toward_remote(void) {
+	// A stream the client ends is reset toward its destination (where the platform can, see
+	// hw_sys_close_reset) only when that cannot cost the destination anything: it spoke last.
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "listen");
+	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
+	int reset = hw_sys_has_close_reset();
+	uint32_t sid;
+	uint8_t buf[8];
+
+	int fd = witness_stream(c, lfd, port, &sid);
+	CHECK_EQ(hw_client_close_stream(c, sid, HW_CLOSE_VOLUNTARY), 0);
+	witness_ends(fd, reset, "destination spoke last");
+
+	// The client spoke last: its bytes arrive, then the stream ends in the ordinary way.
+	fd = witness_stream(c, lfd, port, &sid);
+	CHECK_EQ(hw_client_send(c, sid, "last", 4), 0);
+	CHECK_EQ(hw_client_close_stream(c, sid, HW_CLOSE_VOLUNTARY), 0);
+	CHECK_EQ(witness_read(fd, buf, sizeof(buf)), 4);
+	CHECK(memcmp(buf, "last", 4) == 0, "the client's last bytes");
+	witness_ends(fd, 0, "client spoke last");
+
+	// The client's connection going away ends its streams by the same rule.
+	fd = witness_stream(c, lfd, port, &sid);
+	hw_client_free(c);
+	witness_ends(fd, reset, "connection closed");
+
+	close(lfd);
+	wait_streams_idle(g_server);
+}
+
 static void test_connection_refused(void) {
 	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
 	uint32_t sid;
@@ -708,6 +778,46 @@ static void test_connection_counts(void) {
 	CHECK(after.bytes_in > 0 && after.bytes_out > 0, "byte counters moved");
 }
 
+// A new connection goes to the worker with the fewest, whichever worker's listener the kernel
+// chose for it: eight connections on four workers are two each, not what a hash happens to make
+// of eight source ports, and connections that arrive after some have left fill the gaps.
+static void test_connections_spread(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 4;
+	cfg.log_level = HW_LOG_WARN;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server: %s", strerror(errno));
+	CHECK_EQ(hw_server_start(s), 0);
+	hw_server_stats st;
+	hw_client *c[8];
+	for (int round = 0; round < 3; round++) {
+		// Every connection is usable, the ones that were handed to another worker included.
+		for (int i = 0; i < 8; i++) {
+			if (round > 0 && i % 2) continue; // those stayed
+			c[i] = connect_to(s, i % 2, NULL, NULL, 0);
+			CHECK(c[i] != NULL, "connection %d of round %d", i, round);
+		}
+		hw_server_stats_get(s, &st);
+		CHECK_EQ(st.connections_active, 8);
+		CHECK(st.worker_connections_min == 2 && st.worker_connections_max == 2, "round %d: %llu to %llu per worker",
+		      round, (unsigned long long)st.worker_connections_min, (unsigned long long)st.worker_connections_max);
+		// Half of them leave, from whichever workers they were on.
+		for (int i = 0; i < 8; i += 2) hw_client_free(c[i]);
+		for (int i = 0; i < 500; i++) {
+			hw_server_stats_get(s, &st);
+			if (st.connections_active == 4) break;
+			usleep(10000);
+		}
+		CHECK_EQ(st.connections_active, 4);
+		usleep(50000); // the count a worker is chosen by goes down one loop turn after `active`
+	}
+	for (int i = 1; i < 8; i += 2) hw_client_free(c[i]);
+	hw_server_free(s);
+}
+
 int main(void) {
 	start_echo_services();
 	hw_server_config cfg;
@@ -733,6 +843,7 @@ int main(void) {
 	RUN(test_udp_echo);
 	RUN(test_many_streams_interleaved);
 	RUN(test_remote_eof_closes_stream);
+	RUN(test_close_toward_remote);
 	RUN(test_connection_refused);
 	RUN(test_hostname_resolution);
 	RUN(test_invalid_connect);
@@ -743,6 +854,7 @@ int main(void) {
 	RUN(test_plain_http);
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
+	RUN(test_connections_spread);
 
 	hw_server_stop(g_server);
 	hw_server_free(g_server);

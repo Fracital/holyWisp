@@ -34,7 +34,16 @@ export function holyWispVite(options: holyWispViteOptions): holyWispVitePlugin {
 	const matches =
 		typeof prefix === "function"
 			? prefix
-			: (req: IncomingMessage) => new URL(req.url ?? "/", "http://localhost").pathname.startsWith(prefix);
+			: (req: IncomingMessage) => {
+					// The request target is whatever the client sent, and not everything is a URL
+					// (`//[`). One that cannot be read is not ours; it must not throw inside the
+					// dev server's upgrade event, which would take the dev server down.
+					try {
+						return new URL(req.url ?? "/", "http://localhost").pathname.startsWith(prefix);
+					} catch {
+						return false;
+					}
+				};
 
 	async function attach(server: ViteServer) {
 		const { httpServer } = server;

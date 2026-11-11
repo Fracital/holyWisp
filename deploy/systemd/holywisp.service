@@ -19,7 +19,9 @@ Group=wisp
 # Config and state. /etc/holywisp/holywisp.conf is root:wisp 0640 (it may hold password hashes, so
 # it is not world-readable). The reputation store lives under /var/lib/holywisp.
 ExecStart=/usr/bin/holywisp --config /etc/holywisp/holywisp.conf
-ExecReload=/bin/kill -HUP $MAINPID
+# No ExecReload: the server reads its config once and has no SIGHUP handler, so a HUP would end it
+# (cleanly, which Restart=on-failure does not bring back). `systemctl reload` is refused instead;
+# a config change takes `systemctl restart holywisp`.
 
 # A relay legitimately opens many sockets; raise the fd ceiling but keep it finite.
 LimitNOFILE=262144

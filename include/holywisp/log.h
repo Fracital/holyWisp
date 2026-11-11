@@ -1,5 +1,10 @@
 /*
  * holywisp/log.h - levelled logging to stderr. Thread-safe (one write(2) per line).
+ *
+ * A call is one line, whatever its arguments hold: every byte below 0x20 and 0x7f in the tag and
+ * the formatted message is written as \xNN, so a string that came from a client can neither start
+ * a line of its own nor send an escape sequence to a terminal. Callers pass such strings as they
+ * are and do not escape them first.
  */
 #ifndef HOLYWISP_LOG_H
 #define HOLYWISP_LOG_H

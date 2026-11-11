@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #ifndef CONN_MAX_READ_PER_EVENT
@@ -37,6 +38,12 @@
 // reassembled first: the stream sees the same bytes sooner and they stay cache-warm.
 #define CONN_PT_MIN    (128 * 1024)
 #define CONN_WBUF_KEEP (4 * 1024 * 1024) // a drained write queue keeps at most this much allocated
+// The most payload one DATA packet toward the client carries, whatever max-message-size allows.
+// A WebSocket message is handed to the application whole, so the client has to hold all of it:
+// megabyte packets (a relay pipe holds that much) made its buffer outgrow its cache and cost the
+// client and the echo behind it 20 to 40% more per byte, while the server saved nothing by them.
+// On the bench VM 128 KiB won the multi-connection rows by 8 to 9% and lost none.
+#define CONN_FRAME_MAX (128 * 1024)
 // Frames are not written one by one while the queue is smaller than this: they wait for the end of
 // the loop's batch and leave in one send (conn_kick). Anything larger is worth its own write.
 #define CONN_DEFER_MAX (16 * 1024)
@@ -62,6 +69,7 @@ static void conn_unlink(hw_conn *c) {
 }
 
 static void conn_release(hw_conn *c) {
+	atomic_fetch_sub(&c->w->load, 1);
 	hw_buf_free(&c->rbuf);
 	hw_buf_free(&c->wbuf);
 	free(c->marks);
@@ -96,6 +104,7 @@ static void handshake_timeout_cb(hw_loop *loop, void *ud) {
 void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	hw_conn *c = calloc(1, sizeof(*c));
 	if (!c) {
+		atomic_fetch_sub(&w->load, 1);
 		close(fd);
 		return;
 	}
@@ -119,6 +128,7 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	}
 	if (hw_loop_add_fd(w->loop, fd, HW_EV_READ, conn_io_cb, c) != 0) {
 		HW_WARN("conn", "%s: cannot watch fd: %s", c->peer, strerror(errno));
+		atomic_fetch_sub(&w->load, 1);
 		close(fd);
 		free(c);
 		return;
@@ -150,6 +160,10 @@ void conn_close(hw_conn *c) {
 		hw_loop_cancel_timer(c->w->loop, c->throttle_timer);
 		c->throttle_timer = NULL;
 	}
+	if (c->auth_req) {
+		auth_cancel(c->auth_req);
+		c->auth_req = NULL;
+	}
 	hw_loop_del_fd(c->w->loop, c->fd);
 	close(c->fd);
 	c->fd = -1;
@@ -158,6 +172,10 @@ void conn_close(hw_conn *c) {
 	if (c->conn_slot) {
 		hw_semaphore_release(&c->w->server->connections);
 		c->conn_slot = 0;
+	}
+	if (c->ip_slot) {
+		hw_gauge_release(c->w->server->conns_per_ip, c->ip);
+		c->ip_slot = 0;
 	}
 	atomic_fetch_sub(&c->w->server->connections_active, 1);
 	HW_DEBUG("conn", "%s: closed", c->peer);
@@ -187,14 +205,42 @@ int conn_violation(hw_conn *c, const char *reason) {
 	return 0;
 }
 
-// The client socket's event mask follows three bits of state: reads stop while the bandwidth
-// throttle or the queue budget says so, writes are wanted while wbuf (or the pipe) has bytes.
+// Reads from the client stop for four reasons: the bandwidth throttle, too much queued toward slow
+// remotes (conn-queue-max), too much queued toward the client itself, which is a client that sends
+// but does not read (conn_backpressure), and a plain HTTP reply on its way out, after which nothing
+// the client sends is wanted (reading it would only grow rbuf).
+static int conn_reads_stopped(const hw_conn *c) {
+	return c->throttled || c->read_paused || c->wr_stalled || c->state == CONN_HTTP_REPLY;
+}
+
+// The client socket's event mask follows that and one more bit: writes are wanted while wbuf (or
+// a pipe) has bytes.
 static void conn_apply_events(hw_conn *c) {
 	if (c->closing || c->fd < 0) return;
 	unsigned ev = 0;
-	if (!c->throttled && !c->read_paused) ev |= HW_EV_READ;
+	if (!conn_reads_stopped(c)) ev |= HW_EV_READ;
 	if (c->write_armed) ev |= HW_EV_WRITE;
 	hw_loop_mod_fd(c->w->loop, c->fd, ev);
+}
+
+static int pause_visit(uint32_t key, void *value, void *ud) {
+	stream_pause(value);
+	return 0;
+}
+
+static int resume_visit(uint32_t key, void *value, void *ud) {
+	stream_resume(value);
+	return 0;
+}
+
+// The streams read from their remotes unless the client's send queue is over its mark or the
+// connection is over its bandwidth. `paused` is what stream.c looks at; this keeps it and every
+// stream's read interest equal to the two reasons.
+static void conn_sync_streams(hw_conn *c) {
+	int want = c->bp_paused || c->throttled;
+	if (want == c->paused) return;
+	c->paused = want;
+	hw_map_each(&c->streams, want ? pause_visit : resume_visit, NULL);
 }
 
 static void throttle_wake_cb(hw_loop *loop, void *ud) {
@@ -202,18 +248,24 @@ static void throttle_wake_cb(hw_loop *loop, void *ud) {
 	c->throttle_timer = NULL;
 	c->throttled = 0;
 	conn_apply_events(c);
+	conn_sync_streams(c);
 }
 
 void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
-	if (!c->w->server->bandwidth || c->throttled) return;
+	if (!c->w->server->bandwidth || c->closing) return;
+	// Charged even while paused: the bytes of a pass that was under way when the pause began still
+	// moved, and skipping them made every pause too short (and a download free, since its bytes
+	// arrive while the client's reads are the only thing stopped).
 	uint64_t wait = hw_bandwidth_charge(c->w->server->bandwidth, c->ip, bytes);
 	if (wait == 0) return;
-	// Stop reading from the client until the virtual clock catches up; remote-side reads are
-	// paused with it through the loop's event mask.
-	c->throttled = 1;
-	conn_apply_events(c);
+	// Both directions stop until the virtual clock catches up: reads from the client, and reads
+	// from every remote. Nothing is dropped; what is queued still drains.
 	if (c->throttle_timer) hw_loop_cancel_timer(c->w->loop, c->throttle_timer);
 	c->throttle_timer = hw_loop_add_timer(c->w->loop, wait, 0, throttle_wake_cb, c);
+	if (c->throttled) return;
+	c->throttled = 1;
+	conn_apply_events(c);
+	conn_sync_streams(c);
 }
 
 // One stream on a connection may have the whole advertised window in flight; ten streams with
@@ -253,16 +305,6 @@ static int arm_write(hw_conn *c, int on) {
 	if (c->write_armed == on) return 0;
 	c->write_armed = on;
 	conn_apply_events(c);
-	return 0;
-}
-
-static int pause_visit(uint32_t key, void *value, void *ud) {
-	stream_pause(value);
-	return 0;
-}
-
-static int resume_visit(uint32_t key, void *value, void *ud) {
-	stream_resume(value);
 	return 0;
 }
 
@@ -360,12 +402,56 @@ static size_t conn_queued(const hw_conn *c) {
 static void conn_backpressure(hw_conn *c) {
 	size_t queued = conn_queued(c);
 	size_t high = c->w->server->cfg.ws_write_high_water;
-	if (!c->paused && queued > high) {
-		c->paused = 1;
-		hw_map_each(&c->streams, pause_visit, NULL);
-	} else if (c->paused && queued < high / 4) {
-		c->paused = 0;
-		hw_map_each(&c->streams, resume_visit, NULL);
+	if (!c->bp_paused && queued > high) {
+		c->bp_paused = 1;
+		conn_sync_streams(c);
+	} else if (c->bp_paused && queued < high / 4) {
+		c->bp_paused = 0;
+		conn_sync_streams(c);
+	}
+	// Pausing the remotes bounds what they add, not what the client makes the server say: every
+	// ping is answered and every refused CONNECT gets a CLOSE, so a client that sends those and
+	// never reads would grow this queue without limit. At twice the mark the server stops
+	// listening to it until it has read down to the mark. No reply is larger than what caused it,
+	// so the overshoot is one read. A client that never reads again is closed by the sweep.
+	if (!c->wr_stalled && queued > 2 * high) {
+		HW_DEBUG("conn", "%s: %zu bytes queued for a client that is not reading, pausing its reads", c->peer, queued);
+		c->wr_stalled = 1;
+		conn_apply_events(c);
+	} else if (c->wr_stalled && queued <= high) {
+		c->wr_stalled = 0;
+		conn_apply_events(c);
+	}
+}
+
+static void ws_fail(hw_conn *c, uint16_t code);
+
+void conn_sweep(hw_worker *w) {
+	const hw_server_config *cfg = &w->server->cfg;
+	uint64_t now = hw_now_ms();
+	uint64_t write_ms = (uint64_t)cfg->client_write_timeout_s * 1000;
+	uint64_t idle_ms = (uint64_t)cfg->idle_timeout_s * 1000;
+	hw_conn *next;
+	for (hw_conn *c = w->conns; c; c = next) {
+		next = c->lnext; // conn_close leaves the list alone: the connection is unlinked when it is freed
+		if (c->closing) continue;
+		if (c->heard || c->active_ms == 0) c->active_ms = now;
+		c->heard = 0;
+		if (c->wrote || conn_queued(c) == 0) {
+			c->stall_ms = 0;
+		} else if (c->stall_ms == 0) {
+			c->stall_ms = now;
+		} else if (write_ms > 0 && now - c->stall_ms >= write_ms) {
+			HW_INFO("conn", "%s: closing, %zu bytes queued and the client has read nothing for %d s", c->peer,
+			        conn_queued(c), cfg->client_write_timeout_s);
+			conn_close(c);
+			continue;
+		}
+		c->wrote = 0;
+		if (idle_ms > 0 && c->state == CONN_WS && hw_map_count(&c->streams) == 0 && now - c->active_ms >= idle_ms) {
+			HW_DEBUG("conn", "%s: idle for %d s with no streams, closing", c->peer, cfg->idle_timeout_s);
+			ws_fail(c, 1001);
+		}
 	}
 }
 
@@ -390,6 +476,7 @@ void conn_flush(hw_conn *c) {
 				m->n -= (size_t)n;
 				m->p->pending -= (size_t)n;
 				c->pipe_bytes -= (size_t)n;
+				c->wrote = 1;
 				if (m->n == 0) mark_pop(c);
 				continue;
 			}
@@ -411,6 +498,7 @@ void conn_flush(hw_conn *c) {
 			if (n > 0) {
 				hw_buf_consume(&c->wbuf, (size_t)n);
 				c->wsent += (uint64_t)n;
+				c->wrote = 1;
 				continue;
 			}
 		} else {
@@ -465,6 +553,13 @@ void conn_batch_end(hw_loop *loop, void *ud) {
 	}
 }
 
+// The payload of one DATA packet toward this client: within max-message-size and CONN_FRAME_MAX.
+static size_t frame_payload_max(const hw_conn *c) {
+	size_t max = c->w->server->cfg.max_message_size - HW_WISP_HEADER_LEN;
+	if (max > CONN_FRAME_MAX) max = CONN_FRAME_MAX;
+	return max < 1 ? 1 : max;
+}
+
 ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
 	if (c->throttled) return -2;
 	hw_spipe *p = s->pipe;
@@ -473,8 +568,8 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
 		if (!p) return -2;
 	}
 	if (p->pending > 0) return -3;
-	size_t max = c->w->server->cfg.max_message_size - HW_WISP_HEADER_LEN;
-	size_t cap = p->size < max ? p->size : max;
+	size_t cap = frame_payload_max(c);
+	if (cap > p->size) cap = p->size;
 	size_t got = 0;
 	for (int i = 0; i < PIPE_FILLS && got < cap; i++) {
 		ssize_t n = hw_sys_splice(s->fd, p->fd[1], cap - got);
@@ -528,10 +623,9 @@ int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 
 int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
 	if (c->closing) return -1;
-	// One remote read may be larger than the negotiated message size: it goes out as several DATA
-	// packets, each within max-message-size, so a strict peer never sees an oversize frame.
-	size_t max = c->w->server->cfg.max_message_size - HW_WISP_HEADER_LEN;
-	if (max < 1) max = 1;
+	// One remote read may be larger than a packet may carry: it goes out as several DATA packets,
+	// each within max-message-size, so a strict peer never sees an oversize frame.
+	size_t max = frame_payload_max(c);
 	size_t total = len;
 	do {
 		size_t n = len < max ? len : max;
@@ -606,6 +700,7 @@ static void http_reply_x(hw_conn *c, int status, const char *reason, const char 
 		return;
 	}
 	c->state = CONN_HTTP_REPLY;
+	conn_apply_events(c); // nothing more is read from this client (conn_reads_stopped)
 	conn_flush(c);
 }
 
@@ -644,18 +739,42 @@ static void stats_json(hw_conn *c) {
 	http_reply(c, 200, "OK", "application/json", body);
 }
 
+static int ct_equal(const char *a, const char *b, size_t n);
+
 // Fill c->ip from the trusted-proxy headers when the peer is a trusted proxy.
-static void resolve_real_ip(hw_conn *c, const hw_http_request *req) {
+// Who the client is, from the trusted headers when a trusted proxy sent the request. 0, or -1 when
+// the request cannot be believed either way and is to be refused.
+static int resolve_real_ip(hw_conn *c, const hw_http_request *req) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	if (!cfg->parse_real_ip || cfg->trusted_proxy_count == 0) return;
-	const char *values[HW_MAX_TRUSTED_HEADERS];
-	int nvalues = 0;
-	for (int i = 0; i < cfg->trusted_header_count; i++) {
-		const char *v = hw_http_header_get(req, cfg->trusted_headers[i]);
-		if (v) values[nvalues++] = v;
+	if (!cfg->parse_real_ip || cfg->trusted_proxy_count == 0) return 0;
+	if (cfg->trusted_proxy_secret[0]) {
+		// The proxy's address alone is not proof (see trusted_proxy_secret): without the secret the
+		// request is treated as coming from the peer itself.
+		const char *got = hw_http_header_get(req, "X-HolyWisp-Proxy-Secret");
+		size_t want = strlen(cfg->trusted_proxy_secret);
+		if (!got || strlen(got) != want || !ct_equal(got, cfg->trusted_proxy_secret, want)) return 0;
 	}
-	hw_real_ip((const struct sockaddr *)&c->peer_addr, cfg->trusted_proxies, cfg->trusted_proxy_count, values, nvalues,
-	           c->ip);
+	int from_proxy = hw_cidr_any_contains(cfg->trusted_proxies, cfg->trusted_proxy_count,
+	                                      (const struct sockaddr *)&c->peer_addr);
+	// Every instance of each trusted header, in the order of the request: a proxy that appends
+	// its own line after the client's must be read last, not dropped for the client's first one.
+	const char *values[HW_MAX_TRUSTED_HEADERS][HW_HTTP_MAX_HEADERS];
+	hw_real_ip_header headers[HW_MAX_TRUSTED_HEADERS];
+	for (int i = 0; i < cfg->trusted_header_count; i++) {
+		int cut = 0;
+		headers[i].values = values[i];
+		headers[i].count = hw_http_header_all(req, cfg->trusted_headers[i], values[i], HW_HTTP_MAX_HEADERS, &cut);
+		// A trusted header with a cut value has lost its end, and the end is where the proxy wrote
+		// the real address: what is left is the client's own text. From a trusted proxy that is a
+		// request whose client cannot be known, and counting it as the proxy itself would give it
+		// the proxy's allowance and its clean record: it is refused. From anyone else the header
+		// means nothing anyway.
+		if (cut && from_proxy) return -1;
+		if (cut) return 0;
+	}
+	hw_real_ip((const struct sockaddr *)&c->peer_addr, cfg->trusted_proxies, cfg->trusted_proxy_count, headers,
+	           cfg->trusted_header_count, c->ip);
+	return 0;
 }
 
 // Apply reputation tier to the connection: STRICT refuses, THROTTLE tightens the stream cap.
@@ -767,7 +886,24 @@ static int http_process(hw_conn *c) {
 		return 0;
 	}
 
-	resolve_real_ip(c, &req);
+	// A browser names the page that opened the socket, and cannot be made to lie about it. With
+	// allow-origin set, a page that is not on the list may not use this relay from its visitors'
+	// addresses (and so cannot spend their rate limits or their reputation). A client that sends
+	// no Origin is not a browser, and is not stopped by this: it speaks for itself.
+	if (cfg->allow_origin_count > 0) {
+		const char *origin = hw_http_header_get(&req, "Origin");
+		int ok = origin == NULL;
+		for (int i = 0; i < cfg->allow_origin_count && !ok; i++) ok = strcasecmp(origin, cfg->allow_origins[i]) == 0;
+		if (!ok) {
+			http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "origin not allowed\n");
+			return 0;
+		}
+	}
+
+	if (resolve_real_ip(c, &req) != 0) {
+		http_reply(c, 400, "Bad Request", "text/plain; charset=utf-8", "forwarding header too long\n");
+		return 0;
+	}
 
 	// Per-IP connection rate.
 	if (srv->conn_rate && !hw_window_allow(srv->conn_rate, c->ip)) {
@@ -782,6 +918,18 @@ static int http_process(hw_conn *c) {
 		http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "blocked\n");
 		return 0;
 	}
+	// Concurrent connections from one address, so that no single client can hold every slot of the
+	// server-wide cap below. Refused like the rate limit is.
+	int ip_slot = hw_gauge_acquire(srv->conns_per_ip, c->ip);
+	if (ip_slot == 0) {
+		HW_STAT_INC(srv, refused_connection_limit);
+		char retry[64];
+		snprintf(retry, sizeof(retry), "Retry-After: %d\r\n",
+		         cfg->connection_window_s > 0 ? cfg->connection_window_s : 10);
+		http_reply_x(c, 429, "Too Many Requests", "text/plain; charset=utf-8", retry, "too many connections\n", 21);
+		return 0;
+	}
+	c->ip_slot = ip_slot == 1;
 	// Server-wide concurrent connection cap.
 	if (!hw_semaphore_try(&srv->connections)) {
 		HW_STAT_INC(srv, refused_connection_limit);
@@ -834,51 +982,67 @@ static int ct_equal(const char *a, const char *b, size_t n) {
 	return diff == 0;
 }
 
-static int password_ok(const hw_server_config *cfg, const char *user, size_t ulen, const char *pass, size_t plen) {
+// How a password offered in INFO stands against the configured users. A plain stored password is
+// compared here and now. A hashed one is not: crypt(3) is slow by design, so it goes to the auth
+// threads and the answer comes back to info_finish through auth_done.
+enum {
+	PASS_BAD = 0,
+	PASS_OK,
+	PASS_PENDING, // c->auth_req is set
+	PASS_BUSY     // too many checks waiting: turned away, and not held against the client
+};
+
+static void info_finish(hw_conn *c, int tried, int ok);
+
+static void auth_done(hw_loop *loop, int ok, void *ud) {
+	hw_conn *c = ud;
+	c->auth_req = NULL;
+	info_finish(c, 1, ok);
+}
+
+static int password_check(hw_conn *c, const char *user, size_t ulen, const char *pass, size_t plen) {
+	const hw_server_config *cfg = &c->w->server->cfg;
+	hw_auth *auth = c->w->server->auth;
 	char userz[64], passz[256];
-	if (ulen >= sizeof(userz) || plen >= sizeof(passz)) return 0;
+	if (ulen >= sizeof(userz) || plen >= sizeof(passz)) return PASS_BAD;
 	memcpy(userz, user, ulen);
 	userz[ulen] = '\0';
 	memcpy(passz, pass, plen);
 	passz[plen] = '\0';
+	const hw_password_user *found = NULL;
+	const hw_password_user *hashed = NULL; // any user with a hash, for the cost of a name that is not there
 	for (int i = 0; i < cfg->password_user_count; i++) {
 		const hw_password_user *u = &cfg->password_users[i];
-		if (strcmp(u->user, userz) != 0) continue;
-		if (u->pass[0] == '$') {
-			// crypt(3) hash: hash the candidate with the stored value as its salt and compare.
-			char got[256];
-			if (hw_sys_crypt(passz, u->pass, got, sizeof(got)) != 0) return 0;
-			size_t gl = strlen(got), sl = strlen(u->pass);
-			return gl == sl && ct_equal(got, u->pass, gl);
-		}
-		size_t sl = strlen(u->pass);
-		return sl == plen && ct_equal(u->pass, passz, sl);
+		if (!hashed && u->pass[0] == '$') hashed = u;
+		if (!found && strcmp(u->user, userz) == 0) found = u;
 	}
-	return 0;
+	if (found && found->pass[0] != '$') {
+		size_t sl = strlen(found->pass);
+		return sl == plen && ct_equal(found->pass, passz, sl) ? PASS_OK : PASS_BAD;
+	}
+	// A hashed user, or nobody. Nobody is hashed too when hashes are in use at all, against some
+	// user's salt, so that the time the answer takes does not say which names exist.
+	const hw_password_user *with = found ? found : hashed;
+	if (!with || !auth) return PASS_BAD;
+	c->auth_req = auth_check(auth, c->w->loop, passz, with->pass, found != NULL, auth_done, c);
+	return c->auth_req ? PASS_PENDING : PASS_BUSY;
 }
 
-static void handle_info(hw_conn *c, const hw_wisp_packet *p) {
+// The rest of the INFO exchange, once the password (if one was offered: `tried`) has its answer.
+static void info_finish(hw_conn *c, int tried, int ok) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	hw_wisp_info info;
-	if (hw_wisp_parse_info(p, &info) != 0 || info.major != HW_WISP_MAJOR) {
-		HW_DEBUG("conn", "%s: incompatible client INFO", c->peer);
-		conn_send_close(c, 0, HW_CLOSE_INCOMPATIBLE);
+	if (tried && !ok) {
+		// The name is not logged: it is whatever the client typed, and a failed login is where a
+		// password typed into the wrong field ends up.
+		HW_INFO("auth", "%s: bad password", c->peer);
+		HW_STAT_INC(c->w->server, auth_failures);
+		conn_rep_source(c, HW_REP_AUTH_FAILURE);
+		conn_send_close(c, 0, HW_CLOSE_AUTH_BAD_PASSWORD);
 		conn_flush(c); // the CLOSE is deferred like any small frame: write it before the socket goes
 		conn_close(c);
 		return;
 	}
-	if (cfg->password_user_count > 0 && info.has_password && info.user) {
-		if (!password_ok(cfg, info.user, info.user_len, info.pass, info.pass_len)) {
-			HW_INFO("auth", "%s: bad password for '%.*s'", c->peer, (int)HW_MIN(info.user_len, 64), info.user);
-			HW_STAT_INC(c->w->server, auth_failures);
-			conn_rep_source(c, HW_REP_AUTH_FAILURE);
-			conn_send_close(c, 0, HW_CLOSE_AUTH_BAD_PASSWORD);
-			conn_flush(c);
-			conn_close(c);
-			return;
-		}
-		c->authenticated = 1;
-	}
+	if (tried) c->authenticated = 1;
 	if (cfg->password_required && !c->authenticated) {
 		HW_STAT_INC(c->w->server, auth_failures);
 		conn_rep_source(c, HW_REP_AUTH_FAILURE);
@@ -887,8 +1051,47 @@ static void handle_info(hw_conn *c, const hw_wisp_packet *p) {
 		conn_close(c);
 		return;
 	}
-	c->stream_confirm = info.has_stream_confirm;
 	handshake_done(c);
+}
+
+static void handle_info(hw_conn *c, const hw_wisp_packet *p) {
+	const hw_server_config *cfg = &c->w->server->cfg;
+	hw_wisp_info info;
+	if (c->auth_req) return; // a second INFO while the first one's password is being checked
+	if (hw_wisp_parse_info(p, &info) != 0 || info.major != HW_WISP_MAJOR) {
+		HW_DEBUG("conn", "%s: incompatible client INFO", c->peer);
+		conn_send_close(c, 0, HW_CLOSE_INCOMPATIBLE);
+		conn_flush(c); // the CLOSE is deferred like any small frame: write it before the socket goes
+		conn_close(c);
+		return;
+	}
+	c->stream_confirm = info.has_stream_confirm;
+	if (cfg->password_user_count > 0 && info.has_password && info.user) {
+		int r = password_check(c, info.user, info.user_len, info.pass, info.pass_len);
+		if (r == PASS_PENDING) return; // auth_done carries on
+		if (r == PASS_BUSY) {
+			conn_send_close(c, 0, HW_CLOSE_THROTTLED);
+			conn_flush(c);
+			conn_close(c);
+			return;
+		}
+		info_finish(c, 1, r == PASS_OK);
+		return;
+	}
+	info_finish(c, 0, 0);
+}
+
+// A destination is a hostname or an address literal, and both are made of these bytes. Anything
+// else is refused before it can reach a resolver, a log line or an upstream proxy's request line
+// (a space or a line break in the host of an HTTP CONNECT is a second request).
+static int host_chars_ok(const char *host, size_t len) {
+	for (size_t i = 0; i < len; i++) {
+		unsigned char ch = (unsigned char)host[i];
+		int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' ||
+		         ch == '-' || ch == '_' || ch == ':' || ch == '[' || ch == ']';
+		if (!ok) return 0;
+	}
+	return 1;
 }
 
 static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
@@ -902,9 +1105,12 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
-	if (hw_map_get(&c->streams, p->stream_id)) {
+	hw_stream *dup = hw_map_get(&c->streams, p->stream_id);
+	if (dup) {
+		// The CLOSE this earns names the id, so the client now believes that stream is gone. It
+		// is closed here too: left open, it would relay for an id the client no longer knows.
 		HW_DEBUG("conn", "%s: duplicate stream %u", c->peer, p->stream_id);
-		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
+		stream_close(dup, HW_CLOSE_INVALID_INFO, 1);
 		return;
 	}
 	if (c->stream_cap > 0 && hw_map_count(&c->streams) >= (size_t)c->stream_cap) {
@@ -916,9 +1122,14 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 	// Twisp terminal stream: off unless explicitly enabled, v2, and authenticated. Each gate also
 	// feeds reputation, since probing it is a strong abuse signal.
 	if (req.stream_type == HW_STREAM_TERM) {
-		if (!cfg->enable_twisp || !c->is_v2 || !c->authenticated) {
-			HW_WARN("twisp", "%s: terminal stream refused (enabled=%d v2=%d auth=%d)", c->peer, cfg->enable_twisp,
-			        c->is_v2, c->authenticated);
+		if (!cfg->enable_twisp) {
+			// Nothing to probe: the feature does not exist on this server. Asking is not abuse, and
+			// scoring it let any page spend its visitors' reputation here with one packet.
+			conn_send_close(c, p->stream_id, HW_CLOSE_BLOCKED);
+			return;
+		}
+		if (!c->is_v2 || !c->authenticated) {
+			HW_WARN("twisp", "%s: terminal stream refused (v2=%d auth=%d)", c->peer, c->is_v2, c->authenticated);
 			conn_rep_source(c, HW_REP_TWISP_NO_AUTH);
 			conn_send_close(c, p->stream_id, HW_CLOSE_BLOCKED);
 			return;
@@ -933,6 +1144,10 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 		return;
 	}
 	if (req.stream_type != HW_STREAM_TCP && req.stream_type != HW_STREAM_UDP) {
+		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
+		return;
+	}
+	if (!host_chars_ok(req.host, req.host_len)) {
 		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
@@ -1150,7 +1365,7 @@ static void conn_process(hw_conn *c) {
 
 static void conn_read(hw_conn *c) {
 	size_t total = 0;
-	while (!c->closing && !c->throttled && !c->read_paused && total < CONN_MAX_READ_PER_EVENT) {
+	while (!c->closing && !conn_reads_stopped(c) && total < CONN_MAX_READ_PER_EVENT) {
 		if (hw_buf_reserve(&c->rbuf, c->read_chunk) != 0) {
 			conn_close(c);
 			return;
@@ -1171,6 +1386,7 @@ static void conn_read(hw_conn *c) {
 		}
 		hw_buf_commit(&c->rbuf, (size_t)n);
 		total += (size_t)n;
+		c->heard = 1;
 		conn_process(c);
 		if (c->closing) return;
 		if ((size_t)n == room) {
@@ -1195,5 +1411,13 @@ static void conn_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 	if (c->closing) return;
 	if (events & HW_EV_WRITE) conn_flush(c);
 	if (c->closing) return;
-	if ((events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR)) && !c->throttled && !c->read_paused) conn_read(c);
+	if (!(events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR))) return;
+	if (!conn_reads_stopped(c)) {
+		conn_read(c);
+	} else if (events & (HW_EV_HUP | HW_EV_ERROR)) {
+		// The client's socket is dead while its reads are paused. Nothing can clear that
+		// level-triggered condition but closing, and there is no one left to relay for.
+		HW_DEBUG("conn", "%s: hung up while paused", c->peer);
+		conn_close(c);
+	}
 }

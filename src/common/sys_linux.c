@@ -14,9 +14,11 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/wait.h>
 
 int hw_sys_socket(int domain, int type, int protocol, int nonblock) {
@@ -57,6 +59,33 @@ ssize_t hw_sys_splice(int from, int to, size_t n) {
 	return splice(from, NULL, to, NULL, n, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
 }
 
+int hw_sys_has_close_reset(void) {
+	return 1;
+}
+
+int hw_sys_close_reset(int fd) {
+	// SIOCOUTQ counts what the peer has not acknowledged, sent or not. A close with a zero linger
+	// time resets the connection and discards exactly that, so it is asked for only at zero.
+	int queued = 1;
+	struct linger lg = {.l_onoff = 1, .l_linger = 0};
+	int reset = ioctl(fd, SIOCOUTQ, &queued) == 0 && queued == 0 &&
+	            setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg)) == 0;
+	close(fd);
+	return reset;
+}
+
+int hw_sys_random(void *buf, size_t len) {
+	uint8_t *p = buf;
+	while (len > 0) {
+		ssize_t n = getrandom(p, len, 0);
+		if (n < 0 && errno == EINTR) continue;
+		if (n <= 0) return -1;
+		p += n;
+		len -= (size_t)n;
+	}
+	return 0;
+}
+
 int hw_sys_has_crypt(void) {
 	return 1;
 }
@@ -81,6 +110,9 @@ pid_t hw_sys_pty_spawn(char *const argv[], int *master) {
 	pid_t pid = forkpty(master, NULL, NULL, NULL);
 	if (pid < 0) return -1;
 	if (pid == 0) {
+		// The server ignores SIGPIPE and an ignored signal stays ignored across exec, where a
+		// shell cannot even set it back: `yes | head` would never end.
+		signal(SIGPIPE, SIG_DFL);
 		setenv("TERM", "xterm-256color", 1);
 		execvp(argv[0], argv);
 		_exit(127); // exec failed; the master sees the end at once

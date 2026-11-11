@@ -104,6 +104,74 @@ size_t hw_window_count(hw_window *w) {
 	return n;
 }
 
+// ---------------------------------------------------------------------------------- gauge
+
+struct hw_gauge {
+	int limit;
+	pthread_mutex_t lock;
+	hw_smap holders; // key -> int *, present only while the count is above zero
+};
+
+hw_gauge *hw_gauge_new(int limit) {
+	hw_gauge *g = calloc(1, sizeof(*g));
+	if (!g) return NULL;
+	g->limit = limit;
+	pthread_mutex_init(&g->lock, NULL);
+	hw_smap_init(&g->holders);
+	return g;
+}
+
+void hw_gauge_free(hw_gauge *g) {
+	if (!g) return;
+	hw_smap_each(&g->holders, free_entry_visit, NULL);
+	hw_smap_free(&g->holders);
+	pthread_mutex_destroy(&g->lock);
+	free(g);
+}
+
+int hw_gauge_acquire(hw_gauge *g, const char *key) {
+	if (!g || g->limit <= 0) return -1;
+	int r;
+	pthread_mutex_lock(&g->lock);
+	int *n = hw_smap_get(&g->holders, key);
+	if (!n) {
+		n = calloc(1, sizeof(*n));
+		if (!n || hw_smap_put(&g->holders, key, n) != 0) {
+			free(n);
+			pthread_mutex_unlock(&g->lock);
+			return -1; // out of memory: fail open, uncounted
+		}
+	}
+	if (*n >= g->limit) {
+		r = 0;
+	} else {
+		(*n)++;
+		r = 1;
+	}
+	pthread_mutex_unlock(&g->lock);
+	return r;
+}
+
+void hw_gauge_release(hw_gauge *g, const char *key) {
+	if (!g) return;
+	pthread_mutex_lock(&g->lock);
+	int *n = hw_smap_get(&g->holders, key);
+	if (n && --(*n) <= 0) {
+		hw_smap_remove(&g->holders, key);
+		free(n);
+	}
+	pthread_mutex_unlock(&g->lock);
+}
+
+int hw_gauge_value(hw_gauge *g, const char *key) {
+	if (!g) return 0;
+	pthread_mutex_lock(&g->lock);
+	const int *n = hw_smap_get(&g->holders, key);
+	int v = n ? *n : 0;
+	pthread_mutex_unlock(&g->lock);
+	return v;
+}
+
 // ---------------------------------------------------------------------------------- semaphore
 
 void hw_semaphore_init(hw_semaphore *s, int64_t max) {
@@ -219,6 +287,10 @@ void hw_sigdet_record(hw_sigdet *d, int ok, uint64_t now_ms, uint64_t window_ms)
 		if (d->at[tail] >= cutoff) break;
 		d->count--;
 	}
+}
+
+uint64_t hw_sigdet_last(const hw_sigdet *d) {
+	return d->at[(d->head - 1 + HW_SIGDET_RING) % HW_SIGDET_RING];
 }
 
 int hw_sigdet_match(const hw_sigdet *d, int min_samples, double failed_ratio) {

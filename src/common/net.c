@@ -6,6 +6,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/sys.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -143,9 +144,25 @@ int hw_connect_tcp(const char *host, uint16_t port, int timeout_ms) {
 	return fd;
 }
 
-static int digits_and_dots(const char *s) {
-	for (; *s; s++) {
-		if (*s != '.' && (*s < '0' || *s > '9')) return 0;
+// Whether the last label of host is a number: all digits, or hexadecimal behind "0x". Such a name
+// is an address to every resolver's inet_aton ("0x7f.1", "2130706433", "0x8.0x8.0x8.0x8"), never
+// a name in the DNS, whose top-level labels are not numeric. One trailing dot is not a label.
+static int ends_in_number(const char *host) {
+	size_t n = strlen(host);
+	if (n > 0 && host[n - 1] == '.') n--;
+	size_t start = n;
+	while (start > 0 && host[start - 1] != '.') start--;
+	const char *label = host + start;
+	size_t len = n - start;
+	if (len == 0) return 0;
+	if (len >= 2 && label[0] == '0' && (label[1] == 'x' || label[1] == 'X')) {
+		for (size_t i = 2; i < len; i++) {
+			if (!isxdigit((unsigned char)label[i])) return 0;
+		}
+		return 1;
+	}
+	for (size_t i = 0; i < len; i++) {
+		if (label[i] < '0' || label[i] > '9') return 0;
 	}
 	return 1;
 }
@@ -176,11 +193,19 @@ int hw_addr_parse(const char *host, uint16_t port, struct sockaddr_storage *out,
 		*out_len = sizeof(*v6);
 		return 1;
 	}
-	// Brackets around something that is not an IPv6 literal, or digits and dots that inet_pton
-	// rejected, or a stray colon: a malformed literal rather than a hostname.
+	// Brackets around something that is not an address, a stray colon, or a name that ends in a
+	// number: a malformed literal rather than a hostname. The last one matters most. A resolver
+	// reads such a name as an address without asking the DNS (one to four parts, each decimal,
+	// octal or hexadecimal), so handing it on as a hostname would connect to an address that was
+	// never checked as a literal.
 	if (bracketed) return -1;
-	if (n > 0 && digits_and_dots(host)) return -1;
 	if (strchr(host, ':')) return -1;
+	if (ends_in_number(host)) return -1;
+	// Nor is anything with a space or a control byte in it a name. Some resolvers stop reading
+	// a number at the first whitespace and take what stood before it ("0x7f.1 x").
+	for (const char *c = host; *c; c++) {
+		if ((unsigned char)*c <= 0x20 || *c == 0x7f) return -1;
+	}
 	return 0;
 }
 
@@ -218,10 +243,19 @@ static enum hw_addr_class classify_v4(uint32_t a) {
 	if (b0 >= 240) return HW_ADDR_RESERVED;
 	if (b0 == 192 && b1 == 0 && b2 == 0) return HW_ADDR_RESERVED;     // IETF protocol assignments
 	if (b0 == 192 && b1 == 0 && b2 == 2) return HW_ADDR_RESERVED;     // TEST-NET-1
+	if (b0 == 192 && b1 == 88 && b2 == 99) return HW_ADDR_RESERVED;   // 6to4 relay anycast, deprecated
 	if (b0 == 198 && b1 == 51 && b2 == 100) return HW_ADDR_RESERVED;  // TEST-NET-2
 	if (b0 == 203 && b1 == 0 && b2 == 113) return HW_ADDR_RESERVED;   // TEST-NET-3
 	if (b0 == 198 && (b1 == 18 || b1 == 19)) return HW_ADDR_RESERVED; // benchmarking
 	return HW_ADDR_PUBLIC;
+}
+
+// An IPv4 address carried inside an IPv6 one by a translation or tunnelling scheme: the packet
+// ends up at the IPv4 address, so that is what the policy is about. A public one is still not a
+// public IPv6 destination (nothing routes these prefixes for a stranger), so it is reserved.
+static enum hw_addr_class classify_wrapped(const uint8_t *v4) {
+	enum hw_addr_class c = classify_v4((uint32_t)v4[0] << 24 | (uint32_t)v4[1] << 16 | (uint32_t)v4[2] << 8 | v4[3]);
+	return c == HW_ADDR_PUBLIC ? HW_ADDR_RESERVED : c;
 }
 
 enum hw_addr_class hw_addr_classify(const struct sockaddr *sa) {
@@ -232,30 +266,36 @@ enum hw_addr_class hw_addr_classify(const struct sockaddr *sa) {
 	const uint8_t *a = ((const struct sockaddr_in6 *)sa)->sin6_addr.s6_addr;
 	static const uint8_t zero[15] = {0};
 	if (memcmp(a, zero, 15) == 0) return a[15] == 1 ? HW_ADDR_LOOPBACK : HW_ADDR_UNSPECIFIED;
-	// ::ffff:a.b.c.d
+	// ::ffff:a.b.c.d is the IPv4 address itself, public ones included: a dual-stack socket
+	// connects to it over IPv4.
 	static const uint8_t mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
 	if (memcmp(a, mapped, 12) == 0) {
-		uint32_t v4 = (uint32_t)a[12] << 24 | (uint32_t)a[13] << 16 | (uint32_t)a[14] << 8 | a[15];
-		return classify_v4(v4);
+		return classify_v4((uint32_t)a[12] << 24 | (uint32_t)a[13] << 16 | (uint32_t)a[14] << 8 | a[15]);
 	}
-	// 64:ff9b::/96 (NAT64) and ::a.b.c.d (deprecated compat) also wrap an IPv4 address.
+	// The other forms that wrap an IPv4 address in the last 32 bits: 64:ff9b::/96 (NAT64),
+	// ::a.b.c.d (deprecated compatible) and ::ffff:0:a.b.c.d (IPv4-translated, RFC 2765).
 	static const uint8_t nat64[12] = {0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0};
-	if (memcmp(a, nat64, 12) == 0 || memcmp(a, zero, 12) == 0) {
-		uint32_t v4 = (uint32_t)a[12] << 24 | (uint32_t)a[13] << 16 | (uint32_t)a[14] << 8 | a[15];
-		enum hw_addr_class c = classify_v4(v4);
-		return c == HW_ADDR_PUBLIC ? HW_ADDR_RESERVED : c;
+	static const uint8_t translated[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0};
+	if (memcmp(a, nat64, 12) == 0 || memcmp(a, zero, 12) == 0 || memcmp(a, translated, 12) == 0) {
+		return classify_wrapped(a + 12);
 	}
 	if (a[0] == 0xff) return HW_ADDR_MULTICAST;
-	if ((a[0] & 0xfe) == 0xfc) return HW_ADDR_PRIVATE;                                         // fc00::/7 ULA
-	if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return HW_ADDR_LINK_LOCAL;                      // fe80::/10
-	if (a[0] == 0xfe && (a[1] & 0xc0) == 0xc0) return HW_ADDR_RESERVED;                        // fec0::/10 site-local
+	// An ISATAP interface id (RFC 5214: 0000:5efe or 0200:5efe, then the IPv4 address) under any
+	// prefix, link-local and private ones included: a host with such an interface tunnels the
+	// packet to the IPv4 address, so that address decides before the prefix does.
+	if ((a[8] & 0xfd) == 0 && a[9] == 0 && a[10] == 0x5e && a[11] == 0xfe) return classify_wrapped(a + 12);
+	if ((a[0] & 0xfe) == 0xfc) return HW_ADDR_PRIVATE;                    // fc00::/7 ULA
+	if (a[0] == 0xfe && (a[1] & 0xc0) == 0x80) return HW_ADDR_LINK_LOCAL; // fe80::/10
+	// Global unicast is 2000::/3 and nothing else. What is left outside it is unassigned or set
+	// aside: 64:ff9b:1::/48 (local-use NAT64, whose IPv4 address sits at a place only its operator
+	// knows), 100::/64 (discard), 5f00::/16 (SRv6 SIDs), fec0::/10 (site-local) and the rest.
+	if ((a[0] & 0xe0) != 0x20) return HW_ADDR_RESERVED;
+	if (a[0] == 0x20 && a[1] == 0x02) return classify_wrapped(a + 2); // 2002::/16, 6to4
+	// 2001::/23, the IETF protocol assignments: Teredo (2001::/32), benchmarking (2001:2::/48),
+	// ORCHID (2001:10::/28, 2001:20::/28) and smaller ones, none of them a host to relay to.
+	if (a[0] == 0x20 && a[1] == 0x01 && a[2] <= 0x01) return HW_ADDR_RESERVED;
 	if (a[0] == 0x20 && a[1] == 0x01 && a[2] == 0x0d && a[3] == 0xb8) return HW_ADDR_RESERVED; // 2001:db8::/32
-	if (a[0] == 0x20 && a[1] == 0x02) {                                                        // 6to4
-		uint32_t v4 = (uint32_t)a[2] << 24 | (uint32_t)a[3] << 16 | (uint32_t)a[4] << 8 | a[5];
-		enum hw_addr_class c = classify_v4(v4);
-		return c == HW_ADDR_PUBLIC ? HW_ADDR_RESERVED : c;
-	}
-	if (a[0] == 0x20 && a[1] == 0x01 && a[2] == 0 && a[3] == 0) return HW_ADDR_RESERVED; // Teredo
+	if (a[0] == 0x3f && a[1] == 0xff && (a[2] & 0xf0) == 0) return HW_ADDR_RESERVED;           // 3fff::/20
 	return HW_ADDR_PUBLIC;
 }
 

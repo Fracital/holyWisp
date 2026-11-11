@@ -46,11 +46,12 @@ export class Logger {
 	/**
 	 * A line the server wrote to stderr. Its own level decides how it is shown (the server has
 	 * already filtered by `logLevel`); a line that is not a log line is something going wrong
-	 * before logging was up, or a crash, and is an error.
+	 * before logging was up, or a crash, and is an error. `clean` is applied to what is shown (the
+	 * wrapper's redaction of secrets), after the level has been read from the line as it came.
 	 */
-	server(line: string): void {
+	server(line: string, clean: (text: string) => string = (text) => text): void {
 		const match = serverLine.exec(line);
-		if (match) this.log(match[1] as Exclude<LogLevel, "none">, match[2] as string);
-		else if (line.trim()) this.log("error", line);
+		if (match) this.log(match[1] as Exclude<LogLevel, "none">, clean(match[2] as string));
+		else if (line.trim()) this.log("error", clean(line));
 	}
 }

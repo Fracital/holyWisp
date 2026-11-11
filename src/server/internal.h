@@ -50,6 +50,11 @@ typedef struct hw_pipe_mark {
 	hw_spipe *p;
 } hw_pipe_mark;
 
+// auth.c: hashed-password checks on threads of their own.
+typedef struct hw_auth hw_auth;
+typedef struct hw_auth_req hw_auth_req;
+typedef void (*hw_auth_cb)(hw_loop *loop, int ok, void *ud);
+
 typedef struct hw_worker {
 	hw_server *server;
 	hw_loop *loop;
@@ -76,7 +81,16 @@ typedef struct hw_worker {
 	// Connections holding small frames that have not been written yet (conn_kick). The loop's
 	// batch-end hook writes them, so frames queued by several callbacks leave in one send.
 	struct hw_conn *flush_head;
-	uint64_t pipe_retry_ms; // a relay pipe could not be had: do not ask the kernel again before this
+	uint64_t pipe_retry_ms;  // a relay pipe could not be had: do not ask the kernel again before this
+	uint64_t accept_warn_ms; // when "out of file descriptors" was last logged
+	// Placement of new connections (server.c, "Which worker gets a connection"). `load` is the
+	// connections given to this worker and not yet freed: raised by whichever worker accepted,
+	// lowered here, read by every worker that has one to place. The inbox holds connections
+	// another worker accepted for this one until this loop takes them; nothing else of a worker
+	// is touched from outside its thread.
+	_Atomic int load;
+	pthread_mutex_t inbox_lock;
+	struct hw_handoff *inbox;
 } hw_worker;
 
 enum proxy_kind {
@@ -100,6 +114,7 @@ struct hw_server {
 	hw_worker *workers;
 	int nworkers;
 	hw_resolver *resolver;
+	hw_auth *auth; // NULL unless a password-user holds a crypt(3) hash
 	hw_dns_cache *dns_cache;
 	hw_proxy_config proxy;
 	// The CONTINUE window actually advertised: buffer-remaining, capped so a full window of
@@ -122,6 +137,8 @@ struct hw_server {
 	hw_window *per_dest_min; // ... per minute
 	hw_semaphore in_flight_syns;
 	hw_semaphore connections;
+	hw_gauge *syns_per_ip;  // TCP connects in progress per client IP
+	hw_gauge *conns_per_ip; // WebSocket clients per client IP
 	hw_bandwidth *bandwidth;
 	hw_reputation *reputation;
 
@@ -181,13 +198,15 @@ typedef struct hw_conn {
 	int handshake_done; // v2: client INFO received; v1: always
 	int stream_confirm; // v2 extension: CONTINUE a stream once it connects
 	int authenticated;
+	hw_auth_req *auth_req; // a hashed password is being checked: the INFO exchange waits for it
 	hw_timer *handshake_timer;
 	hw_timer *throttle_timer; // bandwidth pause
 	int throttled;            // reads suspended until throttle_timer fires
 	int write_armed;          // HW_EV_WRITE requested
 	int flush_queued;         // on the worker's flush list
 	struct hw_conn *flush_next;
-	int paused;        // remote reads suspended: wbuf past the high-water mark
+	int paused;        // remote reads suspended: bp_paused or throttled (conn_sync_streams)
+	int bp_paused;     // the send queue passed the high-water mark and has not drained yet
 	size_t queued_out; // bytes waiting in every stream's `out` toward its remote
 	size_t pkt_avg;    // running average DATA payload from this client, 0 until the first
 	size_t read_chunk; // room offered to each recv: grows while reads fill it, decays when idle
@@ -197,10 +216,16 @@ typedef struct hw_conn {
 	uint32_t pt_stream;
 	uint8_t pt_mask[4];
 	size_t pt_off;
-	int read_paused; // client reads suspended: queued_out past conn-queue-max
+	int read_paused;    // client reads suspended: queued_out past conn-queue-max
+	int wr_stalled;     // client reads suspended: its own send queue is far past the high-water mark
+	int wrote;          // bytes left for the client since the worker's last sweep
+	uint64_t stall_ms;  // when a sweep first found the send queue not moving, 0 while it moves
+	uint64_t active_ms; // last frame from the client, for idle-timeout-s
 	int closing;
 	int violations;
 	int conn_slot;  // holds one of server->connections
+	int ip_slot;    // holds one of server->conns_per_ip for c->ip
+	int heard;      // a read from the client since the worker's last sweep
 	int stream_cap; // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
 	char peer[HW_ADDR_STR_LEN]; // socket peer, with port, for logs
@@ -238,7 +263,11 @@ typedef struct hw_stream {
 	int parked;         // reads stopped until the stream's own pipe has drained into the client
 	hw_spipe *pipe;     // opened when the stream first goes bulk
 	int read_armed;
-	int syn_held; // holds one of server->in_flight_syns
+	int detached;    // hung up while reads were paused: off the loop until they resume
+	int heard;       // the remote has sent something since the client last did
+	int syn_held;    // holds one of server->in_flight_syns
+	int syn_ip_held; // ... and one of server->syns_per_ip for the client's IP
+	uint8_t denied;  // close reason of the last address policy refused (dest_policy), 0 for none
 	hw_resolve_req *resolve;
 	hw_timer *connect_timer;
 	struct sockaddr_storage addrs[HW_STREAM_MAX_ADDRS];
@@ -296,9 +325,24 @@ uint32_t conn_window(const hw_conn *c);
 // stops reading the client (never closes anything) and resumes at half the mark.
 void conn_queue_add(hw_conn *c, size_t n);
 void conn_queue_sub(hw_conn *c, size_t n);
+// The worker's periodic pass over its connections: closes one whose send queue has not moved for
+// client-write-timeout-s, or (idle-timeout-s) one with no streams that has sent nothing for that long.
+void conn_sweep(hw_worker *w);
 // Reputation shortcuts (no-ops when disabled).
 void conn_rep_source(hw_conn *c, enum hw_rep_event e);
 void conn_rep_dest(hw_conn *c, const char *dest, enum hw_rep_event e);
+
+// auth.c
+hw_auth *auth_new(void);
+void auth_free(hw_auth *a);
+// Hash `pass` the way `stored` (a crypt(3) hash) was made, on the pool, and run cb on `loop` with
+// whether they match. With `known` zero the work is done and the answer is always no: a name that
+// does not exist must cost what one that does costs. NULL when too many checks are waiting, or
+// out of memory: nothing will be called. The result belongs to the pool; keep it only to cancel.
+hw_auth_req *auth_check(hw_auth *a, hw_loop *loop, const char *pass, const char *stored, int known, hw_auth_cb cb,
+                        void *ud);
+// The caller is going away: cb will not run. Loop thread only.
+void auth_cancel(hw_auth_req *req);
 
 // stream.c
 void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port);
@@ -321,8 +365,10 @@ void stream_resume(hw_stream *s);
 // has written it (stream_unpark, from conn_flush).
 void stream_park(hw_stream *s);
 void stream_unpark(hw_stream *s);
-// The remote (or proxy handshake) is up: finish opening the stream toward the client.
-void stream_connected(hw_stream *s);
+// The remote (or proxy handshake) is up: finish opening the stream toward the client and send what
+// it queued meanwhile. 0 when the stream is open, -1 when that closed it (or the connection): the
+// stream is freed then, and a caller with more to do tests the result, never s->state.
+int stream_connected(hw_stream *s);
 // Adopt an already-connected fd (a PTY master for Twisp): register it on the loop and open the
 // stream. Closes the stream on failure.
 void stream_adopt(hw_stream *s, int fd);

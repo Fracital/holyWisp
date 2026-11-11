@@ -1,4 +1,7 @@
-# systemd-tmpfiles: own the config and state directories for the static `wisp` user, 0750 so the
-# reputation store and config are not world-readable.
-d /etc/holywisp 0750 wisp wisp -
+# systemd-tmpfiles: the config and state directories, 0750 so neither the config nor the
+# reputation store is world-readable. The config directory is root's, with the `wisp` group
+# reading it: it holds the password file, and a directory the service user owned would let a
+# compromised server replace that file (or plant a link where the maintainer scripts chown and
+# chmod as root). Only the state directory belongs to the service user.
+d /etc/holywisp 0750 root wisp -
 d /var/lib/holywisp 0750 wisp wisp -

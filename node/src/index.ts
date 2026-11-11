@@ -11,6 +11,7 @@
  * table and the DNS cache are one set shared by every worker instead of N independent ones.
  */
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
 import { request, type IncomingMessage } from "node:http";
 import * as net from "node:net";
@@ -18,7 +19,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createInterface } from "node:readline";
 import type { Duplex } from "node:stream";
-import { trustedHeaders, workerArgs, type holyWispConfig, type holyWispOptions } from "./config.js";
+import {
+	bindHost,
+	PROXY_SECRET_HEADER,
+	redactor,
+	trustedHeaders,
+	workerArgs,
+	type holyWispConfig,
+	type holyWispOptions,
+} from "./config.js";
 import { Logger } from "./logger.js";
 import { bundledBinary, platformKey } from "./path.js";
 
@@ -51,7 +60,15 @@ export type holyWispStats = {
 };
 
 const READY_TIMEOUT_MS = 10_000;
+// How long a server must stay alive after its port first answered before it counts as ready. One
+// that lost its port to another process is gone within a few milliseconds of starting.
+const READY_SETTLE_MS = 30;
 const MAX_WORKERS = 1024;
+const PROXY_SECRET_BYTES = 32;
+const SECRET_HEADER = PROXY_SECRET_HEADER.toLowerCase();
+// The server keeps 511 bytes of a header value and drops the rest without a word, so a list that
+// is cut loses its right-hand end: the entries the proxies wrote. See forwardedList().
+const FORWARDED_MAX_BYTES = 400;
 // autoRestart: the wait before the first attempt, its ceiling, and how long a server must have
 // stayed up for its next death to count as a first one again.
 const RESTART_MIN_MS = 100;
@@ -106,11 +123,48 @@ function untrack(child: ChildProcess): void {
 	if (live.delete(child) && live.size === 0) unhook();
 }
 
-/** Node reports IPv4 peers of a dual-stack listener as `::ffff:a.b.c.d`. */
+/**
+ * The address of a socket's peer in the form the server parses, or undefined when there is none
+ * to give. Node reports IPv4 peers of a dual-stack listener as `::ffff:a.b.c.d` and link-local
+ * IPv6 peers with their zone (`fe80::1%eth0`); the server knows neither form, and takes a header
+ * it cannot parse for no header at all.
+ */
 function plainAddress(address: string | undefined): string | undefined {
 	if (!address) return undefined;
-	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(address);
-	return mapped ? mapped[1] : address;
+	const zone = address.indexOf("%");
+	const bare = zone < 0 ? address : address.slice(0, zone);
+	const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/i.exec(bare);
+	const plain = mapped ? (mapped[1] as string) : bare;
+	return net.isIP(plain) !== 0 ? plain : undefined;
+}
+
+/**
+ * The X-Forwarded-For value for a request from a trusted proxy: what it sent, then the proxy
+ * itself. The server reads the list from the right and stops at the first address that is not a
+ * trusted hop, so when the list is too long for it the left-hand end is what can go; cut on the
+ * right, as the server would, the answer would be an entry the client wrote.
+ */
+function forwardedList(received: readonly string[], peer: string): string {
+	const entries = received
+		.flatMap((value) => value.split(","))
+		.map((entry) => entry.trim())
+		.filter((entry) => entry !== "");
+	const kept = [peer];
+	let bytes = Buffer.byteLength(peer);
+	for (let i = entries.length - 1; i >= 0; i--) {
+		const entry = entries[i] as string;
+		bytes += Buffer.byteLength(entry) + 2;
+		if (bytes > FORWARDED_MAX_BYTES) break;
+		kept.unshift(entry);
+	}
+	return kept.join(", ");
+}
+
+/** Answer an upgrade that will not be routed, and close. */
+function refuse(socket: Duplex, status: string): void {
+	if (socket.destroyed) return;
+	socket.on("error", () => socket.destroy());
+	socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`, () => socket.destroy());
 }
 
 function family(address: string): "ipv4" | "ipv6" {
@@ -198,6 +252,14 @@ export class holyWisp {
 	readonly config: holyWispConfig;
 	private child: ChildProcess | undefined;
 	private boundPort: number | undefined;
+	/**
+	 * The secret the running server was started with (`trusted-proxy-secret`), which route() sends
+	 * so that the server believes it and nobody else on loopback. A new one for every server
+	 * process, set together with `boundPort`. A `#` field: it is not in `console.log(wisp)`.
+	 */
+	#proxySecret: string | undefined;
+	/** Whether the "no peer address" case has been explained in the log yet. */
+	private warnedNoPeer = false;
 	private starting = false;
 	/** start() was called and neither stop() nor kill() since: a server that exits is restarted. */
 	private wanted = false;
@@ -218,7 +280,10 @@ export class holyWisp {
 	private readonly trusted: net.BlockList;
 
 	constructor(options: holyWispOptions = {}) {
-		this.config = { host: "127.0.0.1", ...structuredClone(options) };
+		const given = structuredClone(options);
+		// After the spread: `host: undefined` is an own property too, and would replace a default
+		// that came first. The server would then bind every interface.
+		this.config = { ...given, host: bindHost(given) };
 		this.logger = new Logger(this.config.logLevel ?? "warn");
 		this.headers = trustedHeaders(this.config);
 		this.headerSet = new Set(this.headers.map((header) => header.toLowerCase()));
@@ -253,8 +318,8 @@ export class holyWisp {
 
 	/** Where this process reaches the server: loopback when it listens on every interface. */
 	private get workerHost(): string {
-		const host = this.config.host;
-		if (!host || host === "0.0.0.0") return "127.0.0.1";
+		const host = bindHost(this.config);
+		if (host === "0.0.0.0") return "127.0.0.1";
 		return host === "::" ? "::1" : host;
 	}
 
@@ -312,19 +377,21 @@ export class holyWisp {
 		let secretsDir: string | undefined;
 		try {
 			const binary = this.binary();
-			const bindHost = this.config.host || undefined;
-			const port = await freePort(this.lastPort ?? this.basePort(), bindHost);
-			const { args, secrets, ignored } = workerArgs(this.config, { port, workers });
+			const port = await freePort(this.lastPort ?? this.basePort(), bindHost(this.config));
+			// Every server process gets a secret of its own; route() learns it once that server is up.
+			const proxySecret = randomBytes(PROXY_SECRET_BYTES).toString("hex");
+			const { args, secrets, ignored, sensitive } = workerArgs(this.config, { port, workers, proxySecret });
 			for (const option of ignored) this.logger.warn(`ignoring ${option}`);
+			// Whatever the server says about its config is said about this file. None of its values
+			// may come back out through a log line or an Error.
+			const redact = redactor(sensitive);
 
-			if (secrets.length > 0) {
-				// Passwords go through a file only this user can read, not the argument list, which
-				// any local user can see. The server reads it once at startup.
-				secretsDir = fs.mkdtempSync(path.join(os.tmpdir(), "holywisp-"));
-				const file = path.join(secretsDir, "secrets.conf");
-				fs.writeFileSync(file, secrets.join("\n") + "\n", { mode: 0o600 });
-				args.unshift("--config", file);
-			}
+			// The secret and the passwords go through a file only this user can read, not the
+			// argument list, which any local user can see. The server reads it once at startup.
+			secretsDir = fs.mkdtempSync(path.join(os.tmpdir(), "holywisp-"));
+			const file = path.join(secretsDir, "secrets.conf");
+			fs.writeFileSync(file, secrets.join("\n") + "\n", { mode: 0o600 });
+			args.unshift("--config", file);
 
 			// stdin is a pipe nothing is ever written to: see `stop-on-stdin-eof` in config.ts.
 			const child = spawn(binary, args, { stdio: ["pipe", "ignore", "pipe"], windowsHide: true });
@@ -342,9 +409,9 @@ export class holyWisp {
 			// What it said last, for the error if it dies before it is ready.
 			const recent: string[] = [];
 			createInterface({ input: child.stderr! }).on("line", (line) => {
-				recent.push(line);
+				recent.push(redact(line));
 				if (recent.length > 20) recent.shift();
-				this.logger.server(line);
+				this.logger.server(line, redact);
 			});
 			child.on("error", (err) => this.logger.error(`server process error: ${err.message}`));
 			child.once("close", (code, signal) => {
@@ -377,6 +444,7 @@ export class holyWisp {
 				if (this.child === child) this.child = undefined;
 				throw err;
 			}
+			this.#proxySecret = proxySecret;
 			this.boundPort = port;
 			this.lastPort = port;
 			this.readySince = Date.now();
@@ -419,8 +487,20 @@ export class holyWisp {
 		return pending;
 	}
 
+	/**
+	 * Resolve once the server answers on its port. `recent` is what it wrote to stderr, already
+	 * redacted.
+	 *
+	 * An answer on the port is not yet an answer from this server: the port was free when
+	 * freePort() looked, and another process may have taken it since. The server then fails to
+	 * bind and exits within milliseconds, so one that is still alive a moment after the port first
+	 * answered, and answers again, is taken to be the one answering. That narrows the window; it
+	 * does not prove who holds the port, which only the server could (by reporting readiness on a
+	 * channel of its own).
+	 */
 	private async waitReady(child: ChildProcess, port: number, recent: readonly string[]): Promise<void> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
+		let answered = false;
 		while (Date.now() < deadline) {
 			if (!this.wanted) throw new Error("holyWisp: stopped while starting");
 			if (child.exitCode !== null || child.signalCode !== null) {
@@ -436,8 +516,10 @@ export class holyWisp {
 				(res) => res.status === 200,
 				() => false,
 			);
-			if (healthy) return;
-			await new Promise((resolve) => setTimeout(resolve, 20));
+			// The exit is looked at once more: the server may have gone while the port was answering.
+			if (healthy && answered && child.exitCode === null && child.signalCode === null) return;
+			answered = healthy;
+			await new Promise((resolve) => setTimeout(resolve, healthy ? READY_SETTLE_MS : 20));
 		}
 		throw new Error(`holyWisp: server on port ${port} did not become ready within ${READY_TIMEOUT_MS / 1000} seconds`);
 	}
@@ -449,43 +531,73 @@ export class holyWisp {
 	 * apply to the real client and not to this process. Forwarding headers that came with the
 	 * request are only passed on when that peer is one of `trustedProxies`; from anyone else they
 	 * are a claim the client made about itself, and are dropped.
+	 *
+	 * What this function says about the client is written directly after the request line, before
+	 * anything the client sent: the server reads the first header of a name and a bounded number
+	 * of headers, and neither may be something a client can use to get its own word in first.
 	 */
 	route(req: IncomingMessage, socket: Duplex, head: Buffer): void {
 		const port = this.boundPort;
-		if (port === undefined) {
+		const secret = this.#proxySecret;
+		if (port === undefined || secret === undefined) {
 			this.logger.error("route() called while the server is not running");
-			socket.end("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", () =>
-				socket.destroy(),
-			);
+			refuse(socket, "503 Service Unavailable");
 			return;
 		}
 
-		const peer = plainAddress((socket as Partial<net.Socket>).remoteAddress);
-		const trustedPeer = peer !== undefined && net.isIP(peer) !== 0 && this.trusted.check(peer, family(peer));
-		const lines = [`${req.method ?? "GET"} ${req.url ?? "/"} HTTP/1.1`];
+		// A front that listens on a Unix socket has no peer address to give. Whoever reaches it is a
+		// local process that was let at the socket file, which is what loopback is: it is taken for
+		// 127.0.0.1, so a proxy there is believed when trustedProxies lists that address, and
+		// otherwise every client that arrives this way is one client to the server (said once in
+		// the log, because it means one allowance and one reputation for all of them). An address
+		// that is there but is not one, or a socket that is already gone, is refused: there is
+		// nothing true to tell the server about it.
+		const remote = (socket as Partial<net.Socket>).remoteAddress;
+		let peer = plainAddress(remote);
+		if (peer === undefined && remote === undefined && !socket.destroyed) {
+			peer = "127.0.0.1";
+			if (!this.warnedNoPeer && !this.trusted.check(peer, "ipv4")) {
+				this.warnedNoPeer = true;
+				this.logger.warn(
+					"route() was given a socket with no peer address (a server on a Unix socket?): its clients all count " +
+						"as 127.0.0.1. If a proxy is in front, list 127.0.0.1 in trustedProxies so its X-Forwarded-For is used.",
+				);
+			}
+		}
+		if (peer === undefined) {
+			refuse(socket, "403 Forbidden");
+			return;
+		}
+		const trustedPeer = this.trusted.check(peer, family(peer));
+		// Ours: the proof that this is route() speaking, then who the client is.
+		const own = [`${PROXY_SECRET_HEADER}: ${secret}`];
+		// A trusted proxy's word, other than the list this hop adds itself to.
+		const vouched: string[] = [];
 		const forwardedFor: string[] = [];
+		const rest: string[] = [];
 		const raw = req.rawHeaders;
 		for (let i = 0; i + 1 < raw.length; i += 2) {
 			const name = raw[i] as string;
 			const value = raw[i + 1] as string;
 			const lower = name.toLowerCase();
+			// Nobody but this function sends the secret header, whatever is in it.
+			if (lower === SECRET_HEADER) continue;
 			if (this.headerSet.has(lower)) {
 				if (!trustedPeer) continue;
-				if (lower === "x-forwarded-for") {
-					forwardedFor.push(value);
-					continue;
-				}
+				if (lower === "x-forwarded-for") forwardedFor.push(value);
+				else vouched.push(`${name}: ${value}`);
+				continue;
 			}
-			lines.push(`${name}: ${value}`);
+			rest.push(`${name}: ${value}`);
 		}
 		if (trustedPeer) {
+			own.push(...vouched);
 			// A hop in a chain of proxies: add the one we saw to the list, as a proxy does.
-			if (this.headerSet.has("x-forwarded-for")) {
-				lines.push(`X-Forwarded-For: ${[...forwardedFor, peer].join(", ")}`);
-			}
-		} else if (peer !== undefined) {
-			lines.push(`${this.headers[0]}: ${peer}`);
+			if (this.headerSet.has("x-forwarded-for")) own.push(`X-Forwarded-For: ${forwardedList(forwardedFor, peer)}`);
+		} else {
+			own.push(`${this.headers[0]}: ${peer}`);
 		}
+		const lines = [`${req.method ?? "GET"} ${req.url ?? "/"} HTTP/1.1`, ...own, ...rest];
 
 		const upstream = net.connect({ host: this.workerHost, port, noDelay: true });
 		let connected = false;

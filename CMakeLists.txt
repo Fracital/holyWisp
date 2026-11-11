@@ -5,6 +5,7 @@ project(holyWisp VERSION 0.5.3 LANGUAGES C)
 option(HW_WERROR "Treat warnings as errors" ON)
 option(HW_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" OFF)
 option(HW_BUILD_TESTS "Build the test binaries" ON)
+option(HW_HARDEN "Exploit mitigations in optimised builds: a stack protector, and on Linux FORTIFY, PIE and full RELRO" ON)
 set(HW_VERSION_SUFFIX "" CACHE STRING "Appended to the reported version, e.g. +<commit>")
 
 set(CMAKE_C_STANDARD 11)
@@ -66,6 +67,65 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
   target_compile_options(hw_flags INTERFACE -O2)
 endif()
 
+# Exploit mitigations. --------------------------------------------------------------------------
+# The server parses bytes from anybody, so an optimised build is made the way distributions make
+# theirs. Debug and sanitizer builds are left exactly as they were: ASan has its own interceptors
+# and FORTIFY needs optimisation.
+#   -fstack-protector-strong  a canary in every function that has an array or takes an address.
+#   _FORTIFY_SOURCE=2         glibc's checked memcpy/strcpy/snprintf/read where the compiler
+#                             knows the size of the destination. musl has no such headers, so
+#                             the static npm binaries (node/scripts/build.mjs) gain nothing from
+#                             it; defining it there is harmless.
+#   PIE                       so the kernel can randomise where the executable is mapped. The
+#                             compile half (-fPIE) is CMAKE_POSITION_INDEPENDENT_CODE above; the
+#                             link half (-pie) is only passed once check_pie_supported() has run
+#                             (CMP0083). With zig and a musl target that makes a static PIE.
+#   -z relro -z now           relocations resolved at start and the GOT read-only after it.
+#                             glibc's loader does the protecting; musl's static start-up code
+#                             does not, so in the static npm binaries the segment is marked
+#                             but stays writable (there is no lazy binding in them to abuse).
+# All four are for Linux. The other linkers do not take the ELF flags and do not need them: a
+# Mach-O executable is position-independent as it is, and a PE one is relocatable (ASLR) as lld
+# links it. macOS gets the canary, which Apple's own clang turns on by default and zig's does
+# not, and has FORTIFY from its headers already. Windows is left alone: MinGW's canary and its
+# FORTIFY both rest on libssp, which nothing here has run.
+if(HW_HARDEN AND NOT HW_SANITIZE AND CMAKE_BUILD_TYPE MATCHES "^(Release|RelWithDebInfo|MinSizeRel)$")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(CheckCSourceCompiles)
+    include(CheckPIESupported)
+
+    target_compile_options(hw_flags INTERFACE -fstack-protector-strong)
+
+    # Ubuntu's compilers define _FORTIFY_SOURCE themselves when optimising, and distribution
+    # flags (%cmake, dpkg-buildflags) put it on the command line, often at level 3. A second
+    # definition is a "redefined" warning, which -Werror makes fatal, and would lower theirs:
+    # only define it when nothing has. Asked again at every configure, because CMAKE_C_FLAGS
+    # may have changed since the last one.
+    unset(HW_FORTIFY_PRESET CACHE)
+    set(CMAKE_REQUIRED_FLAGS "-O2")
+    check_c_source_compiles("
+#ifndef _FORTIFY_SOURCE
+#error nothing defined it
+#endif
+int main(void) { return 0; }
+" HW_FORTIFY_PRESET)
+    unset(CMAKE_REQUIRED_FLAGS)
+    if(NOT HW_FORTIFY_PRESET)
+      target_compile_definitions(hw_flags INTERFACE _FORTIFY_SOURCE=2)
+    endif()
+
+    check_pie_supported(OUTPUT_VARIABLE HW_PIE_OUTPUT LANGUAGES C)
+    if(NOT CMAKE_C_LINK_PIE_SUPPORTED)
+      message(WARNING "holyWisp: this toolchain cannot link a position-independent executable; "
+                      "the binaries will load at a fixed address.\n${HW_PIE_OUTPUT}")
+    endif()
+
+    target_link_options(hw_flags INTERFACE -Wl,-z,relro,-z,now)
+  elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    target_compile_options(hw_flags INTERFACE -fstack-protector-strong)
+  endif()
+endif()
+
 # libholywisp: everything the server, client and tests share. ------------------------------
 add_library(holywisp STATIC
   src/common/base64.c
@@ -103,6 +163,7 @@ add_custom_command(
   VERBATIM)
 
 add_library(holywisp-server STATIC
+  src/server/auth.c
   src/server/config.c
   src/server/conn.c
   src/server/egress.c
@@ -144,7 +205,8 @@ if(HW_BUILD_TESTS)
     # The end-to-end suites run a whole server plus client, echo and proxy threads in one process.
     # Under a parallel `ctest -j`, CPU contention starves those threads and their internal timeouts
     # flake. RUN_SERIAL keeps them from competing with the rest of the suite.
-    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security OR ${name} STREQUAL test_flow)
+    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security OR ${name} STREQUAL test_flow OR
+       ${name} STREQUAL test_abuse)
       set_tests_properties(${name} PROPERTIES RUN_SERIAL ON)
     endif()
   endfunction()
@@ -152,6 +214,7 @@ if(HW_BUILD_TESTS)
   hw_test(test_crypto)
   hw_test(test_map)
   hw_test(test_smap)
+  hw_test(test_log)
   hw_test(test_net)
   hw_test(test_wisp)
   hw_test(test_ws)
@@ -166,7 +229,11 @@ if(HW_BUILD_TESTS)
   hw_test(test_reputation)
   hw_test(test_e2e)
   hw_test(test_security)
+  hw_test(test_abuse)
   hw_test(test_flow)
+  hw_test(test_client)
+  # Measures how long the client waits, against a fake server on its own thread.
+  set_tests_properties(test_client PROPERTIES RUN_SERIAL ON)
 endif()
 
 install(TARGETS holywisp-bin RUNTIME DESTINATION bin)

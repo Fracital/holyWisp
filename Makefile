@@ -112,12 +112,15 @@ tidy: build ## clang-tidy with the debug compile database
 # ---------------------------------------------------------------------------------- bench
 
 BENCH_DIR := build/bench
+# What libholywisp.a needs from the system besides libc, as CMakeLists.txt's HW_PLATFORM_LIBS has
+# it: crypt(3) and forkpty(3) are their own libraries on Linux and part of libSystem on macOS.
+BENCH_LIBS := $(if $(filter Darwin,$(shell uname -s)),,-lcrypt -lutil)
 
 bench: release ## build the benchmark tools (bench/echo, bench/pump) into build/bench
 	mkdir -p $(BENCH_DIR)
 	$(CC) -O2 -Wall -Wextra -pthread -o $(BENCH_DIR)/echo bench/echo.c
 	$(CC) -O2 -Wall -Wextra -pthread -I include -o $(BENCH_DIR)/pump bench/pump.c \
-		$(RELEASE_DIR)/libholywisp-client.a $(RELEASE_DIR)/libholywisp.a
+		$(RELEASE_DIR)/libholywisp-client.a $(RELEASE_DIR)/libholywisp.a $(BENCH_LIBS)
 
 # ---------------------------------------------------------------------------------- npm
 

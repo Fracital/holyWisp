@@ -1,10 +1,15 @@
 #include "holywisp/hw.h"
 #include "holywisp/loop.h"
+#include "holywisp/net.h"
+#include "holywisp/sys.h"
 
 #include "test.h"
 
+#include <poll.h>
 #include <pthread.h>
 #include <unistd.h>
+
+#include <sys/socket.h>
 
 static int g_order[8];
 static int g_norder;
@@ -186,6 +191,49 @@ static void test_busy_poll(void) {
 	hw_loop_free(loop);
 }
 
+static int g_quiet_events;
+
+static void quiet_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
+	g_quiet_events++;
+}
+
+// An fd that is watched for nothing is not woken by its peer's half-close. The condition never
+// clears, so a backend that reported it there would turn every paused socket whose peer finished
+// into a busy loop. With reading wanted again, the half-close is readable.
+static void test_half_close_needs_read_interest(void) {
+	hw_loop *loop = hw_loop_new();
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "listen");
+	int peer = hw_connect_tcp("127.0.0.1", port, 2000);
+	CHECK(peer >= 0, "connect");
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 2000), 1);
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
+	int fd = hw_sys_accept(lfd, (struct sockaddr *)&ss, &sl);
+	CHECK(fd >= 0, "accept");
+	close(lfd);
+
+	g_quiet_events = 0;
+	CHECK_EQ(hw_loop_add_fd(loop, fd, HW_EV_READ, quiet_cb, NULL), 0);
+	CHECK_EQ(hw_loop_mod_fd(loop, fd, 0), 0);
+	CHECK_EQ(shutdown(peer, SHUT_WR), 0);
+	CHECK_EQ(hw_loop_run_once(loop, 100), 0);
+	CHECK_EQ(g_quiet_events, 0);
+
+	CHECK_EQ(hw_loop_mod_fd(loop, fd, HW_EV_READ), 0);
+	CHECK_EQ(hw_loop_run_once(loop, 2000), 0);
+	CHECK_EQ(g_quiet_events, 1);
+	char byte;
+	CHECK_EQ(recv(fd, &byte, 1, 0), 0);
+
+	hw_loop_del_fd(loop, fd);
+	close(fd);
+	close(peer);
+	hw_loop_free(loop);
+}
+
 int main(void) {
 	RUN(test_timers_fire_in_order);
 	RUN(test_repeating_timer_cancels_itself);
@@ -193,5 +241,6 @@ int main(void) {
 	RUN(test_fd_events);
 	RUN(test_batch_end_hook);
 	RUN(test_busy_poll);
+	RUN(test_half_close_needs_read_interest);
 	return 0;
 }

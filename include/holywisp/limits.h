@@ -32,6 +32,17 @@ int hw_semaphore_try(hw_semaphore *s); // 1 acquired
 void hw_semaphore_release(hw_semaphore *s);
 int64_t hw_semaphore_value(const hw_semaphore *s);
 
+// Concurrent holders per key: at most `limit` at once (limit <= 0 = unlimited). A key costs
+// memory only while someone holds it, so there is nothing to evict.
+typedef struct hw_gauge hw_gauge;
+hw_gauge *hw_gauge_new(int limit);
+void hw_gauge_free(hw_gauge *g);
+// 1: acquired, release it. 0: the key is at its limit. -1: let through without being counted
+// (no limit, or no memory for the count: fail open); there is nothing to release.
+int hw_gauge_acquire(hw_gauge *g, const char *key);
+void hw_gauge_release(hw_gauge *g, const char *key);
+int hw_gauge_value(hw_gauge *g, const char *key); // holders of key now
+
 // Per-key bandwidth: a virtual clock per key advances by bytes / rate; a one-second burst is
 // free. Returns the milliseconds the caller should wait before moving more bytes (0 = none).
 typedef struct hw_bandwidth hw_bandwidth;
@@ -50,6 +61,8 @@ typedef struct hw_sigdet {
 	int count;
 } hw_sigdet;
 void hw_sigdet_record(hw_sigdet *d, int ok, uint64_t now_ms, uint64_t window_ms);
+// When the newest sample was recorded, 0 for a ring that never had one.
+uint64_t hw_sigdet_last(const hw_sigdet *d);
 // 1 when at least min_samples are in the window and the failed share is >= ratio.
 int hw_sigdet_match(const hw_sigdet *d, int min_samples, double failed_ratio);
 

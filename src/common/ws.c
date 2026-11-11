@@ -162,6 +162,25 @@ static void first_token(char *dst, size_t cap, const char *list) {
 	dst[n] = '\0';
 }
 
+// A header name is a token (RFC 9110): letters, digits and these marks, nothing else.
+static int is_token_char(unsigned char c) {
+	return isalnum(c) || (c != '\0' && strchr("!#$%&'*+-.^_`|~", c) != NULL);
+}
+
+// Copy a header value without the whitespace around it. Returns 1 when it did not fit and was cut.
+static int copy_value(char *dst, size_t cap, const char *src, size_t n) {
+	while (n > 0 && (src[0] == ' ' || src[0] == '\t')) {
+		src++;
+		n--;
+	}
+	while (n > 0 && (src[n - 1] == ' ' || src[n - 1] == '\t')) n--;
+	int cut = n >= cap;
+	if (cut) n = cap - 1;
+	memcpy(dst, src, n);
+	dst[n] = '\0';
+	return cut;
+}
+
 int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req) {
 	size_t head = find_head_end(data, len);
 	if (head == 0) return len >= HW_HTTP_MAX_REQUEST ? HW_ERR_PROTOCOL : HW_ERR_AGAIN;
@@ -182,6 +201,9 @@ int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req)
 	if (strncmp(sp2 + 1, "HTTP/1.1", 8) != 0 && strncmp(sp2 + 1, "HTTP/1.0", 8) != 0) return HW_ERR_PROTOCOL;
 	if (!req->method[0] || !req->path[0]) return HW_ERR_PROTOCOL;
 
+	// Every header goes into the table as it was sent, or the head is refused. What the table
+	// drops, cuts or folds is what a client uses to hide the header its proxy wrote, or to pass
+	// off one of its own: a proxy and this parser must never disagree on what a header says.
 	int upgrade = 0, connection = 0, version13 = 0;
 	p = eol + 1;
 	while (p < end) {
@@ -190,18 +212,26 @@ int hw_http_parse_request(const uint8_t *data, size_t len, hw_http_request *req)
 		size_t line_len = (size_t)(eol - p);
 		if (line_len > 0 && p[line_len - 1] == '\r') line_len--;
 		if (line_len == 0) break;
+		// A line that starts with whitespace continues the header before it (obs-fold), which
+		// some proxies join and others pass on: refused. So is a name with whitespace or anything
+		// else that is not a token in it, where one side reads a header and the other does not.
 		const char *colon = memchr(p, ':', line_len);
 		if (!colon) return HW_ERR_PROTOCOL;
 		size_t name_len = (size_t)(colon - p);
+		if (name_len == 0 || name_len >= sizeof(req->headers[0].name)) return HW_ERR_PROTOCOL;
+		for (size_t i = 0; i < name_len; i++) {
+			if (!is_token_char((unsigned char)p[i])) return HW_ERR_PROTOCOL;
+		}
 		const char *value = colon + 1;
 		size_t value_len = line_len - name_len - 1;
-		char val[512];
-		copy_trimmed(val, sizeof(val), value, value_len);
-		if (req->header_count < HW_HTTP_MAX_HEADERS) {
-			hw_http_header *h = &req->headers[req->header_count++];
-			copy_trimmed(h->name, sizeof(h->name), p, name_len);
-			memcpy(h->value, val, sizeof(val));
-		}
+		// A NUL would end the stored string early, a CR is a line end to some parsers.
+		if (memchr(value, '\0', value_len) || memchr(value, '\r', value_len)) return HW_ERR_PROTOCOL;
+		if (req->header_count >= HW_HTTP_MAX_HEADERS) return HW_ERR_PROTOCOL;
+		hw_http_header *h = &req->headers[req->header_count++];
+		memcpy(h->name, p, name_len);
+		h->name[name_len] = '\0';
+		h->cut = copy_value(h->value, sizeof(h->value), value, value_len);
+		const char *val = h->value;
 
 		if (name_len == 4 && strncasecmp(p, "Host", 4) == 0) {
 			copy_trimmed(req->host, sizeof(req->host), val, strlen(val));
@@ -229,8 +259,33 @@ const char *hw_http_header_get(const hw_http_request *req, const char *name) {
 	return NULL;
 }
 
+int hw_http_header_all(const hw_http_request *req, const char *name, const char **values, int cap, int *cut) {
+	int n = 0;
+	*cut = 0;
+	for (int i = 0; i < req->header_count; i++) {
+		if (strcasecmp(req->headers[i].name, name) != 0) continue;
+		if (req->headers[i].cut) *cut = 1;
+		if (n < cap) values[n] = req->headers[i].value;
+		n++;
+	}
+	return n;
+}
+
+// Whether s can be written into a request head as one word: not empty, and no space or control
+// byte that would end the word or the line it is on.
+static int is_head_word(const char *s) {
+	if (!*s) return 0;
+	for (; *s; s++) {
+		unsigned char c = (unsigned char)*s;
+		if (c <= 0x20 || c == 0x7f) return 0;
+	}
+	return 1;
+}
+
 size_t hw_http_write_upgrade(char *out, size_t cap, const char *host, uint16_t port, const char *path,
                              const char key[25], const char *protocol, const char *extra) {
+	if (!is_head_word(host) || !is_head_word(path)) return 0;
+	if (protocol && *protocol && !is_head_word(protocol)) return 0;
 	char proto_line[128] = "";
 	if (protocol && *protocol) snprintf(proto_line, sizeof(proto_line), "Sec-WebSocket-Protocol: %s\r\n", protocol);
 	int n = snprintf(out, cap,

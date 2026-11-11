@@ -27,9 +27,11 @@ int hw_poller_wake_open(int fds[2]) {
 
 int hw_poller_set(int poller, int fd, int fresh, unsigned old, unsigned events, uint32_t gen) {
 	struct epoll_event ev;
-	// A peer's half-close is always reported, as readable: reading is how it is noticed.
-	ev.events = EPOLLRDHUP;
-	if (events & HW_EV_READ) ev.events |= EPOLLIN;
+	// A peer's half-close is reported as readable, because reading is how it is noticed, and so
+	// only while reading is wanted: the condition never clears, and an fd whose reads are paused
+	// would otherwise wake the loop for as long as the pause lasts.
+	ev.events = 0;
+	if (events & HW_EV_READ) ev.events |= EPOLLIN | EPOLLRDHUP;
 	if (events & HW_EV_WRITE) ev.events |= EPOLLOUT;
 	ev.data.u64 = (uint64_t)fd << 32 | gen;
 	return epoll_ctl(poller, fresh ? EPOLL_CTL_ADD : EPOLL_CTL_MOD, fd, &ev);

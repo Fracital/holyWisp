@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 
 #define DNS_MAX_MSG    4096
+#define DNS_MAX_NAME   253
 #define DNS_TYPE_A     1
 #define DNS_TYPE_CNAME 5
 #define DNS_TYPE_AAAA  28
@@ -28,7 +29,7 @@
 
 size_t hw_dns_build_query(uint8_t *out, size_t cap, uint16_t id, const char *host, uint16_t qtype) {
 	size_t hl = strlen(host);
-	if (hl == 0 || hl > 253 || cap < 12 + hl + 2 + 4) return 0;
+	if (hl == 0 || hl > DNS_MAX_NAME || cap < 12 + hl + 2 + 4) return 0;
 	out[0] = (uint8_t)(id >> 8);
 	out[1] = (uint8_t)id;
 	out[2] = 0x01; // RD
@@ -42,6 +43,12 @@ size_t hw_dns_build_query(uint8_t *out, size_t cap, uint16_t id, const char *hos
 		const char *dot = strchr(p, '.');
 		size_t label = dot ? (size_t)(dot - p) : strlen(p);
 		if (label == 0 || label > 63) return 0;
+		// Letters, digits, hyphen and underscore are all a host name is made of. Anything else
+		// in a label (a space, a control byte, a byte of another alphabet that should have come
+		// as punycode) is not asked for.
+		for (size_t i = 0; i < label; i++) {
+			if (!isalnum((unsigned char)p[i]) && p[i] != '-' && p[i] != '_') return 0;
+		}
 		out[o++] = (uint8_t)label;
 		memcpy(out + o, p, label);
 		o += label;
@@ -73,7 +80,7 @@ static size_t skip_name(const uint8_t *msg, size_t len, size_t off) {
 	}
 }
 
-static int add_addr(hw_dns_result *res, int family, const uint8_t *rdata, uint16_t rdlen, uint32_t ttl) {
+static int add_addr(hw_dns_result *res, int family, const uint8_t *rdata, uint16_t rdlen) {
 	if (res->count >= HW_DNS_MAX_ADDRS) return 0;
 	struct sockaddr_storage *ss = &res->addrs[res->count];
 	memset(ss, 0, sizeof(*ss));
@@ -91,24 +98,44 @@ static int add_addr(hw_dns_result *res, int family, const uint8_t *rdata, uint16
 		res->lens[res->count] = sizeof(*v6);
 	}
 	res->count++;
-	if (res->ttl_s == 0 || ttl < res->ttl_s) res->ttl_s = ttl;
 	return 1;
 }
 
-int hw_dns_parse_response(const uint8_t *msg, size_t len, uint16_t id, hw_dns_result *res, int *rcode_out) {
+// A record's TTL bounds how long the whole answer may be kept: the smallest one counts, a
+// CNAME's like an address's, and 0 is a TTL like any other (do not keep it at all).
+static void note_ttl(hw_dns_result *res, uint32_t ttl) {
+	if (!res->ttl_known || ttl < res->ttl_s) res->ttl_s = ttl;
+	res->ttl_known = 1;
+}
+
+// Whether the question section of a response is the one question that was asked: this name
+// (letters compared without case), this type, class IN. Returns the offset after it, or 0.
+static size_t match_question(const uint8_t *msg, size_t len, const char *host, uint16_t qtype) {
+	uint8_t want[DNS_MAX_NAME + 18];
+	size_t wl = hw_dns_build_query(want, sizeof(want), 0, host, qtype);
+	if (wl == 0 || len < wl) return 0;
+	if (msg[4] != 0 || msg[5] != 1) return 0; // QDCOUNT is 1
+	for (size_t i = 12; i < wl; i++) {
+		// A length byte is below 64 and so never a letter: lowering both sides compares the
+		// labels without case and everything else exactly.
+		if (tolower(msg[i]) != tolower(want[i])) return 0;
+	}
+	return wl;
+}
+
+int hw_dns_parse_response(const uint8_t *msg, size_t len, uint16_t id, const char *host, uint16_t qtype,
+                          hw_dns_result *res, int *rcode_out) {
 	if (len < 12) return HW_ERR_INVALID;
 	if (((uint16_t)msg[0] << 8 | msg[1]) != id) return HW_ERR_INVALID;
 	if (!(msg[2] & 0x80)) return HW_ERR_INVALID; // not a response
-	if (msg[2] & 0x02) return HW_ERR_AGAIN;      // truncated: caller may retry over another server
+	// The id is 16 bits, and whoever can send to our port can try all of them. The echoed
+	// question is what ties an answer to what was asked: without it, an answer for any name,
+	// from anyone who guessed the id, would be cached under this one.
+	size_t off = match_question(msg, len, host, qtype);
+	if (!off) return HW_ERR_INVALID;
+	if (msg[2] & 0x02) return HW_ERR_AGAIN; // truncated: caller may retry over another server
 	*rcode_out = msg[3] & 0x0F;
-	uint16_t qd = (uint16_t)(msg[4] << 8 | msg[5]);
 	uint16_t an = (uint16_t)(msg[6] << 8 | msg[7]);
-	size_t off = 12;
-	for (uint16_t i = 0; i < qd; i++) {
-		off = skip_name(msg, len, off);
-		if (!off || off + 4 > len) return HW_ERR_INVALID;
-		off += 4;
-	}
 	for (uint16_t i = 0; i < an; i++) {
 		off = skip_name(msg, len, off);
 		if (!off || off + 10 > len) return HW_ERR_INVALID;
@@ -120,8 +147,10 @@ int hw_dns_parse_response(const uint8_t *msg, size_t len, uint16_t id, hw_dns_re
 		if (off + rdlen > len) return HW_ERR_INVALID;
 		// CNAMEs in the answer section are followed by the target's records, which we take as
 		// they come; no name matching is needed for a client that asked one question.
-		if (type == DNS_TYPE_A) add_addr(res, AF_INET, msg + off, rdlen, ttl);
-		if (type == DNS_TYPE_AAAA) add_addr(res, AF_INET6, msg + off, rdlen, ttl);
+		int used = type == DNS_TYPE_CNAME;
+		if (type == DNS_TYPE_A) used = add_addr(res, AF_INET, msg + off, rdlen);
+		if (type == DNS_TYPE_AAAA) used = add_addr(res, AF_INET6, msg + off, rdlen);
+		if (used) note_ttl(res, ttl);
 		off += rdlen;
 	}
 	return HW_OK;
@@ -156,7 +185,14 @@ void hw_dns_set_port(hw_dns_result *res, uint16_t port) {
 
 // ---------------------------------------------------------------------------------- transport
 
+// The transaction id is the one secret in a query besides its source port, so it comes from the
+// kernel's random source: an id that follows from a counter, the pid and the clock is an id an
+// off-path sender can predict.
 static uint16_t next_id(void) {
+	uint16_t id;
+	if (hw_sys_random(&id, sizeof(id)) == 0) return id;
+	// No random source. Better a guessable id than no lookups at all; the question match and the
+	// connected socket still stand.
 	static _Atomic uint32_t counter;
 	uint32_t c = atomic_fetch_add(&counter, 0x9E37u);
 	return (uint16_t)(c ^ (uint32_t)getpid() ^ (uint32_t)hw_now_ms());
@@ -196,7 +232,7 @@ static int query_one(const struct sockaddr *server, socklen_t slen, const char *
 			return EAI_AGAIN;
 		}
 		int rcode = 0;
-		int pr = hw_dns_parse_response(buf, (size_t)n, id, res, &rcode);
+		int pr = hw_dns_parse_response(buf, (size_t)n, id, host, qtype, res, &rcode);
 		if (pr == HW_ERR_INVALID) continue; // not ours; keep waiting
 		close(fd);
 		if (pr == HW_ERR_AGAIN) return EAI_AGAIN;
@@ -299,7 +335,10 @@ int hw_dns_cache_get(hw_dns_cache *c, const char *host, hw_dns_result *res, int 
 void hw_dns_cache_put(hw_dns_cache *c, const char *host, const hw_dns_result *res, int err) {
 	if (!c) return;
 	uint32_t ttl = err ? c->negative_ttl_s : c->ttl_s;
-	if (!err && res->ttl_s && res->ttl_s < ttl) ttl = res->ttl_s;
+	// The configured lifetime is a cap. An answer that came with a TTL is kept no longer than
+	// that, and one that came with a TTL of 0 is not kept at all: its owner said so, typically
+	// because the address is about to change.
+	if (!err && res->ttl_known && res->ttl_s < ttl) ttl = res->ttl_s;
 	if (ttl == 0) return;
 	char key[256];
 	lower(key, sizeof(key), host);

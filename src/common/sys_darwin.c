@@ -69,6 +69,21 @@ ssize_t hw_sys_splice(int from, int to, size_t n) {
 	return -1;
 }
 
+int hw_sys_has_close_reset(void) {
+	return 0;
+}
+
+int hw_sys_close_reset(int fd) {
+	close(fd);
+	return 0;
+}
+
+int hw_sys_random(void *buf, size_t len) {
+	// Seeded from the kernel and reseeded by it; it cannot fail.
+	arc4random_buf(buf, len);
+	return 0;
+}
+
 int hw_sys_has_crypt(void) {
 	return 1;
 }
@@ -98,6 +113,14 @@ pid_t hw_sys_pty_spawn(char *const argv[], int *master) {
 	pid_t pid = forkpty(master, NULL, NULL, NULL);
 	if (pid < 0) return -1;
 	if (pid == 0) {
+		// Nothing of the server's goes into the command. A descriptor is made close-on-exec in a
+		// second call here (hw_sys_socket and friends), and a fork on another thread between the
+		// two would hand the child a client's socket or the listener: close everything above the
+		// terminal's three, whatever its flags.
+		int top = getdtablesize();
+		for (int fd = 3; fd < top; fd++) close(fd);
+		// An ignored signal stays ignored across exec, where a shell cannot even set it back.
+		signal(SIGPIPE, SIG_DFL);
 		setenv("TERM", "xterm-256color", 1);
 		execvp(argv[0], argv);
 		_exit(127); // exec failed; the master sees the end at once

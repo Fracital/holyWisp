@@ -7,6 +7,10 @@
  * interest is registered. A backend may report an fd more than once in a batch, and may report
  * an event the interest no longer covers if it changed inside the batch; callbacks already have
  * to cope with a socket that turns out not to be ready.
+ *
+ * A peer's half-close counts as readable and is reported only while HW_EV_READ is registered. An
+ * error or a full hang-up may be reported whatever the interest (epoll does), and it does not go
+ * away: a callback that will not read or close the fd then must take it off the loop.
  */
 #ifndef HOLYWISP_LOOP_BACKEND_H
 #define HOLYWISP_LOOP_BACKEND_H

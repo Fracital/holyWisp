@@ -41,6 +41,34 @@ static void test_semaphore(void) {
 	for (int i = 0; i < 1000; i++) CHECK(hw_semaphore_try(&u), "unlimited");
 }
 
+static void test_gauge(void) {
+	hw_gauge *g = hw_gauge_new(2);
+	CHECK(g != NULL, "new");
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 1);
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 1);
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 0);
+	CHECK_EQ(hw_gauge_value(g, "a"), 2);
+	// Another key has its own count.
+	CHECK_EQ(hw_gauge_acquire(g, "b"), 1);
+	hw_gauge_release(g, "a");
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 1);
+	hw_gauge_release(g, "a");
+	hw_gauge_release(g, "a");
+	CHECK_EQ(hw_gauge_value(g, "a"), 0);
+	// A release nobody holds does not go below zero, and does not lend the next holder a slot.
+	hw_gauge_release(g, "a");
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 1);
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 1);
+	CHECK_EQ(hw_gauge_acquire(g, "a"), 0);
+	hw_gauge_free(g);
+	// No limit, or no gauge at all: let through, nothing to release.
+	hw_gauge *u = hw_gauge_new(0);
+	CHECK_EQ(hw_gauge_acquire(u, "a"), -1);
+	hw_gauge_free(u);
+	CHECK_EQ(hw_gauge_acquire(NULL, "a"), -1);
+	hw_gauge_release(NULL, "a");
+}
+
 static void test_bandwidth(void) {
 	// 1 MiB/s. The first second is a free burst, then charges accrue.
 	hw_bandwidth *b = hw_bandwidth_new(1024 * 1024);
@@ -73,11 +101,15 @@ static void test_sigdet(void) {
 	for (int i = 0; i < 40; i++) hw_sigdet_record(&d, 0, 1000, 500); // all at t=1000
 	hw_sigdet_record(&d, 1, 2000, 500);                              // 1000 ms later: the rest expire
 	CHECK(!hw_sigdet_match(&d, 10, 0.5), "stale failures dropped");
+	CHECK_EQ(hw_sigdet_last(&d), 2000);
+	memset(&d, 0, sizeof(d));
+	CHECK_EQ(hw_sigdet_last(&d), 0);
 }
 
 int main(void) {
 	RUN(test_window);
 	RUN(test_semaphore);
+	RUN(test_gauge);
 	RUN(test_bandwidth);
 	RUN(test_sigdet);
 	return 0;

@@ -17,6 +17,7 @@
 
 #define HW_MAX_PASSWORD_USERS  64
 #define HW_MAX_TRUSTED_HEADERS 8
+#define HW_MAX_ORIGINS         32
 #define HW_MAX_DNS_SERVERS     8
 
 typedef struct hw_password_user {
@@ -29,8 +30,10 @@ typedef struct hw_flood_config {
 	int max_connects_per_source_per_second; // CONNECT packets per client IP
 	int max_connects_per_dest_per_second;   // keyed by resolved ip:port
 	int max_connects_per_dest_per_minute;
-	int max_in_flight_syns;         // TCP connects in progress, server-wide
-	int max_concurrent_connections; // WebSocket clients, server-wide
+	int max_in_flight_syns;                // TCP connects in progress, server-wide
+	int max_in_flight_syns_per_ip;         // ... and per client IP, so one client cannot hold them all
+	int max_concurrent_connections;        // WebSocket clients, server-wide
+	int max_concurrent_connections_per_ip; // ... and per client IP
 	int syn_signature_enabled;
 	int syn_signature_window_ms;
 	int syn_signature_min_samples;
@@ -70,6 +73,16 @@ typedef struct hw_server_config {
 	int trusted_proxy_count;
 	char trusted_headers[HW_MAX_TRUSTED_HEADERS][64];
 	int trusted_header_count;
+	// When set, a trusted proxy is believed only on a request that carries this value in
+	// X-HolyWisp-Proxy-Secret: an address in trusted_proxies is then not enough, which matters
+	// when the proxy is on loopback and any local process shares its address.
+	char trusted_proxy_secret[128];
+
+	// Pages that may open a connection, as the browser names them in Origin ("https://host[:port]",
+	// compared without regard to case). Empty: any page. A request with no Origin header is not
+	// from a browser and is always let through.
+	char allow_origins[HW_MAX_ORIGINS][128];
+	int allow_origin_count;
 
 	// Per-client limits.
 	int connections_limit_per_ip; // new WebSockets per IP per window; 0 = off
@@ -91,7 +104,7 @@ typedef struct hw_server_config {
 
 	// Limits and tuning.
 	uint32_t buffer_remaining;  // CONTINUE window in packets (Wisp "buffer size")
-	size_t max_message_size;    // largest WebSocket message accepted
+	size_t max_message_size;    // largest WebSocket message accepted (1024 or more)
 	size_t ws_write_high_water; // pause remote reads when a client's send queue grows past this
 	size_t stream_queue_max;    // bytes queued toward a remote before the stream is throttled
 	size_t conn_queue_max;      // bytes queued toward remotes across one client before its reads pause
@@ -100,6 +113,12 @@ typedef struct hw_server_config {
 	int max_streams_per_conn;   // 0 = unlimited
 	int connect_timeout_ms;     // remote TCP connect
 	int handshake_timeout_ms;   // HTTP upgrade + v2 INFO exchange
+	// A client whose send queue holds bytes and has taken none of them for this long is closed:
+	// it is not reading, and everything the server keeps for it is memory it will never free.
+	// 0 = never.
+	int client_write_timeout_s;
+	// A client with no streams that has sent nothing for this long is closed. 0 = never (default).
+	int idle_timeout_s;
 	int resolver_threads;
 	// Microseconds a worker keeps polling after an iteration that had events before it sleeps.
 	// Lowers round-trip latency under load at the cost of CPU time spent waiting; 0 = always sleep.
@@ -143,6 +162,11 @@ typedef struct hw_server_stats {
 	uint64_t dns_cache_entries;
 	uint64_t reputation_sources;
 	uint64_t reputation_dests;
+	// Connections on the worker that has the fewest and on the one that has the most. A new
+	// connection goes to the worker with the fewest, so these stay within one of each other
+	// while connections only arrive.
+	uint64_t worker_connections_min;
+	uint64_t worker_connections_max;
 } hw_server_stats;
 
 typedef struct hw_server hw_server;

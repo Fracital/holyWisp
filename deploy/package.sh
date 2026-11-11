@@ -5,7 +5,7 @@
 #
 #   deploy/package.sh [deb|rpm|all]   (default: all that this host can build)
 #
-# Output goes to deploy/out/. VERSION defaults to the project version; override with HW_VERSION.
+# Output goes to build/packages/. VERSION defaults to the project version; override with HW_VERSION.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,10 +25,32 @@ want="${1:-all}"
 
 mkdir -p "$out"
 
+# The binaries that go into the .deb. The RPM compiles its own from the source tarball, under
+# %cmake, which hands the build the distribution's flags; a .deb made by debhelper would get
+# Debian's the same way. This one is made by hand (dpkg-deb, below), so the flags are asked for
+# here: where dpkg-buildflags exists (dpkg-dev: Debian, Ubuntu) its CPPFLAGS, CFLAGS and LDFLAGS
+# go to CMake, with every hardening feature it knows unless DEB_BUILD_MAINT_OPTIONS says
+# otherwise. They are passed as cache entries, not through the environment, which CMake reads
+# only the first time it configures a tree. Where it does not exist, the build has the project's
+# own mitigations (CMakeLists.txt, "Exploit mitigations") and nothing else, as before.
+deb_flags=0
 build_binaries() {
 	echo "==> building release binaries"
+	local flags=()
+	if [ "$want" != rpm ] && command -v dpkg-buildflags >/dev/null; then
+		export DEB_BUILD_MAINT_OPTIONS="${DEB_BUILD_MAINT_OPTIONS:-hardening=+all}"
+		local cflags ldflags
+		# CMake has no CPPFLAGS of its own; the preprocessor flags ride with the compiler's.
+		cflags="$(dpkg-buildflags --get CPPFLAGS) $(dpkg-buildflags --get CFLAGS)"
+		ldflags="$(dpkg-buildflags --get LDFLAGS)"
+		flags+=("-DCMAKE_C_FLAGS=$cflags" "-DCMAKE_EXE_LINKER_FLAGS=$ldflags")
+		deb_flags=1
+		echo "    dpkg-buildflags: $cflags"
+		echo "    dpkg-buildflags: $ldflags"
+	fi
 	cmake -S "$root" -B "$root/build/pkg" -G "${GENERATOR:-Ninja}" \
-		-DCMAKE_BUILD_TYPE=Release -DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX="" >/dev/null
+		-DCMAKE_BUILD_TYPE=Release -DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX="" \
+		${flags[@]+"${flags[@]}"} >/dev/null
 	cmake --build "$root/build/pkg" >/dev/null
 	"$root/build/pkg/holywisp" --version
 }
@@ -39,6 +61,11 @@ build_deb() {
 	rm -rf "$stage"
 	install -D -m 0755 "$root/build/pkg/holywisp" "$stage/usr/bin/holywisp"
 	install -D -m 0755 "$root/build/pkg/holywisp-client" "$stage/usr/bin/holywisp-client"
+	# Debian's CFLAGS carry -g, which debhelper would strip into a -dbgsym package. There is no
+	# such package here, so the debug sections go; the symbol table stays, as it always has.
+	if [ "$deb_flags" = 1 ] && command -v strip >/dev/null; then
+		strip --strip-debug "$stage/usr/bin/holywisp" "$stage/usr/bin/holywisp-client"
+	fi
 	install -D -m 0640 "$root/deploy/holywisp.conf" "$stage/etc/holywisp/holywisp.conf"
 	install -D -m 0644 "$root/deploy/systemd/holywisp.service" "$stage/lib/systemd/system/holywisp.service"
 	install -D -m 0644 "$root/deploy/systemd/holywisp.sysusers" "$stage/usr/lib/sysusers.d/holywisp.conf"

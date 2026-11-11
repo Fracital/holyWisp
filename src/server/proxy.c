@@ -14,6 +14,7 @@
 
 #include "internal.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -340,7 +341,13 @@ static int http_step(hw_stream *s, size_t *consumed) {
 		proxy_fail(s, "http proxy: not an HTTP response", HW_CLOSE_NETWORK_ERROR);
 		return -1;
 	}
-	int status = (int)strtol((const char *)d + 9, NULL, 10);
+	// Three digits, read as such: the head is not a string, and strtol would skip a missing status
+	// as white space and run on past the end of what was received.
+	if (d[8] != ' ' || !isdigit(d[9]) || !isdigit(d[10]) || !isdigit(d[11])) {
+		proxy_fail(s, "http proxy: not an HTTP response", HW_CLOSE_NETWORK_ERROR);
+		return -1;
+	}
+	int status = (d[9] - '0') * 100 + (d[10] - '0') * 10 + (d[11] - '0');
 	if (status < 200 || status > 299) {
 		char why[48];
 		snprintf(why, sizeof(why), "http proxy: CONNECT returned %d", status);
@@ -364,8 +371,7 @@ int proxy_on_data(hw_stream *s, const uint8_t *data, size_t len) {
 		if (r == 1) {
 			// Whatever follows the handshake is already payload from the destination.
 			size_t rest = hw_buf_avail(&s->pin);
-			stream_connected(s);
-			if (c->closing || s->state != STREAM_OPEN) return -1;
+			if (stream_connected(s) != 0) return -1; // closed, and s is gone: nothing of it is read
 			if (rest > 0) {
 				conn_send_data(c, s->id, hw_buf_head(&s->pin), rest);
 				if (c->closing) return -1;

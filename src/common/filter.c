@@ -15,21 +15,23 @@
 
 // ---------------------------------------------------------------------------------- hostnames
 
-void hw_hostname_normalize(char *dst, size_t cap, const char *src, size_t src_len) {
+int hw_hostname_normalize(char *dst, size_t cap, const char *src, size_t src_len) {
 	while (src_len > 0 && isspace((unsigned char)src[0])) {
 		src++;
 		src_len--;
 	}
 	while (src_len > 0 && (isspace((unsigned char)src[src_len - 1]) || src[src_len - 1] == '.')) src_len--;
-	size_t n = src_len < cap - 1 ? src_len : cap - 1;
+	int fits = src_len < cap;
+	size_t n = fits ? src_len : cap - 1;
 	for (size_t i = 0; i < n; i++) dst[i] = (char)tolower((unsigned char)src[i]);
 	dst[n] = '\0';
+	return fits ? 0 : -1;
 }
 
 int hw_hostlist_add(hw_hostlist *l, const char *pattern) {
 	if (l->count >= HW_MAX_FILTER_HOSTS) return -1;
 	char norm[HW_FILTER_HOST_LEN];
-	hw_hostname_normalize(norm, sizeof(norm), pattern, strlen(pattern));
+	if (hw_hostname_normalize(norm, sizeof(norm), pattern, strlen(pattern)) != 0) return -1;
 	if (!norm[0]) return -1;
 	// "*.x" and ".x" are the same wildcard; store as ".x".
 	if (norm[0] == '*' && norm[1] == '.') memmove(norm, norm + 1, strlen(norm));
@@ -41,7 +43,8 @@ int hw_hostlist_add(hw_hostlist *l, const char *pattern) {
 int hw_hostlist_match(const hw_hostlist *l, const char *host, size_t host_len) {
 	if (l->count == 0) return 0;
 	char norm[HW_FILTER_HOST_LEN];
-	hw_hostname_normalize(norm, sizeof(norm), host, host_len);
+	// Never compare the part of a name that fits: its end is what a suffix rule is about.
+	if (hw_hostname_normalize(norm, sizeof(norm), host, host_len) != 0) return -1;
 	size_t n = strlen(norm);
 	for (int i = 0; i < l->count; i++) {
 		const char *e = l->entries[i];
@@ -174,36 +177,77 @@ const char *hw_addr_ip_str(const struct sockaddr *sa, char *buf, size_t cap) {
 	return buf;
 }
 
-void hw_real_ip(const struct sockaddr *peer, const hw_cidr *trusted, int ntrusted, const char *const *header_values,
-                int nvalues, char out[HW_IP_STR_LEN]) {
-	hw_addr_ip_str(peer, out, HW_IP_STR_LEN);
-	if (ntrusted == 0 || !hw_cidr_any_contains(trusted, ntrusted, peer)) return;
-	for (int h = 0; h < nvalues; h++) {
-		const char *v = header_values[h];
-		if (!v || !*v) continue;
-		// Walk the comma list from the right: the right-most address not added by a trusted hop.
+// One entry of a forwarded-for list into an address: "ip", "ip:port", "[v6]" or "[v6]:port".
+// 0, or -1 for anything else.
+static int parse_forwarded(const char *tok, size_t n, struct sockaddr_storage *out) {
+	char buf[HW_ADDR_STR_LEN];
+	if (n == 0 || n >= sizeof(buf)) return -1;
+	memcpy(buf, tok, n);
+	buf[n] = '\0';
+	char *port = NULL;
+	if (buf[0] == '[') {
+		char *close = strchr(buf, ']');
+		if (!close) return -1;
+		if (close[1] == ':') {
+			port = close + 2;
+		} else if (close[1] != '\0') {
+			return -1;
+		}
+		close[1] = '\0';
+	} else {
+		// One colon is an IPv4 address and its port; more than one is an IPv6 address.
+		char *colon = strchr(buf, ':');
+		if (colon && !strchr(colon + 1, ':')) {
+			*colon = '\0';
+			port = colon + 1;
+		}
+	}
+	if (port) {
+		size_t digits = strspn(port, "0123456789");
+		if (digits == 0 || digits > 5 || port[digits] != '\0' || strtol(port, NULL, 10) > 65535) return -1;
+	}
+	socklen_t len;
+	if (hw_addr_parse(buf, 0, out, &len) != 1) return -1;
+	// Brackets are for IPv6.
+	if (buf[0] == '[' && out->ss_family != AF_INET6) return -1;
+	return 0;
+}
+
+// Walk one header's list from the right. 1: the client is in out. 0: the list held nothing but
+// trusted proxies. -1: an entry is not an address.
+static int walk_forwarded(const hw_real_ip_header *h, const hw_cidr *trusted, int ntrusted, char out[HW_IP_STR_LEN]) {
+	for (int i = h->count - 1; i >= 0; i--) {
+		const char *v = h->values[i];
 		const char *end = v + strlen(v);
-		while (end > v) {
+		for (;;) {
 			const char *start = end;
 			while (start > v && start[-1] != ',') start--;
 			const char *tok = start;
 			const char *tok_end = end;
 			while (tok < tok_end && isspace((unsigned char)*tok)) tok++;
 			while (tok_end > tok && isspace((unsigned char)tok_end[-1])) tok_end--;
-			char cand[HW_IP_STR_LEN + 2];
-			size_t n = (size_t)(tok_end - tok);
-			if (n > 0 && n < sizeof(cand)) {
-				memcpy(cand, tok, n);
-				cand[n] = '\0';
-				struct sockaddr_storage ss;
-				socklen_t sl;
-				if (hw_addr_parse(cand, 0, &ss, &sl) == 1 &&
-				    !hw_cidr_any_contains(trusted, ntrusted, (struct sockaddr *)&ss)) {
-					hw_addr_ip_str((struct sockaddr *)&ss, out, HW_IP_STR_LEN);
-					return;
-				}
+			struct sockaddr_storage ss;
+			if (parse_forwarded(tok, (size_t)(tok_end - tok), &ss) != 0) return -1;
+			if (!hw_cidr_any_contains(trusted, ntrusted, (struct sockaddr *)&ss)) {
+				hw_addr_ip_str((struct sockaddr *)&ss, out, HW_IP_STR_LEN);
+				return 1;
 			}
-			end = start > v ? start - 1 : v;
+			if (start == v) break;
+			end = start - 1;
 		}
 	}
+	return 0;
+}
+
+int hw_real_ip(const struct sockaddr *peer, const hw_cidr *trusted, int ntrusted, const hw_real_ip_header *headers,
+               int nheaders, char out[HW_IP_STR_LEN]) {
+	hw_addr_ip_str(peer, out, HW_IP_STR_LEN);
+	if (ntrusted == 0 || !hw_cidr_any_contains(trusted, ntrusted, peer)) return 0;
+	for (int h = 0; h < nheaders; h++) {
+		if (headers[h].count <= 0) continue;
+		// The walk writes out only when it has found the client: until then it is the peer.
+		int r = walk_forwarded(&headers[h], trusted, ntrusted, out);
+		if (r != 0) return r;
+	}
+	return 0;
 }

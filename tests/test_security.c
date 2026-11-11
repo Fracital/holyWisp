@@ -176,11 +176,17 @@ static void spawn_detached(void *(*fn)(void *), int fd) {
 	pthread_attr_destroy(&attr);
 }
 
+// The thread owns the listener and closes it on the way out; a case only shuts it down. Closed from
+// the case, its number went to the next case's listener (often the server's) while this thread was
+// still between two accepts, and the next accept took that case's connections.
 static void *accept_loop(int lfd, void *(*handler)(void *)) {
 	for (;;) {
 		int fd = accept(lfd, NULL, NULL);
 		if (fd < 0) {
-			if (errno == EINVAL || errno == EBADF) return NULL; // listener shut down
+			if (errno == EINVAL || errno == EBADF) { // listener shut down
+				close(lfd);
+				return NULL;
+			}
 			continue;
 		}
 		spawn_detached(handler, fd);
@@ -366,12 +372,44 @@ static int wait_close(hw_client *c, uint32_t sid, uint8_t *reason) {
 static int echo_once_t(hw_client *c, uint32_t sid, const char *msg, int timeout_ms) {
 	if (hw_client_send(c, sid, msg, strlen(msg)) != 0) return 0;
 	uint8_t buf[64];
-	long n = hw_client_read_exact(c, sid, buf, strlen(msg), timeout_ms);
+	long long n = hw_client_read_exact(c, sid, buf, strlen(msg), timeout_ms);
 	return n == (long)strlen(msg) && memcmp(buf, msg, strlen(msg)) == 0;
 }
 
 static int echo_once(hw_client *c, uint32_t sid, const char *msg) {
 	return echo_once_t(c, sid, msg, 10000);
+}
+
+// A TCP port whose connects fail without anyone answering: a listener that never accepts, with its
+// accept queue filled from here. On Linux every further SYN to it is dropped, so a connect hangs
+// until the dialler gives up; other kernels refuse it. Either is a failed dial, and only the first
+// goes through the server's connect timeout. Returns 0 when this kernel never fills the queue. The
+// descriptors in `fds` (-1 when unused) stay open for as long as the port is wanted.
+#define BLACKHOLE_FDS 66
+static uint16_t start_blackhole(int fds[BLACKHOLE_FDS]) {
+	for (int i = 0; i < BLACKHOLE_FDS; i++) fds[i] = -1;
+	uint16_t port = 0;
+	fds[0] = hw_listen_tcp("127.0.0.1", 0, 0, 0, &port);
+	CHECK(fds[0] >= 0, "listen");
+	struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	for (int i = 1; i < BLACKHOLE_FDS; i++) {
+		fds[i] = hw_socket_nb(AF_INET, SOCK_STREAM, 0);
+		CHECK(fds[i] >= 0, "socket");
+		if (connect(fds[i], (struct sockaddr *)&sin, sizeof(sin)) != 0 && errno != EINPROGRESS) return port; // refused
+		struct pollfd pfd = {.fd = fds[i], .events = POLLOUT};
+		int err = 0;
+		socklen_t el = sizeof(err);
+		if (poll(&pfd, 1, 300) <= 0) return port; // hangs
+		if (getsockopt(fds[i], SOL_SOCKET, SO_ERROR, &err, &el) != 0 || err != 0) return port;
+	}
+	return 0;
+}
+
+static void stop_blackhole(int fds[BLACKHOLE_FDS]) {
+	for (int i = 0; i < BLACKHOLE_FDS; i++) {
+		if (fds[i] >= 0) close(fds[i]);
+	}
 }
 
 // ---------------------------------------------------------------------------------- cases
@@ -440,6 +478,54 @@ static void test_per_source_throttle(void) {
 	CHECK(st.throttled_source >= 1, "stat recorded");
 	hw_client_free(c);
 	hw_server_free(s);
+}
+
+// The SYN-flood signature closes the whole connection, and with it every stream, from inside the
+// path that recorded the failed dial. One of those paths is the connect timeout, which went on to
+// read the stream it had just lost. Two samples come from each dial that hangs (the timeout, then
+// "no address left"), so with three wanted the match falls on the second dial's timeout.
+static void test_syn_signature_on_connect_timeout(void) {
+	int hole[BLACKHOLE_FDS];
+	uint16_t port = start_blackhole(hole);
+	if (port == 0) {
+		stop_blackhole(hole);
+		return;
+	}
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.connect_timeout_ms = 150;
+	cfg.flood.enabled = 1;
+	cfg.flood.syn_signature_enabled = 1;
+	cfg.flood.syn_signature_min_samples = 3;
+	cfg.flood.syn_signature_window_ms = 30000;
+	hw_server *s = hw_server_new(&cfg);
+	hw_server_start(s);
+	hw_client *c = connect_plain(s);
+	for (int i = 0; i < 4; i++) {
+		uint32_t sid;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sid), 0);
+	}
+	int gone = 0;
+	for (int i = 0; i < 16 && !gone; i++) {
+		hw_client_event ev;
+		int r = hw_client_poll(c, 5000, &ev);
+		if (r == 0) break;
+		gone = r < 0;
+	}
+	CHECK(gone, "the signature match closed the connection");
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.syn_signatures, 1);
+	hw_client_free(c);
+
+	// The worker that closed it is still serving.
+	hw_client *d = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(d, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	CHECK(echo_once(d, sid, "still here"), "echo after the match");
+	hw_client_free(d);
+	hw_server_free(s);
+	stop_blackhole(hole);
 }
 
 static void test_concurrent_cap(void) {
@@ -602,8 +688,7 @@ static void proxy_echo_case(const char *scheme, void *(*proxy_fn)(void *)) {
 	}
 	CHECK(ok, "%s: echo via proxy", scheme);
 	hw_server_free(s);
-	shutdown(pfd, SHUT_RDWR); // wake the proxy thread's blocked accept(2) so it exits
-	close(pfd);
+	shutdown(pfd, SHUT_RDWR); // the proxy thread's accept(2) fails, and it closes the listener
 }
 
 static void test_http_proxy(void) {
@@ -654,7 +739,6 @@ static void test_socks5_proxy_hostname(void) {
 	hw_client_free(c);
 	hw_server_free(s);
 	shutdown(pfd, SHUT_RDWR);
-	close(pfd);
 }
 
 // wispurr 0001: DATA that arrives while the upstream dial is still in flight. The proxy sits on
@@ -694,7 +778,96 @@ static void test_data_queued_during_proxy_connect(void) {
 	hw_client_free(c);
 	hw_server_free(s);
 	shutdown(pfd, SHUT_RDWR);
-	close(pfd);
+}
+
+// An upstream proxy that answers with g_reset_proxy_reply and hangs up hard. It leaves most of the
+// request unread, so its close is a reset, and it waits first, so the client's DATA is queued
+// behind the handshake.
+static const char *g_reset_proxy_reply; // set before the proxy is spawned
+
+static void *reset_proxy_conn(void *arg) {
+	int fd = (int)(intptr_t)arg;
+	set_blocking(fd);
+	uint8_t first[8];
+	if (read_full(fd, first, sizeof(first)) == 0) {
+		usleep(100 * 1000);
+		ssize_t r = write(fd, g_reset_proxy_reply, strlen(g_reset_proxy_reply));
+		(void)r;
+	}
+	close(fd);
+	return NULL;
+}
+
+static void *reset_proxy_main(void *arg) {
+	return accept_loop((int)(intptr_t)arg, reset_proxy_conn);
+}
+
+// The proxy's reply opens the stream, and opening it writes what the client queued meanwhile. When
+// that write fails the stream is closed and freed inside stream_connected, and the handshake code
+// went on to read its state. Each stream here ends that way (or, when the reply is read before the
+// reset lands, with an ordinary read error): one CLOSE each, and the connection lives.
+static void test_proxy_reset_after_reply(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	g_reset_proxy_reply = "HTTP/1.1 200 Connection Established\r\n\r\n";
+	spawn(reset_proxy_main, pfd);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "http://127.0.0.1:%u", pport);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	hw_client *c = connect_plain(s);
+	enum {
+		N = 8
+	};
+	const char queued[] = "queued behind the handshake";
+	for (int i = 0; i < N; i++) {
+		uint32_t sid;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+		CHECK_EQ(hw_client_send(c, sid, queued, sizeof(queued)), 0);
+	}
+	int closed = 0;
+	while (closed < N) {
+		hw_client_event ev;
+		if (hw_client_poll(c, 5000, &ev) <= 0) break;
+		if (ev.type == HW_CEV_CLOSE) closed++;
+	}
+	CHECK_EQ(closed, N);
+	hw_client_free(c);
+
+	// The worker is still serving.
+	hw_client *d = connect_plain(s);
+	CHECK(d != NULL, "a connection after the resets");
+	hw_client_free(d);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
+}
+
+// A proxy reply with no status in it is not an HTTP response. The head is bytes, not a string: a
+// parser that skips the line ends looking for a number reads whatever lies behind the reply.
+static void test_proxy_reply_without_status(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	g_reset_proxy_reply = "HTTP/1.1 \r\n\r\n";
+	spawn(reset_proxy_main, pfd);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "http://127.0.0.1:%u", pport);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	uint8_t reason = 0;
+	CHECK_EQ(wait_close(c, sid, &reason), 1);
+	CHECK_EQ(reason, HW_CLOSE_NETWORK_ERROR);
+	hw_client_free(c);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
 }
 
 // With a proxy configured, UDP is refused by default (the proxy cannot carry it) and relayed
@@ -742,7 +915,6 @@ static void test_udp_with_proxy(void) {
 	hw_client_free(c);
 	hw_server_free(s);
 	shutdown(pfd, SHUT_RDWR);
-	close(pfd);
 }
 
 static void test_twisp(void) {
@@ -810,6 +982,7 @@ int main(void) {
 	RUN(test_port_filter);
 	RUN(test_host_filter);
 	RUN(test_per_source_throttle);
+	RUN(test_syn_signature_on_connect_timeout);
 	RUN(test_concurrent_cap);
 	RUN(test_connection_rate_retry_after);
 	RUN(test_password_crypt);
@@ -818,6 +991,8 @@ int main(void) {
 	RUN(test_socks5_proxy);
 	RUN(test_socks5_proxy_hostname);
 	RUN(test_data_queued_during_proxy_connect);
+	RUN(test_proxy_reset_after_reply);
+	RUN(test_proxy_reply_without_status);
 	RUN(test_udp_with_proxy);
 	RUN(test_twisp);
 	printf("ok all security cases\n");

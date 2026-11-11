@@ -3,6 +3,10 @@
  *
  * Keys are copied and owned by the map. Not thread-safe; the rate limiters that use it hold their
  * own lock. Deletion uses tombstones, like hw_map.
+ *
+ * The keys are whatever a client makes them (its address, the destinations it asks for), so the
+ * hash is keyed with random bytes drawn once per process: nobody outside the process can tell
+ * which keys share a probe chain.
  */
 #ifndef HOLYWISP_SMAP_H
 #define HOLYWISP_SMAP_H
@@ -23,7 +27,9 @@ typedef struct hw_smap {
 	size_t used;
 } hw_smap;
 
-// FNV-1a over the string, also usable on its own for conn-local tables.
+// The map's hash of a string, never 0. The same string hashes the same for the life of the
+// process and differently in the next one (the key is random), so it is good for tables in
+// memory and for nothing that is stored or sent. Thread-safe.
 uint32_t hw_str_hash(const char *s);
 
 void hw_smap_init(hw_smap *m);

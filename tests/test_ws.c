@@ -107,6 +107,116 @@ static void test_http_request(void) {
 	CHECK_EQ(hw_http_parse_request(big, sizeof(big), &r), HW_ERR_PROTOCOL);
 }
 
+static int parse(const char *head, hw_http_request *r) {
+	return hw_http_parse_request((const uint8_t *)head, strlen(head), r);
+}
+
+// The header table is what was sent, or the head is refused. Each case here was a way to make
+// the server read a client address other than the one its proxy wrote.
+static void test_http_header_table(void) {
+	static hw_http_request r;
+	char head[HW_HTTP_MAX_REQUEST];
+	const char *values[4];
+	int cut = -1;
+
+	// Exactly as many headers as the table holds are all kept, in order.
+	size_t o = (size_t)snprintf(head, sizeof(head), "GET / HTTP/1.1\r\n");
+	for (int i = 0; i < HW_HTTP_MAX_HEADERS - 1; i++) {
+		o += (size_t)snprintf(head + o, sizeof(head) - o, "X-J%d: %d\r\n", i, i);
+	}
+	size_t full = o;
+	o += (size_t)snprintf(head + o, sizeof(head) - o, "X-Forwarded-For: 203.0.113.9\r\n\r\n");
+	CHECK_EQ(parse(head, &r), (int)o);
+	CHECK_EQ(r.header_count, HW_HTTP_MAX_HEADERS);
+	CHECK_STR(hw_http_header_get(&r, "x-forwarded-for"), "203.0.113.9");
+	CHECK_STR(hw_http_header_get(&r, "X-J46"), "46");
+	// One more and the head is refused: a proxy's header after 48 of the client's was dropped.
+	snprintf(head + full, sizeof(head) - full, "X-J: 1\r\nX-Forwarded-For: 203.0.113.9\r\n\r\n");
+	CHECK_EQ(parse(head, &r), HW_ERR_PROTOCOL);
+
+	// Every instance of a name, in order; the first one alone is not the header.
+	const char *twice = "GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6\r\nHost: x\r\n"
+	                    "x-forwarded-for:  203.0.113.9, 10.0.0.1 \r\n\r\n";
+	CHECK_EQ(parse(twice, &r), (int)strlen(twice));
+	CHECK_STR(hw_http_header_get(&r, "X-Forwarded-For"), "6.6.6.6");
+	CHECK_EQ(hw_http_header_all(&r, "X-Forwarded-For", values, 4, &cut), 2);
+	CHECK_EQ(cut, 0);
+	CHECK_STR(values[0], "6.6.6.6");
+	CHECK_STR(values[1], "203.0.113.9, 10.0.0.1");
+	// More instances than the caller has room for: the count says so, the room is not overrun.
+	values[1] = "untouched";
+	CHECK_EQ(hw_http_header_all(&r, "X-Forwarded-For", values, 1, &cut), 2);
+	CHECK_STR(values[1], "untouched");
+	CHECK_EQ(hw_http_header_all(&r, "CF-Connecting-IP", values, 4, &cut), 0);
+	CHECK_EQ(cut, 0);
+
+	// A value that does not fit is kept cut, and says so: its end, where the proxy appended the
+	// real address, is not there.
+	o = (size_t)snprintf(head, sizeof(head), "GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6, ");
+	memset(head + o, 'a', 502);
+	o += 502;
+	o += (size_t)snprintf(head + o, sizeof(head) - o, ", 203.0.113.9\r\nX-Forwarded-For: 10.0.0.1\r\n\r\n");
+	CHECK_EQ(parse(head, &r), (int)o);
+	CHECK_EQ(hw_http_header_all(&r, "X-Forwarded-For", values, 4, &cut), 2);
+	CHECK_EQ(cut, 1);
+	CHECK_EQ(r.headers[0].cut, 1);
+	CHECK_EQ(r.headers[1].cut, 0);
+	CHECK_EQ(strlen(values[0]), sizeof(r.headers[0].value) - 1);
+	CHECK(strstr(values[0], "203.0.113.9") == NULL, "the cut value lost its end");
+	// One byte under the limit is whole.
+	o = (size_t)snprintf(head, sizeof(head), "GET / HTTP/1.1\r\nCookie: ");
+	memset(head + o, 'c', sizeof(r.headers[0].value) - 1);
+	o += sizeof(r.headers[0].value) - 1;
+	o += (size_t)snprintf(head + o, sizeof(head) - o, "\r\n\r\n");
+	CHECK_EQ(parse(head, &r), (int)o);
+	CHECK_EQ(hw_http_header_all(&r, "Cookie", values, 4, &cut), 1);
+	CHECK_EQ(cut, 0);
+
+	// Names are tokens, as sent: nothing is trimmed into a trusted name.
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX-Forwarded-For : 6.6.6.6\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX-Forwarded-For\t: 6.6.6.6\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX Forwarded-For: 6.6.6.6\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	CHECK_EQ(parse("GET / HTTP/1.1\r\n: no name\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	// A continuation line (obs-fold), with a space or a tab.
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX-A: 1\r\n X-Forwarded-For: 6.6.6.6\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6,\r\n\t203.0.113.9\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	// A name the table cannot hold whole would be stored as a shorter, different name.
+	o = (size_t)snprintf(head, sizeof(head), "GET / HTTP/1.1\r\n");
+	memset(head + o, 'n', sizeof(r.headers[0].name));
+	o += sizeof(r.headers[0].name);
+	snprintf(head + o, sizeof(head) - o, ": 1\r\n\r\n");
+	CHECK_EQ(parse(head, &r), HW_ERR_PROTOCOL);
+	// A CR inside a value is a line end to some parsers.
+	CHECK_EQ(parse("GET / HTTP/1.1\r\nX-A: 1\rX-Forwarded-For: 6.6.6.6\r\n\r\n", &r), HW_ERR_PROTOCOL);
+	// And a NUL would end the stored value before the part the proxy appended.
+	const char nul[] = "GET / HTTP/1.1\r\nX-Forwarded-For: 6.6.6.6\0, 203.0.113.9\r\n\r\n";
+	CHECK_EQ(hw_http_parse_request((const uint8_t *)nul, sizeof(nul) - 1, &r), HW_ERR_PROTOCOL);
+	// A value may be empty, and the whitespace around one is not part of it.
+	const char *plain = "GET / HTTP/1.1\r\nX-Empty:\r\nX-Pad: \t padded \t\r\n\r\n";
+	CHECK_EQ(parse(plain, &r), (int)strlen(plain));
+	CHECK_STR(hw_http_header_get(&r, "X-Empty"), "");
+	CHECK_STR(hw_http_header_get(&r, "X-Pad"), "padded");
+}
+
+// The client writes host and path into the head: neither may carry a line of its own.
+static void test_http_upgrade_injection(void) {
+	char req[1024];
+	const char *key = "dGhlIHNhbXBsZSBub25jZQ==";
+	CHECK(hw_http_write_upgrade(req, sizeof(req), "localhost", 6001, "/wisp/", key, NULL, NULL) > 0, "plain");
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "a\r\nX-Forwarded-For: 6.6.6.6", 80, "/", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "a\nb", 80, "/", key, NULL, NULL), 0);
+	CHECK_EQ(
+	    hw_http_write_upgrade(req, sizeof(req), "localhost", 80, "/ HTTP/1.1\r\nX-Evil: 1\r\n\r\n", key, NULL, NULL),
+	    0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "localhost", 80, "/a\rb", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "localhost", 80, "/a\tb", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "local\x7fhost", 80, "/", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "localhost", 80, "/a b", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "", 80, "/", key, NULL, NULL), 0);
+	CHECK_EQ(hw_http_write_upgrade(req, sizeof(req), "localhost", 80, "/", key, "wisp\r\nX-Evil: 1", NULL), 0);
+	CHECK(hw_http_write_upgrade(req, sizeof(req), "[::1]", 80, "/w?x=%20y", key, "wisp-v2", "X-A: 1\r\n") > 0, "ipv6");
+}
+
 static void test_http_upgrade_roundtrip(void) {
 	char req[1024];
 	size_t n = hw_http_write_upgrade(req, sizeof(req), "localhost", 6001, "/", "dGhlIHNhbXBsZSBub25jZQ==", "wisp-v2",
@@ -140,6 +250,8 @@ int main(void) {
 	RUN(test_header_rejections);
 	RUN(test_mask);
 	RUN(test_http_request);
+	RUN(test_http_header_table);
+	RUN(test_http_upgrade_injection);
 	RUN(test_http_upgrade_roundtrip);
 	return 0;
 }

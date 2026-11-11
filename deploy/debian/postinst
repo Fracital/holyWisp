@@ -20,15 +20,29 @@ configure)
 
 	# Config is root-owned and group-readable by wisp (it may hold password hashes), never
 	# world-readable. State is owned by wisp.
+	#
+	# This runs as root on paths that an earlier install left writable by the service user (the
+	# tmpfiles.d entry used to give it /etc/holywisp), so nothing here follows a symbolic link:
+	# chown -h changes a link itself, never what it points at, and chmod (which has no such
+	# option) only runs on a real directory or a regular file. The directory comes first: once it
+	# is root's, the service user can no longer swap what is inside it.
 	mkdir -p /etc/holywisp /var/lib/holywisp
-	chown root:wisp /etc/holywisp
-	chmod 0750 /etc/holywisp
-	if [ -f /etc/holywisp/holywisp.conf ]; then
-		chown root:wisp /etc/holywisp/holywisp.conf
-		chmod 0640 /etc/holywisp/holywisp.conf
+	chown -h root:wisp /etc/holywisp
+	if [ -d /etc/holywisp ] && [ ! -L /etc/holywisp ]; then
+		chmod 0750 /etc/holywisp
 	fi
-	chown wisp:wisp /var/lib/holywisp
-	chmod 0750 /var/lib/holywisp
+	conf=/etc/holywisp/holywisp.conf
+	if [ -L "$conf" ]; then
+		chown -h root:wisp "$conf"
+		echo "holywisp: $conf is a symbolic link; its target's owner and mode are left alone" >&2
+	elif [ -f "$conf" ]; then
+		chown -h root:wisp "$conf"
+		chmod 0640 "$conf"
+	fi
+	chown -h wisp:wisp /var/lib/holywisp
+	if [ -d /var/lib/holywisp ] && [ ! -L /var/lib/holywisp ]; then
+		chmod 0750 /var/lib/holywisp
+	fi
 
 	# systemd: reload, enable, (re)start, but only when systemd is actually running (not in a
 	# container image build, for instance).

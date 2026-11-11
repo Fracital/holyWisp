@@ -52,6 +52,20 @@ int hw_sys_relay_pipe(int fds[2], size_t want, size_t min, size_t *size);
 // EINVAL/ENOSYS when the pair cannot be spliced).
 ssize_t hw_sys_splice(int from, int to, size_t n);
 
+// Whether hw_sys_close_reset ever does more than close.
+int hw_sys_has_close_reset(void);
+// Close a connected TCP socket the caller has no more use for, without what an ordinary close
+// leaves behind: the connection in TIME_WAIT for a minute, and its local port taken for as long.
+// It is reset instead, but only when the peer has acknowledged every byte written to it.
+// Otherwise, and where the kernel cannot tell, this is close(2): nothing that was written is ever
+// dropped on its way to the peer. 1 when the connection was reset, 0 when it was closed.
+int hw_sys_close_reset(int fd);
+
+// Fill buf with len bytes from the kernel's random source, the one that is fit for keys: nothing
+// about them can be guessed from the clock, the pid or earlier output. 0, or -1 when the kernel
+// has none to give, and then buf holds nothing to rely on.
+int hw_sys_random(void *buf, size_t len);
+
 // Whether there is a crypt(3) at all. Without one hw_sys_crypt always fails, so a hashed password
 // can never match and the server refuses a config that holds one.
 int hw_sys_has_crypt(void);
@@ -63,8 +77,10 @@ int hw_sys_crypt(const char *key, const char *setting, char *out, size_t out_cap
 // Whether hw_sys_pty_spawn can work at all here.
 int hw_sys_has_pty(void);
 // Run argv[0] (looked up on PATH) with the arguments argv on a new pseudo-terminal with default
-// settings and TERM=xterm-256color. The child's pid, with the terminal's master side in *master:
-// non-blocking, close-on-exec, read and written like a socket, EIO once the child has gone.
+// settings and TERM=xterm-256color, with SIGPIPE at its default whatever the caller has made of
+// it, and with none of the caller's descriptors. The child's pid, with the terminal's master side
+// in *master: non-blocking, close-on-exec, read and written like a socket, EIO once the child has
+// gone.
 // -1 with errno (ENOTSUP without hw_sys_has_pty).
 pid_t hw_sys_pty_spawn(char *const argv[], int *master);
 // Tell the terminal behind `master` the size of its window.

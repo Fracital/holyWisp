@@ -37,8 +37,9 @@ int hw_loop_add_fd(hw_loop *loop, int fd, unsigned events, hw_io_cb cb, void *ud
 int hw_loop_mod_fd(hw_loop *loop, int fd, unsigned events);
 void hw_loop_del_fd(hw_loop *loop, int fd);
 
-// Timers in monotonic milliseconds. repeat_ms 0 = one shot: the handle is invalid once the
-// callback has run, so forget it there. Cancelling a timer from inside its own callback is fine.
+// Timers in monotonic milliseconds. repeat_ms 0 = one shot: the timer is freed before its callback
+// runs, so the callback forgets the handle and never cancels it. A repeating timer may be cancelled
+// from inside its own callback.
 hw_timer *hw_loop_add_timer(hw_loop *loop, uint64_t delay_ms, uint64_t repeat_ms, hw_timer_cb cb, void *ud);
 void hw_loop_cancel_timer(hw_loop *loop, hw_timer *t);
 

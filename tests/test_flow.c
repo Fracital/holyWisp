@@ -185,7 +185,7 @@ static int wait_event(hw_client *c, uint32_t sid, int type, hw_client_event *out
 static int echo_once(hw_client *c, uint32_t sid, const char *msg) {
 	if (hw_client_send(c, sid, msg, strlen(msg)) != 0) return 0;
 	uint8_t buf[64];
-	long n = hw_client_read_exact(c, sid, buf, strlen(msg), 5000);
+	long long n = hw_client_read_exact(c, sid, buf, strlen(msg), 5000);
 	return n == (long)strlen(msg) && memcmp(buf, msg, strlen(msg)) == 0;
 }
 
@@ -241,10 +241,42 @@ static void test_egress_frames_within_max_message(void) {
 	fill_pattern(data, (size_t)N * CHUNK, 11);
 	for (int i = 0; i < N; i++) CHECK_EQ(hw_client_send(c, sid, data + (size_t)i * CHUNK, CHUNK), 0);
 	uint8_t *back = malloc((size_t)N * CHUNK);
-	long got = hw_client_read_exact(c, sid, back, (size_t)N * CHUNK, 5000);
-	CHECK(got == (long)N * CHUNK, "echo of %d bytes through %d-byte frames: got %ld", N * CHUNK, LIMIT, got);
+	long long got = hw_client_read_exact(c, sid, back, (size_t)N * CHUNK, 5000);
+	CHECK(got == (long)N * CHUNK, "echo of %d bytes through %d-byte frames: got %lld", N * CHUNK, LIMIT, got);
 	CHECK(memcmp(data, back, (size_t)N * CHUNK) == 0, "split frames reassemble in order");
 	free(data);
+	free(back);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
+// Toward the client a DATA packet carries at most CONN_FRAME_MAX (conn.c) of payload, however
+// large max-message-size is: a client holds a whole WebSocket message before it can use any of
+// it, and megabyte ones made its buffer outgrow its cache. The client is told the cap as its limit
+// and fails the socket on anything larger. It reads nothing at first, so the origin's bytes pile
+// up in the server's socket and one splice could take far more than the cap.
+static void test_egress_frames_capped(void) {
+	enum {
+		CAP = 128 * 1024 // CONN_FRAME_MAX
+	};
+	hw_server_config def;
+	hw_server_config_defaults(&def);
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.max_message_size = def.max_message_size;
+	CHECK(cfg.max_message_size > CAP + HW_WISP_HEADER_LEN, "the default allows frames past the cap");
+	hw_server *s = start_server(&cfg);
+	hw_client *c = connect_plain(s, CAP + HW_WISP_HEADER_LEN);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_blast_port, &sid), 0);
+	usleep(300 * 1000);
+	uint8_t *want = malloc(BLAST_BYTES);
+	uint8_t *back = malloc(BLAST_BYTES);
+	fill_pattern(want, BLAST_BYTES, BLAST_SEED);
+	long long got = hw_client_read_exact(c, sid, back, BLAST_BYTES, 10000);
+	CHECK(got == (long long)BLAST_BYTES, "%u bytes in frames of at most %d: got %lld", BLAST_BYTES, CAP, got);
+	CHECK(memcmp(want, back, BLAST_BYTES) == 0, "capped frames reassemble in order");
+	free(want);
 	free(back);
 	hw_client_free(c);
 	hw_server_free(s);
@@ -523,6 +555,7 @@ int main(void) {
 	start_service(blast_main, &g_blast_port);
 	RUN(test_data_before_connect_completes);
 	RUN(test_egress_frames_within_max_message);
+	RUN(test_egress_frames_capped);
 	RUN(test_slow_client_backpressure);
 	RUN(test_ingress_window_stalled_upstream);
 	RUN(test_conn_queue_pauses_reads);

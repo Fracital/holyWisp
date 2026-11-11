@@ -7,7 +7,9 @@
  *
  * Re-entrancy rule: stream_close() frees the stream, and anything that writes to the client may
  * close the connection, which frees every stream. Callers read `hw_conn *c = s->conn` first and
- * test c->closing afterwards instead of touching s again.
+ * test c->closing afterwards instead of touching s again. c->closing says nothing about a stream
+ * that was closed alone: a function that can do that (stream_flush, stream_connected,
+ * signature_record) reports it in its result, and its caller tests the result, never s->state.
  */
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
@@ -68,10 +70,45 @@ static int stream_update_events(hw_stream *s) {
 	unsigned ev = 0;
 	if (s->read_armed) ev |= HW_EV_READ;
 	if (hw_buf_avail(&s->out) > 0) ev |= HW_EV_WRITE;
+	if (s->detached) {
+		// The socket hung up while its reads were paused and was taken off the loop
+		// (stream_io_cb). It goes back when the stream may read again: that read finds what the
+		// remote left, then the end or the error, and closes the stream.
+		if (!s->read_armed) return 0;
+		s->detached = 0;
+		return hw_loop_add_fd(s->conn->w->loop, s->fd, ev, stream_io_cb, s);
+	}
 	return hw_loop_mod_fd(s->conn->w->loop, s->fd, ev);
 }
 
 // ---------------------------------------------------------------------------------- lifecycle
+
+// A TCP connect in progress holds one of the server's in-flight slots and one of its client
+// address's. Both are held from the dial until the connect resolves (success, failure, timeout).
+// Returns 0 with both held, or the reason there is none: 1 the server-wide cap, 2 this client's.
+static int syn_acquire(hw_stream *s) {
+	hw_conn *c = s->conn;
+	hw_server *srv = c->w->server;
+	if (s->syn_held) return 0;
+	int mine = hw_gauge_acquire(srv->syns_per_ip, c->ip);
+	if (mine == 0) return 2;
+	if (!hw_semaphore_try(&srv->in_flight_syns)) {
+		if (mine == 1) hw_gauge_release(srv->syns_per_ip, c->ip);
+		return 1;
+	}
+	s->syn_held = 1;
+	s->syn_ip_held = mine == 1;
+	return 0;
+}
+
+static void syn_release(hw_stream *s) {
+	hw_server *srv = s->conn->w->server;
+	if (!s->syn_held) return;
+	hw_semaphore_release(&srv->in_flight_syns);
+	if (s->syn_ip_held) hw_gauge_release(srv->syns_per_ip, s->conn->ip);
+	s->syn_held = 0;
+	s->syn_ip_held = 0;
+}
 
 hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port) {
 	hw_stream *s = calloc(1, sizeof(*s));
@@ -103,6 +140,18 @@ hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, s
 	return s;
 }
 
+// Whether the socket toward the remote may be reset when it is closed, which spares this host a
+// connection in TIME_WAIT and a local port for every stream that ends (hw_sys_close_reset). Only
+// where a reset cannot cost the remote anything the client sent: the client itself ended the
+// stream (its CLOSE, or its connection), the remote has spoken since the client last did, so it
+// has read what it was answering, and nothing is waiting here to be written. The kernel adds its
+// own condition: every byte written has been acknowledged. Never toward an upstream proxy, which
+// may still be holding bytes for the destination. A stream the remote ended, or one the server
+// closes for a reason of its own, is closed in the ordinary way.
+static int stream_may_reset(const hw_stream *s, int send_close) {
+	return !send_close && s->type == HW_STREAM_TCP && s->heard && hw_buf_avail(&s->out) == 0 && !stream_uses_proxy(s);
+}
+
 void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	hw_conn *c = s->conn;
 	if (s->state == STREAM_CLOSED) return;
@@ -115,14 +164,15 @@ void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 		hw_resolve_cancel(s->resolve);
 		s->resolve = NULL;
 	}
-	if (s->syn_held) {
-		hw_semaphore_release(&c->w->server->in_flight_syns);
-		s->syn_held = 0;
-	}
+	syn_release(s);
 	if (s->type == HW_STREAM_TERM) twisp_kill(s);
 	if (s->fd >= 0) {
 		hw_loop_del_fd(c->w->loop, s->fd);
-		close(s->fd);
+		if (stream_may_reset(s, send_close)) {
+			hw_sys_close_reset(s->fd);
+		} else {
+			close(s->fd);
+		}
 		s->fd = -1;
 	}
 	hw_map_remove(&c->streams, s->id);
@@ -170,9 +220,42 @@ void stream_unpark(hw_stream *s) {
 
 // ---------------------------------------------------------------------------------- SYN signature
 
+// A connection keeps a record for the destinations it dialled most recently, and no more than
+// this many: the records are 2 KiB each and a client can name a new destination with every
+// CONNECT. A flood has to keep returning to its target, so its record is never the oldest.
+#define SIGDET_MAX_PER_CONN 32
+
+typedef struct sigdet_oldest {
+	const char *key;
+	hw_sigdet *d;
+} sigdet_oldest;
+
+static int sigdet_oldest_visit(const char *key, void *value, void *ud) {
+	sigdet_oldest *o = ud;
+	hw_sigdet *d = value;
+	if (!o->d || hw_sigdet_last(d) < hw_sigdet_last(o->d)) {
+		o->key = key;
+		o->d = d;
+	}
+	return 0;
+}
+
 static hw_sigdet *sigdet_for(hw_conn *c, const char *dest) {
 	hw_sigdet *d = hw_smap_get(&c->sigdets, dest);
 	if (d) return d;
+	if (hw_smap_count(&c->sigdets) >= SIGDET_MAX_PER_CONN) {
+		// Reuse the record that has gone longest without a sample for the new destination.
+		sigdet_oldest o = {0};
+		hw_smap_each(&c->sigdets, sigdet_oldest_visit, &o);
+		if (!o.d) return NULL;
+		hw_smap_remove(&c->sigdets, o.key);
+		memset(o.d, 0, sizeof(*o.d));
+		if (hw_smap_put(&c->sigdets, dest, o.d) != 0) {
+			free(o.d);
+			return NULL;
+		}
+		return o.d;
+	}
 	d = calloc(1, sizeof(*d));
 	if (!d || hw_smap_put(&c->sigdets, dest, d) != 0) {
 		free(d);
@@ -182,8 +265,9 @@ static hw_sigdet *sigdet_for(hw_conn *c, const char *dest) {
 }
 
 // Record a connect outcome against the SYN-flood signature and act on a match. Returns 1 when the
-// match closed the whole connection.
-static int signature_record(hw_stream *s, int ok) {
+// match closed the whole connection: `s` is freed then, and the caller returns without reading it.
+// The result may not be dropped (the connect timeout did, and read the stream it had lost).
+HW_MUST_USE static int signature_record(hw_stream *s, int ok) {
 	hw_conn *c = s->conn;
 	const hw_flood_config *f = &c->w->server->cfg.flood;
 	if (!f->enabled || !f->syn_signature_enabled || s->type != HW_STREAM_TCP) return 0;
@@ -208,15 +292,12 @@ void stream_adopt(hw_stream *s, int fd) {
 		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
 		return;
 	}
-	stream_connected(s);
+	(void)stream_connected(s);
 }
 
-void stream_connected(hw_stream *s) {
+int stream_connected(hw_stream *s) {
 	hw_conn *c = s->conn;
-	if (s->syn_held) {
-		hw_semaphore_release(&c->w->server->in_flight_syns);
-		s->syn_held = 0;
-	}
+	syn_release(s);
 	if (s->connect_timer) {
 		hw_loop_cancel_timer(c->w->loop, s->connect_timer);
 		s->connect_timer = NULL;
@@ -228,15 +309,25 @@ void stream_connected(hw_stream *s) {
 	// is left; setting it here as well would be a second epoll_ctl for every such stream.
 	if (hw_buf_avail(&s->out) == 0 && stream_update_events(s) != 0) {
 		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
-		return;
+		return -1;
 	}
 	conn_rep_source(c, HW_REP_SUCCESSFUL_STREAM);
 	HW_DEBUG("stream", "%s: stream %u open to %s:%u", c->peer, s->id, s->host, s->port);
 	if (c->stream_confirm) {
 		conn_send_continue(c, s->id, s->remaining);
-		if (c->closing) return;
+		if (c->closing) return -1;
 	}
-	stream_flush(s);
+	return stream_flush(s); // what the client sent while the dial was in progress
+}
+
+// The stream is still waiting for something other than a connect when its time is up: a name
+// that has not resolved, or a proxy that has not answered.
+static void open_timeout_cb(hw_loop *loop, void *ud) {
+	hw_stream *s = ud;
+	s->connect_timer = NULL;
+	HW_DEBUG("stream", "%s: stream %u to %s:%u: no answer while %s", s->conn->peer, s->id, s->host, s->port,
+	         s->state == STREAM_RESOLVING ? "resolving" : "asking the proxy");
+	stream_close(s, s->state == STREAM_RESOLVING ? HW_CLOSE_UNREACHABLE : HW_CLOSE_NO_RESPONSE, 1);
 }
 
 // A TCP connect (direct or to the proxy) completed. Start the proxy handshake or open directly.
@@ -251,24 +342,67 @@ static void connect_succeeded(hw_stream *s) {
 			stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
 			return;
 		}
+		// The proxy gets as long to answer as a remote gets to accept: a proxy that takes the
+		// connection and then says nothing would otherwise hold the stream for good.
+		s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)c->w->server->cfg.connect_timeout_ms, 0,
+		                                     open_timeout_cb, s);
 		proxy_start(s); // closes the stream itself on a write error
 		return;
 	}
-	stream_connected(s);
+	(void)stream_connected(s);
 }
 
 static void connect_timeout_cb(hw_loop *loop, void *ud) {
 	hw_stream *s = ud;
 	s->connect_timer = NULL;
+	syn_release(s);
 	hw_loop_del_fd(loop, s->fd);
 	close(s->fd);
 	s->fd = -1;
-	signature_record(s, 0);
-	if (s->state == STREAM_CLOSED) return;
+	if (signature_record(s, 0)) return; // the match closed the connection, and s went with it
 	stream_connect_next(s, ETIMEDOUT);
 }
 
+// Per-destination policy for the address about to be dialled (s->dest): rate caps and destination
+// reputation. Returns 0 to dial it, or the close reason that address is refused with.
+//
+// A hit here is not held against the client that ran into it. The caps are per destination and
+// shared by every client, so the one that finds a window full is as likely to be a bystander as
+// the cause, and a client cannot know what the server has learned about a destination. Counting
+// these let one client get others closed and banned, and (by scoring the destination for its own
+// popularity) get any destination refused for everyone, for hours. The client that floods is
+// counted where it can be told apart: by its own connect rate, in handle_connect.
+static uint8_t dest_policy(hw_stream *s) {
+	hw_conn *c = s->conn;
+	hw_server *srv = c->w->server;
+	if (srv->per_dest_sec && !hw_window_allow(srv->per_dest_sec, s->dest)) {
+		HW_STAT_INC(srv, throttled_dest);
+		return HW_CLOSE_THROTTLED;
+	}
+	if (srv->per_dest_min && !hw_window_allow(srv->per_dest_min, s->dest)) {
+		HW_STAT_INC(srv, throttled_dest);
+		return HW_CLOSE_THROTTLED;
+	}
+	if (srv->reputation) {
+		int score = hw_reputation_dest_score(srv->reputation, s->dest);
+		if (hw_reputation_tier(srv->reputation, score) == HW_TIER_STRICT) {
+			HW_WARN("reputation", "%s: destination %s refused (score %d)", c->ip, s->dest, score);
+			return HW_CLOSE_BLOCKED;
+		}
+	}
+	return 0;
+}
+
+static void stream_dest_set(hw_stream *s, const struct sockaddr *sa) {
+	char ipbuf[HW_IP_STR_LEN];
+	hw_addr_ip_str(sa, ipbuf, sizeof(ipbuf));
+	snprintf(s->dest, sizeof(s->dest), "%s:%u", ipbuf, s->port);
+}
+
 // Try the next resolved address. With the proxy on, "the address" is the proxy and we try it once.
+// Each address is put to the destination policy before it is dialled, not only the first: the
+// limits are per address, and a name that resolves to several would otherwise be counted against
+// one and connected to another.
 static void stream_connect_next(hw_stream *s, int last_errno) {
 	hw_conn *c = s->conn;
 	hw_server *srv = c->w->server;
@@ -279,6 +413,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 		if (proxying) {
 			if (s->addr_idx >= 1) break; // one shot at the proxy
 			s->addr_idx = 1;             // target for proxy_start is addrs[0]
+			stream_dest_set(s, (const struct sockaddr *)&s->addrs[0]);
 			sa = (const struct sockaddr *)&srv->proxy.addr;
 			sl = srv->proxy.addr_len;
 		} else {
@@ -286,6 +421,12 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			sa = (const struct sockaddr *)&s->addrs[s->addr_idx];
 			sl = s->addr_lens[s->addr_idx];
 			s->addr_idx++;
+			stream_dest_set(s, sa);
+		}
+		uint8_t denied = dest_policy(s);
+		if (denied) {
+			s->denied = denied;
+			continue;
 		}
 		int socktype = s->type == HW_STREAM_UDP ? SOCK_DGRAM : SOCK_STREAM;
 		s->fd = hw_socket_nb(sa->sa_family, socktype, 0);
@@ -293,19 +434,23 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			last_errno = errno;
 			continue;
 		}
-		// In-flight SYN cap: held from here until the connect resolves (success, failure, timeout).
-		if (s->type == HW_STREAM_TCP && !s->syn_held) {
-			if (!hw_semaphore_try(&srv->in_flight_syns)) {
+		if (s->type == HW_STREAM_TCP) {
+			int full = syn_acquire(s);
+			if (full) {
 				HW_STAT_INC(srv, throttled_syns);
 				close(s->fd);
 				s->fd = -1;
-				conn_violation(c, "in_flight_syns");
-				if (c->closing) return;
+				// Only the client's own cap is the client's doing. The server-wide one is full
+				// because of everyone, and whoever arrives last is not to blame for it.
+				if (full == 2) {
+					conn_violation(c, "in_flight_syns_per_ip");
+					if (c->closing) return;
+				}
 				stream_close(s, HW_CLOSE_THROTTLED, 1);
 				return;
 			}
-			s->syn_held = 1;
 		}
+		s->denied = 0; // an address is being dialled: the stream ends with what the dial finds
 		int r = connect(s->fd, sa, sl);
 		last_errno = r == 0 ? 0 : errno;
 		if (r == 0 || last_errno == EINPROGRESS) {
@@ -324,12 +469,14 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			}
 			last_errno = errno;
 		}
-		if (s->syn_held) {
-			hw_semaphore_release(&srv->in_flight_syns);
-			s->syn_held = 0;
-		}
+		syn_release(s);
 		close(s->fd);
 		s->fd = -1;
+	}
+	if (s->denied) {
+		// Nothing was dialled after the policy refused an address: that refusal is the answer.
+		stream_close(s, s->denied, 1);
+		return;
 	}
 	if (signature_record(s, 0)) return;
 	HW_DEBUG("stream", "%s: stream %u to %s:%u failed: %s", c->peer, s->id, s->host, s->port, strerror(last_errno));
@@ -339,43 +486,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 	stream_close(s, map_errno(last_errno), 1);
 }
 
-// Per-destination policy once the address set is known: rate caps and destination reputation.
-// Returns 0 to proceed, -1 when the stream was closed.
-static int dest_policy(hw_stream *s) {
-	hw_conn *c = s->conn;
-	hw_server *srv = c->w->server;
-	char ipbuf[HW_IP_STR_LEN];
-	hw_addr_ip_str((const struct sockaddr *)&s->addrs[0], ipbuf, sizeof(ipbuf));
-	snprintf(s->dest, sizeof(s->dest), "%s:%u", ipbuf, s->port);
-
-	if (srv->per_dest_sec && !hw_window_allow(srv->per_dest_sec, s->dest)) {
-		HW_STAT_INC(srv, throttled_dest);
-		conn_rep_source(c, HW_REP_BURST_RATE);
-		conn_rep_dest(c, s->dest, HW_REP_BURST_RATE);
-		conn_violation(c, "per_dest_sec");
-		if (c->closing) return -1;
-		stream_close(s, HW_CLOSE_THROTTLED, 1);
-		return -1;
-	}
-	if (srv->per_dest_min && !hw_window_allow(srv->per_dest_min, s->dest)) {
-		HW_STAT_INC(srv, throttled_dest);
-		stream_close(s, HW_CLOSE_THROTTLED, 1);
-		return -1;
-	}
-	if (srv->reputation) {
-		int score = hw_reputation_dest_score(srv->reputation, s->dest);
-		if (hw_reputation_tier(srv->reputation, score) == HW_TIER_STRICT) {
-			HW_WARN("reputation", "%s: destination %s refused (score %d)", c->ip, s->dest, score);
-			conn_rep_source(c, HW_REP_KNOWN_BAD_DEST);
-			stream_close(s, HW_CLOSE_BLOCKED, 1);
-			return -1;
-		}
-	}
-	return 0;
-}
-
 static void begin_dial(hw_stream *s) {
-	if (dest_policy(s) != 0) return;
 	stream_connect_next(s, EHOSTUNREACH);
 }
 
@@ -383,6 +494,10 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 	hw_stream *s = ud;
 	hw_conn *c = s->conn;
 	s->resolve = NULL;
+	if (s->connect_timer) {
+		hw_loop_cancel_timer(loop, s->connect_timer);
+		s->connect_timer = NULL;
+	}
 	if (gai_err != 0) {
 		HW_DEBUG("stream", "%s: stream %u: resolve %s: %s", c->peer, s->id, s->host, gai_strerror(gai_err));
 		stream_close(s, HW_CLOSE_UNREACHABLE, 1);
@@ -414,8 +529,8 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 // Host/port allow and block lists. Returns 0 when the target is permitted.
 static int filter_ok(const hw_server_config *cfg, const char *host, size_t host_len, uint16_t port) {
 	if (cfg->allow_hosts.count > 0) {
-		if (!hw_hostlist_match(&cfg->allow_hosts, host, host_len)) return -1;
-	} else if (hw_hostlist_match(&cfg->block_hosts, host, host_len)) {
+		if (!hw_hostlist_allows(&cfg->allow_hosts, host, host_len)) return -1;
+	} else if (hw_hostlist_blocks(&cfg->block_hosts, host, host_len)) {
 		return -1;
 	}
 	if (cfg->allow_ports.count > 0) {
@@ -478,7 +593,12 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 	}
 	s->state = STREAM_RESOLVING;
 	s->resolve = hw_resolve(c->w->server->resolver, c->w->loop, s->host, port, resolve_cb, s);
-	if (!s->resolve) stream_close(s, HW_CLOSE_UNKNOWN, 1);
+	if (!s->resolve) {
+		stream_close(s, HW_CLOSE_UNKNOWN, 1);
+		return;
+	}
+	// The resolver has its own timeouts, but not for the time a request waits its turn.
+	s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)cfg->connect_timeout_ms, 0, open_timeout_cb, s);
 }
 
 // ---------------------------------------------------------------------------------- client -> remote
@@ -600,6 +720,7 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 	hw_worker *w = c->w;
 	const hw_server_config *cfg = &w->server->cfg;
 	if (s->state == STREAM_CLOSED) return;
+	s->heard = 0;
 
 	if (w->batch_n > 0 && w->batch_stream != s) {
 		stream_batch_flush(w);
@@ -681,8 +802,13 @@ static void stream_read(hw_stream *s) {
 	hw_conn *c = s->conn;
 	if (s->type == HW_STREAM_TCP && s->bulk) {
 		int copy = 0; // finish this event on the copying path
-		for (int i = 0; i < STREAM_MAX_READS_PER_EVENT && s->read_armed && !copy; i++) {
+		// One event relays up to STREAM_MAX_READS_PER_EVENT pipes' worth, in however many packets
+		// that takes: a connection that is given small packets does the same work per event.
+		size_t done = 0;
+		size_t budget = STREAM_MAX_READS_PER_EVENT * (size_t)1024 * 1024;
+		while (done < budget && s->read_armed && !copy) {
 			ssize_t n = conn_splice_data(c, s);
+			if (s->pipe) budget = STREAM_MAX_READS_PER_EVENT * s->pipe->size;
 			if (n == -3) {
 				// The previous payload is still in the pipe, so the client is not keeping up.
 				// The bytes stay in the kernel until the queue has written it.
@@ -704,6 +830,8 @@ static void stream_read(hw_stream *s) {
 				stream_close(s, map_errno(errno), 1);
 				return;
 			}
+			s->heard = 1;
+			done += (size_t)n;
 			// One small splice does not end bulk mode: right after a switch the remote's data is
 			// still arriving in pieces, and leaving on the first of them would flap between the
 			// two paths for the rest of the transfer. A run of them does.
@@ -739,6 +867,7 @@ static void stream_read(hw_stream *s) {
 			stream_close(s, HW_CLOSE_VOLUNTARY, 1);
 			return;
 		}
+		s->heard = 1;
 		conn_send_data(c, s->id, scratch, (size_t)n);
 		if (c->closing) return;
 		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP) s->bulk = 1;
@@ -765,10 +894,7 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 			s->connect_timer = NULL;
 		}
 		if (err != 0) {
-			if (s->syn_held) {
-				hw_semaphore_release(&c->w->server->in_flight_syns);
-				s->syn_held = 0;
-			}
+			syn_release(s);
 			hw_loop_del_fd(loop, fd);
 			close(fd);
 			s->fd = -1;
@@ -795,6 +921,15 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		return;
 	}
 	if (s->state != STREAM_OPEN) return;
+	if (!s->read_armed && (events & (HW_EV_HUP | HW_EV_ERROR))) {
+		// The remote reset or hung up while this stream may not read (the client is not taking
+		// what is already queued for it). The condition is level-triggered and nothing here can
+		// clear it, so the loop would report it without end: stop watching the socket until
+		// reads resume (stream_update_events). What the remote sent before stays in the kernel.
+		hw_loop_del_fd(loop, fd);
+		s->detached = 1;
+		return;
+	}
 	if (events & HW_EV_WRITE) {
 		if (stream_flush(s) != 0) return;
 	}

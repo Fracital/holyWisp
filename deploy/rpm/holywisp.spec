@@ -59,13 +59,22 @@ getent passwd wisp >/dev/null || \
 exit 0
 
 %post
-%sysusers_create_compat %{_sysusersdir}/holywisp.conf
-%tmpfiles_create_compat %{_tmpfilesdir}/holywisp.conf
+# The account exists by now: %%pre made it (and rpm 4.19 and newer make it themselves from the
+# packaged sysusers.d file). The tmpfiles.d entry is applied here rather than at the next boot.
+%tmpfiles_create holywisp.conf
 # Config may hold password hashes: root-owned, group-readable by wisp, not world-readable.
-chown root:wisp %{_sysconfdir}/holywisp %{_sysconfdir}/holywisp/holywisp.conf 2>/dev/null || :
-chmod 0750 %{_sysconfdir}/holywisp 2>/dev/null || :
-chmod 0640 %{_sysconfdir}/holywisp/holywisp.conf 2>/dev/null || :
-chown wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
+# Nothing here follows a symbolic link (an earlier tmpfiles.d entry left the directory writable by
+# the service user): chown -h changes a link itself, and chmod only runs on a real directory or a
+# regular file. The directory comes first, so that what is inside it can no longer be swapped.
+chown -h root:wisp %{_sysconfdir}/holywisp 2>/dev/null || :
+if [ -d %{_sysconfdir}/holywisp ] && [ ! -L %{_sysconfdir}/holywisp ]; then
+    chmod 0750 %{_sysconfdir}/holywisp 2>/dev/null || :
+fi
+chown -h root:wisp %{_sysconfdir}/holywisp/holywisp.conf 2>/dev/null || :
+if [ -f %{_sysconfdir}/holywisp/holywisp.conf ] && [ ! -L %{_sysconfdir}/holywisp/holywisp.conf ]; then
+    chmod 0640 %{_sysconfdir}/holywisp/holywisp.conf 2>/dev/null || :
+fi
+chown -h wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
 %systemd_post holywisp.service
 
 %preun

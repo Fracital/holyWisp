@@ -95,7 +95,9 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("max-connects-per-dest-per-second", flood.max_connects_per_dest_per_second, 0, 1 << 24)
 	INT_KEY("max-connects-per-dest-per-minute", flood.max_connects_per_dest_per_minute, 0, 1 << 24)
 	INT_KEY("max-in-flight-syns", flood.max_in_flight_syns, 0, 1 << 24)
+	INT_KEY("max-in-flight-syns-per-ip", flood.max_in_flight_syns_per_ip, 0, 1 << 24)
 	INT_KEY("max-concurrent-connections", flood.max_concurrent_connections, 0, 1 << 24)
+	INT_KEY("max-concurrent-connections-per-ip", flood.max_concurrent_connections_per_ip, 0, 1 << 24)
 	BOOL_KEY("syn-signature", flood.syn_signature_enabled)
 	INT_KEY("syn-signature-window-ms", flood.syn_signature_window_ms, 1, 600000)
 	INT_KEY("syn-signature-min-samples", flood.syn_signature_min_samples, 1, HW_SIGDET_RING)
@@ -117,6 +119,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("dns-timeout-ms", dns_timeout_ms, 100, 60000)
 	// Where streams go.
 	STR_KEY("proxy", proxy)
+	STR_KEY("trusted-proxy-secret", trusted_proxy_secret)
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
 	INT_KEY("max-message-size", max_message_size, 1024, 1LL << 30)
 	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1LL << 31)
@@ -127,6 +130,8 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
 	INT_KEY("connect-timeout-ms", connect_timeout_ms, 100, 600000)
 	INT_KEY("handshake-timeout-ms", handshake_timeout_ms, 100, 600000)
+	INT_KEY("client-write-timeout-s", client_write_timeout_s, 0, 86400)
+	INT_KEY("idle-timeout-s", idle_timeout_s, 0, 86400 * 30)
 	INT_KEY("resolver-threads", resolver_threads, 1, 256)
 	INT_KEY("busy-poll-us", busy_poll_us, 0, 10000)
 	BOOL_KEY("tcp-nodelay", tcp_nodelay)
@@ -191,6 +196,21 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		cfg->trusted_proxy_count++;
 		return 0;
 	}
+	if (!strcmp(key, "allow-origin")) {
+		if (cfg->allow_origin_count >= HW_MAX_ORIGINS) {
+			snprintf(err, err_cap, "too many allow-origin entries");
+			return -1;
+		}
+		// What a browser sends: scheme://host[:port], nothing after it.
+		const char *rest = strstr(value, "://");
+		if (!rest || rest == value || rest[3] == '\0' || strpbrk(rest + 3, "/ \t") != NULL) {
+			snprintf(err, err_cap, "allow-origin: expected scheme://host[:port], as in https://example.com");
+			return -1;
+		}
+		if (set_str(cfg->allow_origins[cfg->allow_origin_count], 128, value) != 0) goto bad_value;
+		cfg->allow_origin_count++;
+		return 0;
+	}
 	if (!strcmp(key, "trusted-header")) {
 		if (cfg->trusted_header_count >= HW_MAX_TRUSTED_HEADERS) {
 			snprintf(err, err_cap, "too many trusted-header entries");
@@ -237,15 +257,19 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		return 0;
 	}
 	if (!strcmp(key, "password-user")) {
+		// The value holds a password: an error names the key, never the value.
 		const char *colon = strchr(value, ':');
-		if (!colon || colon == value) goto bad_value;
 		char user[64];
-		size_t ulen = (size_t)(colon - value);
-		if (ulen >= sizeof(user)) goto bad_value;
+		size_t ulen = colon ? (size_t)(colon - value) : 0;
+		if (!colon || colon == value || ulen >= sizeof(user)) {
+			snprintf(err, err_cap, "password-user: expected USER:PASS with a user name of 1 to 63 bytes");
+			return -1;
+		}
 		memcpy(user, value, ulen);
 		user[ulen] = '\0';
 		if (hw_server_config_add_user(cfg, user, colon + 1) != 0) {
-			snprintf(err, err_cap, "password-user: %s", errno == ENOSPC ? "too many users" : "field too long");
+			snprintf(err, err_cap, "password-user: %s",
+			         errno == ENOSPC ? "too many users" : "the password is empty, or a field is too long");
 			return -1;
 		}
 		return 0;
@@ -253,7 +277,12 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	snprintf(err, err_cap, "unknown option '%s'", key);
 	return -1;
 bad_value:
-	snprintf(err, err_cap, "bad value '%s' for '%s'", value, key);
+	// A value that may hold a credential is never repeated: this text goes to the log.
+	if (!strcmp(key, "proxy") || !strcmp(key, "trusted-proxy-secret")) {
+		snprintf(err, err_cap, "bad value for '%s' (not shown: it may hold a secret)", key);
+	} else {
+		snprintf(err, err_cap, "bad value '%s' for '%s'", value, key);
+	}
 	return -1;
 }
 
@@ -332,42 +361,52 @@ void hw_config_usage(const char *argv0) {
 	    "  password-user USER:PASS                   v2 auth user; PASS may be a crypt(3) hash (repeatable)\n"
 	    "  password-required                         refuse unauthenticated v2 clients (off)\n"
 	    "  parse-real-ip, trusted-proxy CIDR,        honour proxy headers from trusted sources\n"
-	    "  trusted-header NAME\n"
+	    "  trusted-header NAME                       (default header: X-Forwarded-For)\n"
+	    "  trusted-proxy-secret VALUE                a trusted proxy must also send X-HolyWisp-Proxy-Secret: VALUE\n"
+	    "  allow-origin ORIGIN                       only pages of these origins may connect, e.g.\n"
+	    "                                            https://example.com (repeatable; default: any page)\n"
 	    "  connections-limit-per-ip, connection-window-s   new WebSockets per IP per window (200 / 10s)\n"
 	    "  bandwidth-limit-kbps                      per-IP bandwidth cap, each direction (0 = off)\n"
-	    "  flood-protection                          master switch for the limits below (on)\n"
-	    "  max-connects-per-source-per-second        per client IP (500)\n"
-	    "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
-	    "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
-	    "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
-	    "  syn-signature-min-samples, syn-signature-failed-ratio\n"
-	    "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"
-	    "  reputation, reputation-store,             IP reputation scoring, persisted as JSON\n"
-	    "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
-	    "  reputation-decay-per-hour, reputation-evict-after-days,\n"
-	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
-	    "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
-	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
-	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
-	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
-	    "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
-	    "                                            0x49), per client (256 MiB, pauses its reads)\n"
-	    "  max-message-size, ws-write-high-water, socket-buffer-size\n"
-	    "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
-	    "                                            it (8 MiB; 0 = leave to the kernel)\n"
-	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
-	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
-	    "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
-	    "                                            before sleeping: lower latency, more CPU (0 = off)\n"
-	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
-	    "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
-	    "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
-	    "  log-level                                 debug|info|warn|error|none (info)\n"
-	    "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
-	    "                                            holds a pipe to it, never under a service manager (off)\n"
-	    "\n"
-	    "  --version, --help\n",
+	    "  flood-protection                          master switch for the limits below (on)\n",
 	    argv0);
+	// Two calls: one string literal may not be longer than 4095 bytes.
+	printf("  max-connects-per-source-per-second        per client IP (500)\n"
+	       "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
+	       "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
+	       "  max-in-flight-syns-per-ip,                the same per client IP, so one client cannot hold them\n"
+	       "  max-concurrent-connections-per-ip         all (512 / 5000)\n"
+	       "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
+	       "  syn-signature-min-samples, syn-signature-failed-ratio\n"
+	       "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"
+	       "  reputation, reputation-store,             IP reputation scoring, persisted as JSON\n"
+	       "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
+	       "  reputation-decay-per-hour, reputation-evict-after-days,\n"
+	       "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
+	       "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
+	       "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
+	       "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
+	       "  buffer-remaining                          CONTINUE window in packets (128)\n"
+	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
+	       "                                            0x49), per client (256 MiB, pauses its reads)\n"
+	       "  max-message-size, ws-write-high-water, socket-buffer-size\n"
+	       "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
+	       "                                            it (8 MiB; 0 = leave to the kernel)\n"
+	       "  max-streams-per-conn                      0 = unlimited (2048)\n"
+	       "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
+	       "  client-write-timeout-s                    close a client that has read nothing of what is queued\n"
+	       "                                            for it for this long (120; 0 = never)\n"
+	       "  idle-timeout-s                            close a client with no streams that sent nothing for\n"
+	       "                                            this long (0 = never)\n"
+	       "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
+	       "                                            before sleeping: lower latency, more CPU (0 = off)\n"
+	       "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
+	       "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
+	       "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
+	       "  log-level                                 debug|info|warn|error|none (info)\n"
+	       "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
+	       "                                            holds a pipe to it, never under a service manager (off)\n"
+	       "\n"
+	       "  --version, --help\n");
 }
 
 int hw_config_parse_args(hw_server_config *cfg, int argc, char **argv, char *err, size_t err_cap) {

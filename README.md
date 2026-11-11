@@ -92,19 +92,31 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   resolves to a private address is blocked. IPv4-mapped IPv6, NAT64 and 6to4 are unwrapped first.
 - **Host and port filters.** `allow-host` / `block-host` (with `*.suffix` wildcards) and
   `allow-port` / `block-port` (single ports or ranges).
-- **Flood protection.** Per-source-IP and per-destination connect-rate windows, a server-wide
-  in-flight-SYN cap and concurrent-connection cap, a per-connection stream cap, and a SYN-flood
-  signature that watches the failed-connect ratio per destination and drops the client on a match.
+- **Flood protection.** Per-source-IP and per-destination connect-rate windows, in-flight-SYN and
+  concurrent-connection caps both server-wide and per client address (so one client cannot take
+  every slot), a per-connection stream cap, and a SYN-flood signature that watches the
+  failed-connect ratio per destination and drops the client on a match.
+- **Clients that stop reading.** A client that will not take what it asked for is no longer read
+  from once its queue is at twice `ws-write-high-water`, and is closed after
+  `client-write-timeout-s` without progress. `idle-timeout-s` closes silent connections if you
+  want that.
+- **Origin allowlist.** `allow-origin` restricts which web pages may open a connection through a
+  visitor's browser. Unset, any page may, as a public relay needs.
 - **Per-IP limits.** New-connection rate limiting per client IP and a per-IP bandwidth cap in both
   directions (a token-bucket pause, never a drop).
 - **IP reputation.** A 0–100 score per source IP and per destination, raised by weighted events
-  (auth failures, SYN signatures, burst rates, probing a terminal stream, private-egress attempts)
-  and decayed over time. Tiers escalate from logging to tightening a client's limits to refusing
+  (auth failures, SYN signatures, burst rates, probing a terminal stream) and decayed over time.
+  Only what a client does on its own account is scored: hitting a limit that all clients share,
+  or asking for a private address (which any web page can make a browser do), is refused and
+  counted but not held against the address. Tiers escalate from logging to tightening a client's limits to refusing
   it outright. Persisted as JSON and reloaded on restart.
 - **Password auth (Wisp v2).** `password-user USER:PASS`, where `PASS` may be a `crypt(3)` hash
-  (`$2b$`, `$6$`, `$y$`, …) checked in constant time, not only plaintext.
-- **Real client IP.** Honours `X-Forwarded-For` / `CF-Connecting-IP` and the like, but only from
-  trusted proxy CIDRs, taking the right-most untrusted address in the chain.
+  (`$2b$`, `$6$`, `$y$`, …) checked in constant time, not only plaintext. Hashes are computed
+  off the event loops, so a slow hash never stalls other clients. An empty password is refused.
+- **Real client IP.** Honours `X-Forwarded-For` (and any other header you name with
+  `trusted-header`, for a proxy that overwrites it), but only from trusted proxy CIDRs, taking the
+  right-most untrusted address in the chain. `trusted-proxy-secret` additionally requires a
+  shared secret on the request, for a proxy that shares its address with other local processes.
 - **WebSocket strictness.** Client frames must be masked; reserved bits, text frames and oversize
   messages are rejected per RFC 6455.
 - **Hardened by default when installed.** The systemd unit runs as the unprivileged, shell-less
@@ -130,7 +142,11 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `enable-v2`, `motd` | on, `""` | Wisp v2 handshake, message of the day |
 | `enable-twisp` | off | PTY terminal streams; needs v2 and an authenticated client |
 | `password-user USER:PASS`, `password-required` | none, off | v2 password auth (hash or plaintext); refuse unauthenticated clients |
+| `trusted-proxy`, `trusted-header`, `trusted-proxy-secret` | none, `X-Forwarded-For`, none | Whose proxy headers name the client, which header, and a secret the proxy must also send |
+| `allow-origin` | none | Origins (`scheme://host[:port]`) a browser may connect from; none means any |
 | `connections-limit-per-ip`, `connection-window-s` | 200, 10 | New WebSockets per IP per window |
+| `max-concurrent-connections-per-ip`, `max-in-flight-syns-per-ip` | 5000, 512 | One client address's share of the server-wide connection and in-flight-connect caps |
+| `client-write-timeout-s`, `idle-timeout-s` | 120, 0 | Close a client that takes nothing queued for it for this long; close a connection silent in both directions for this long (0 = never) |
 | `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap, each direction |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |
 | `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence |

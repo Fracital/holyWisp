@@ -13,6 +13,7 @@
 #endif
 
 #define HW_UNUSED                        __attribute__((unused))
+#define HW_MUST_USE                      __attribute__((warn_unused_result)) // dropping the result is a bug
 #define HW_PRINTF(fmt_index, args_index) __attribute__((format(printf, fmt_index, args_index)))
 #define HW_LIKELY(x)                     __builtin_expect(!!(x), 1)
 #define HW_UNLIKELY(x)                   __builtin_expect(!!(x), 0)

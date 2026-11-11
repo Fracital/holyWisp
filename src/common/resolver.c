@@ -3,14 +3,25 @@
  * to the requesting loop.
  *
  * Ownership: the resolver owns every request from hw_resolve() until the delivery task has run on
- * the loop (or hw_resolver_free drops it). Cancellation only flips a flag the loop thread reads in
- * that same delivery task, so nothing crosses threads except through the queue.
+ * the loop (or hw_resolver_free drops it), and frees it nowhere else: the caller keeps the pointer
+ * to cancel through. Cancellation only sets a flag. The loop thread reads it in that same
+ * delivery task, which is what keeps the callback from running; a pool thread reads it when it
+ * takes the request off the queue, to skip a lookup nobody is waiting for, and still hands the
+ * request to the delivery task to be freed. The flag is atomic and nothing else about a request
+ * crosses threads except through the queue.
+ *
+ * The pool is small and every lookup in it can take as long as the resolver's timeout, so what
+ * one client can make it do is bounded three ways: a name the cache knows is answered by
+ * hw_resolve itself and never takes a thread, a request cancelled while it waited costs no
+ * lookup, and the queue has a length (HW_RESOLVER_QUEUE_MAX) past which a request fails at once
+ * with EAI_AGAIN instead of waiting behind thousands of others.
  */
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -22,7 +33,7 @@ struct hw_resolve_req {
 	uint16_t port;
 	hw_resolve_cb cb;
 	void *ud;
-	int cancelled; // loop thread only
+	atomic_int cancelled; // set on the loop thread, read there and by the pool thread that dequeues it
 	int gai_err;
 	hw_dns_result res;
 	struct hw_resolve_req *next;     // pending queue
@@ -39,6 +50,7 @@ struct hw_resolver {
 	hw_resolve_req *head;
 	hw_resolve_req *tail;
 	hw_resolve_req *all;
+	size_t pending; // length of the head..tail queue
 	int stop;
 };
 
@@ -64,7 +76,7 @@ static void deliver_cb(hw_loop *loop, void *ud) {
 	pthread_mutex_lock(&r->lock);
 	all_unlink(r, req);
 	pthread_mutex_unlock(&r->lock);
-	if (!req->cancelled) req->cb(loop, req->gai_err, req->gai_err ? NULL : &req->res, req->ud);
+	if (!atomic_load(&req->cancelled)) req->cb(loop, req->gai_err, req->gai_err ? NULL : &req->res, req->ud);
 	req_free(req);
 }
 
@@ -126,16 +138,23 @@ static void *worker_main(void *arg) {
 		hw_resolve_req *req = r->head;
 		r->head = req->next;
 		if (!r->head) r->tail = NULL;
+		r->pending--;
 		pthread_mutex_unlock(&r->lock);
 
-		resolve_one(r, req);
-
-		if (hw_loop_post(req->loop, deliver_cb, req) != 0) {
-			pthread_mutex_lock(&r->lock);
-			all_unlink(r, req);
-			pthread_mutex_unlock(&r->lock);
-			req_free(req);
+		// A request whose stream is gone is not looked up: a client that opens streams and closes
+		// them at once would otherwise keep every thread busy with names nobody wants. Its
+		// delivery task still runs, to free it. (Cancelled a moment later, it is looked up and
+		// the answer dropped, as before.)
+		if (atomic_load(&req->cancelled)) {
+			req->gai_err = EAI_AGAIN;
+		} else {
+			resolve_one(r, req);
 		}
+
+		// Out of memory for the task: the answer is lost, and the caller waits until it cancels.
+		// The request is not freed here, because the caller still holds it and will write its
+		// cancel flag: it stays on the `all` list for hw_resolver_free.
+		(void)hw_loop_post(req->loop, deliver_cb, req);
 	}
 }
 
@@ -169,6 +188,7 @@ void hw_resolver_free(hw_resolver *r) {
 	r->stop = 1;
 	hw_resolve_req *req = r->head;
 	r->head = r->tail = NULL;
+	r->pending = 0;
 	while (req) {
 		hw_resolve_req *next = req->next;
 		all_unlink(r, req);
@@ -204,21 +224,45 @@ hw_resolve_req *hw_resolve(hw_resolver *r, hw_loop *loop, const char *host, uint
 	req->port = port;
 	req->cb = cb;
 	req->ud = ud;
+	// A name the cache knows needs no thread: it is answered from here, through the loop like
+	// every other answer, so it never waits behind the slow lookups of somebody else.
+	int answered = r->cfg.cache && hw_dns_cache_get(r->cfg.cache, host, &req->res, &req->gai_err);
+	if (answered && req->gai_err == 0) hw_dns_set_port(&req->res, port);
+
 	pthread_mutex_lock(&r->lock);
+	if (!answered && r->pending >= HW_RESOLVER_QUEUE_MAX) {
+		// The queue is as long as it gets. Waiting in it would take longer than the caller's
+		// connect timeout anyway: fail now, as a temporary failure, which is never cached.
+		req->gai_err = EAI_AGAIN;
+		answered = 1;
+	}
 	req->all_next = r->all;
 	if (r->all) r->all->all_prev = req;
 	r->all = req;
-	if (r->tail) {
-		r->tail->next = req;
-	} else {
-		r->head = req;
+	if (!answered) {
+		if (r->tail) {
+			r->tail->next = req;
+		} else {
+			r->head = req;
+		}
+		r->tail = req;
+		r->pending++;
+		pthread_cond_signal(&r->cond);
 	}
-	r->tail = req;
-	pthread_cond_signal(&r->cond);
 	pthread_mutex_unlock(&r->lock);
+	if (answered && hw_loop_post(loop, deliver_cb, req) != 0) {
+		// Nobody has the pointer yet, so unlike a pool thread in this position we can take the
+		// request back and report the failure to the caller.
+		pthread_mutex_lock(&r->lock);
+		all_unlink(r, req);
+		pthread_mutex_unlock(&r->lock);
+		req_free(req);
+		errno = ENOMEM;
+		return NULL;
+	}
 	return req;
 }
 
 void hw_resolve_cancel(hw_resolve_req *req) {
-	if (req) req->cancelled = 1;
+	if (req) atomic_store(&req->cancelled, 1);
 }

@@ -9,17 +9,20 @@
 // (cmake/zig-toolchain.cmake), so one machine produces all of them. ZIG names the executable;
 // otherwise `zig`, then `python-zig` (what `pip install ziglang` provides), is used.
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, closeSync, copyFileSync, mkdirSync, openSync, readFileSync, readSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Node's <platform>-<arch> to the zig target. Linux builds are static against musl: they run on
-// any distribution, glibc or musl, with nothing installed. macOS builds link libSystem, as
-// everything there does, target macOS 13 (the oldest release a supported Node runs on), and zig
-// signs them ad hoc (arm64 will not run unsigned code). Windows builds are MinGW ones: they need
-// nothing but the DLLs Windows 10 itself has. Adding a platform here is the last step of porting
-// the server to it (a loop backend and a half of sys.h); the wrapper already looks in
-// bin/<platform>-<arch>/.
+// any distribution, glibc or musl, with nothing installed. They are static PIEs with a stack
+// protector (CMakeLists.txt, "Exploit mitigations"): the kernel loads them at a random address,
+// and `isPie` below fails the build if a zig that stops making them so comes along. Two things
+// musl does not give a static binary: checked variants of its functions (FORTIFY) and a
+// read-only RELRO segment. macOS builds link libSystem, as everything there does, target macOS
+// 13 (the oldest release a supported Node runs on), and zig signs them ad hoc (arm64 will not
+// run unsigned code). Windows builds are MinGW ones: they need nothing but the DLLs Windows 10
+// itself has. Adding a platform here is the last step of porting the server to it (a loop
+// backend and a half of sys.h); the wrapper already looks in bin/<platform>-<arch>/.
 const TARGETS = {
 	"linux-x64": "x86_64-linux-musl",
 	"linux-arm64": "aarch64-linux-musl",
@@ -47,6 +50,19 @@ function run(command, args, options = {}) {
 
 function works(command, args) {
 	return spawnSync(command, args, { stdio: "ignore" }).status === 0;
+}
+
+// Is this ELF file position-independent (e_type ET_DYN, the u16 at offset 16)? A fixed-address
+// executable is ET_EXEC. Both Linux targets are little-endian.
+function isPie(file) {
+	const head = Buffer.alloc(18);
+	const fd = openSync(file, "r");
+	try {
+		readSync(fd, head, 0, head.length, 0);
+	} finally {
+		closeSync(fd);
+	}
+	return head.toString("latin1", 0, 4) === "\x7fELF" && head.readUInt16LE(16) === 3;
 }
 
 function findZig() {
@@ -88,6 +104,10 @@ if (!argv.includes("--no-binaries")) {
 		]);
 		run("cmake", ["--build", tree, "--target", "holywisp-bin"]);
 		const exe = key.startsWith("win32") ? "holywisp.exe" : "holywisp";
+		if (key.startsWith("linux") && !isPie(join(tree, exe))) {
+			console.error(`build: ${key}: ${exe} is not a position-independent executable (see CMakeLists.txt, HW_HARDEN)`);
+			process.exit(1);
+		}
 		mkdirSync(join(pkg, "bin", key), { recursive: true });
 		copyFileSync(join(tree, exe), join(pkg, "bin", key, exe));
 		chmodSync(join(pkg, "bin", key, exe), 0o755);

@@ -3,7 +3,9 @@
  * (limiters, reputation, DNS cache, upstream proxy), listeners, worker threads, stats.
  *
  * Every worker has its own SO_REUSEPORT listener on the same port, so the kernel spreads incoming
- * connections across threads and no lock is involved in accepting. The limiters, the reputation
+ * connections across threads and no lock is involved in accepting; a worker that has more
+ * connections than another then gives the one it just accepted to the one with the fewest (see
+ * "Which worker gets a connection"). The limiters, the reputation
  * table and the DNS cache are process-wide and lock internally. One maintenance thread does the
  * periodic evictions, reputation decay and saves, and DNS cache expiry.
  */
@@ -34,9 +36,10 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->allow_udp = 1;
 	cfg->enable_v2 = 1;
 	cfg->parse_real_ip = 1;
-	snprintf(cfg->trusted_headers[0], sizeof(cfg->trusted_headers[0]), "CF-Connecting-IP");
-	snprintf(cfg->trusted_headers[1], sizeof(cfg->trusted_headers[1]), "X-Forwarded-For");
-	cfg->trusted_header_count = 2;
+	// One header by default, and the one every proxy rewrites. A header a proxy passes through
+	// untouched (CF-Connecting-IP behind anything but Cloudflare) would let the client name itself.
+	snprintf(cfg->trusted_headers[0], sizeof(cfg->trusted_headers[0]), "X-Forwarded-For");
+	cfg->trusted_header_count = 1;
 	cfg->connections_limit_per_ip = 200;
 	cfg->connection_window_s = 10;
 	cfg->buffer_remaining = 128;
@@ -48,6 +51,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->max_streams_per_conn = 2048;
 	cfg->connect_timeout_ms = 15000;
 	cfg->handshake_timeout_ms = 10000;
+	cfg->client_write_timeout_s = 120;
 	cfg->resolver_threads = 4;
 	cfg->dns_ttl_s = 120;
 	cfg->dns_negative_ttl_s = 10;
@@ -63,7 +67,9 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->flood.max_connects_per_dest_per_second = 100;
 	cfg->flood.max_connects_per_dest_per_minute = 3000;
 	cfg->flood.max_in_flight_syns = 4096;
+	cfg->flood.max_in_flight_syns_per_ip = 512;
 	cfg->flood.max_concurrent_connections = 50000;
+	cfg->flood.max_concurrent_connections_per_ip = 5000;
 	cfg->flood.syn_signature_enabled = 1;
 	cfg->flood.syn_signature_window_ms = 2000;
 	cfg->flood.syn_signature_min_samples = 128;
@@ -85,7 +91,8 @@ int hw_server_config_add_user(hw_server_config *cfg, const char *user, const cha
 		return -1;
 	}
 	hw_password_user *u = &cfg->password_users[cfg->password_user_count];
-	if (strlen(user) >= sizeof(u->user) || strlen(pass) >= sizeof(u->pass) || !*user) {
+	// An empty password is not a password: it would let anyone who knows the name in.
+	if (strlen(user) >= sizeof(u->user) || strlen(pass) >= sizeof(u->pass) || !*user || !*pass) {
 		errno = EINVAL;
 		return -1;
 	}
@@ -100,8 +107,10 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "buffer-remaining must be greater than zero");
 		return -1;
 	}
-	if (cfg->max_message_size < 5) {
-		snprintf(err, err_cap, "max-message-size must be at least 5");
+	// The same floor as the config file's: a message that holds a Wisp header and nothing else
+	// leaves no room for a payload, and the relay paths divide a read by that room.
+	if (cfg->max_message_size < 1024) {
+		snprintf(err, err_cap, "max-message-size must be at least 1024");
 		return -1;
 	}
 	if (cfg->conn_queue_max < cfg->stream_queue_max) {
@@ -239,6 +248,101 @@ void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
 
 // ---------------------------------------------------------------------------------- workers
 
+#define ACCEPT_RETRY_MS 100  // how long a listener rests after accept ran out of descriptors
+#define SWEEP_MS        5000 // how often, at most, a worker looks for clients to time out (conn_sweep)
+
+static void accept_resume_cb(hw_loop *loop, void *ud) {
+	hw_worker *w = ud;
+	hw_loop_mod_fd(loop, w->listen_fd, HW_EV_READ);
+}
+
+static void sweep_cb(hw_loop *loop, void *ud) {
+	conn_sweep(ud);
+}
+
+// Which worker gets a connection.
+//
+// Each worker has a listener of its own and the kernel picks one per connection by a hash of its
+// addresses. Over thousands of connections that is even. Over eight it is not: two of them on one
+// worker while others sit idle is the usual outcome, and those two then share one core for as
+// long as they live. So the worker that accepted keeps a connection only if no other worker has
+// fewer; otherwise it gives the descriptor, still untouched, to the one with the fewest. The
+// connection is created on the loop that receives it and belongs to that loop from then on, so
+// nothing about who may touch a connection changes: only a descriptor and an address cross.
+typedef struct hw_handoff {
+	struct hw_handoff *next;
+	int fd;
+	struct sockaddr_storage peer;
+} hw_handoff;
+
+// Loop thread of the receiving worker.
+static void inbox_task(hw_loop *loop, void *ud) {
+	hw_worker *w = ud;
+	pthread_mutex_lock(&w->inbox_lock);
+	hw_handoff *h = w->inbox;
+	w->inbox = NULL;
+	pthread_mutex_unlock(&w->inbox_lock);
+	while (h) {
+		hw_handoff *next = h->next;
+		conn_accept(w, h->fd, (struct sockaddr *)&h->peer);
+		free(h);
+		h = next;
+	}
+}
+
+// What is still in an inbox when the workers have stopped was never anyone's connection.
+static void inbox_drop(hw_worker *w) {
+	hw_handoff *h = w->inbox;
+	w->inbox = NULL;
+	while (h) {
+		hw_handoff *next = h->next;
+		close(h->fd);
+		free(h);
+		h = next;
+	}
+}
+
+// 1 when `to` has the connection (its load already counts it), 0 when it could not be given.
+static int hand_off(hw_worker *to, int fd, const struct sockaddr_storage *peer) {
+	hw_handoff *h = malloc(sizeof(*h));
+	if (!h) return 0;
+	h->fd = fd;
+	h->peer = *peer;
+	pthread_mutex_lock(&to->inbox_lock);
+	h->next = to->inbox;
+	to->inbox = h;
+	pthread_mutex_unlock(&to->inbox_lock);
+	if (hw_loop_post(to->loop, inbox_task, to) == 0) return 1;
+	// No task to announce it. Unless an earlier task has taken it meanwhile, take it back.
+	int taken = 1;
+	pthread_mutex_lock(&to->inbox_lock);
+	for (hw_handoff **p = &to->inbox; *p; p = &(*p)->next) {
+		if (*p == h) {
+			*p = h->next;
+			taken = 0;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&to->inbox_lock);
+	if (!taken) free(h);
+	return taken;
+}
+
+// The worker with the fewest connections, `self` when none has fewer than it.
+static hw_worker *least_loaded(hw_worker *self) {
+	hw_server *s = self->server;
+	hw_worker *best = self;
+	int low = atomic_load_explicit(&self->load, memory_order_relaxed);
+	for (int i = 0; i < s->nworkers && low > 0; i++) {
+		int load = atomic_load_explicit(&s->workers[i].load, memory_order_relaxed);
+		if (load < low) {
+			low = load;
+			best = &s->workers[i];
+		}
+	}
+	return best;
+}
+
 static void accept_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 	hw_worker *w = ud;
 	for (;;) {
@@ -248,12 +352,30 @@ static void accept_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		if (cfd < 0) {
 			if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) return;
 			if (errno == EMFILE || errno == ENFILE) {
-				HW_WARN("accept", "worker %d: out of file descriptors", w->index);
+				// The connection stays in the backlog and the listener stays readable, so returning
+				// here would bring the loop straight back: stop listening for a moment instead, and
+				// say so once in a while, not once per turn.
+				uint64_t now = hw_now_ms();
+				if (now - w->accept_warn_ms >= 5000) {
+					w->accept_warn_ms = now;
+					HW_WARN("accept", "worker %d: out of file descriptors, not accepting", w->index);
+				}
+				hw_loop_mod_fd(loop, fd, 0);
+				hw_loop_add_timer(loop, ACCEPT_RETRY_MS, 0, accept_resume_cb, w);
 				return;
 			}
 			if (errno == ECONNABORTED) continue;
 			HW_ERROR("accept", "worker %d: accept: %s", w->index, strerror(errno));
 			return;
+		}
+		// Counted where it is going before it gets there, so that a burst accepted in one pass
+		// is spread and not sent to whichever worker was idle when the pass began.
+		hw_worker *to = least_loaded(w);
+		atomic_fetch_add(&to->load, 1);
+		if (to != w && hand_off(to, cfd, &ss)) continue;
+		if (to != w) {
+			atomic_fetch_sub(&to->load, 1);
+			atomic_fetch_add(&w->load, 1);
 		}
 		conn_accept(w, cfd, (struct sockaddr *)&ss);
 	}
@@ -272,6 +394,7 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	w->server = s;
 	w->index = index;
 	w->listen_fd = -1;
+	pthread_mutex_init(&w->inbox_lock, NULL);
 	w->loop = hw_loop_new();
 	w->scratch = malloc(HW_READ_CHUNK);
 	if (!w->loop || !w->scratch) return -1;
@@ -282,10 +405,23 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	                          : hw_sys_listen_more(s->workers[0].listen_fd, s->cfg.host, port, s->cfg.listen_backlog);
 	if (w->listen_fd < 0) return -1;
 	if (hw_loop_add_fd(w->loop, w->listen_fd, HW_EV_READ, accept_cb, w) != 0) return -1;
+	// Half the shorter of the two timeouts, so that a timeout is never late by more than half of
+	// itself, and no more often than a few times a second.
+	int shortest = s->cfg.client_write_timeout_s;
+	if (s->cfg.idle_timeout_s > 0 && (shortest <= 0 || s->cfg.idle_timeout_s < shortest)) {
+		shortest = s->cfg.idle_timeout_s;
+	}
+	if (shortest > 0) {
+		uint64_t every = (uint64_t)shortest * 500;
+		if (every > SWEEP_MS) every = SWEEP_MS;
+		if (!hw_loop_add_timer(w->loop, every, every, sweep_cb, w)) return -1;
+	}
 	return 0;
 }
 
 static void worker_destroy(hw_worker *w) {
+	inbox_drop(w);
+	pthread_mutex_destroy(&w->inbox_lock);
 	if (w->listen_fd >= 0) close(w->listen_fd);
 	hw_loop_free(w->loop);
 	free(w->scratch);
@@ -312,7 +448,7 @@ static void *maint_main(void *arg) {
 			hw_window_evict(s->conn_rate, 2 * (uint64_t)s->cfg.connection_window_s * 1000 + 120000);
 			hw_window_evict(s->per_source, 120000);
 			hw_window_evict(s->per_dest_sec, 120000);
-			hw_window_evict(s->per_dest_min, 7200000);
+			hw_window_evict(s->per_dest_min, 120000);
 			hw_bandwidth_evict(s->bandwidth, 600000);
 			hw_dns_cache_expire(s->dns_cache);
 			if (s->reputation) {
@@ -361,6 +497,14 @@ static int build_limiters(hw_server *s) {
 		}
 		hw_semaphore_init(&s->in_flight_syns, f->max_in_flight_syns);
 		hw_semaphore_init(&s->connections, f->max_concurrent_connections);
+		if (f->max_in_flight_syns_per_ip > 0) {
+			s->syns_per_ip = hw_gauge_new(f->max_in_flight_syns_per_ip);
+			if (!s->syns_per_ip) return -1;
+		}
+		if (f->max_concurrent_connections_per_ip > 0) {
+			s->conns_per_ip = hw_gauge_new(f->max_concurrent_connections_per_ip);
+			if (!s->conns_per_ip) return -1;
+		}
 	} else {
 		hw_semaphore_init(&s->in_flight_syns, 0);
 		hw_semaphore_init(&s->connections, 0);
@@ -447,6 +591,13 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	}
 	s->resolver = hw_resolver_new(&rc);
 	if (!s->resolver) goto fail;
+	// Hashed passwords are checked on threads of their own (auth.c); a server with none has no use
+	// for them.
+	for (int i = 0; i < cfg->password_user_count && !s->auth; i++) {
+		if (cfg->password_users[i].pass[0] != '$') continue;
+		s->auth = auth_new();
+		if (!s->auth) goto fail;
+	}
 
 	s->port = cfg->port;
 	for (int i = 0; i < s->nworkers; i++) {
@@ -462,12 +613,15 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 fail: {
 	int saved = errno;
 	hw_resolver_free(s->resolver);
+	auth_free(s->auth);
 	hw_dns_cache_free(s->dns_cache);
 	hw_window_free(s->conn_rate);
 	hw_window_free(s->per_source);
 	hw_window_free(s->per_dest_sec);
 	hw_window_free(s->per_dest_min);
 	hw_bandwidth_free(s->bandwidth);
+	hw_gauge_free(s->syns_per_ip);
+	hw_gauge_free(s->conns_per_ip);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
@@ -544,12 +698,15 @@ void hw_server_free(hw_server *s) {
 		while (s->workers[i].conns) conn_shutdown_free(s->workers[i].conns);
 	}
 	hw_resolver_free(s->resolver);
+	auth_free(s->auth);
 	hw_dns_cache_free(s->dns_cache);
 	hw_window_free(s->conn_rate);
 	hw_window_free(s->per_source);
 	hw_window_free(s->per_dest_sec);
 	hw_window_free(s->per_dest_min);
 	hw_bandwidth_free(s->bandwidth);
+	hw_gauge_free(s->syns_per_ip);
+	hw_gauge_free(s->conns_per_ip);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
@@ -566,10 +723,16 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->connections_active = atomic_load(&s->connections_active);
 	out->streams_total = atomic_load(&s->streams_total);
 	out->streams_active = atomic_load(&s->streams_active);
+	out->worker_connections_min = UINT64_MAX;
 	for (int i = 0; i < s->nworkers; i++) {
 		out->bytes_in += atomic_load(&s->workers[i].bytes_in);
 		out->bytes_out += atomic_load(&s->workers[i].bytes_out);
+		int load = atomic_load(&s->workers[i].load);
+		uint64_t n = load > 0 ? (uint64_t)load : 0;
+		if (n < out->worker_connections_min) out->worker_connections_min = n;
+		if (n > out->worker_connections_max) out->worker_connections_max = n;
 	}
+	if (s->nworkers == 0) out->worker_connections_min = 0;
 	out->refused_connection_rate = atomic_load(&s->refused_connection_rate);
 	out->refused_connection_limit = atomic_load(&s->refused_connection_limit);
 	out->refused_reputation = atomic_load(&s->refused_reputation);

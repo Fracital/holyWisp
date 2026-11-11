@@ -3,21 +3,93 @@
  */
 #include "holywisp/smap.h"
 
+#include "holywisp/hw.h"
+#include "holywisp/sys.h"
+
 #include <errno.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 #define SMAP_MIN_CAP 16
 static char TOMB_STORAGE;
 #define HW_SMAP_TOMB (&TOMB_STORAGE)
 
-uint32_t hw_str_hash(const char *s) {
-	uint32_t h = 2166136261u;
-	for (; *s; s++) {
-		h ^= (uint8_t)*s;
-		h *= 16777619u;
+// The hash is keyed. Keys here are chosen by clients (addresses, "ip:port" strings), and with a
+// hash anyone can compute, a client picks keys that all land in one probe chain and every lookup
+// of a limiter walks it. SipHash-1-3 under a key drawn once per process from the kernel leaves
+// nothing to aim at: which keys collide is different in every process and cannot be worked out
+// from outside it.
+static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
+static uint64_t g_key[2];
+
+static uint64_t mix64(uint64_t x) {
+	x += 0x9E3779B97F4A7C15u;
+	x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9u;
+	x = (x ^ (x >> 27)) * 0x94D049BB133111EBu;
+	return x ^ (x >> 31);
+}
+
+static void key_init(void) {
+	if (hw_sys_random(g_key, sizeof(g_key)) == 0) return;
+	// No random source: what is left is the clocks, the pid and where the loader put us. Guessable
+	// with effort, but still not the same in any two processes.
+	g_key[0] = mix64((uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ hw_now_ms());
+	g_key[1] = mix64(g_key[0] ^ (uint64_t)(uintptr_t)&g_key);
+}
+
+static uint64_t rotl64(uint64_t x, int b) {
+	return x << b | x >> (64 - b);
+}
+
+static void sip_round(uint64_t v[4]) {
+	v[0] += v[1];
+	v[1] = rotl64(v[1], 13);
+	v[1] ^= v[0];
+	v[0] = rotl64(v[0], 32);
+	v[2] += v[3];
+	v[3] = rotl64(v[3], 16);
+	v[3] ^= v[2];
+	v[0] += v[3];
+	v[3] = rotl64(v[3], 21);
+	v[3] ^= v[0];
+	v[2] += v[1];
+	v[1] = rotl64(v[1], 17);
+	v[1] ^= v[2];
+	v[2] = rotl64(v[2], 32);
+}
+
+// SipHash-1-3 (one round per word, three to finish) of len bytes under the key k0, k1.
+static uint64_t siphash13(const uint8_t *in, size_t len, uint64_t k0, uint64_t k1) {
+	uint64_t v[4] = {k0 ^ 0x736f6d6570736575u, k1 ^ 0x646f72616e646f6du, k0 ^ 0x6c7967656e657261u,
+	                 k1 ^ 0x7465646279746573u};
+	size_t whole = len & ~(size_t)7;
+	for (size_t i = 0; i < whole; i += 8) {
+		uint64_t m = 0;
+		for (int k = 7; k >= 0; k--) m = m << 8 | in[i + (size_t)k];
+		v[3] ^= m;
+		sip_round(v);
+		v[0] ^= m;
 	}
-	return h ? h : 1;
+	uint64_t last = (uint64_t)len << 56;
+	for (size_t i = len; i > whole; i--) last |= (uint64_t)in[i - 1] << (8 * (i - 1 - whole));
+	v[3] ^= last;
+	sip_round(v);
+	v[0] ^= last;
+	v[2] ^= 0xff;
+	sip_round(v);
+	sip_round(v);
+	sip_round(v);
+	return v[0] ^ v[1] ^ v[2] ^ v[3];
+}
+
+uint32_t hw_str_hash(const char *s) {
+	pthread_once(&g_key_once, key_init);
+	uint64_t h = siphash13((const uint8_t *)s, strlen(s), g_key[0], g_key[1]);
+	uint32_t folded = (uint32_t)(h ^ h >> 32);
+	return folded ? folded : 1;
 }
 
 void hw_smap_init(hw_smap *m) {

@@ -2,6 +2,7 @@
 
 #include "test.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
 static int count_visit(const char *key, void *value, void *ud) {
@@ -62,9 +63,51 @@ static void test_each_and_hash(void) {
 	hw_smap_free(&m);
 }
 
+// The hash anyone can compute: FNV-1a, which is what the map used before it was keyed.
+static uint32_t fnv1a(const char *s) {
+	uint32_t h = 2166136261u;
+	for (; *s; s++) {
+		h ^= (uint8_t)*s;
+		h *= 16777619u;
+	}
+	return h;
+}
+
+// A client that chooses the keys ("ip:port" destinations) must not be able to choose their slots.
+// These are keys picked to share the low 16 bits of an unkeyed FNV-1a, so that every one of them
+// starts its probe in the same slot of a 65536-slot table. Under the keyed hash they scatter.
+static void test_hash_is_keyed(void) {
+	enum {
+		KEYS = 32
+	};
+	static char keys[KEYS][24];
+	int found = 0;
+	for (unsigned i = 0; found < KEYS && i < 100000000u; i++) {
+		char k[24];
+		snprintf(k, sizeof(k), "198.51.%u.%u:%u", i >> 24 & 255, i >> 16 & 255, i & 65535);
+		if ((fnv1a(k) & 0xffff) == 0x1234) memcpy(keys[found++], k, sizeof(k));
+	}
+	CHECK_EQ(found, KEYS);
+	int same_slot = 0, same_hash = 0;
+	for (int i = 0; i < KEYS; i++) {
+		if ((hw_str_hash(keys[i]) & 0xffff) == (hw_str_hash(keys[0]) & 0xffff)) same_slot++;
+		if (hw_str_hash(keys[i]) == fnv1a(keys[i])) same_hash++;
+	}
+	// By chance one other key in 65536 shares a slot with the first; all 32 never do.
+	CHECK(same_slot <= 4, "%d of %d chosen keys still share a slot", same_slot, KEYS);
+	CHECK(same_hash <= 1, "%d of %d hashes are plain FNV-1a", same_hash, KEYS);
+	// And the map still finds every one of them.
+	hw_smap m;
+	hw_smap_init(&m);
+	for (int i = 0; i < KEYS; i++) CHECK_EQ(hw_smap_put(&m, keys[i], keys[i]), 0);
+	for (int i = 0; i < KEYS; i++) CHECK(hw_smap_get(&m, keys[i]) == keys[i], "get %s", keys[i]);
+	hw_smap_free(&m);
+}
+
 int main(void) {
 	RUN(test_put_get_remove);
 	RUN(test_tombstone_churn);
 	RUN(test_each_and_hash);
+	RUN(test_hash_is_keyed);
 	return 0;
 }

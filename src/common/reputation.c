@@ -12,6 +12,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -59,7 +60,11 @@ void hw_reputation_config_defaults(hw_reputation_config *cfg) {
 	cfg->warn = 21;
 	cfg->throttle = 51;
 	cfg->strict = 81;
-	cfg->source_weights[HW_REP_PRIVATE_EGRESS] = 15;
+	// A CONNECT to a private address is refused and costs the server nothing, and it is what a
+	// client sends for every page that names localhost or a router: a client is not scored for it
+	// by default (it was 15, and half a dozen subresources of somebody else's page got the client
+	// that loaded it refused for hours). reputation-weight privateEgress:N brings it back.
+	cfg->source_weights[HW_REP_PRIVATE_EGRESS] = 0;
 	cfg->source_weights[HW_REP_SYN_SIGNATURE] = 25;
 	cfg->source_weights[HW_REP_TWISP_NO_AUTH] = 40;
 	cfg->source_weights[HW_REP_BURST_RATE] = 5;
@@ -378,14 +383,28 @@ int hw_reputation_save(hw_reputation *r) {
 		return -1;
 	}
 
+	// The temporary file is made here and by nobody else: whatever stands at its name (the rest
+	// of a save that was cut short, or a link someone put there to have this process write
+	// through it) is removed, and O_EXCL then refuses to open anything that is not a new file,
+	// a symbolic link included. It is 0600 from the first byte, not after a chmod.
 	char tmp[600];
 	snprintf(tmp, sizeof(tmp), "%s.tmp", r->cfg.store_path);
-	FILE *f = fopen(tmp, "w");
-	if (!f) {
+	unlink(tmp);
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) {
 		hw_buf_free(&o.buf);
 		return -1;
 	}
-	chmod(tmp, 0600);
+	(void)hw_set_cloexec(fd); // a Twisp child has no business with it
+	FILE *f = fdopen(fd, "w");
+	if (!f) {
+		int saved = errno;
+		close(fd);
+		unlink(tmp);
+		hw_buf_free(&o.buf);
+		errno = saved;
+		return -1;
+	}
 	size_t len = hw_buf_avail(&o.buf);
 	size_t wrote = fwrite(hw_buf_head(&o.buf), 1, len, f);
 	hw_buf_free(&o.buf);
@@ -398,10 +417,16 @@ int hw_reputation_save(hw_reputation *r) {
 
 // ---------------------------------------------------------------------------------- JSON in
 
+// How deep a value we do not understand may nest before the file is called malformed. Our own
+// shape is four levels deep; skip_value recurses once per level, and a file of nothing but "["
+// would otherwise take the stack with it.
+#define JSON_MAX_DEPTH 32
+
 typedef struct parser {
 	const char *p;
 	const char *end;
 	int err;
+	int depth; // of the values skip_value is inside
 } parser;
 
 static void skip_ws(parser *ps) {
@@ -473,6 +498,11 @@ static void skip_value(parser *ps) {
 		char tmp[8];
 		parse_string(ps, tmp, sizeof(tmp));
 	} else if (c == '{' || c == '[') {
+		if (ps->depth >= JSON_MAX_DEPTH) {
+			ps->err = 1;
+			return;
+		}
+		ps->depth++;
 		char close = c == '{' ? '}' : ']';
 		ps->p++;
 		while (!ps->err && !peek(ps, close)) {
@@ -486,6 +516,7 @@ static void skip_value(parser *ps) {
 			ps->p++;
 		}
 		expect(ps, close);
+		ps->depth--;
 	} else {
 		while (ps->p < ps->end && !strchr(",}] \n\r\t", *ps->p)) ps->p++;
 	}

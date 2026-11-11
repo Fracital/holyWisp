@@ -7,6 +7,9 @@
  * listening socket), no crypt(3) (a hashed password never matches) and no pseudo-terminal that a
  * readiness loop can watch (Twisp is refused when the server starts).
  */
+// rand_s is declared by <stdlib.h> only when this is defined before the first header.
+#define _CRT_RAND_S
+
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
 #include "holywisp/sys.h"
@@ -16,6 +19,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <mstcpip.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <netinet/in.h>
@@ -82,6 +87,29 @@ int hw_sys_relay_pipe(int fds[2], size_t want, size_t min, size_t *size) {
 ssize_t hw_sys_splice(int from, int to, size_t n) {
 	errno = ENOSYS;
 	return -1;
+}
+
+int hw_sys_has_close_reset(void) {
+	return 0;
+}
+
+int hw_sys_close_reset(int fd) {
+	close(fd);
+	return 0;
+}
+
+int hw_sys_random(void *buf, size_t len) {
+	// The runtime's rand_s is the system generator (RtlGenRandom), one unsigned int at a time.
+	uint8_t *p = buf;
+	while (len > 0) {
+		unsigned int word;
+		if (rand_s(&word) != 0) return -1;
+		size_t n = len < sizeof(word) ? len : sizeof(word);
+		memcpy(p, &word, n);
+		p += n;
+		len -= n;
+	}
+	return 0;
 }
 
 int hw_sys_has_crypt(void) {

@@ -1,4 +1,4 @@
-# AGENTS.md — holyWisp
+# AGENTS.md: holyWisp
 
 Guidance for AI coding agents working in this repository. Read this fully before making changes.
 When a section conflicts with a habit, follow the section. `STYLE.md` is the companion document
@@ -9,7 +9,8 @@ for how the C is written; this one is about how the repository is worked on.
 holyWisp is a [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) server written in C11 with
 no dependencies beyond libc and pthreads. It accepts WebSocket connections, speaks Wisp v1 and v2,
 and relays TCP and UDP streams to the hosts its clients ask for. It is built for throughput: one
-epoll loop per worker thread, `SO_REUSEPORT` listeners so the kernel load-balances accepts, at most
+epoll loop per worker thread, `SO_REUSEPORT` listeners so every worker accepts (and each new
+connection then goes to the worker with the fewest), at most
 one copy per direction on the data path (none toward the client for a bulk TCP stream, which goes
 remote socket to its own pipe to client socket with `splice`), and flow control that is tied to whether the
 remote is actually draining.
@@ -150,19 +151,43 @@ every test still passes, so each item has a test and a change to it needs a reas
   maximum], so one stream gets the whole window and ten streams do not make the server buffer ten
   windows. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
   never counted. Toward the
-  client, one remote read is split into as many DATA packets as `max-message-size` requires
-  (`conn_send_data`); no frame ever exceeds the negotiated size.
+  client, one remote read is split into as many DATA packets as it takes (`conn_send_data`), each
+  within the negotiated size and within `CONN_FRAME_MAX` (128 KiB of payload, `frame_payload_max`
+  in `conn.c`) whatever that size allows: a client holds a whole message before it can use any of
+  it, and megabyte frames cost the client and the echo behind it 20 to 40% more per byte while
+  saving the server nothing (`test_egress_frames_capped`).
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
   CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x48` blocked
   by egress policy, `0x49` throttled. A client's CLOSE for a stream gets no CLOSE back. A CONNECT
-  on stream 0 gets no reply at all (a CLOSE on stream 0 would end the whole connection).
+  on stream 0 gets no reply at all (a CLOSE on stream 0 would end the whole connection). A CONNECT
+  for an id that is already open closes that stream with `0x41` and opens nothing: the id is the
+  only name the two ends share for it, and two streams under one name is two ends that disagree.
+- **Closing toward the remote.** A stream's socket is closed in the ordinary way (FIN) except in
+  one case, where it is reset: the stream ended from the *client's* side (its CLOSE, or the end
+  of its connection), the stream is TCP and not through an upstream proxy, the remote has sent something since
+  the client last did (`s->heard`), nothing is queued toward the remote, and the kernel reports
+  every written byte acknowledged (`stream_may_reset` in `src/server/stream.c`,
+  `hw_sys_close_reset`). A reset leaves no connection in TIME_WAIT and frees the local port at
+  once, which on the churn row is 15% more streams per second; an ordinary close of a stream the
+  client aborted mid-download was already a reset, because Linux resets on close with unread
+  data. Every condition is there so that a reset can never cost the remote bytes the client sent:
+  do not widen it (a stream the remote ended, or one the server closes for its own reasons, is
+  never reset), and where the kernel cannot tell what is acknowledged (macOS, Windows) it is a
+  plain close. `test_close_toward_remote` and `test_close_reset` hold both halves.
 - **WebSocket strictness.** Client frames must be masked; unmasked, reserved bits, text frames and
   oversize messages close the socket with the RFC 6455 codes `1002` / `1003` / `1009`. Pings get
   pongs; a CLOSE is echoed. Server frames are never masked.
 - **Plain HTTP on the same port.** `GET /health` is `{"status":"ok"}`, `GET /stats` is the
   counters, any other non-upgrade request gets `non-ws-response` (or 426 when it is empty), and a
-  malformed head gets 400. An upgrade refused by `connections-limit-per-ip` is 429 with
-  `Retry-After: <connection-window-s>`. All with `Connection: close`. With `serve-webclient`, `GET /` is the
+  malformed head gets 400. Malformed is everything that would make the header table differ from
+  what was sent (`hw_http_parse_request` in `ws.c`): too many headers, a name that is not a token,
+  a continuation line, a NUL or bare CR in a value. An upgrade refused by
+  `connections-limit-per-ip` or by `max-concurrent-connections-per-ip` is 429 with
+  `Retry-After: <connection-window-s>`; one whose `Origin` is not on a non-empty `allow-origin`
+  list is 403 (a request with no `Origin` is never refused for it: that header is a browser's);
+  one from a trusted proxy whose forwarding header was too long to keep whole is 400. All with
+  `Connection: close`, and once a reply is queued the connection is not read from again
+  (`CONN_HTTP_REPLY` in `conn_reads_stopped`). With `serve-webclient`, `GET /` is the
   embedded client; `webclient-wisp-url` is spliced into it as `window.HOLYWISP_CONFIG.wisp`
   (validated: `ws(s)://`, nothing that can escape a script string) for when the relay is not
   the origin that served the page.
@@ -186,7 +211,22 @@ runs on. The defaults deny everything that is not public unicast and every chang
   here first, but the proxy is then handed the *hostname* (SOCKS5 ATYP 3, CONNECT `host:port`) so
   a classifying router can resolve it itself; only a literal IP is sent as an address.
 - Hostnames are passed to the resolver as given, but a NUL inside the host, an empty host, a port
-  of 0 or a host over 255 bytes is `0x41` before anything is looked up.
+  of 0 or a host over 255 bytes is `0x41` before anything is looked up. So is a host with a byte
+  outside `[A-Za-z0-9._:\[\]-]` and `_` (`host_chars_ok` in `conn.c`), and a name whose last
+  label is a number (`0x7f.1`, `2130706433`, `1.2.3`): a resolver's `inet_aton` turns those into
+  an address without asking the DNS, so only the canonical dotted quad is an IPv4 literal
+  (`hw_addr_parse_literal`) and nothing else numeric reaches a resolver.
+- IPv6 is public only inside `2000::/3`. The translation and tunnel forms that wrap a *public*
+  IPv4 address (NAT64, 6to4, IPv4-compatible, IPv4-translated, an ISATAP interface id) are
+  reserved, not public: this host has no business being someone's translator. Only IPv4-mapped
+  is classified as exactly the IPv4 it wraps.
+- The host filters compare a host whole or not at all (`hw_hostlist_allows`,
+  `hw_hostlist_blocks`): a host too long to compare is not on an allow list and is on a non-empty
+  block list. Never match the part that fits.
+- The upstream proxy resolves the hostname again, so this check and that dial can see different
+  addresses (DNS rebinding). The server cannot close that gap alone; a proxy that reaches private
+  networks has to check what *it* resolved. abulxt's `edge-router.py` does (it resolves once,
+  refuses anything not public, and dials or forwards the address it checked).
 
 ## Security suite (do not regress)
 
@@ -195,12 +235,52 @@ in `hw_server_new` (`build_limiters`), lock internally, and are evicted and pers
 maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_reputation`,
 `test_filter`) and the whole path has `test_security`. Keep these invariants:
 
-- **Where each check runs.** Connection-level checks (real-IP resolution, per-IP connect rate,
-  reputation tier, the concurrent-connection semaphore) are in `http_process` at upgrade time.
+- **Where each check runs.** Connection-level checks (the origin allowlist, real-IP resolution,
+  per-IP connect rate, reputation tier, the per-IP connection gauge, the concurrent-connection
+  semaphore) are in `http_process` at upgrade time, in that order.
   Per-CONNECT checks (per-source connect rate, the Twisp gate) are in `handle_connect`.
   Per-destination checks (host/port filters, per-dest rate, destination reputation, the in-flight
-  SYN cap, the SYN-flood signature) are in `stream.c` around the dial. Do not move a check to a
-  cheaper-but-wrong place; the per-destination ones must see the resolved address.
+  SYN caps, the SYN-flood signature) are in `stream.c` around the dial. Do not move a check to a
+  cheaper-but-wrong place; the per-destination ones must see the resolved address, and they see
+  *each* one: `stream_connect_next` applies `dest_policy` to every address it is about to dial,
+  not to the first of the list (a name whose first address is a decoy used to carry the rest
+  past the per-destination limits).
+- **A shared limit is shared by its users, not by one of them.** Every server-wide cap that one
+  client could fill has a per-client share next to it (`hw_gauge`, keyed by client address):
+  `max-in-flight-syns-per-ip` beside `max-in-flight-syns`, `max-concurrent-connections-per-ip`
+  beside `max-concurrent-connections`. A new server-wide cap needs one too. The SYN-signature
+  records a connection keeps are bounded (`SIGDET_MAX_PER_CONN`, oldest reused), and the
+  resolver and the password pool have bounded queues that fail the newcomer (`EAI_AGAIN`,
+  CLOSE `0x49`) instead of growing.
+- **What is held against a client.** Only what it did on its own account. Running into a limit
+  all clients share (the per-destination windows, the server-wide SYN cap) closes the stream
+  `0x49` and is not a violation and not a reputation event, for the client or the destination:
+  it used to be, and one client could get a destination refused for everyone, or the others
+  closed for its flood. Its own cap (`max-in-flight-syns-per-ip`) is a violation.
+  `privateEgress` weighs 0 by default and Twisp-when-off is not scored at all, because any web
+  page can make its visitor's browser send either; both are refused (`0x48`) and counted. The
+  same reasoning is why `allow-origin` exists: without it, a page's rate-limit events land on
+  its visitor's address.
+- **A client that will not read.** Backpressure stops the *remotes*; frames the server makes
+  itself (pongs, CLOSE for a refused CONNECT, CONTINUE) are answers to what the client sends, so
+  past twice `ws-write-high-water` the client is not read from either (`wr_stalled` in
+  `conn_backpressure`, cleared at the mark). `conn_sweep` (a per-worker timer) closes a
+  connection whose queue has not moved for `client-write-timeout-s`, and with `idle-timeout-s`
+  one that has been silent both ways (1001). Nothing a client can send may grow `wbuf` without
+  bound; a new server-made frame type has to be covered by this, not exempt from it.
+- **The client's address.** `hw_real_ip` reads every instance of the first trusted header the
+  request carries, as one list, from the right, and stops at the first entry that is not a
+  trusted proxy; an entry that is not an address ends the walk with the peer as the answer. The
+  default trusted header is `X-Forwarded-For` alone: a header the proxy in front does not
+  overwrite is the client's to choose. `trusted-proxy-secret` makes the headers count only with
+  `X-HolyWisp-Proxy-Secret`, for a proxy that shares 127.0.0.1 with other processes (the npm
+  wrapper sets one per start). Per-client keys are the full address, IPv6 included.
+- **The tables are keyed by what clients choose** (addresses, destinations), so `hw_smap` hashes
+  with SipHash under a key drawn once per process from `hw_sys_random`. Do not hash client data
+  with anything unkeyed, and do not persist or send a hash.
+- **Logs.** `hw_log` writes every control byte of the tag and message as `\xNN`; callers pass
+  client strings as they are. A failed login is logged without the user name it tried, and a
+  config error never echoes the value of `proxy`, `trusted-proxy-secret` or a `password-user`.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
   lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits
@@ -211,12 +291,20 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   the request through (`hw_window_allow` returns 1); a policy that denies always denies. Keep that
   asymmetry: a transient OOM must not lock out every client, but a blocked address stays blocked.
 - **Passwords** are compared in constant time, and a `$`-prefixed stored value goes through
-  `hw_sys_crypt` (`crypt_r` on Linux), never a plain `strcmp`. Where there is no crypt(3) at all
+  `hw_sys_crypt` (`crypt_r` on Linux), never a plain `strcmp`. That call takes tens of
+  milliseconds on purpose, so it never runs on a loop: `auth.c` has two threads of its own and
+  posts the answer back (`auth_check`, `auth_done` in `conn.c`), with the resolver's ownership
+  rules, a queue of 64 past which a login is turned away with `0x49`, and the same hash computed
+  for a user that does not exist. An empty password is refused in the config
+  (`hw_server_config_add_user`): the password extension cannot tell it from none. Where there is
+  no crypt(3) at all
   (`hw_sys_has_crypt`: Windows) a config holding a hashed password is refused when the server is
   made, not left to never match. The config that holds them is never logged and is installed
   `0640 root:wisp`.
 - **Bandwidth throttling pauses, never drops.** `conn_charge_bandwidth` suspends reads and arms a
-  timer; it must never discard stream data. The upstream proxy and DNS client are in `proxy.c` and
+  timer; it must never discard stream data. It charges both directions: a throttled connection's
+  streams stop reading from their remotes too (`conn_sync_streams`), or the limit would only
+  ever have applied to uploads. The upstream proxy and DNS client are in `proxy.c` and
   `dns.c`; the destination is resolved and policy-checked before the proxy is dialled, so egress
   still applies through a proxy, and the proxy then receives the hostname (see "Egress policy").
   UDP through a proxy is refused unless the operator sets `proxy-udp = direct`, which relays UDP
@@ -224,40 +312,72 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 
 ## Twisp / terminal streams (do not regress)
 
-`enable-twisp` runs an operator-chosen command on a PTY and relays it (`twisp.c`). It is a remote
-shell by design, so the gate in `handle_connect` is the whole access-control story and must stay
+`enable-twisp` runs a command on a PTY and relays it (`twisp.c`). The command line is the
+*client's*: the CONNECT payload is split like a shell would and executed as the server's user,
+with nothing in the config narrowing what it may be. It is a remote shell by design, so the gate in `handle_connect` is the whole access-control story and must stay
 intact: **`enable-twisp` on, the client on Wisp v2, and the client authenticated** with a
-configured password. Probing it unauthenticated is a reputation event. The config validator refuses
+configured password. Probing it unauthenticated while it is on is a reputation event; while it is off the CONNECT is
+closed `0x48` and nothing is scored (see "What is held against a client"). The config validator refuses
 `enable-twisp` without `enable-v2` and at least one `password-user`, and on a platform with no
 pseudo-terminal (`hw_sys_has_pty`: Windows) refuses it outright. The terminal and its process are
 the platform's (`hw_sys_pty_spawn`, `_resize`, `_end`); `twisp.c` holds the gate and the command
 line. The systemd sandbox
 (`NoNewPrivileges`, capability drop, read-only FS, syscall filter) is the backstop that keeps a
-spawned shell from escalating; do not weaken it to make Twisp "more useful".
+spawned shell from escalating; do not weaken it to make Twisp "more useful". The child gets the
+PTY and nothing else: on Linux every descriptor is made close-on-exec in the call that creates
+it, and on macOS, where that takes a second call, the child closes everything above 2 itself.
 
 ## Concurrency model (do not regress)
 
-- One `hw_loop` per worker thread. Every `hw_conn` and `hw_stream` belongs to the loop that
-  accepted it and is only ever touched from that thread. The only cross-thread paths are
-  `hw_loop_post()` (resolver completions, eventfd-woken) and the `_Atomic` counters in
+- One `hw_loop` per worker thread. Every `hw_conn` and `hw_stream` belongs to the loop it was
+  created on and is only ever touched from that thread. The only cross-thread paths are
+  `hw_loop_post()` (resolver completions, eventfd-woken), a worker's inbox of accepted
+  descriptors (below) and the `_Atomic` counters in
   `hw_server` and `hw_worker` (the per-packet byte counters live in the worker so no cache line
   is written by two threads; `hw_server_stats_get` sums them). Do not add a mutex to the data path; if a design needs one, it is the wrong design.
+- **Placement.** The kernel deals connections to the workers' listeners by a hash, which is even
+  over thousands and lumpy over a handful: 8 connections on 16 workers usually put two on one
+  worker, and those two share a core for as long as they live (on the bench VM the churn row
+  ran on 6 saturated workers instead of 8). So `accept_cb` keeps a connection only if no worker
+  has fewer (`least_loaded`, by `hw_worker.load`); otherwise `hand_off` puts the untouched
+  descriptor and peer address in the target's inbox and posts `inbox_task`, and the `hw_conn` is
+  created on the loop that receives it. `load` is raised by the accepting thread before the
+  hand-off, so a burst accepted in one pass is spread, and lowered in `conn_release`. Only a
+  descriptor ever crosses threads; never hand over a connection that exists, and never read
+  another worker's fields besides `load`. `test_connections_spread` holds it.
 - **Deferred free.** `conn_close()` tears the socket and streams down immediately but frees the
   `hw_conn` on the next loop iteration via `hw_loop_post`. Streams are freed immediately by
   `stream_close()`. The re-entrancy rules at the top of `src/server/conn.c` and
   `src/server/stream.c` follow from this: after any call that can write to the client, check
   `c->closing` and return; never touch the stream after `stream_close()` or after a call that may
-  have closed the connection.
+  have closed the connection. `c->closing` does not show a stream that was closed alone: a function
+  that can do that (`stream_flush`, `stream_connected`, `signature_record`) reports it in its result,
+  and the caller tests that result, never `s->state` (both use-after-frees found so far read it).
 - **fd generations.** The loop delivers an event only when the fd's generation matches the one it
   was registered with, so a close-and-reuse inside a dispatch batch is safe. Do not cache fds
   across callbacks.
+- **An fd that is not being read must not be able to spin the loop.** Readiness is
+  level-triggered, and a kernel reports error and hang-up whatever the interest. So: a backend
+  asks for the half-close (`EPOLLRDHUP`) only together with `HW_EV_READ`
+  (`test_half_close_needs_read_interest`); a paused stream that gets an error or hang-up it will
+  not act on takes its fd off the loop (`s->detached`, re-added by `stream_update_events`); a
+  connection whose reads are stopped (`conn_reads_stopped`) closes on HUP or ERROR; and a
+  listener that fails with EMFILE or ENFILE is disarmed for `ACCEPT_RETRY_MS` instead of being
+  retried in a loop (`accept_resume_cb`). Each of these was a worker at 100% CPU that any client
+  could cause. A new "ignore this event for now" has to say which of the four it is.
+- **Every wait has an end.** A stream has a timer from CONNECT to connected, not only around
+  `connect()`: resolving (`0x42`) and the upstream proxy's handshake (`0x43`) are covered by
+  `open_timeout_cb` on the same `connect_timer`.
 - **Relay pipes.** A TCP stream whose remote delivers full reads (`s->bulk`) gets its own pipe
   (`hw_spipe`, opened on first use) and relays remote to client through it without a copy
   (`conn_splice_data`): the frame header is appended to `wbuf`, the payload is spliced into the
   pipe, and a mark (`hw_pipe_mark`) records "after this many queue bytes, splice n from this
   pipe". `conn_flush` sends `wbuf` up to the head mark (with `MSG_MORE`), empties that pipe into
   the socket, and goes on, so frames never interleave and any number of streams can have a
-  payload queued at once. A stream may not refill its pipe while its previous payload is still in
+  payload queued at once. One splice takes at most a frame's payload (`CONN_FRAME_MAX`), however
+  large the pipe, and one read event on the stream relays up to `STREAM_MAX_READS_PER_EVENT`
+  pipes' worth of bytes in as many frames as that is (the byte budget in `stream_read`), so a
+  smaller frame does not mean less work per wakeup. A stream may not refill its pipe while its previous payload is still in
   it: it parks (`stream_park`) and `mark_pop` unparks it; it never copies behind its own pipe. A
   stream that closes with a payload queued leaves its pipe to the queue (`conn_pipe_drop`), which
   frees it when the payload is out or the connection closes (`marks_free`). The kernel charges
@@ -301,7 +421,9 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   `0x49`. Both limits are configuration; neither may become unbounded.
 - The resolver owns `hw_resolve_req` from `hw_resolve()` until its delivery task runs or
   `hw_resolver_free` drops it. Cancellation is a flag read on the loop thread. Do not free a
-  request from stream code.
+  request from stream code. `auth.c` is the same pattern for `hw_auth_req` (`auth_check`,
+  `auth_cancel` from `conn_close`, `auth_free`), and a third thing that leaves the loop for a
+  thread should be a third copy of it, not a new idea.
 
 ## Verification before you hand work off
 
@@ -316,6 +438,12 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   `build/release/holywisp --port 6001 --allow-loopback --allow-direct-ip` and
   `build/release/holywisp-client --bench 268435456 127.0.0.1 <echo port>` against any TCP echo
   service. Throughput on loopback should be hundreds of MiB/s; a drop to tens is a regression.
+- If you touched a limiter, a timeout, backpressure or anything else a hostile client leans on,
+  run `test_abuse` several times (`for i in 1 2 3 4 5; do build/debug/test_abuse || break; done`).
+  It holds the cases that were found by attacking the server: a client that never reads, a remote
+  that resets while paused (it measures the server's CPU time), the per-IP caps, the origin
+  list, bandwidth on downloads, hostile host bytes, raw CONNECTs, passwords on and off the loop.
+  A fix for an abuse case is not done until this file fails without it.
 - If you touched the proxy path, run `test_security` several times (it starts real SOCKS5 and HTTP
   CONNECT proxies in-process): `for i in $(seq 1 20); do build/debug/test_security || break; done`.
 - If you added or renamed a config key or CLI flag: `src/server/config.c` (parser and `--help`
@@ -329,6 +457,13 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   table and in `tests/config.test.mjs`. The wrapper's rule for client addresses is a security
   invariant: `route()` drops every trusted header that arrives from a peer outside
   `trustedProxies` and writes the socket's peer address itself. Do not forward them unfiltered.
+  Its own headers go first in the head it writes, with the secret of this start
+  (`trusted-proxy-secret`, generated per start, passed in the 0600 file, never in argv), and a
+  copy of the secret header from the client is dropped: the server believes proxy headers from
+  127.0.0.1 only with that secret, so another local process cannot name a client. A socket with
+  no peer address at all (a front on a Unix socket) counts as 127.0.0.1 and says so once in the
+  log; one whose address does not parse is refused. The binary and the wrapper change together
+  here: after touching either side of that exchange, `make npm` before `make npm-test`.
 - If you touched `loop.c`, a loop backend, `sys.h` or any of its halves, or `src/compat/win32`:
   nothing here runs macOS, so `make npm` is the local check that both macOS targets still compile
   with `-Werror` (zig cross-builds them); the `macOS` job in `build.yml` is where that code
@@ -355,6 +490,10 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
   is what ends the server when Node is killed outright and what `stop()` uses on Windows, where
   there is no SIGTERM. Never spawn it with an inherited or ignored stdin: `/dev/null` is at end of
   file from the start, and the server would stop as soon as it was up.
+- Release builds carry `HW_HARDEN` (stack protector everywhere but Windows; FORTIFY, PIE and
+  full RELRO on Linux). It is off under the sanitizers and must not cost the data path: if a
+  bench row moves, find the flag, do not drop the option. The unit has no `ExecReload` on
+  purpose: the server has no SIGHUP handler, so a reload would stop it.
 - If you touched packaging or the unit: `bash deploy/package.sh all` builds both packages, and
   `systemd-analyze security --offline=true deploy/systemd/holywisp.service` must still rate "OK"
   (~1.3). Never lower the sandbox to work around a bug; fix the bug.
@@ -367,7 +506,7 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
 | `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
 | `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
-| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, crypt, the pseudo-terminal. |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, crypt, the pseudo-terminal, random bytes fit for keys. |
 | `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |
@@ -382,18 +521,21 @@ spawned shell from escalating; do not weaken it to make Twisp "more useful".
 | `src/server/stream.c` | One relayed TCP/UDP stream: resolve, connect with fallback, both data directions. |
 | `src/server/egress.c` | The allow/deny decision for a remote address (address class only). |
 | `src/server/proxy.c` | Upstream SOCKS5 / HTTP CONNECT handshake, driven on the stream socket. |
+| `src/server/auth.c` | Hashed-password checks on two threads of their own, answered on the loop that asked. |
 | `src/server/twisp.c` | PTY terminal streams: shell-split the command, `hw_sys_pty_spawn`, relay the master. |
 | `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`, validation. |
 | `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM, or (`stop-on-stdin-eof`) when stdin closes. |
-| `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, token-bucket bandwidth, SYN-signature ring. |
+| `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, per-key gauge, token-bucket bandwidth, SYN-signature ring. |
 | `include/holywisp/reputation.h`, `src/common/reputation.c` | Per-IP / per-dest scoring, tiers, decay, JSON persistence. |
 | `include/holywisp/filter.h`, `src/common/filter.c` | Host/port allow-block lists, CIDR match, real-client-IP from proxy headers. |
 | `include/holywisp/dns.h`, `src/common/dns.c` | Built-in A/AAAA DNS client and the shared result cache. |
-| `include/holywisp/smap.h`, `src/common/smap.c` | String-keyed open-addressing map used by the limiters, reputation and DNS cache. |
+| `include/holywisp/smap.h`, `src/common/smap.c` | String-keyed open-addressing map used by the limiters, reputation and DNS cache; SipHash under a per-process random key. |
 | `include/holywisp/client.h`, `src/client/client.c` | Blocking client library: connect, open, send, poll, read_exact. |
 | `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
+| `tests/test_abuse.c` | End-to-end from the attacker's side: each case is something a hostile client or remote did to the server before it was fixed. |
+| `tests/test_client.c`, `tests/test_log.c` | The client library against servers that misbehave; log lines that hold client bytes. |
 | `node/src/index.ts` | The npm package's `holyWisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |
 | `node/src/config.ts` | wispurr-shaped options to `holywisp` flags; secrets go to a 0600 file, not argv. |
 | `node/src/vite.ts`, `logger.ts`, `path.ts` | Vite plugin, log relay, where the platform's binary lives. |

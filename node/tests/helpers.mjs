@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { existsSync } from "node:fs";
 import { createServer, request } from "node:http";
-import { createServer as createTcpServer } from "node:net";
+import { connect, createServer as createTcpServer } from "node:net";
 import { arch, platform } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -126,4 +126,90 @@ export function upgrade(port, headers = {}, path = "/") {
 		req.once("error", reject);
 		req.end();
 	});
+}
+
+const upgradeLines = [
+	"Host: front.test",
+	"Upgrade: websocket",
+	"Connection: Upgrade",
+	"Sec-WebSocket-Version: 13",
+	"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+];
+
+/**
+ * An upgrade written byte for byte, so that a test decides every header line, how many there are
+ * and (with `local`) which loopback address it comes from. Resolves to the status code, or 0 when
+ * the connection closed without an answer.
+ */
+export function rawUpgrade(port, lines = [], { path = "/", local } = {}) {
+	return new Promise((resolve, reject) => {
+		const socket = connect({ host: "127.0.0.1", port, localAddress: local });
+		let answer = "";
+		const done = () => {
+			socket.destroy();
+			resolve(Number(/^HTTP\/1\.1 (\d{3})/.exec(answer)?.[1] ?? 0));
+		};
+		let connected = false;
+		socket.once("connect", () => {
+			connected = true;
+			socket.write(`GET ${path} HTTP/1.1\r\n${[...upgradeLines, ...lines].join("\r\n")}\r\n\r\n`);
+		});
+		socket.on("data", (chunk) => {
+			answer += chunk.toString("latin1");
+			if (answer.includes("\r\n")) done();
+		});
+		// A reset once connected is an answer too: the other side hung up without one.
+		socket.on("error", (err) => (connected ? done() : reject(err)));
+		socket.once("close", done);
+	});
+}
+
+/** Whether this machine lets a client connect from `local` (macOS has 127.0.0.1 and nothing else of 127/8). */
+export async function canConnectFrom(local, port) {
+	return new Promise((resolve) => {
+		const socket = connect({ host: "127.0.0.1", port, localAddress: local });
+		socket.once("connect", () => {
+			socket.destroy();
+			resolve(true);
+		});
+		socket.once("error", () => resolve(false));
+	});
+}
+
+/**
+ * Stand a recording TCP server in for holyWisp behind `wisp`, which must be running: route() then
+ * writes to it what it would have written to the server. `heads` collects every request head it
+ * received, as the list of its lines; each is answered 400. `restore()` points `wisp` back at its
+ * real server.
+ */
+export async function spy(t, wisp) {
+	const heads = [];
+	const waiting = [];
+	const server = createTcpServer((socket) => {
+		let text = "";
+		socket.on("error", () => {});
+		socket.on("data", (chunk) => {
+			text += chunk.toString("latin1");
+			const end = text.indexOf("\r\n\r\n");
+			if (end < 0) return;
+			socket.removeAllListeners("data");
+			const lines = text.slice(0, end).split("\r\n");
+			const next = waiting.shift();
+			if (next) next(lines);
+			else heads.push(lines);
+			socket.end("HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+		});
+	});
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	t.after(() => new Promise((resolve) => server.close(resolve)));
+	const real = wisp.boundPort;
+	wisp.boundPort = server.address().port;
+	return {
+		/** The next head route() writes. */
+		next: () => (heads.length > 0 ? Promise.resolve(heads.shift()) : new Promise((resolve) => waiting.push(resolve))),
+		restore: () => {
+			if (wisp.boundPort === server.address().port) wisp.boundPort = real;
+		},
+	};
 }

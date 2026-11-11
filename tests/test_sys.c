@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <unistd.h>
@@ -264,6 +265,59 @@ static void test_relay_pipe(void) {
 	close(fds[1]);
 }
 
+// One read, waiting up to five seconds for it: the count, 0 at the end of the stream, -1 with errno.
+static ssize_t read_wait(int fd, void *buf, size_t cap) {
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	if (poll(&pfd, 1, 5000) <= 0) {
+		errno = ETIMEDOUT;
+		return -1;
+	}
+	return read(fd, buf, cap);
+}
+
+static void test_close_reset(void) {
+	// Bytes the peer has not acknowledged are never given up for a reset. The peer here reads
+	// nothing until the socket is closed, so most of what was written is still on this side: it
+	// must all arrive, followed by the end of the stream and not by an error.
+	int client;
+	int afd = tcp_pair(&client);
+	static uint8_t chunk[65536];
+	memset(chunk, 0x5a, sizeof(chunk));
+	size_t sent = 0;
+	for (;;) {
+		ssize_t w = send(afd, chunk, sizeof(chunk), HW_MSG_NOSIGNAL);
+		if (w < 0) break;
+		sent += (size_t)w;
+	}
+	CHECK(errno == EAGAIN || errno == EWOULDBLOCK, "the send buffer filled, got %d", errno);
+	CHECK(sent > 0, "something was written");
+	CHECK_EQ(hw_sys_close_reset(afd), 0);
+	size_t got = 0;
+	ssize_t n;
+	while ((n = read_wait(client, chunk, sizeof(chunk))) > 0) got += (size_t)n;
+	CHECK(n == 0, "the stream ends cleanly, got errno %d", errno);
+	CHECK(got == sent, "all %zu bytes arrived, got %zu", sent, got);
+	close(client);
+
+	// With everything acknowledged (the peer's reply carries the acknowledgement) the close is a
+	// reset where the platform has one, and what was written before it had arrived either way.
+	afd = tcp_pair(&client);
+	char buf[8];
+	CHECK_EQ(send(afd, "hello", 5, HW_MSG_NOSIGNAL), 5);
+	CHECK_EQ(read_wait(client, buf, sizeof(buf)), 5);
+	CHECK_EQ(send(client, "ok", 2, HW_MSG_NOSIGNAL), 2);
+	CHECK_EQ(read_wait(afd, buf, sizeof(buf)), 2);
+	int reset = hw_sys_close_reset(afd);
+	CHECK_EQ(reset, hw_sys_has_close_reset());
+	n = read_wait(client, buf, sizeof(buf));
+	if (reset) {
+		CHECK(n < 0 && errno == ECONNRESET, "the peer sees a reset, got %zd errno %d", n, errno);
+	} else {
+		CHECK(n == 0, "the peer sees the end of the stream, got %zd errno %d", n, errno);
+	}
+	close(client);
+}
+
 static void test_crypt(void) {
 	// Whatever method the C library reads this setting as, it is a function of key and setting.
 	char a[128], b[128], c[128], tiny[4];
@@ -283,6 +337,30 @@ static void test_crypt(void) {
 	CHECK_EQ(hw_sys_crypt("hunter2", a, b, sizeof(b)), 0);
 	CHECK_STR(a, b);
 	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", tiny, sizeof(tiny)), -1);
+}
+
+// Random bytes that are fit for keys: the whole buffer is written, and no two calls agree.
+static void test_random(void) {
+	uint8_t a[64], b[64], zero[64];
+	memset(a, 0, sizeof(a));
+	memset(b, 0, sizeof(b));
+	memset(zero, 0, sizeof(zero));
+	CHECK_EQ(hw_sys_random(a, sizeof(a)), 0);
+	CHECK_EQ(hw_sys_random(b, sizeof(b)), 0);
+	CHECK(memcmp(a, zero, sizeof(a)) != 0, "the buffer was filled");
+	CHECK(memcmp(a, b, sizeof(a)) != 0, "two calls differ");
+	// Every position is written, not only the first word: over 32 calls no byte stays the same.
+	// (One that did by chance would be 1 in 256^31.)
+	uint8_t first[37], changed[37];
+	CHECK_EQ(hw_sys_random(first, sizeof(first)), 0);
+	memset(changed, 0, sizeof(changed));
+	for (int i = 0; i < 32; i++) {
+		uint8_t next[37];
+		CHECK_EQ(hw_sys_random(next, sizeof(next)), 0);
+		for (size_t k = 0; k < sizeof(next); k++) changed[k] |= (uint8_t)(next[k] != first[k]);
+	}
+	for (size_t k = 0; k < sizeof(changed); k++) CHECK(changed[k], "byte %zu never changes", k);
+	CHECK_EQ(hw_sys_random(a, 0), 0);
 }
 
 // Read from a pty master until `want` shows up or the terminal ends. What was read is in buf.
@@ -331,6 +409,19 @@ static void test_pty(void) {
 	CHECK(hw_now_ms() - t0 < 5000, "pty_end waited for the child");
 	CHECK(!pty_expect(master, buf, sizeof(buf), "never printed"), "read \"%s\"", buf);
 	close(master);
+
+	// A caller that ignores SIGPIPE (the server does) does not pass that on: the command gets the
+	// default, under which the signal ends it. Ignored, the shell would live to print the word.
+	void (*before)(int) = signal(SIGPIPE, SIG_IGN);
+	char pipe_script[] = "echo started; kill -PIPE $$; echo survived";
+	char *pipe_argv[] = {sh, dash_c, pipe_script, NULL};
+	pid = hw_sys_pty_spawn(pipe_argv, &master);
+	signal(SIGPIPE, before);
+	CHECK(pid > 0, "pty_spawn: errno %d", errno);
+	CHECK(!pty_expect(master, buf, sizeof(buf), "survived"), "read \"%s\"", buf);
+	CHECK(strstr(buf, "started") != NULL, "read \"%s\"", buf);
+	hw_sys_pty_end(pid);
+	close(master);
 }
 
 int main(void) {
@@ -340,7 +431,9 @@ int main(void) {
 	RUN(test_listen_more);
 	RUN(test_shared_accept_never_blocks);
 	RUN(test_relay_pipe);
+	RUN(test_close_reset);
 	RUN(test_crypt);
+	RUN(test_random);
 	RUN(test_pty);
 	return 0;
 }

@@ -16,6 +16,7 @@
 #include <unistd.h>
 
 #define PIPE_CHUNK (64 * 1024)
+#define MOTD_SHOWN (4 * 511 + 1) // the longest MOTD the client keeps, every byte of it escaped
 
 static void usage(const char *argv0) {
 	fprintf(stderr,
@@ -105,9 +106,47 @@ static int write_all(int fd, const uint8_t *p, size_t n) {
 	return 0;
 }
 
+// Why a send failed, for the user.
+static const char *send_error(int r) {
+	switch (r) {
+	case HW_ERR_TIMEOUT:
+		return "no CONTINUE from the server in time";
+	case HW_ERR_TOOBIG:
+		return "the server sent more than the client may queue while it waited for a CONTINUE";
+	default:
+		return "stream closed";
+	}
+}
+
+// Write what has arrived to stdout, without waiting. 0 to go on; 1 when the relay is over, with
+// the exit code in *rc.
+static int pipe_drain(hw_client *c, uint32_t sid, int *rc) {
+	hw_client_event ev;
+	int r;
+	while ((r = hw_client_poll(c, 0, &ev)) > 0) {
+		log_event(&ev);
+		if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
+			if (write_all(STDOUT_FILENO, ev.data, ev.len) != 0) {
+				*rc = 1;
+				return 1;
+			}
+		} else if (ev.type == HW_CEV_CLOSE && (ev.stream_id == sid || ev.stream_id == 0)) {
+			*rc = ev.reason == HW_CLOSE_VOLUNTARY ? 0 : 1;
+			return 1;
+		}
+	}
+	if (r < 0) {
+		fprintf(stderr, "connection closed\n");
+		*rc = 1;
+		return 1;
+	}
+	return 0;
+}
+
 static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 	uint8_t buf[PIPE_CHUNK];
 	int stdin_open = 1;
+	int rc;
 	for (;;) {
 		struct pollfd pfds[2] = {{.fd = hw_client_fd(c), .events = POLLIN}, {.fd = STDIN_FILENO, .events = POLLIN}};
 		int r = poll(pfds, stdin_open ? 2 : 1, stdin_open ? -1 : idle_ms);
@@ -118,26 +157,21 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 			ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
 			if (n <= 0) {
 				stdin_open = 0;
-			} else if (hw_client_send(c, sid, buf, (size_t)n) != 0) {
-				fprintf(stderr, "send failed: stream closed\n");
-				return 1;
-			}
-		}
-		if (pfds[0].revents) {
-			hw_client_event ev;
-			while ((r = hw_client_poll(c, 0, &ev)) > 0) {
-				log_event(&ev);
-				if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
-					if (write_all(STDOUT_FILENO, ev.data, ev.len) != 0) return 1;
-				} else if (ev.type == HW_CEV_CLOSE && (ev.stream_id == sid || ev.stream_id == 0)) {
-					return ev.reason == HW_CLOSE_VOLUNTARY ? 0 : 1;
+			} else {
+				// A send that timed out sent nothing. The server holds its CONTINUE for as long as
+				// the remote is slow to take what it has, so like any pipe this one waits: it
+				// writes out what arrived meanwhile and offers the same bytes again.
+				while ((r = hw_client_send(c, sid, buf, (size_t)n)) == HW_ERR_TIMEOUT) {
+					if (g_verbose) fprintf(stderr, "[stream %u] still waiting for a CONTINUE\n", sid);
+					if (pipe_drain(c, sid, &rc)) return rc;
+				}
+				if (r != 0) {
+					fprintf(stderr, "send failed: %s\n", send_error(r));
+					return 1;
 				}
 			}
-			if (r < 0) {
-				fprintf(stderr, "connection closed\n");
-				return 1;
-			}
 		}
+		if (pfds[0].revents && pipe_drain(c, sid, &rc)) return rc;
 	}
 }
 
@@ -151,8 +185,9 @@ static int run_bench(hw_client *c, uint32_t sid, size_t total) {
 	while (received < total) {
 		if (sent < total) {
 			size_t n = HW_MIN(PIPE_CHUNK, total - sent);
-			if (hw_client_send(c, sid, chunk, n) != 0) {
-				fprintf(stderr, "send failed at %zu bytes\n", sent);
+			int s = hw_client_send(c, sid, chunk, n);
+			if (s != 0) {
+				fprintf(stderr, "send failed at %zu bytes: %s\n", sent, send_error(s));
 				free(chunk);
 				return 1;
 			}
@@ -257,13 +292,22 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "%s\n", err);
 		return 1;
 	}
+	if (o.user && o.pass && !hw_client_authenticated(c)) {
+		fprintf(stderr, "warning: the server did not ask for a password, so none was sent: not authenticated\n");
+	}
 	if (g_verbose) {
+		// The MOTD is the server's bytes; this is the user's terminal.
+		const char *motd = hw_client_motd(c);
+		char shown[MOTD_SHOWN];
+		hw_client_printable(shown, sizeof(shown), motd, strlen(motd));
 		fprintf(stderr, "connected: wisp-v%d, window %u%s%s\n", hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c),
-		        hw_client_motd(c)[0] ? ", motd: " : "", hw_client_motd(c));
+		        shown[0] ? ", motd: " : "", shown);
 	}
 	uint32_t sid;
-	if (hw_client_open(c, udp ? HW_STREAM_UDP : HW_STREAM_TCP, positional[0], (uint16_t)target_port, &sid) != 0) {
-		fprintf(stderr, "cannot open stream\n");
+	int opened = hw_client_open(c, udp ? HW_STREAM_UDP : HW_STREAM_TCP, positional[0], (uint16_t)target_port, &sid);
+	if (opened != 0) {
+		fprintf(stderr, "%s\n",
+		        opened == HW_ERR_INVALID ? "bad host: a hostname is 1 to 255 bytes" : "cannot open stream");
 		hw_client_free(c);
 		return 1;
 	}

@@ -34,7 +34,9 @@ No dependencies, no install script, nothing compiled on your machine. Node 20 or
 
 - `new holyWisp(options?)`: validates the options; nothing is started yet.
 - `start(workers = 1)`: start the server with that many worker threads (`0` = one per CPU) and
-  resolve once it answers. Rejects with the server's own message if it refuses the config.
+  resolve once it answers. Rejects with the server's own message if it refuses the config; a
+  password, proxy credential or other secret that message quotes is replaced by `[redacted]`, in
+  the Error and in the log.
 - `route(req, socket, head)`: the handler for an HTTP server's `upgrade` event.
 - `stop(timeoutMs = 10000)`: ask it to shut down (SIGTERM; on Windows, by closing its stdin), then
   kill it if it has not exited in time.
@@ -68,6 +70,7 @@ class name. What differs:
 | `ports` | n entries | one entry |
 | Default `host` | all interfaces | `127.0.0.1`: `route()` is the way in. Set `host: "0.0.0.0"` to expose the port too |
 | Client address behind `route()` | every client is `127.0.0.1` unless a proxy header says otherwise, and a client can send that header itself | the peer of the socket `route()` was given; see below |
+| Default `trustedHeaders` | `CF-Connecting-IP`, `X-Forwarded-For` | `X-Forwarded-For` only; see below |
 | Passwords | in the process arguments | in a `0600` file that is deleted once the server is up |
 | Defaults | a bundled JSON file | the server's own (`holywisp --help`); an option you leave out is not passed |
 | `tcpBufferSize`, `pendingQueueSize`, `dnsMethod`, `websocketPermessageDeflate`, `staticDir` | used | accepted and ignored, with a warning |
@@ -77,8 +80,19 @@ class name. What differs:
 Every limit holyWisp enforces per client (connection rate, bandwidth, reputation) depends on
 knowing the client's address, and behind `route()` the server only ever sees a connection from
 this process. So `route()` tells it: the address of the socket it was handed is written into the
-first of `trustedHeaders`, and any such header that arrived with the request is dropped, because
-from an arbitrary client it is just a claim.
+first of `trustedHeaders`, and any such header that arrived with the request is dropped, in
+whatever case and however often it was sent, because from an arbitrary client it is just a claim.
+What `route()` writes comes directly after the request line, before every header of the client's,
+so no number of those can push it out of what the server reads.
+
+The server takes this from `route()` and from nobody else. The wrapper reaches it over loopback,
+an address every process on the machine has, so the address proves nothing: each time a server is
+started the wrapper makes up a random secret, hands it over in the same private file as the
+passwords (never in the argument list) and sends it with every upgrade in an
+`X-HolyWisp-Proxy-Secret` header. A request without it, such as one from another local process
+that connects to the server's port, is treated as coming from whoever sent it, whatever its
+headers say; a client's own header of that name is dropped. A server that was restarted has a new
+secret.
 
 If your Node server is itself behind a reverse proxy (nginx, a CDN), list that proxy in
 `trustedProxies`. Requests arriving from it keep their forwarding headers, and the server walks
@@ -88,7 +102,23 @@ them as usual to the right-most address that is not a trusted hop.
 new holyWisp({ trustedProxies: ["127.0.0.1", "10.0.0.0/8"] });
 ```
 
+`trustedHeaders` is `X-Forwarded-For` unless you set it. List a header there only if the proxy
+in front **overwrites** it on every request (or, for `X-Forwarded-For`, appends the address it
+saw). A header the proxy merely passes through is the client's to choose: `CF-Connecting-IP`
+means something behind Cloudflare and is an open door behind an nginx that never touches it, which
+is why it is no longer in the default.
+
 `parseRealIP: false` ignores `trustedProxies`: the client is always the socket's peer.
+
+Two things follow from the server believing only `route()`:
+
+- A proxy that connects to the server's own port (with `host: "0.0.0.0"`) instead of to your Node
+  server is not believed, listed in `trustedProxies` or not. It does not have the secret. Send
+  its requests through `route()`.
+- `route()` refuses an upgrade (403) when the socket has no peer address, which is the case when
+  your HTTP server listens on a Unix socket. There is then nothing to tell the server, and it
+  would count every client as one. Listen on a TCP port, on loopback if it is only for a proxy
+  on the same machine.
 
 ## Options
 
@@ -98,7 +128,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | Option | Flag |
 | --- | --- |
 | `port` (default 6001; the next free port is used if taken; `0` = any) | `port` |
-| `host` (default `127.0.0.1`) | `host` |
+| `host` (default `127.0.0.1`, also for `undefined` and `""`; the server's own default of every interface is never used) | `host` |
 | `binary` (or the `HOLYWISP_BIN` environment variable) | path of the server to run |
 | `autoRestart` (default `true`) | none: whether the wrapper starts a server that died again |
 | `allowTCP`, `allowUDP`, `allowDirectIP` | `allow-tcp`, `allow-udp`, `allow-direct-ip` |
@@ -106,17 +136,18 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `blacklist.hostnames`, `blacklist.ports` | `block-host`, `block-port` |
 | `whitelist.hostnames`, `whitelist.ports` | `allow-host`, `allow-port` |
 | `enableV2`, `enableTwisp`, `motd` | `enable-v2`, `enable-twisp`, `motd` |
-| `passwordUsers`, `passwordAuth`, `passwordAuthRequired` | `password-user`, `password-required` |
-| `parseRealIP`, `trustedProxies`, `trustedHeaders` | `trusted-proxy`, `trusted-header` |
+| `passwordUsers` (a name of 1 to 63 bytes without `:`, a password of at most 127 bytes on one line), `passwordAuth`, `passwordAuthRequired` | `password-user`, `password-required` |
+| `parseRealIP`, `trustedProxies`, `trustedHeaders` (default `X-Forwarded-For`) | `trusted-proxy`, `trusted-header`; `trusted-proxy-secret` is set by the wrapper |
+| `allowedOrigins` (each `scheme://host[:port]`; empty means any page may connect) | `allow-origin` |
 | `connectionsLimitPerIP`, `connectionWindowSeconds`, `bandwidthLimitKbps` | `connections-limit-per-ip`, `connection-window-s`, `bandwidth-limit-kbps` |
-| `floodProtection.*` | `flood-protection`, `max-connects-per-*`, `max-in-flight-syns`, `max-streams-per-conn`, `max-concurrent-connections`, `syn-signature*`, `ws-close-after-violations`, `log-blocked-dials` |
+| `floodProtection.*` | `flood-protection`, `max-connects-per-*`, `max-in-flight-syns`, `max-in-flight-syns-per-ip`, `max-streams-per-conn`, `max-concurrent-connections`, `max-concurrent-connections-per-ip`, `syn-signature*`, `ws-close-after-violations`, `log-blocked-dials` |
 | `reputation.*` | `reputation`, `reputation-store`, `reputation-save-interval-s`, `reputation-decay-per-hour`, `reputation-evict-after-days`, `reputation-{warn,throttle,strict}`, `reputation-weight`, `reputation-dest-weight` |
 | `proxy`, `proxyUDP` | `proxy`, `proxy-udp` |
 | `dnsServers`, `dnsResultOrder`, `dnsTtlSeconds`, `dnsNegativeTtlSeconds`, `dnsTimeoutMs` | `dns-server`, `dns-order`, `dns-ttl-s`, `dns-negative-ttl-s`, `dns-timeout-ms` |
 | `bufferRemainingLength`, `maxMessageSize` | `buffer-remaining`, `max-message-size` |
 | `wsWriteHighWater`, `streamQueueMax`, `connQueueMax` | `ws-write-high-water`, `stream-queue-max`, `conn-queue-max` |
 | `socketBufferSize`, `clientRecvBuffer`, `listenBacklog` | `socket-buffer-size`, `client-recv-buffer`, `listen-backlog` |
-| `connectTimeoutMs`, `handshakeTimeoutSeconds` | `connect-timeout-ms`, `handshake-timeout-ms` |
+| `connectTimeoutMs`, `handshakeTimeoutSeconds`, `clientWriteTimeoutSeconds`, `idleTimeoutSeconds` | `connect-timeout-ms`, `handshake-timeout-ms`, `client-write-timeout-s`, `idle-timeout-s` |
 | `resolverThreads`, `busyPollUs`, `tcpNoDelay`, `tcpQuickAck` | `resolver-threads`, `busy-poll-us`, `tcp-nodelay`, `tcp-quickack` |
 | `nonWSResponse`, `serveWebclient`, `webclientWispUrl` | `non-ws-response`, `serve-webclient`, `webclient-wisp-url` |
 | `logLevel` (default `warn`) | `log-level` |
@@ -154,12 +185,13 @@ share one listening socket. Deploy on Linux.
 
 On Windows two options are refused by `start()`, with the server's own message: `enableTwisp`
 (there is no pseudo-terminal the server could watch) and a hashed password in `passwordUsers`
-(there is no `crypt`). The file passwords travel in is protected by your temporary directory's
-access list rather than by a mode. Under WSL 2 the Linux binaries work as they are, with neither
-limit.
+(there is no `crypt`). The file the passwords and the proxy secret travel in is protected by your
+temporary directory's access list rather than by a mode. Under WSL 2 the Linux binaries work as
+they are, with neither limit.
 
 To run a build of your own, or on a system with no binary here, point `binary` (or
-`HOLYWISP_BIN`) at a `holywisp` executable.
+`HOLYWISP_BIN`) at a `holywisp` executable. It has to be a build that knows `trusted-proxy-secret`
+(`holywisp --help` lists it); an older one refuses to start with "unknown option".
 
 Password hashes (a `passwordUsers` value starting with `$`) are checked by the C library's
 `crypt`. The Linux binaries carry musl's, which knows `$1$`, `$2a$`/`$2b$`, `$5$` and `$6$` but not
