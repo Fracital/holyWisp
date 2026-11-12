@@ -1114,7 +1114,14 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 		return;
 	}
 	if (c->stream_cap > 0 && hw_map_count(&c->streams) >= (size_t)c->stream_cap) {
-		conn_violation(c, "per_ws_streams");
+		// A browser opens many concurrent streams over one multiplexor as a matter of course (one
+		// page's subresources, a challenge that fans out dozens of XHRs); refusing the ones past the
+		// cap is back-pressure on that client, not a protocol violation. Counting it as one closed
+		// the whole connection once the burst passed ws-close-after-violations and drove the source's
+		// reputation to STRICT, so a client throttled to a low cap lost every in-flight stream the
+		// moment a page burst (its epoxy reported Wisp(MuxTaskEnded)) and then had its reconnect
+		// refused. Refuse the one stream and leave the connection and the client's standing alone.
+		HW_STAT_INC(c->w->server, throttled_source);
 		conn_send_close(c, p->stream_id, HW_CLOSE_THROTTLED);
 		return;
 	}

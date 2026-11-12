@@ -560,6 +560,63 @@ static void test_in_flight_syns_per_ip(void) {
 	}
 }
 
+// Opening more concurrent streams than the per-connection cap is a browser bursting its
+// subresources (a Cloudflare challenge fans out dozens of XHRs at once), not an attack: each
+// stream past the cap is refused with THROTTLED, but the connection stays up and the client keeps
+// its standing. Counted as a violation, a page that burst past the cap used to lose the whole
+// multiplexor (every in-flight stream) the moment the burst passed ws-close-after-violations, and
+// then had its reconnect refused as its reputation went to STRICT.
+static void test_stream_cap_is_not_a_violation(void) {
+	int hole[BLACKHOLE_FDS];
+	uint16_t port = start_blackhole(hole);
+	if (port != 0) {
+		hw_server_config cfg;
+		base_config(&cfg);
+		cfg.connect_timeout_ms = 10000; // the cap-filling connects outlast the test
+		cfg.max_streams_per_conn = 4;
+		// Low enough that one page's burst past the cap would trip it, if the cap counted.
+		cfg.flood.ws_close_after_violations = 2;
+		hw_server *s = start(&cfg);
+		hw_client *c = connect_plain(s);
+		// Fill the cap with connects that never finish, so every later one is over the cap.
+		uint32_t held[4];
+		for (int i = 0; i < 4; i++) {
+			CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &held[i]), 0);
+		}
+		// Several more than ws-close-after-violations: each is refused, none closes the connection.
+		for (int i = 0; i < 6; i++) {
+			uint32_t over;
+			CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &over), 0);
+			uint8_t reason = 0;
+			CHECK(wait_close(c, over, &reason, NULL), "the over-cap stream was answered");
+			CHECK_EQ(reason, HW_CLOSE_THROTTLED);
+		}
+		hw_server_stats st;
+		hw_server_stats_get(s, &st);
+		CHECK(st.throttled_source >= 6, "over-cap streams counted as throttled");
+		CHECK_EQ(st.ws_closed_violations, 0);
+		// The connection is still up: free a slot and a fresh stream serves.
+		CHECK_EQ(hw_client_close_stream(c, held[0], HW_CLOSE_VOLUNTARY), 0);
+		uint32_t sid;
+		uint8_t buf[8];
+		uint64_t deadline = hw_now_ms() + 5000;
+		int echoed = 0;
+		while (!echoed && hw_now_ms() < deadline) {
+			CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+			CHECK_EQ(hw_client_send(c, sid, "hello", 5), 0);
+			echoed = hw_client_read_exact(c, sid, buf, 5, 500) == 5;
+		}
+		CHECK(echoed, "the connection survived the burst and still serves");
+		hw_client_free(c);
+		hw_server_free(s);
+	} else {
+		CHECK(1, "this kernel refuses where a blackhole is wanted");
+	}
+	for (int i = 0; i < BLACKHOLE_FDS; i++) {
+		if (hole[i] >= 0) close(hole[i]);
+	}
+}
+
 // bandwidth-limit-kbps counts both directions. A download used to be free: the pause stopped only
 // the client's own reads, and bytes that arrived during it were not charged.
 static void test_bandwidth_limits_downloads(void) {
@@ -760,6 +817,7 @@ int main(void) {
 	RUN(test_forwarded_address);
 	RUN(test_connections_per_ip);
 	RUN(test_in_flight_syns_per_ip);
+	RUN(test_stream_cap_is_not_a_violation);
 	RUN(test_bandwidth_limits_downloads);
 	RUN(test_idle_timeout);
 	RUN(test_host_bytes);
