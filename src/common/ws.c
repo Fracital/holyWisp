@@ -8,6 +8,7 @@
 #include "holywisp/sha1.h"
 
 #include <ctype.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -48,13 +49,76 @@ int hw_ws_parse_header(const uint8_t *data, size_t len, hw_ws_frame *f) {
 	return (int)hlen;
 }
 
+// Unmasking is the server's only per-byte work in user space: every byte a client uploads passes
+// through it, and before it was vectorised it was a tenth of the server's CPU under load. 32 bytes
+// a step with the compiler's generic vectors, which are two SSE2 or NEON registers anywhere and one
+// AVX2 register where the CPU has it: on the bench VM at 16x4 that was 4.8% more bytes per CPU
+// second than 8 bytes a step (2.4% for SSE2 alone). `data` starts on a mask cycle; returns the
+// bytes done, a multiple of 32.
+typedef uint8_t mask_v32 __attribute__((vector_size(32)));
+
+static inline __attribute__((always_inline)) size_t mask_v32_run(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	mask_v32 key;
+	for (int k = 0; k < 32; k++) key[k] = mask[k & 3];
+	size_t i = 0;
+	for (; len - i >= 32; i += 32) {
+		mask_v32 v;
+		memcpy(&v, data + i, 32);
+		v ^= key;
+		memcpy(data + i, &v, 32);
+	}
+	return i;
+}
+
+static size_t mask_v32_base(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	return mask_v32_run(data, len, mask);
+}
+
+// The one architecture #if in the tree: AVX2 is not in the x86-64 baseline the release builds
+// target, so it is compiled in beside the baseline and picked by asking the CPU, once.
+#if defined(__x86_64__)
+#include <cpuid.h>
+
+__attribute__((target("avx2"))) static size_t mask_v32_avx2(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	return mask_v32_run(data, len, mask);
+}
+
+// AVX2 in the CPU (leaf 7) and its registers saved by the OS (OSXSAVE, then XCR0's SSE and AVX
+// bits): a CPU that has it under an OS that does not save YMM faults on the first use.
+static int cpu_has_avx2(void) {
+	unsigned a, b, c, d;
+	if (!__get_cpuid(1, &a, &b, &c, &d) || !(c & bit_OSXSAVE) || !(c & bit_AVX)) return 0;
+	unsigned lo, hi;
+	__asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+	if ((lo & 6) != 6) return 0;
+	if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return 0;
+	return (b & bit_AVX2) != 0;
+}
+
+static _Atomic int g_mask_avx2 = -1; // unknown until the first large unmask; every thread finds the same
+
+static size_t mask_vec(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	int avx2 = atomic_load_explicit(&g_mask_avx2, memory_order_relaxed);
+	if (avx2 < 0) {
+		avx2 = cpu_has_avx2();
+		atomic_store_explicit(&g_mask_avx2, avx2, memory_order_relaxed);
+	}
+	return avx2 ? mask_v32_avx2(data, len, mask) : mask_v32_base(data, len, mask);
+}
+#else
+static size_t mask_vec(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	return mask_v32_base(data, len, mask);
+}
+#endif
+
 void hw_ws_mask(uint8_t *data, size_t len, const uint8_t mask[4], size_t offset) {
 	size_t i = 0;
-	// Align to the mask cycle, then XOR 8 bytes at a time with a rotated 64-bit key.
+	// Align to the mask cycle, then 32 bytes at a time, then 8 with a rotated 64-bit key.
 	while (i < len && ((offset + i) & 3) != 0) {
 		data[i] ^= mask[(offset + i) & 3];
 		i++;
 	}
+	if (len - i >= 32) i += mask_vec(data + i, len - i, mask);
 	if (len - i >= 8) {
 		uint64_t key = 0;
 		for (int k = 7; k >= 0; k--) key = key << 8 | mask[k & 3];

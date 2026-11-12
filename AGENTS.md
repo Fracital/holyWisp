@@ -103,7 +103,9 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   `CMakeLists.txt`. Windows alone has a third part, because it lacks the POSIX socket calls
   themselves: `src/compat/win32/` supplies them over Winsock under their POSIX names (headers in
   `include/`, all of the code in `posix.c`), so no other file knows it is not on POSIX. The one
-  platform `#if` in the tree is the pair of `send` flags in `sys.h`. Do not add another, do not
+  platform `#if` in the tree is the pair of `send` flags in `sys.h` (the one architecture `#if` is
+  `__x86_64__` around the AVX2 unmask in `ws.c`, which is about the CPU, not the OS; see "The
+  unmask"). Do not add another, do not
   write `_WIN32` or a Winsock call outside the three Windows files, and do not call a
   kernel-specific function (`accept4`, `splice`, `pipe2`, `crypt_r`, `forkpty`, `MSG_NOSIGNAL`,
   ...) outside the platform files: add it to `sys.h`, implement it three times, and test the
@@ -416,6 +418,21 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   `conn_free_task` can run, which is what makes it safe to hold `hw_conn` pointers in it. The
   retries after a short write in `conn_flush` and `conn_splice_data` are deliberate: removing them
   saved 11% of the syscalls and lost 3 to 4% of throughput.
+- **The unmask.** `hw_ws_mask` is the server's only per-byte work in user space (every uploaded
+  byte, a tenth of its CPU under load). It goes 32 bytes a step with the compiler's generic
+  vectors, compiled twice on x86-64 and picked at the first call by asking the CPU (`cpuid` and
+  `xgetbv`, never `__builtin_cpu_supports` or an ifunc, which musl and Mach-O lack): AVX2 was 4.8%
+  more bytes per CPU second at 16x4 on the bench VM, SSE2 half that. Elsewhere it is two NEON or
+  SSE2 registers.
+- **Measured and not kept** (bench VM, 2026-11-12, alternating A/B, 6 to 8 rounds). None of these
+  moved throughput or bytes per CPU second outside the noise, so do not redo them without a new
+  reason: reading a copied remote read straight into `wbuf` behind a header gap (it saves one
+  `memcpy`, which is not where the time goes); entering splice mode at 16 KiB or 4 KiB, or always
+  splicing (under load streams are already bulk); deferring frames past 16 KiB to the batch end;
+  and splicing up to 1 MiB into a pipe per fill, framed as several 128 KiB packets. That one
+  cut the syscalls per frame by 16% and still changed nothing: past about 2 GiB/s a stream costs
+  per byte (the kernel's copies and TCP), not per syscall, and a bigger fill only coarsens how
+  streams share a connection.
 - **Backpressure.** When a client's send queue (`wbuf` plus the payloads queued in pipes) passes
   `ws-write-high-water`, every stream on that connection stops reading from its remote
   (`stream_pause`), and resumes at a quarter of the mark.

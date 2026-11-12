@@ -71,6 +71,21 @@ static void test_mask(void) {
 	hw_ws_mask(data, 7, mask, 0);
 	hw_ws_mask(data + 7, sizeof(data) - 7, mask, 7);
 	for (size_t i = 0; i < sizeof(data); i++) CHECK(data[i] == (copy[i] ^ mask[i & 3]), "offset byte %zu", i);
+	// Every length across the 32-, 8- and 1-byte steps, at every position in the mask cycle and
+	// every alignment of the buffer, against the byte-at-a-time definition.
+	for (size_t off = 0; off < 4; off++) {
+		for (size_t len = 0; len <= 200; len++) {
+			for (size_t at = 0; at < 8; at++) {
+				for (size_t i = 0; i < len; i++) data[at + i] = copy[i];
+				hw_ws_mask(data + at, len, mask, off);
+				size_t bad = len;
+				for (size_t i = 0; i < len && bad == len; i++) {
+					if (data[at + i] != (copy[i] ^ mask[(off + i) & 3])) bad = i;
+				}
+				CHECK(bad == len, "offset %zu length %zu alignment %zu: byte %zu", off, len, at, bad);
+			}
+		}
+	}
 }
 
 static void test_http_request(void) {
