@@ -52,6 +52,13 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
   built with its own `bench/release.sh` (a static release build with its pinned nightly toolchain),
   run as `finalwisp --allow-loopback --allow-private --log-level error`, the way its own harness
   starts it. Its limits are off by default.
+- `epoxy` is `epoxy-server` from [epoxy-tls](https://github.com/MercuryWorkshop/epoxy-tls), the
+  server that epoxy's Wisp client is made for, cloned to `~/src/epoxy-tls` and built with `cargo
+  build --release` in `server/` (the repository pins a nightly toolchain). It reads
+  `configs/epoxy-server-bench.toml`: its defaults plus the bind address, error-level logging and a
+  `max_message_size` of 1 MiB plus the Wisp header. Its default of 64 KiB is smaller than one
+  64 KiB packet from the native client with its 5-byte header, so out of the box it closes the
+  connection on the first one.
 
 The wisp-js client is wispmark's own `client/js/client.mjs`. Clone wispmark to `~/src/wispmark`
 and run `npm install` in `client/js`.
@@ -60,7 +67,7 @@ and run `npm install` in `client/js`.
 
 ```sh
 make bench                                  # release build plus build/bench/{echo,pump}
-python3 -I bench/run.py --duration 10 --repeats 8 --out bench/results/full
+python3 -I bench/run.py --duration 10 --repeats 12 --out bench/results/full
 python3 -I bench/charts.py bench/results/full --png
 ```
 
@@ -70,9 +77,10 @@ scenario inherits the state the previous scenario left the host in. On the 16-vC
 published numbers come from, the server that ran first after a light scenario was 6 to 10% slower
 with 8 connections for most of its window, and the one that ran first after the saturating
 16-connection scenario measured a 47 us median round trip against 75 to 87 us for the same server
-one slot later. So use a repeat count that is a multiple of the number of servers (4 gives every
-server every slot once, 8 also balances which server it follows); with any other count the
-medians favour or penalise whoever held the first slot more often.
+one slot later. So use a repeat count that is a multiple of the number of servers (with the six servers
+of the published run, 6 gives every server every slot once and 12, which it used, gives each slot
+twice and also balances which server it follows); with any other count the medians favour or
+penalise whoever held the first slot more often.
 
 Use `--only holywisp,wispurr-cpp` or `--scenarios native-10,rtt-64` to run part of the matrix,
 and `--replace` with `--only` to re-measure one server and splice it into an existing results

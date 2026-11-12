@@ -1,0 +1,9 @@
+# epoxy-server for bench/run.py. Everything not named here is the server's default
+# (`epoxy-server --default-config`): multi-threaded runtime, a 128-packet CONTINUE window,
+# 128 KiB reads from the remote, loopback and literal IPs allowed.
+[server]
+bind = ["tcp", "127.0.0.1:16401"]
+log_level = "ERROR"
+# The default, 65536, is smaller than one 64 KiB packet from the native client plus its 5-byte Wisp
+# header, and the server closes the connection on it. One 1 MiB payload plus its header, as holyWisp.
+max_message_size = 1048581

@@ -35,7 +35,7 @@ ECHO_PORTS = 8  # the echo service listens on this many consecutive ports (see t
 # ------------------------------------------------------------------------------------- servers
 # Every server gets its "speed" profile: loopback + literal-IP egress allowed (the echo is at
 # 127.0.0.1), flood protection, reputation and per-IP connection limits off, error-level logging,
-# default worker count (= CPUs for all three).
+# default worker count (= CPUs for every server).
 
 HW_COMMON = ["--port", str(WISP_PORT), "--allow-loopback=on", "--allow-direct-ip=on", "--flood-protection=off",
              "--reputation=off", "--connections-limit-per-ip=0", "--connection-window-s=0",
@@ -80,6 +80,16 @@ SERVERS = {
         "cmd": [str(SRC / "finalwisp/server/target/x86_64-unknown-linux-gnu/release/finalwisp"), "--port", str(WISP_PORT),
                 "--allow-loopback", "--allow-private", "--log-level", "error"],
         "cwd": str(SRC / "finalwisp"),
+    },
+    "epoxy": {
+        # epoxy-server from https://github.com/MercuryWorkshop/epoxy-tls (server/), the server
+        # epoxy's own Wisp client is made for, built with `cargo build --release`. Its config is
+        # its defaults (multi-threaded runtime, a 128-packet window, 128 KiB reads) with the bind
+        # address, error-level logging and a 1 MiB message limit: its default of 64 KiB is less than
+        # one of the native client's 64 KiB packets plus its Wisp header, so it refused every row.
+        "label": "epoxy-server (Rust)",
+        "cmd": [str(SRC / "epoxy-tls/target/release/epoxy-server"), str(ROOT / "bench/configs/epoxy-server-bench.toml")],
+        "cwd": str(SRC / "epoxy-tls"),
     },
     "wispurr-cpp": {
         "label": "wispurr (C++23)",
