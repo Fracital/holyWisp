@@ -1,11 +1,13 @@
-## holyWisp RPM spec for Fedora/RHEL. Builds the server and client, installs the hardened systemd
-## unit, and creates the isolated `wisp` system user via systemd-sysusers. Release artifacts are
-## built by deploy/package.sh and the Release CI workflow.
+## holyWisp RPM spec for Fedora/RHEL. Builds the server and client into two packages: `holywisp`
+## installs the hardened systemd unit and creates the isolated `wisp` system user via
+## systemd-sysusers; `holywisp-client` is the command-line client alone. Release artifacts are
+## built by deploy/package.sh (which defines hw_version, hw_release and hw_client_split) and the
+## Release CI workflow.
 %global debug_package %{nil}
 
 Name:           holywisp
 Version:        %{?hw_version}%{!?hw_version:0.5.3}
-Release:        1%{?dist}
+Release:        %{?hw_release}%{!?hw_release:2}%{?dist}
 Summary:        A Wisp v1/v2 server in C with no runtime dependencies
 
 License:        MIT
@@ -20,6 +22,7 @@ BuildRequires:  systemd-rpm-macros
 
 Requires(pre):  shadow-utils
 %{?systemd_requires}
+Suggests:       %{name}-client
 
 %description
 holyWisp is a Wisp (https://github.com/MercuryWorkshop/wisp-protocol) server written in C11 with
@@ -27,7 +30,18 @@ no dependencies beyond libc and pthreads. It speaks Wisp v1 and v2 over WebSocke
 UDP streams, and ships flood protection, per-IP rate and bandwidth limits, IP reputation scoring,
 a default-deny egress policy, host and port filters, an optional upstream proxy and optional PTY
 terminal streams. This package runs it as a dedicated, unprivileged, heavily sandboxed systemd
-service.
+service. The command-line client is in holywisp-client.
+
+%package client
+Summary:        Command-line client for Wisp v1/v2 servers
+# Until this release the client's binary was in the server package: the two cannot both own it.
+Conflicts:      %{name} < %{?hw_client_split}%{!?hw_client_split:0.5.3-2}
+
+%description client
+holywisp-client is netcat through a Wisp server: it opens a TCP or UDP stream through any Wisp v1
+or v2 server and relays it to standard input and output, with password login and an echo
+benchmark. This package installs the client only: no service, no user, no configuration. The
+server is in the holywisp package.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -87,7 +101,6 @@ chown -h wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
 %license LICENSE
 %doc README.md
 %{_bindir}/holywisp
-%{_bindir}/holywisp-client
 %{_unitdir}/holywisp.service
 %{_sysusersdir}/holywisp.conf
 %{_tmpfilesdir}/holywisp.conf
@@ -95,6 +108,14 @@ chown -h wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
 %dir %attr(0750,root,wisp) %{_sysconfdir}/holywisp
 %dir %attr(0750,wisp,wisp) %{_sharedstatedir}/holywisp
 
+%files client
+%license LICENSE
+%doc README.md
+%{_bindir}/holywisp-client
+
 %changelog
+* Thu Nov 12 2026 holyWisp maintainers <noreply@example.com> - 0.5.3-2
+- The client is its own package, holywisp-client; the server package no longer carries it.
+
 * Wed Nov 05 2025 holyWisp maintainers <noreply@example.com> - 0.1.0-1
 - Initial package: hardened systemd service running as the dedicated wisp user.

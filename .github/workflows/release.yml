@@ -5,8 +5,10 @@ name: Release
 #   push of a tag v*         -> release <tag>, kept
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
 # binaries run on glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 and newer), each archive flat
-# (holywisp, holywisp-client, README, LICENSE-less by design), the .deb and .rpm built in their
-# native containers (deploy/package.sh: hardened unit, dedicated `wisp` user), the npm package
+# (holywisp, holywisp-client, README, LICENSE-less by design), holywisp-client-<platform>.tar.gz
+# with the client alone, the .debs and .rpms built in their native containers (deploy/package.sh:
+# `holywisp` with the hardened unit and the dedicated `wisp` user, `holywisp-client` with the
+# client and nothing else), the npm package
 # holywisp-<version>.tgz (node/: the Node.js wrapper with a binary for Linux, macOS and Windows,
 # installable with `npm install <url>`), plus SHA256SUMS over all of them. A tag v<version> also
 # publishes that tarball to the npm registry (the `npm-publish` job). The stable URL
@@ -140,6 +142,12 @@ jobs:
           cp holywisp.conf.example "$stage/holywisp.conf"
           tar -C out -czf "out/holywisp-$PLATFORM.tar.gz" "holywisp-$PLATFORM"
           rm -r "$stage"
+          # The client alone, for a machine that only connects to Wisp servers.
+          stage="out/holywisp-client-$PLATFORM"
+          mkdir -p "$stage"
+          cp build/release/holywisp-client README.md "$stage/"
+          tar -C out -czf "out/holywisp-client-$PLATFORM.tar.gz" "holywisp-client-$PLATFORM"
+          rm -r "$stage"
           ls -l out
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -167,7 +175,17 @@ jobs:
           apt-get install -y build-essential cmake ninja-build libcrypt-dev dpkg-dev fakeroot git
       - name: Build .deb
         run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh deb
-      - name: Install and smoke test the package
+      # The client first, on a system with no server: it must bring nothing of the service along.
+      - name: Install and smoke test the client package
+        run: |
+          set -euo pipefail
+          apt-get install -y ./build/packages/holywisp-client_*.deb
+          holywisp-client --help > /dev/null
+          if getent passwd wisp; then echo "::error::the client package made the wisp user"; exit 1; fi
+          for f in /usr/bin/holywisp /etc/holywisp /lib/systemd/system/holywisp.service; do
+            if [ -e "$f" ]; then echo "::error::the client package installed $f"; exit 1; fi
+          done
+      - name: Install and smoke test the server package
         run: |
           set -euo pipefail
           apt-get install -y ./build/packages/holywisp_*.deb
@@ -185,6 +203,16 @@ jobs:
           grep -E 'Type:[[:space:]]+DYN' readelf.txt
           grep -E 'BIND_NOW' readelf.txt
           grep -E -m1 '__stack_chk_fail' readelf.txt
+          # The client stays the client package's, and talks to the server through Wisp: the
+          # server's own health page, fetched through a stream to itself.
+          test "$(dpkg -S /usr/bin/holywisp-client)" = "holywisp-client: /usr/bin/holywisp-client"
+          holywisp --port 16001 --host 127.0.0.1 --allow-loopback --allow-direct-ip --log-level error &
+          server=$!
+          sleep 1
+          printf 'GET /health HTTP/1.0\r\n\r\n' |
+            timeout 10 holywisp-client -s ws://127.0.0.1:16001/ 127.0.0.1 16001 > health.txt
+          kill "$server"
+          grep -F '"status":"ok"' health.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: holywisp-deb
@@ -208,11 +236,21 @@ jobs:
         run: dnf install -y gcc cmake ninja-build libxcrypt-devel rpm-build systemd-rpm-macros git
       - name: Build .rpm
         run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh rpm
-      - name: Install and smoke test the package
+      - name: Install and smoke test the client package
         run: |
           set -euo pipefail
-          dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-*.rpm
+          dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-client-*.rpm
+          holywisp-client --help > /dev/null
+          if getent passwd wisp; then echo "::error::the client package made the wisp user"; exit 1; fi
+          for f in /usr/bin/holywisp /etc/holywisp /usr/lib/systemd/system/holywisp.service; do
+            if [ -e "$f" ]; then echo "::error::the client package installed $f"; exit 1; fi
+          done
+      - name: Install and smoke test the server package
+        run: |
+          set -euo pipefail
+          dnf install -y ./build/packages/rpmbuild/RPMS/*/holywisp-[0-9]*.rpm
           holywisp --version
+          test "$(rpm -qf --qf '%{NAME}' /usr/bin/holywisp-client)" = holywisp-client
           getent passwd wisp
           # As in the .deb: root owns the config and its directory, the service user only reads.
           test "$(stat -c '%a %U:%G' /etc/holywisp/holywisp.conf)" = "640 root:wisp"
@@ -342,8 +380,11 @@ jobs:
           | --- | --- |
           | \`holywisp-linux-x64.tar.gz\` | x86_64 Linux, glibc 2.35+ |
           | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, glibc 2.35+ |
-          | \`holywisp_<version>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: hardened systemd unit, \`wisp\` user |
-          | \`holywisp-<version>.fc41.x86_64.rpm\` | Fedora 41+: the same |
+          | \`holywisp-client-linux-x64.tar.gz\`, \`holywisp-client-linux-arm64.tar.gz\` | The client alone, for the same systems |
+          | \`holywisp_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the server as a hardened systemd unit, \`wisp\` user |
+          | \`holywisp-client_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the client alone, no service |
+          | \`holywisp-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the server, as the .deb |
+          | \`holywisp-client-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the client alone |
           | \`holywisp-<version>.tgz\` | Node.js 20+ on Linux (x64/arm64, glibc or musl), macOS 13+ and Windows 10+ (x64/arm64): \`npm install <asset url>\` |
           | \`SHA256SUMS\` | checksums of the above |
 

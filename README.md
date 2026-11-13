@@ -22,14 +22,30 @@ starts a hardened systemd service listening on `127.0.0.1:6001`:
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.3_amd64.deb
-sudo apt install ./holywisp_0.5.3_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.3-2_amd64.deb
+sudo apt install ./holywisp_0.5.3-2_amd64.deb
 
 # Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.3-1.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.3-2.fc41.x86_64.rpm
 
 sudo systemctl status holywisp            # running as user "wisp", sandboxed
 sudoedit /etc/holywisp/holywisp.conf      # then: sudo systemctl restart holywisp
+```
+
+**Only the client?** `holywisp-client` is its own package, with no service, user or config, for a
+machine that only connects to Wisp servers (the server package no longer carries it; install both
+for both):
+
+```sh
+# Debian / Ubuntu
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.3-2_amd64.deb
+sudo apt install ./holywisp-client_0.5.3-2_amd64.deb
+
+# Fedora / RHEL
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.3-2.fc41.x86_64.rpm
+
+# Any glibc 2.35+ Linux (x64 or arm64)
+curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-linux-x64.tar.gz | tar xz
 ```
 
 **Or grab a prebuilt binary** (x86_64 or arm64 Linux, glibc 2.35+). The `latest` link always
@@ -75,8 +91,8 @@ and hashed passwords (no `crypt(3)`). `holywisp-client` is not built there.
 make            # debug build with ASan/UBSan -> build/debug
 make test       # unit + end-to-end tests
 make release    # optimised build -> build/release
-make deb        # build a .deb        -> build/packages/
-make rpm        # build an .rpm       -> build/packages/
+make deb        # the server and client .debs -> build/packages/
+make rpm        # the server and client .rpms -> build/packages/
 make npm        # the npm package     -> node/bin, node/dist (needs zig)
 make test-windows  # the Windows build and its tests under Wine (needs zig and wine)
 make help

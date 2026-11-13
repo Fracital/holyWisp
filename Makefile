@@ -138,10 +138,10 @@ npm-test: release node/node_modules ## the Node wrapper's tests against the rele
 
 # ---------------------------------------------------------------------------------- misc
 
-deb: ## build a .deb into build/packages/
+deb: ## build the server and client .debs into build/packages/
 	deploy/package.sh deb
 
-rpm: ## build an .rpm into build/packages/
+rpm: ## build the server and client .rpms into build/packages/
 	deploy/package.sh rpm
 
 packages: ## build every package this host can (.deb and/or .rpm)

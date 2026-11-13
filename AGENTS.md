@@ -517,9 +517,15 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   full RELRO on Linux). It is off under the sanitizers and must not cost the data path: if a
   bench row moves, find the flag, do not drop the option. The unit has no `ExecReload` on
   purpose: the server has no SIGHUP handler, so a reload would stop it.
-- If you touched packaging or the unit: `bash deploy/package.sh all` builds both packages, and
+- If you touched packaging or the unit: `bash deploy/package.sh all` builds all four packages, and
   `systemd-analyze security --offline=true deploy/systemd/holywisp.service` must still rate "OK"
-  (~1.3). Never lower the sandbox to work around a bug; fix the bug.
+  (~1.3). Never lower the sandbox to work around a bug; fix the bug. `holywisp-client` is the
+  client and nothing else: no maintainer scripts, no user, no unit, no config (the release
+  workflow installs it alone on a clean system and fails if any of those appear). Until 0.5.3-2
+  the client's binary was in `holywisp`, and the client package takes it over with `Replaces`
+  (rpm: `Conflicts`). The .deb has no `Breaks`, because apt satisfies one by removing the older
+  server, and installing a client must never remove a server. A packaging-only change raises
+  `pkg_release` in `package.sh`.
 
 ## Repository layout
 
@@ -569,7 +575,7 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `deploy/systemd/holywisp.service` | The hardened unit (the sandbox is load-bearing; see "Security suite"). |
 | `deploy/holywisp.conf` | The installed default config (loopback bind, reputation store under /var/lib). |
 | `deploy/debian/`, `deploy/rpm/holywisp.spec` | Debian maintainer scripts and the RPM spec. |
-| `deploy/package.sh` | Builds the `.deb` (dpkg-deb) and `.rpm` (rpmbuild) into `build/packages/`. |
+| `deploy/package.sh` | Builds two `.deb`s (dpkg-deb) and two `.rpm`s (rpmbuild) into `build/packages/`: `holywisp`, the server as a service, and `holywisp-client`, the client alone. |
 | `CMakeLists.txt`, `CMakePresets.json`, `Makefile` | CMake compiles; the Makefile is the one entry point (`make help`). |
 | `.clang-format`, `.clang-tidy`, `.editorconfig` | Enforcement of `STYLE.md`. |
 | `.github/workflows/build.yml` | GCC + Clang, Debug + Release, ctest, clang-tidy, binary smoke; macOS; the Windows cross build and its tests on Windows; the npm package installed and tested on every platform it carries. |

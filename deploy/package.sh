@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build holyWisp distribution packages: a .deb (dpkg-deb) and/or an .rpm (rpmbuild). Both install
-# the hardened systemd unit and the dedicated `wisp` user. Run from anywhere; paths are resolved
-# from the repo root.
+# Build holyWisp distribution packages, two of each kind: `holywisp`, the server as a hardened
+# systemd service with its dedicated `wisp` user, and `holywisp-client`, the command-line client
+# alone (no service, no user, no config), as .debs (dpkg-deb) and/or .rpms (rpmbuild). Run from
+# anywhere; paths are resolved from the repo root.
 #
 #   deploy/package.sh [deb|rpm|all]   (default: all that this host can build)
 #
@@ -20,6 +21,12 @@ case "$version" in
 	[0-9]*) ;;
 	*) version="$default_version" ;;
 esac
+# The packaging's own revision (the deb's -N, the rpm's Release), for a change to the packages
+# that is not a change to the version. 2 is the first without holywisp-client inside `holywisp`:
+# `client_split` below is where the client's file changed hands, and stays that forever. Raise
+# pkg_release when the packaging changes again; it need not go back to 1 for a new version.
+pkg_release="${HW_PKG_RELEASE:-2}"
+client_split="0.5.3-2"
 arch_deb="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 want="${1:-all}"
 
@@ -55,17 +62,35 @@ build_binaries() {
 	"$root/build/pkg/holywisp" --version
 }
 
+# Debian's CFLAGS carry -g, which debhelper would strip into a -dbgsym package. There is no such
+# package here, so the debug sections go; the symbol table stays, as it always has.
+strip_debug() {
+	if [ "$deb_flags" = 1 ] && command -v strip >/dev/null; then
+		strip --strip-debug "$@"
+	fi
+}
+
+# md5sums for everything outside DEBIAN/, then the package itself.
+deb_finish() {
+	local stage="$1" deb="$2"
+	(cd "$stage" && find . -type f -not -path './DEBIAN/*' -printf '%P\n' | sort |
+		while read -r f; do md5sum "$f"; done > DEBIAN/md5sums)
+	fakeroot dpkg-deb --build --root-owner-group "$stage" "$deb" >/dev/null
+	echo "    $deb"
+	dpkg-deb --info "$deb" | sed 's/^/    /'
+}
+
 build_deb() {
-	echo "==> building .deb"
+	build_deb_server
+	build_deb_client
+}
+
+build_deb_server() {
+	echo "==> building .deb: holywisp"
 	local stage="$out/deb"
 	rm -rf "$stage"
 	install -D -m 0755 "$root/build/pkg/holywisp" "$stage/usr/bin/holywisp"
-	install -D -m 0755 "$root/build/pkg/holywisp-client" "$stage/usr/bin/holywisp-client"
-	# Debian's CFLAGS carry -g, which debhelper would strip into a -dbgsym package. There is no
-	# such package here, so the debug sections go; the symbol table stays, as it always has.
-	if [ "$deb_flags" = 1 ] && command -v strip >/dev/null; then
-		strip --strip-debug "$stage/usr/bin/holywisp" "$stage/usr/bin/holywisp-client"
-	fi
+	strip_debug "$stage/usr/bin/holywisp"
 	install -D -m 0640 "$root/deploy/holywisp.conf" "$stage/etc/holywisp/holywisp.conf"
 	install -D -m 0644 "$root/deploy/systemd/holywisp.service" "$stage/lib/systemd/system/holywisp.service"
 	install -D -m 0644 "$root/deploy/systemd/holywisp.sysusers" "$stage/usr/lib/sysusers.d/holywisp.conf"
@@ -78,11 +103,12 @@ build_deb() {
 	install -d "$stage/DEBIAN"
 	cat > "$stage/DEBIAN/control" <<CTL
 Package: holywisp
-Version: $version
+Version: $version-$pkg_release
 Architecture: $arch_deb
 Maintainer: holyWisp maintainers <noreply@example.com>
 Installed-Size: $isize
 Depends: libc6, libcrypt1, adduser
+Suggests: holywisp-client
 Section: net
 Priority: optional
 Homepage: https://github.com/Fracital/holyWisp
@@ -98,14 +124,45 @@ CTL
 	install -m 0755 "$root/deploy/debian/postinst" "$stage/DEBIAN/postinst"
 	install -m 0755 "$root/deploy/debian/prerm" "$stage/DEBIAN/prerm"
 	install -m 0755 "$root/deploy/debian/postrm" "$stage/DEBIAN/postrm"
-	# md5sums for everything outside DEBIAN/.
-	(cd "$stage" && find . -type f -not -path './DEBIAN/*' -printf '%P\n' | sort |
-		while read -r f; do md5sum "$f"; done > DEBIAN/md5sums)
+	deb_finish "$stage" "$out/holywisp_${version}-${pkg_release}_${arch_deb}.deb"
+}
 
-	local deb="$out/holywisp_${version}_${arch_deb}.deb"
-	fakeroot dpkg-deb --build --root-owner-group "$stage" "$deb" >/dev/null
-	echo "    $deb"
-	dpkg-deb --info "$deb" | sed 's/^/    /'
+# The client alone: one binary and its documentation, no maintainer scripts. Until client_split
+# the binary was in `holywisp`, so this package takes the file over from one of those (Replaces).
+# There is deliberately no Breaks beside it, as policy would have for a moved file: with an older
+# server installed and no newer one to hand, apt satisfies a Breaks by removing the server, and
+# installing a client must never take a running server away. The older server keeps working
+# without the client's file, and stops claiming it once dpkg has handed it over.
+build_deb_client() {
+	echo "==> building .deb: holywisp-client"
+	local stage="$out/deb-client"
+	rm -rf "$stage"
+	install -D -m 0755 "$root/build/pkg/holywisp-client" "$stage/usr/bin/holywisp-client"
+	strip_debug "$stage/usr/bin/holywisp-client"
+	install -D -m 0644 "$root/README.md" "$stage/usr/share/doc/holywisp-client/README.md"
+	install -D -m 0644 "$root/LICENSE" "$stage/usr/share/doc/holywisp-client/copyright"
+
+	local isize
+	isize="$(du -k -s "$stage" | cut -f1)"
+	install -d "$stage/DEBIAN"
+	cat > "$stage/DEBIAN/control" <<CTL
+Package: holywisp-client
+Version: $version-$pkg_release
+Architecture: $arch_deb
+Maintainer: holyWisp maintainers <noreply@example.com>
+Installed-Size: $isize
+Depends: libc6, libcrypt1
+Replaces: holywisp (<< $client_split)
+Section: net
+Priority: optional
+Homepage: https://github.com/Fracital/holyWisp
+Description: Command-line client for Wisp v1/v2 servers
+ holywisp-client is netcat through a Wisp server: it opens a TCP or UDP
+ stream through any Wisp v1 or v2 server and relays it to standard input and
+ output, with password login and an echo benchmark. This package installs the
+ client only; the server and its service are in the holywisp package.
+CTL
+	deb_finish "$stage" "$out/holywisp-client_${version}-${pkg_release}_${arch_deb}.deb"
 }
 
 build_rpm() {
@@ -123,7 +180,8 @@ build_rpm() {
 	(cd "$out" && tar -czf "$top/SOURCES/holywisp-$version.tar.gz" "holywisp-$version")
 	rm -rf "$tardir"
 	cp "$root/deploy/rpm/holywisp.spec" "$top/SPECS/"
-	rpmbuild --define "_topdir $top" --define "hw_version $version" -bb "$top/SPECS/holywisp.spec"
+	rpmbuild --define "_topdir $top" --define "hw_version $version" --define "hw_release $pkg_release" \
+		--define "hw_client_split $client_split" -bb "$top/SPECS/holywisp.spec"
 	find "$top/RPMS" -name '*.rpm' -exec cp {} "$out/" \; -exec echo "    {}" \;
 }
 
