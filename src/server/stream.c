@@ -416,15 +416,16 @@ static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
 		HW_STAT_INC(srv, udp_warp_direct);
 		return 0;
 	}
-	char key[256];
+	char site[256], key[HW_WARP_CLIENT_KEY_LEN + 1 + sizeof(site)];
 	int v6 = sa->sa_family == AF_INET6;
 	if (s->literal_host) {
 		const void *a = v6 ? (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr
 		                   : (const void *)&((const struct sockaddr_in *)sa)->sin_addr;
-		if (!inet_ntop(sa->sa_family, a, key, sizeof(key))) key[0] = '\0';
-	} else if (hw_warp_site_key(s->host, key, sizeof(key)) != 0) {
-		key[0] = '\0'; // cannot happen: the host and its site fit in the same 256 bytes
+		if (!inet_ntop(sa->sa_family, a, site, sizeof(site))) site[0] = '\0';
+	} else if (hw_warp_site_key(s->host, site, sizeof(site)) != 0) {
+		site[0] = '\0'; // cannot happen: the host and its site fit in the same 256 bytes
 	}
+	hw_warp_stream_key(s->conn->client_key, site, key, sizeof(key)); // it fits: the buffer is sized for it
 	const hw_warp_tunnel *t = hw_warp_pick(st, v6, key);
 	if (t && hw_sys_set_mark(s->fd, t->mark) == 0) {
 		HW_STAT_INC(srv, udp_warp_marked);

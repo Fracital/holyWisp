@@ -6,12 +6,15 @@
 #include "holywisp/warp.h"
 
 #include "holywisp/blake2b.h"
+#include "holywisp/net.h"
 
 #include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <netinet/in.h>
 
 // Second-level labels under a two-letter TLD that are a public suffix of their own: the router's
 // SLD_SUFFIXES, word for word.
@@ -57,6 +60,50 @@ int hw_warp_site_key(const char *host, char *out, size_t cap) {
 	if (len + 1 > cap) return -1;
 	for (size_t i = 0; i < len; i++) out[i] = (char)tolower((unsigned char)host[start + i]);
 	out[len] = '\0';
+	return 0;
+}
+
+int hw_warp_client_key(const uint8_t *secret, size_t secret_len, const char *ip, char out[HW_WARP_CLIENT_KEY_LEN + 1]) {
+	out[0] = '\0';
+	struct sockaddr_storage ss;
+	socklen_t sl;
+	if (!ip || hw_addr_parse(ip, 0, &ss, &sl) != 1) return -1;
+	static const uint8_t v4_mapped[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+	const uint8_t *a;
+	size_t alen;
+	if (ss.ss_family == AF_INET) {
+		a = (const uint8_t *)&((const struct sockaddr_in *)&ss)->sin_addr;
+		alen = 4;
+	} else {
+		a = (const uint8_t *)&((const struct sockaddr_in6 *)&ss)->sin6_addr;
+		alen = 8;
+		if (!memcmp(a, v4_mapped, sizeof(v4_mapped))) {
+			a += 12;
+			alen = 4;
+		}
+	}
+	uint8_t msg[256 + 1 + 8];
+	if (secret_len > 256) secret_len = 256;
+	if (secret_len) memcpy(msg, secret, secret_len);
+	msg[secret_len] = 0;
+	memcpy(msg + secret_len + 1, a, alen);
+	uint8_t d[8];
+	hw_blake2b(msg, secret_len + 1 + alen, d, sizeof(d));
+	static const char hex_digits[] = "0123456789abcdef";
+	for (int i = 0; i < 8; i++) {
+		out[2 * i] = hex_digits[d[i] >> 4];
+		out[2 * i + 1] = hex_digits[d[i] & 15];
+	}
+	out[HW_WARP_CLIENT_KEY_LEN] = '\0';
+	return 0;
+}
+
+int hw_warp_stream_key(const char *client, const char *site, char *out, size_t cap) {
+	int n = client && *client ? snprintf(out, cap, "%s/%s", client, site) : snprintf(out, cap, "%s", site);
+	if (n < 0 || (size_t)n >= cap) {
+		if (cap) out[0] = '\0';
+		return -1;
+	}
 	return 0;
 }
 

@@ -191,13 +191,21 @@ static int socks5_send_connect(hw_stream *s) {
 	return proxy_send(s, req, n);
 }
 
+// The user name the proxy is given: the client's key with proxy-client-key, else the URL's.
+static const char *proxy_user(const hw_stream *s) {
+	return s->conn->client_key[0] ? s->conn->client_key : s->conn->w->server->proxy.user;
+}
+
 int proxy_start(hw_stream *s) {
 	const hw_proxy_config *p = &s->conn->w->server->proxy;
+	const char *user = proxy_user(s);
 	hw_buf_clear(&s->pin);
 	if (p->kind == PROXY_SOCKS5) {
+		// With a user name both methods are offered, so a proxy that takes no credentials picks
+		// "none" and a client key is simply not heard.
 		uint8_t greet[4] = {5, 1, 0, 0};
 		size_t n = 3;
-		if (p->user[0]) {
+		if (user[0]) {
 			greet[1] = 2;
 			greet[3] = 2; // also offer username/password
 			n = 4;
@@ -209,9 +217,9 @@ int proxy_start(hw_stream *s) {
 	char dest[sizeof(s->host) + 8];
 	target_str(s, dest, sizeof(dest));
 	char auth[512] = "";
-	if (p->user[0]) {
+	if (user[0]) {
 		char cred[260];
-		int cl = snprintf(cred, sizeof(cred), "%s:%s", p->user, p->pass);
+		int cl = snprintf(cred, sizeof(cred), "%s:%s", user, p->pass);
 		char b64[HW_BASE64_LEN(sizeof(cred))];
 		hw_base64_encode((const uint8_t *)cred, (size_t)cl, b64, sizeof(b64));
 		snprintf(auth, sizeof(auth), "Proxy-Authorization: Basic %s\r\n", b64);
@@ -273,13 +281,14 @@ static int socks5_step(hw_stream *s, size_t *consumed) {
 		}
 		*consumed = 2;
 		if (d[1] == 0) return socks5_send_connect(s) == 0 ? 0 : -1;
-		if (d[1] == 2 && p->user[0]) {
+		const char *user = proxy_user(s);
+		if (d[1] == 2 && user[0]) {
 			uint8_t req[1 + 1 + 127 + 1 + 127];
-			size_t ul = strlen(p->user), pl = strlen(p->pass);
+			size_t ul = strlen(user), pl = strlen(p->pass);
 			size_t n = 0;
 			req[n++] = 1;
 			req[n++] = (uint8_t)ul;
-			memcpy(req + n, p->user, ul);
+			memcpy(req + n, user, ul);
 			n += ul;
 			req[n++] = (uint8_t)pl;
 			memcpy(req + n, p->pass, pl);

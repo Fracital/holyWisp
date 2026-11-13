@@ -967,6 +967,10 @@ static int http_process(hw_conn *c) {
 	}
 	c->state = CONN_WS;
 	c->is_v2 = v2;
+	// c->ip is no address only for a peer that is none (a Unix socket): it then has no key.
+	if (cfg->proxy_client_key) {
+		hw_warp_client_key(srv->client_key_secret, srv->client_key_secret_len, c->ip, c->client_key);
+	}
 	HW_DEBUG("conn", "%s (%s): websocket %s", c->peer, c->ip, v2 ? "wisp-v2" : "wisp-v1");
 	if (v2) {
 		send_server_info(c);

@@ -265,6 +265,15 @@ leave from the same exit address as its TCP.
 - **No lock on the data path.** The maintenance thread stats the file once a second, reads it
   only when it is another file (inode, size or mtime), and posts each worker its own copy
   (`warp_publish`, `warp_swap_task`). A stream reads only its worker's copy (`w->warp`).
+- **Per client and site, with `proxy-client-key`.** Each connection gets a key at upgrade
+  (`hw_warp_client_key`: 16 hex digits of BLAKE2b-64 over `proxy-client-key-secret`, a NUL and
+  the client's address, an IPv6 client's /64, from `c->ip` after the trusted headers). The proxy
+  gets it as the user name (the URL's password, if any, stays), and the UDP pick hashes
+  `key "/" site` (`hw_warp_stream_key`), which is what the router hashes for a TCP stream that
+  arrived with a user name. SOCKS5 offers "none" beside username/password, so a router that does
+  not read the key picks "none" and is unaffected: either side can go first. Never send the
+  address itself, and never let the key be made without a secret: unconfigured, it is random per
+  process.
 - **What stays unmarked:** TCP (the router marks it), DNS (`dns.c`, the resolver threads) and
   everything holyWisp opens for itself. The egress policy runs before the mark, as it always does.
   `test_warp` holds the vectors and the reader. `test_udp_warp` holds the state tracking and the
@@ -320,10 +329,13 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   wrapper sets one per start). Per-client keys are the full address, IPv6 included.
 - **The tables are keyed by what clients choose** (addresses, destinations), so `hw_smap` hashes
   with SipHash under a key drawn once per process from `hw_sys_random`. Do not hash client data
-  with anything unkeyed, and do not persist or send a hash.
+  with anything unkeyed, and do not persist or send a hash. The one hash that leaves the process
+  is the client key of `proxy-client-key` (see "UDP on WARP"), which is BLAKE2b under a secret of
+  its own, not the table key, and is sent to the proxy on purpose.
 - **Logs.** `hw_log` writes every control byte of the tag and message as `\xNN`; callers pass
   client strings as they are. A failed login is logged without the user name it tried, and a
-  config error never echoes the value of `proxy`, `trusted-proxy-secret` or a `password-user`.
+  config error never echoes the value of `proxy`, `trusted-proxy-secret`,
+  `proxy-client-key-secret` or a `password-user`.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
   lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits

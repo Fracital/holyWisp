@@ -196,6 +196,66 @@ static void test_marks_parse(void) {
 	CHECK_EQ(hw_warp_marks_parse("1,2,3", m, 2), -1);
 }
 
+// hw_warp_client_key against Python's hashlib.blake2b(secret + b"\0" + bytes, digest_size=8).
+static void test_client_key(void) {
+	const uint8_t *sec = (const uint8_t *)"holywisp-test-secret";
+	size_t sl = strlen((const char *)sec);
+	char k[HW_WARP_CLIENT_KEY_LEN + 1];
+	CHECK_EQ(hw_warp_client_key(sec, sl, "203.0.113.7", k), 0);
+	CHECK_STR(k, "3ca6515e64f358b3");
+	CHECK_EQ(hw_warp_client_key(sec, sl, "::ffff:203.0.113.7", k), 0); // mapped is the IPv4 it wraps
+	CHECK_STR(k, "3ca6515e64f358b3");
+	CHECK_EQ(hw_warp_client_key(sec, sl, "2001:db8:1:2::1", k), 0);
+	CHECK_STR(k, "5ced8b8e9d0c7f9a");
+	CHECK_EQ(hw_warp_client_key(sec, sl, "2001:db8:1:2:aaaa::9", k), 0); // the same /64
+	CHECK_STR(k, "5ced8b8e9d0c7f9a");
+	CHECK_EQ(hw_warp_client_key(sec, sl, "2001:db8:1:3::1", k), 0); // the next one
+	CHECK_STR(k, "acf973f3b2861e7e");
+	const uint8_t *other = (const uint8_t *)"another-secret-here";
+	CHECK_EQ(hw_warp_client_key(other, strlen((const char *)other), "203.0.113.7", k), 0);
+	CHECK_STR(k, "bc722f6082eba200");
+	const char *bad[] = {"", "localhost", "203.0.113", "unix", "1.2.3.4:80"};
+	for (size_t i = 0; i < COUNT(bad); i++) {
+		CHECK(hw_warp_client_key(sec, sl, bad[i], k) == -1, "a key for \"%s\"", bad[i]);
+		CHECK_STR(k, "");
+	}
+	CHECK(hw_warp_client_key(sec, sl, NULL, k) == -1, "a key for NULL");
+}
+
+static void test_stream_key(void) {
+	char k[40];
+	CHECK_EQ(hw_warp_stream_key("", "example.com", k, sizeof(k)), 0);
+	CHECK_STR(k, "example.com");
+	CHECK_EQ(hw_warp_stream_key(NULL, "1.1.1.1", k, sizeof(k)), 0);
+	CHECK_STR(k, "1.1.1.1");
+	CHECK_EQ(hw_warp_stream_key("3ca6515e64f358b3", "example.com", k, sizeof(k)), 0);
+	CHECK_STR(k, "3ca6515e64f358b3/example.com");
+	CHECK_EQ(hw_warp_stream_key("3ca6515e64f358b3", "a-site-that-is-too-long.com", k, sizeof(k)), -1);
+	CHECK_STR(k, "");
+	// The client's key moves the pick off the site's own: over many clients a site spreads over
+	// every tunnel, and one client keeps one tunnel per site.
+	hw_warp_state st;
+	memset(&st, 0, sizeof(st));
+	const char *names[] = {"warp0", "warp1", "warp2", "warp3"};
+	for (int i = 0; i < 4; i++) {
+		snprintf(st.v4[i].name, sizeof(st.v4[i].name), "%s", names[i]);
+		st.v4[i].mark = 0x7701u + (uint32_t)i;
+	}
+	st.n4 = 4;
+	int seen[4] = {0};
+	for (int c = 0; c < 64; c++) {
+		char ip[32], ck[HW_WARP_CLIENT_KEY_LEN + 1];
+		snprintf(ip, sizeof(ip), "198.51.100.%d", c);
+		CHECK_EQ(hw_warp_client_key((const uint8_t *)"s", 1, ip, ck), 0);
+		CHECK_EQ(hw_warp_stream_key(ck, "googlevideo.com", k, sizeof(k)), 0);
+		const hw_warp_tunnel *t = hw_warp_pick(&st, 0, k);
+		CHECK(t != NULL, "a tunnel");
+		seen[t->mark - 0x7701]++;
+		CHECK(t == hw_warp_pick(&st, 0, k), "the same tunnel again");
+	}
+	for (int i = 0; i < 4; i++) CHECK(seen[i] > 0, "%s never picked over 64 clients", names[i]);
+}
+
 int main(void) {
 	RUN(test_blake2b);
 	RUN(test_site_key_vectors);
@@ -204,5 +264,7 @@ int main(void) {
 	RUN(test_state_parse);
 	RUN(test_state_restrict);
 	RUN(test_marks_parse);
+	RUN(test_client_key);
+	RUN(test_stream_key);
 	return 0;
 }

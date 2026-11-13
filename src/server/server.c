@@ -146,6 +146,15 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "udp-warp-marks and udp-warp-state must both be set or both be empty");
 		return -1;
 	}
+	if (cfg->proxy_client_key && !cfg->proxy[0] && cfg->udp_warp_mark_count == 0) {
+		snprintf(err, err_cap, "proxy-client-key needs a proxy or udp-warp-marks to give the key to");
+		return -1;
+	}
+	if (cfg->proxy_client_key_secret[0] && strlen(cfg->proxy_client_key_secret) < 16) {
+		// Never the value: it is a secret.
+		snprintf(err, err_cap, "proxy-client-key-secret must be at least 16 characters");
+		return -1;
+	}
 	if (cfg->udp_warp_mark_count > 0 && !hw_sys_has_mark()) {
 		snprintf(err, err_cap, "udp-warp-marks: this platform cannot mark sockets");
 		return -1;
@@ -727,6 +736,17 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	if (proxy_config_resolve(&s->proxy) != 0) {
 		HW_ERROR("proxy", "cannot resolve %s: %s", s->proxy.host, strerror(errno));
 		goto fail;
+	}
+	if (cfg->proxy_client_key_secret[0]) {
+		s->client_key_secret_len = strlen(cfg->proxy_client_key_secret);
+		memcpy(s->client_key_secret, cfg->proxy_client_key_secret, s->client_key_secret_len);
+	} else if (cfg->proxy_client_key) {
+		s->client_key_secret_len = 32;
+		if (hw_sys_random(s->client_key_secret, s->client_key_secret_len) != 0) {
+			HW_ERROR("server", "proxy-client-key: no random bytes for its secret");
+			goto fail;
+		}
+		HW_INFO("server", "proxy-client-key: no proxy-client-key-secret, so client keys change with every start");
 	}
 	if (build_limiters(s) != 0) goto fail;
 	if (webclient_page_build(s) != 0) goto fail;

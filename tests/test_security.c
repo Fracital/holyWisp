@@ -4,6 +4,7 @@
  * CONNECT proxies, and a Twisp terminal stream. A real server, real helper services, the real
  * client library.
  */
+#include "holywisp/base64.h"
 #include "holywisp/client.h"
 #include "holywisp/filter.h"
 #include "holywisp/hw.h"
@@ -12,6 +13,7 @@
 #include "holywisp/reputation.h"
 #include "holywisp/server.h"
 #include "holywisp/sys.h"
+#include "holywisp/warp.h"
 #include "holywisp/wisp.h"
 
 #include "test.h"
@@ -24,6 +26,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -39,6 +42,14 @@ static _Atomic int g_socks5_requests;
 static _Atomic int g_socks5_atyp;
 static char g_socks5_host[256];
 static _Atomic int g_socks5_reply_delay_ms; // sleep before the CONNECT reply (a slow upstream dial)
+// Credentials: whether the toy proxy picks username/password when it is offered (otherwise it
+// always picks "none", as the edge router did before it read client keys), the methods the last
+// greeting offered (bit n: method n, for 0 and 2), and the last user name and password it read.
+// The HTTP proxy keeps its last Proxy-Authorization value. All written before the reply.
+static _Atomic int g_socks5_take_auth;
+static _Atomic int g_socks5_methods;
+static char g_socks5_user[256], g_socks5_pass[256];
+static char g_http_auth[512];
 
 // ---------------------------------------------------------------------------------- helpers
 
@@ -204,6 +215,10 @@ static void *http_proxy_conn(void *arg) {
 			got_first = 1;
 		}
 		if (!strcmp(line, "\r\n") || !strcmp(line, "\n")) break;
+		if (!strncasecmp(line, "Proxy-Authorization: ", 21)) {
+			snprintf(g_http_auth, sizeof(g_http_auth), "%s", line + 21);
+			g_http_auth[strcspn(g_http_auth, "\r\n")] = '\0';
+		}
 	}
 	char method[16], target[256];
 	if (sscanf(first, "%15s %255s", method, target) != 2 || strcmp(method, "CONNECT") != 0) {
@@ -254,9 +269,31 @@ static void *socks5_proxy_conn(void *arg) {
 		close(fd);
 		return NULL;
 	}
-	uint8_t choose[2] = {5, 0}; // no auth
+	int offered = 0;
+	for (int i = 0; i < nmethods; i++) {
+		if (methods[i] == 0 || methods[i] == 2) offered |= 1 << methods[i];
+	}
+	atomic_store(&g_socks5_methods, offered);
+	int auth = atomic_load(&g_socks5_take_auth) && (offered & 4);
+	uint8_t choose[2] = {5, auth ? 2 : 0};
 	ssize_t r = write(fd, choose, 2);
 	(void)r;
+	if (auth) { // RFC 1929: ver, ulen, user, plen, pass
+		uint8_t v[2], plen;
+		char user[256], pass[256];
+		if (read_full(fd, v, 2) != 0 || v[0] != 1 || read_full(fd, user, v[1]) != 0 || read_full(fd, &plen, 1) != 0 ||
+		    read_full(fd, pass, plen) != 0) {
+			close(fd);
+			return NULL;
+		}
+		user[v[1]] = '\0';
+		pass[plen] = '\0';
+		snprintf(g_socks5_user, sizeof(g_socks5_user), "%s", user);
+		snprintf(g_socks5_pass, sizeof(g_socks5_pass), "%s", pass);
+		uint8_t ok[2] = {1, 0};
+		r = write(fd, ok, 2);
+		(void)r;
+	}
 	uint8_t req[4];
 	if (read_full(fd, req, 4) != 0 || req[1] != 1) {
 		close(fd);
@@ -700,6 +737,102 @@ static void test_socks5_proxy(void) {
 	CHECK_EQ(atomic_load(&g_socks5_atyp), 1); // a literal IP goes as ATYP 1, never as a domain
 }
 
+// One TCP echo through a proxy at the URL cfg->proxy already holds, on a fresh server.
+static int echo_through(hw_server_config *cfg) {
+	hw_server *s = hw_server_new(cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	int ok = 0;
+	for (int attempt = 0; attempt < 4 && !ok; attempt++) {
+		hw_client *c = connect_plain(s);
+		uint32_t sid;
+		ok = hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid) == 0 &&
+		     echo_once_t(c, sid, "with-a-client-key", 4000);
+		hw_client_free(c);
+	}
+	hw_server_free(s);
+	return ok;
+}
+
+// proxy-client-key: the proxy is told which client a stream is for by a key in place of the user
+// name, never the address itself, so the edge router can keep one client and site on one exit.
+// Both methods are offered, so a proxy that does not read credentials picks "none" and goes on
+// working; the password stays the URL's; and the HTTP proxy gets the same key in Basic auth.
+static void test_proxy_client_key(void) {
+	static const char secret[] = "a-secret-of-some-length";
+	char want[HW_WARP_CLIENT_KEY_LEN + 1];
+	CHECK_EQ(hw_warp_client_key((const uint8_t *)secret, strlen(secret), "127.0.0.1", want), 0);
+
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	spawn(socks5_proxy_main, pfd);
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5h://127.0.0.1:%u", pport);
+
+	// Off, and no credentials in the URL: "none" is all that is offered.
+	atomic_store(&g_socks5_take_auth, 1);
+	g_socks5_user[0] = '\0';
+	CHECK(echo_through(&cfg), "echo without a client key");
+	CHECK_EQ(atomic_load(&g_socks5_methods), 1);
+	CHECK_STR(g_socks5_user, "");
+
+	// On: the key, with an empty password.
+	cfg.proxy_client_key = 1;
+	snprintf(cfg.proxy_client_key_secret, sizeof(cfg.proxy_client_key_secret), "%s", secret);
+	CHECK(echo_through(&cfg), "echo with a client key");
+	CHECK_EQ(atomic_load(&g_socks5_methods), 5);
+	CHECK_STR(g_socks5_user, want);
+	CHECK_STR(g_socks5_pass, "");
+	CHECK(strstr(g_socks5_user, "127.0.0.1") == NULL, "the address itself");
+
+	// A proxy that only takes "none" still relays.
+	atomic_store(&g_socks5_take_auth, 0);
+	g_socks5_user[0] = '\0';
+	CHECK(echo_through(&cfg), "echo through a proxy that ignores the key");
+	CHECK_EQ(atomic_load(&g_socks5_methods), 5);
+	CHECK_STR(g_socks5_user, "");
+
+	// The URL's user name gives way to the key; its password is kept.
+	atomic_store(&g_socks5_take_auth, 1);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5://edge:fixed-pw@127.0.0.1:%u", pport);
+	CHECK(echo_through(&cfg), "echo with a client key and a password");
+	CHECK_STR(g_socks5_user, want);
+	CHECK_STR(g_socks5_pass, "fixed-pw");
+
+	// Without a configured secret the key is a random one's: another key, still not the address.
+	cfg.proxy_client_key_secret[0] = '\0';
+	CHECK(echo_through(&cfg), "echo with a random secret");
+	CHECK_EQ(strlen(g_socks5_user), HW_WARP_CLIENT_KEY_LEN);
+	CHECK(strcmp(g_socks5_user, want) != 0, "the configured secret's key without it");
+	atomic_store(&g_socks5_take_auth, 0);
+	shutdown(pfd, SHUT_RDWR);
+
+	// HTTP CONNECT: Basic base64("<key>:").
+	uint16_t hport = start_listener(NULL, &pfd);
+	spawn(http_proxy_main, pfd);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "http://127.0.0.1:%u", hport);
+	snprintf(cfg.proxy_client_key_secret, sizeof(cfg.proxy_client_key_secret), "%s", secret);
+	g_http_auth[0] = '\0';
+	CHECK(echo_through(&cfg), "echo through the HTTP proxy with a client key");
+	char cred[64], b64[HW_BASE64_LEN(64)];
+	int cl = snprintf(cred, sizeof(cred), "%s:", want);
+	hw_base64_encode((const uint8_t *)cred, (size_t)cl, b64, sizeof(b64));
+	char basic[128];
+	snprintf(basic, sizeof(basic), "Basic %s", b64);
+	CHECK_STR(g_http_auth, basic);
+	shutdown(pfd, SHUT_RDWR);
+
+	// The config: a key needs somewhere to go, and a secret has a length.
+	hw_server_config bad;
+	base_config(&bad);
+	bad.proxy_client_key = 1;
+	CHECK(hw_server_new(&bad) == NULL, "proxy-client-key with no proxy and no udp-warp");
+	snprintf(bad.proxy, sizeof(bad.proxy), "socks5://127.0.0.1:1");
+	snprintf(bad.proxy_client_key_secret, sizeof(bad.proxy_client_key_secret), "short");
+	CHECK(hw_server_new(&bad) == NULL, "a 5-character proxy-client-key-secret");
+}
+
 // The upstream SOCKS5 router classifies destinations by name, so a hostname must reach it as an
 // ATYP 3 domain, unresolved, and `socks5h://` (what the wispurr deployments use) must be accepted.
 // A literal IP still goes as ATYP 1, and the egress policy still runs on what the name resolves
@@ -990,6 +1123,7 @@ int main(void) {
 	RUN(test_http_proxy);
 	RUN(test_socks5_proxy);
 	RUN(test_socks5_proxy_hostname);
+	RUN(test_proxy_client_key);
 	RUN(test_data_queued_during_proxy_connect);
 	RUN(test_proxy_reset_after_reply);
 	RUN(test_proxy_reply_without_status);

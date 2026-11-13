@@ -114,6 +114,24 @@ static void test_stop_on_stdin_eof_key(void) {
 	CHECK(hw_config_set(&cfg, "stop-on-stdin-eof", "maybe", err, sizeof(err)) != 0, "rejects a non-boolean");
 }
 
+static void test_proxy_client_key_keys(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(cfg.proxy_client_key, 0);
+	CHECK_STR(cfg.proxy_client_key_secret, "");
+	CHECK_EQ(hw_config_set(&cfg, "proxy-client-key", "on", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.proxy_client_key, 1);
+	CHECK_EQ(hw_config_set(&cfg, "proxy-client-key-secret", "sixteen-or-more!", err, sizeof(err)), 0);
+	CHECK_STR(cfg.proxy_client_key_secret, "sixteen-or-more!");
+	// A secret that does not fit is refused, and the error, which is logged, does not hold it.
+	char longer[200];
+	memset(longer, 'q', sizeof(longer) - 1);
+	longer[sizeof(longer) - 1] = '\0';
+	CHECK(hw_config_set(&cfg, "proxy-client-key-secret", longer, err, sizeof(err)) != 0, "a 199-byte secret");
+	CHECK(strstr(err, "qqqq") == NULL, "the secret in the error: %s", err);
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -126,6 +144,7 @@ int main(void) {
 	RUN(test_webclient_url_validation);
 	RUN(test_busy_poll_key);
 	RUN(test_stop_on_stdin_eof_key);
+	RUN(test_proxy_client_key_keys);
 	RUN(test_shipped_configs);
 	return 0;
 }

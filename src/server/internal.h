@@ -159,11 +159,13 @@ struct hw_server {
 	// the maintenance thread's alone: the state file as last read (its identity, and what it held
 	// or NULL when it was unusable), and what the workers were last given.
 	int warp_on;
-	int warp_seen;                    // the file existed at the last look
-	int64_t warp_mtime;               // its identity at that look: rewritten atomically, it is a new
-	uint64_t warp_ino, warp_size;     // inode each time, so a change within one second still shows
-	struct hw_warp_state *warp_read;  // its content, restricted to udp-warp-marks; NULL: unusable
-	char warp_why[96];                // why it is unusable, for the log
+	int warp_seen;                   // the file existed at the last look
+	int64_t warp_mtime;              // its identity at that look: rewritten atomically, it is a new
+	uint64_t warp_ino, warp_size;    // inode each time, so a change within one second still shows
+	struct hw_warp_state *warp_read; // its content, restricted to udp-warp-marks; NULL: unusable
+	char warp_why[96];               // why it is unusable, for the log
+	uint8_t client_key_secret[128];  // proxy-client-key's secret (the configured one, or random)
+	size_t client_key_secret_len;
 	struct hw_warp_state *warp_given; // what the workers were last given (NULL: unmarked)
 	int warp_published;               // whether every worker has warp_given
 
@@ -247,8 +249,9 @@ typedef struct hw_conn {
 	int heard;      // a read from the client since the worker's last sweep
 	int stream_cap; // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
-	char peer[HW_ADDR_STR_LEN]; // socket peer, with port, for logs
-	char ip[HW_IP_STR_LEN];     // client IP after trusted-proxy headers, for policy
+	char peer[HW_ADDR_STR_LEN];                  // socket peer, with port, for logs
+	char ip[HW_IP_STR_LEN];                      // client IP after trusted-proxy headers, for policy
+	char client_key[HW_WARP_CLIENT_KEY_LEN + 1]; // proxy-client-key: this client's, else ""
 	struct sockaddr_storage peer_addr;
 	struct hw_conn *lprev, *lnext; // worker->conns list
 } hw_conn;

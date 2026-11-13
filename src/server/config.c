@@ -119,6 +119,8 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("dns-timeout-ms", dns_timeout_ms, 100, 60000)
 	// Where streams go.
 	STR_KEY("proxy", proxy)
+	BOOL_KEY("proxy-client-key", proxy_client_key)
+	STR_KEY("proxy-client-key-secret", proxy_client_key_secret)
 	STR_KEY("udp-warp-state", udp_warp_state)
 	INT_KEY("udp-warp-state-max-age-s", udp_warp_state_max_age_s, 0, 86400)
 	STR_KEY("trusted-proxy-secret", trusted_proxy_secret)
@@ -296,7 +298,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	return -1;
 bad_value:
 	// A value that may hold a credential is never repeated: this text goes to the log.
-	if (!strcmp(key, "proxy") || !strcmp(key, "trusted-proxy-secret")) {
+	if (!strcmp(key, "proxy") || !strcmp(key, "trusted-proxy-secret") || !strcmp(key, "proxy-client-key-secret")) {
 		snprintf(err, err_cap, "bad value for '%s' (not shown: it may hold a secret)", key);
 	} else {
 		snprintf(err, err_cap, "bad value '%s' for '%s'", value, key);
@@ -403,6 +405,9 @@ void hw_config_usage(const char *argv0) {
 	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
 	    "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
 	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
+	    "  proxy-client-key BOOL                     give the proxy a key per client as its user name, and pick\n"
+	    "                                            a WARP tunnel for UDP by client and site (off)\n"
+	    "  proxy-client-key-secret S                 what the keys are made with, 16+ characters (random per start)\n"
 	    "  udp-warp-marks M,M,...                    UDP through WARP (Linux, CAP_NET_ADMIN): the tunnels' fwmarks\n"
 	    "  udp-warp-state PATH                       the router's healthy tunnels (JSON), re-read when it changes\n"
 	    "  udp-warp-state-max-age-s                  an older state file is ignored: UDP goes unmarked (60; 0 = never)\n"

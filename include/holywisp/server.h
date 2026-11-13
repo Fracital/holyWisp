@@ -96,6 +96,11 @@ typedef struct hw_server_config {
 	// Where streams go.
 	char proxy[256];      // socks5://[user:pass@]host:port or http://[user:pass@]host:port; "" = direct
 	int proxy_udp_direct; // with a proxy: relay UDP directly (1) instead of refusing it (0)
+	// Exit per client and site: the proxy is given each client's key (hw_warp_client_key) as its
+	// user name, and the UDP WARP pick hashes "key/site". The secret makes the keys; empty means a
+	// random one per process, and then a restart gives every client a new key.
+	int proxy_client_key;
+	char proxy_client_key_secret[128];
 	// UDP through WARP tunnels (Linux, CAP_NET_ADMIN): a UDP socket is given the firewall mark of
 	// the tunnel the edge router would send its site through (holywisp/warp.h). The marks the
 	// state file may choose from, and the file the router publishes its healthy tunnels in. Both,

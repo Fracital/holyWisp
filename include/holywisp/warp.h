@@ -39,6 +39,19 @@ typedef struct hw_warp_state {
 // the address as inet_ntop writes it.
 int hw_warp_site_key(const char *host, char *out, size_t cap);
 
+// A client's key, for when the exit is chosen per client and site (proxy-client-key): 16
+// lower-case hex digits of the first 8 bytes of BLAKE2b(secret "\0" address), with its NUL. The
+// address is an IPv4 address's 4 bytes (IPv4-mapped is unwrapped) or an IPv6 address's first 8,
+// its /64, inside which a privacy address changes. The secret keeps the key from being turned
+// back into an address by trying all of them. 0, or -1 when ip is not an address (out is empty).
+#define HW_WARP_CLIENT_KEY_LEN 16
+int hw_warp_client_key(const uint8_t *secret, size_t secret_len, const char *ip, char out[HW_WARP_CLIENT_KEY_LEN + 1]);
+
+// The key a stream's tunnel is picked by: the site (or address) alone, or "client/site" when the
+// stream has a client key. A '/' is in no host name or address. 0, or -1 when it does not fit
+// (out is then empty).
+int hw_warp_stream_key(const char *client, const char *site, char *out, size_t cap);
+
 // The rendezvous score of a tunnel for a key: the first 8 bytes of BLAKE2b(key "\0" name), read
 // big-endian.
 uint64_t hw_warp_score(const char *key, const char *name);
