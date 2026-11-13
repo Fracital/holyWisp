@@ -1,7 +1,8 @@
 name: Release
 
 # Binaries as public GitHub release assets (CI artifacts need a GitHub login):
-#   push to master, dispatch   -> rolling prerelease `latest`, assets replaced
+#   push to master, dispatch   -> rolling prerelease `latest`, assets replaced (and any it no
+#                                 longer has deleted)
 #   push of a tag v*         -> release <tag>, kept
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
 # binaries run on glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 and newer), each archive flat
@@ -406,6 +407,16 @@ jobs:
               gh release create latest --prerelease --title "latest (master, $DESCRIBE)" --notes "$notes" --target "$GITHUB_SHA"
             fi
             gh release upload latest assets/* --clobber
+            # --clobber replaces a file of the same name and leaves every other one, so a file
+            # this build did not make (a package under an older version or revision) would stay
+            # beside the new ones, outside SHA256SUMS. Those go, after the upload, so the
+            # current files are never missing.
+            gh release view latest --json assets -q '.assets[].name' | while IFS= read -r name; do
+              if [ ! -e "assets/$name" ]; then
+                echo "removing stale asset $name"
+                gh release delete-asset latest "$name" --yes
+              fi
+            done
           else
             gh release create "$TAG" --title "$TAG" --notes "$notes" --verify-tag assets/*
           fi
