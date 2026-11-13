@@ -14,6 +14,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <netinet/in.h>
@@ -380,6 +381,43 @@ static int pty_expect(int master, char *buf, size_t cap, const char *want) {
 	return 0;
 }
 
+// A mark is set or refused, and a refused one leaves the socket as it was: with the capability the
+// mark takes; without it (the usual case here, an unprivileged test) the call says EPERM. Either
+// way the socket still sends. Without marks at all the answer is ENOTSUP.
+static void test_mark(void) {
+	int rx = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(rx >= 0, "socket: errno %d", errno);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	CHECK_EQ(bind(rx, (struct sockaddr *)&a, sizeof(a)), 0);
+	socklen_t al = sizeof(a);
+	CHECK_EQ(getsockname(rx, (struct sockaddr *)&a, &al), 0);
+	int tx = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(tx >= 0, "socket: errno %d", errno);
+	errno = 0;
+	int r = hw_sys_set_mark(tx, 0x7701);
+	if (!hw_sys_has_mark()) {
+		CHECK_EQ(r, -1);
+		CHECK_EQ(errno, ENOTSUP);
+	} else {
+		CHECK(r == 0 || errno == EPERM, "set_mark: %d, errno %d", r, errno);
+	}
+	// A marked socket may route elsewhere; only an unmarked one must still reach loopback here.
+	if (r != 0) {
+		CHECK_EQ(connect(tx, (struct sockaddr *)&a, sizeof(a)), 0);
+		CHECK_EQ(send(tx, "m", 1, 0), 1);
+		struct pollfd p = {rx, POLLIN, 0};
+		CHECK_EQ(poll(&p, 1, 2000), 1);
+		char c = 0;
+		CHECK_EQ(recv(rx, &c, 1, 0), 1);
+		CHECK_EQ(c, 'm');
+	}
+	close(tx);
+	close(rx);
+}
+
 static void test_pty(void) {
 	char sh[] = "sh", dash_c[] = "-c";
 	char script[] = "test -t 0 && echo on a tty && read line && stty size && sleep 30";
@@ -434,6 +472,7 @@ int main(void) {
 	RUN(test_close_reset);
 	RUN(test_crypt);
 	RUN(test_random);
+	RUN(test_mark);
 	RUN(test_pty);
 	return 0;
 }

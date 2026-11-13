@@ -129,6 +129,7 @@ endif()
 # libholywisp: everything the server, client and tests share. ------------------------------
 add_library(holywisp STATIC
   src/common/base64.c
+  src/common/blake2b.c
   src/common/buf.c
   src/common/dns.c
   src/common/filter.c
@@ -141,6 +142,7 @@ add_library(holywisp STATIC
   src/common/resolver.c
   src/common/sha1.c
   src/common/smap.c
+  src/common/warp.c
   src/common/wisp.c
   src/common/ws.c
   ${HW_PLATFORM_SOURCES}
@@ -212,6 +214,8 @@ if(HW_BUILD_TESTS)
   endfunction()
   hw_test(test_buf)
   hw_test(test_crypto)
+  hw_test(test_warp)
+  hw_test(test_udp_warp)
   hw_test(test_map)
   hw_test(test_smap)
   hw_test(test_log)

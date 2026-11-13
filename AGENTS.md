@@ -233,6 +233,44 @@ runs on. The defaults deny everything that is not public unicast and every chang
   networks has to check what *it* resolved. abulxt's `edge-router.py` does (it resolves once,
   refuses anything not public, and dials or forwards the address it checked).
 
+## UDP on WARP (do not regress)
+
+On the abulxt edges, TCP streams leave through the edge router (a SOCKS5 `proxy`), which sends
+each one out through one of several kernel WARP tunnels, chosen by rendezvous hashing of the
+stream's site. UDP never goes through the router (`proxy-udp = direct`), so with
+`udp-warp-marks` and `udp-warp-state` holyWisp marks each UDP socket (`SO_MARK`,
+`hw_sys_set_mark`) for the tunnel the router would have chosen. Then a site's QUIC and WebRTC
+leave from the same exit address as its TCP.
+
+- **The choice is the router's, to the bit.** `holywisp/warp.h` repeats `edge-router.py`'s
+  `site_key` (the last two labels, or three under a two-letter TLD whose second level is on its
+  suffix list), `rendezvous_score` (BLAKE2b-64 of `key "\0" name`, big-endian; `blake2b.c` is
+  in-tree for this alone) and `WarpTunnels.pick` (the highest score, ties to the greater name,
+  over the tunnels healthy for the address family). An IP literal's key is the address as
+  `inet_ntop` writes it, which is what the router is handed. `tests/warp_vectors.h` is
+  generated from the router itself (`tests/gen_warp_vectors.py`). A change to either side
+  without the other moves sites' UDP to another exit than their TCP: regenerate the vectors and
+  change both.
+- **The state file only chooses among configured marks.** The router publishes its healthy
+  tunnels as `{"v4": [{"name", "mark"}], "v6": [...]}`, replaced atomically. Entries whose mark
+  is not in `udp-warp-marks` are dropped (`hw_warp_state_restrict`), so whoever can write that
+  file still cannot give a socket an arbitrary mark. The reader is strict and all-or-nothing.
+- **Unusable state is today's behaviour, never an outage.** A file that is missing, unreadable,
+  malformed or older than `udp-warp-state-max-age-s` means unmarked UDP. The router rewrites
+  the file every probe round (15 s), so an old file means a dead router. A process without
+  `CAP_NET_ADMIN` starts anyway, with marking off and an ERROR in the log (`warp_init`):
+  refusing to start would take the whole relay down over its UDP's exit address. Only a state
+  that lists no tunnel for the family, with `udp-warp-fallback refuse`, refuses a stream (`0x42`,
+  what the router answers a TCP stream then).
+- **No lock on the data path.** The maintenance thread stats the file once a second, reads it
+  only when it is another file (inode, size or mtime), and posts each worker its own copy
+  (`warp_publish`, `warp_swap_task`). A stream reads only its worker's copy (`w->warp`).
+- **What stays unmarked:** TCP (the router marks it), DNS (`dns.c`, the resolver threads) and
+  everything holyWisp opens for itself. The egress policy runs before the mark, as it always does.
+  `test_warp` holds the vectors and the reader. `test_udp_warp` holds the state tracking and the
+  streams: run it also as `unshare -Urn sh -c 'ip link set lo up && build/debug/test_udp_warp'`,
+  where the process has the capability and the marks take.
+
 ## Security suite (do not regress)
 
 The limiters, reputation and filters are the point of this server. They are process-wide, created
@@ -535,13 +573,14 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
 | `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
 | `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
-| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, crypt, the pseudo-terminal, random bytes fit for keys. |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys. |
 | `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |
 | `include/holywisp/wisp.h`, `src/common/wisp.c` | Wisp packet codec and constants. The wire format lives here and nowhere else. |
 | `include/holywisp/map.h`, `src/common/map.c` | `uint32_t -> void *` open-addressing map (stream id to stream). |
 | `include/holywisp/sha1.h`, `base64.h` | Only for `Sec-WebSocket-Accept`. |
+| `include/holywisp/warp.h`, `src/common/warp.c`, `blake2b.h`, `blake2b.c` | UDP on WARP: the edge router's site key, score and tunnel choice, the state file's reader, the mark list. |
 | `include/holywisp/log.h`, `src/common/log.c` | Levelled logging, one `write(2)` per line. |
 | `include/holywisp/server.h` | Public server API: config struct, new/start/stop/free, stats. |
 | `src/server/internal.h` | `hw_server`, `hw_worker`, `hw_conn`, `hw_stream` and the functions conn.c/stream.c share. |
@@ -563,6 +602,8 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
+| `tests/test_warp.c`, `tests/warp_vectors.h`, `tests/gen_warp_vectors.py` | The WARP tunnel choice against vectors generated from `edge-router.py`. |
+| `tests/test_udp_warp.c` | The state file as the server tracks it, and UDP streams marked, unmarked and refused. |
 | `tests/test_abuse.c` | End-to-end from the attacker's side: each case is something a hostile client or remote did to the server before it was fixed. |
 | `tests/test_client.c`, `tests/test_log.c` | The client library against servers that misbehave; log lines that hold client bytes. |
 | `node/src/index.ts` | The npm package's `holyWisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |

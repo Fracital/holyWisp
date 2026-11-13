@@ -84,6 +84,18 @@ int hw_sys_random(void *buf, size_t len) {
 	return 0;
 }
 
+// macOS has no socket marks for policy routing.
+int hw_sys_has_mark(void) {
+	return 0;
+}
+
+int hw_sys_set_mark(int fd, uint32_t mark) {
+	(void)fd;
+	(void)mark;
+	errno = ENOTSUP;
+	return -1;
+}
+
 int hw_sys_has_crypt(void) {
 	return 1;
 }

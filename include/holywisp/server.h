@@ -11,6 +11,7 @@
 #include "holywisp/dns.h"
 #include "holywisp/filter.h"
 #include "holywisp/reputation.h"
+#include "holywisp/warp.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -95,6 +96,16 @@ typedef struct hw_server_config {
 	// Where streams go.
 	char proxy[256];      // socks5://[user:pass@]host:port or http://[user:pass@]host:port; "" = direct
 	int proxy_udp_direct; // with a proxy: relay UDP directly (1) instead of refusing it (0)
+	// UDP through WARP tunnels (Linux, CAP_NET_ADMIN): a UDP socket is given the firewall mark of
+	// the tunnel the edge router would send its site through (holywisp/warp.h). The marks the
+	// state file may choose from, and the file the router publishes its healthy tunnels in. Both,
+	// or neither. A file that is missing, unreadable, malformed or older than the max age means
+	// no marks: UDP goes out directly, as it does without these keys.
+	uint32_t udp_warp_marks[HW_WARP_MAX_TUNNELS];
+	int udp_warp_mark_count;
+	char udp_warp_state[256];
+	int udp_warp_state_max_age_s;             // 0 = never too old
+	int udp_warp_fallback_direct;             // the file lists no tunnel for the family: direct (1) or refuse (0)
 	char dns_servers[HW_MAX_DNS_SERVERS][64]; // "ip" or "ip:port"; empty = system resolver
 	int dns_server_count;
 	int dns_ttl_s;          // cache lifetime cap
@@ -156,6 +167,9 @@ typedef struct hw_server_stats {
 	uint64_t throttled_source; // per-source connect rate
 	uint64_t throttled_dest;   // per-destination connect rate
 	uint64_t throttled_syns;   // in-flight SYN cap
+	uint64_t udp_warp_marked;  // UDP streams dialled through a WARP tunnel
+	uint64_t udp_warp_direct;  // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
+	uint64_t udp_warp_refused; // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
 	uint64_t syn_signatures;   // SYN-flood matches
 	uint64_t ws_closed_violations;
 	uint64_t auth_failures;

@@ -119,6 +119,8 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("dns-timeout-ms", dns_timeout_ms, 100, 60000)
 	// Where streams go.
 	STR_KEY("proxy", proxy)
+	STR_KEY("udp-warp-state", udp_warp_state)
+	INT_KEY("udp-warp-state-max-age-s", udp_warp_state_max_age_s, 0, 86400)
 	STR_KEY("trusted-proxy-secret", trusted_proxy_secret)
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
 	INT_KEY("max-message-size", max_message_size, 1024, 1LL << 30)
@@ -157,6 +159,22 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 			cfg->proxy_udp_direct = 1;
 		} else if (!strcmp(value, "refuse")) {
 			cfg->proxy_udp_direct = 0;
+		} else {
+			goto bad_value;
+		}
+		return 0;
+	}
+	if (!strcmp(key, "udp-warp-marks")) {
+		int count = hw_warp_marks_parse(value, cfg->udp_warp_marks, HW_WARP_MAX_TUNNELS);
+		if (count < 0) goto bad_value;
+		cfg->udp_warp_mark_count = count;
+		return 0;
+	}
+	if (!strcmp(key, "udp-warp-fallback")) {
+		if (!strcmp(value, "direct")) {
+			cfg->udp_warp_fallback_direct = 1;
+		} else if (!strcmp(value, "refuse")) {
+			cfg->udp_warp_fallback_direct = 0;
 		} else {
 			goto bad_value;
 		}
@@ -370,43 +388,48 @@ void hw_config_usage(const char *argv0) {
 	    "  flood-protection                          master switch for the limits below (on)\n",
 	    argv0);
 	// Two calls: one string literal may not be longer than 4095 bytes.
-	printf("  max-connects-per-source-per-second        per client IP (500)\n"
-	       "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
-	       "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
-	       "  max-in-flight-syns-per-ip,                the same per client IP, so one client cannot hold them\n"
-	       "  max-concurrent-connections-per-ip         all (512 / 5000)\n"
-	       "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
-	       "  syn-signature-min-samples, syn-signature-failed-ratio\n"
-	       "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"
-	       "  reputation, reputation-store,             IP reputation scoring, persisted as JSON\n"
-	       "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
-	       "  reputation-decay-per-hour, reputation-evict-after-days,\n"
-	       "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
-	       "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
-	       "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
-	       "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
-	       "  buffer-remaining                          CONTINUE window in packets (128)\n"
-	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
-	       "                                            0x49), per client (256 MiB, pauses its reads)\n"
-	       "  max-message-size, ws-write-high-water, socket-buffer-size\n"
-	       "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
-	       "                                            it (8 MiB; 0 = leave to the kernel)\n"
-	       "  max-streams-per-conn                      0 = unlimited (2048)\n"
-	       "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
-	       "  client-write-timeout-s                    close a client that has read nothing of what is queued\n"
-	       "                                            for it for this long (120; 0 = never)\n"
-	       "  idle-timeout-s                            close a client with no streams that sent nothing for\n"
-	       "                                            this long (0 = never)\n"
-	       "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
-	       "                                            before sleeping: lower latency, more CPU (0 = off)\n"
-	       "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
-	       "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
-	       "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
-	       "  log-level                                 debug|info|warn|error|none (info)\n"
-	       "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
-	       "                                            holds a pipe to it, never under a service manager (off)\n"
-	       "\n"
-	       "  --version, --help\n");
+	printf(
+	    "  max-connects-per-source-per-second        per client IP (500)\n"
+	    "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
+	    "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
+	    "  max-in-flight-syns-per-ip,                the same per client IP, so one client cannot hold them\n"
+	    "  max-concurrent-connections-per-ip         all (512 / 5000)\n"
+	    "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
+	    "  syn-signature-min-samples, syn-signature-failed-ratio\n"
+	    "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"
+	    "  reputation, reputation-store,             IP reputation scoring, persisted as JSON\n"
+	    "  reputation-{warn,throttle,strict},        score thresholds (21 / 51 / 81)\n"
+	    "  reputation-decay-per-hour, reputation-evict-after-days,\n"
+	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
+	    "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
+	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
+	    "  udp-warp-marks M,M,...                    UDP through WARP (Linux, CAP_NET_ADMIN): the tunnels' fwmarks\n"
+	    "  udp-warp-state PATH                       the router's healthy tunnels (JSON), re-read when it changes\n"
+	    "  udp-warp-state-max-age-s                  an older state file is ignored: UDP goes unmarked (60; 0 = never)\n"
+	    "  udp-warp-fallback direct|refuse           no healthy tunnel for the family: unmarked, or refuse (refuse)\n"
+	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
+	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
+	    "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
+	    "                                            0x49), per client (256 MiB, pauses its reads)\n"
+	    "  max-message-size, ws-write-high-water, socket-buffer-size\n"
+	    "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
+	    "                                            it (8 MiB; 0 = leave to the kernel)\n"
+	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
+	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
+	    "  client-write-timeout-s                    close a client that has read nothing of what is queued\n"
+	    "                                            for it for this long (120; 0 = never)\n"
+	    "  idle-timeout-s                            close a client with no streams that sent nothing for\n"
+	    "                                            this long (0 = never)\n"
+	    "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
+	    "                                            before sleeping: lower latency, more CPU (0 = off)\n"
+	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
+	    "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
+	    "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
+	    "  log-level                                 debug|info|warn|error|none (info)\n"
+	    "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
+	    "                                            holds a pipe to it, never under a service manager (off)\n"
+	    "\n"
+	    "  --version, --help\n");
 }
 
 int hw_config_parse_args(hw_server_config *cfg, int argc, char **argv, char *err, size_t err_cap) {

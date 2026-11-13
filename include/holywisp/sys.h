@@ -61,6 +61,13 @@ int hw_sys_has_close_reset(void);
 // dropped on its way to the peer. 1 when the connection was reset, 0 when it was closed.
 int hw_sys_close_reset(int fd);
 
+// Whether hw_sys_set_mark can work at all here.
+int hw_sys_has_mark(void);
+// Give a socket a firewall mark (Linux SO_MARK), which policy routing can send out another way:
+// the WARP tunnels pick their UDP this way. Takes CAP_NET_ADMIN. 0, or -1 with errno (EPERM
+// without the capability; ENOTSUP without hw_sys_has_mark), and then the socket is as it was.
+int hw_sys_set_mark(int fd, uint32_t mark);
+
 // Fill buf with len bytes from the kernel's random source, the one that is fit for keys: nothing
 // about them can be guessed from the clock, the pid or earlier output. 0, or -1 when the kernel
 // has none to give, and then buf holds nothing to rely on.

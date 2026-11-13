@@ -91,6 +91,15 @@ reputation-strict = 81
 # proxy = socks5://user:pass@127.0.0.1:1080  # or http://host:3128
 # UDP cannot go through the proxy: refuse it (default) or relay it directly, bypassing the proxy.
 # proxy-udp = refuse                         # refuse | direct
+# UDP through WARP tunnels (Linux, needs CAP_NET_ADMIN). Each UDP socket gets the fwmark of the
+# tunnel the edge router sends the stream's site through (the same rendezvous hash over the tunnels
+# the router lists as healthy in the state file), so a site's UDP leaves from its TCP's exit. The
+# marks are the ones the state file may choose from; both keys or neither. A state file that is
+# missing, malformed or older than the max age means UDP goes out unmarked, as without these keys.
+# udp-warp-marks = 0x7701,0x7702,0x7703,0x7704
+# udp-warp-state = /run/abulxt-edge-router/warp.json
+# udp-warp-state-max-age-s = 60              # 0: never too old
+# udp-warp-fallback = refuse                 # no healthy tunnel for the family: refuse | direct
 # dns-server = 1.1.1.1
 # dns-server = [2606:4700:4700::1111]:53
 dns-ttl-s = 120

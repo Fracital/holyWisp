@@ -14,6 +14,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
 #include "holywisp/sys.h"
+#include "holywisp/warp.h"
 #include "holywisp/wisp.h"
 
 #include "internal.h"
@@ -23,6 +24,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
 
 #ifndef STREAM_MAX_READS_PER_EVENT
 #define STREAM_MAX_READS_PER_EVENT 4
@@ -399,6 +403,52 @@ static void stream_dest_set(hw_stream *s, const struct sockaddr *sa) {
 	snprintf(s->dest, sizeof(s->dest), "%s:%u", ipbuf, s->port);
 }
 
+// UDP on WARP (udp-warp-marks): mark the socket for the tunnel the edge router sends this
+// stream's site through (holywisp/warp.h), so the site's UDP and TCP leave from one exit. The key
+// is the site of the name, or for an IP literal the address as inet_ntop writes it, which is what
+// the router is handed for one. 0: dial it (marked, or unmarked because there is no state to go by
+// or udp-warp-fallback is direct). -1: refuse it, no tunnel healthy for its family.
+static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
+	hw_worker *w = s->conn->w;
+	hw_server *srv = w->server;
+	const hw_warp_state *st = w->warp;
+	if (!st) {
+		HW_STAT_INC(srv, udp_warp_direct);
+		return 0;
+	}
+	char key[256];
+	int v6 = sa->sa_family == AF_INET6;
+	if (s->literal_host) {
+		const void *a = v6 ? (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+		                   : (const void *)&((const struct sockaddr_in *)sa)->sin_addr;
+		if (!inet_ntop(sa->sa_family, a, key, sizeof(key))) key[0] = '\0';
+	} else if (hw_warp_site_key(s->host, key, sizeof(key)) != 0) {
+		key[0] = '\0'; // cannot happen: the host and its site fit in the same 256 bytes
+	}
+	const hw_warp_tunnel *t = hw_warp_pick(st, v6, key);
+	if (t && hw_sys_set_mark(s->fd, t->mark) == 0) {
+		HW_STAT_INC(srv, udp_warp_marked);
+		return 0;
+	}
+	uint64_t now = hw_now_ms();
+	int warn = now - w->warp_warned_ms >= 60000 || w->warp_warned_ms == 0;
+	if (warn) w->warp_warned_ms = now;
+	if (srv->cfg.udp_warp_fallback_direct) {
+		if (warn) {
+			HW_WARN("warp", "%s for %s: UDP goes out unmarked (udp-warp-fallback direct)",
+			        t ? "cannot mark a socket" : "no healthy WARP tunnel", v6 ? "IPv6" : "IPv4");
+		}
+		HW_STAT_INC(srv, udp_warp_direct);
+		return 0;
+	}
+	if (warn) {
+		HW_WARN("warp", "%s for %s: UDP streams are refused (udp-warp-fallback refuse)",
+		        t ? "cannot mark a socket" : "no healthy WARP tunnel", v6 ? "IPv6" : "IPv4");
+	}
+	HW_STAT_INC(srv, udp_warp_refused);
+	return -1;
+}
+
 // Try the next resolved address. With the proxy on, "the address" is the proxy and we try it once.
 // Each address is put to the destination policy before it is dialled, not only the first: the
 // limits are per address, and a name that resolves to several would otherwise be counted against
@@ -433,6 +483,13 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 		if (s->fd < 0) {
 			last_errno = errno;
 			continue;
+		}
+		if (s->type == HW_STREAM_UDP && srv->warp_on && stream_warp_mark(s, sa) != 0) {
+			close(s->fd);
+			s->fd = -1;
+			// 0x42, as a TCP stream gets then: the router answers REP_UNREACH when it cannot dial.
+			stream_close(s, HW_CLOSE_UNREACHABLE, 1);
+			return;
 		}
 		if (s->type == HW_STREAM_TCP) {
 			int full = syn_acquire(s);

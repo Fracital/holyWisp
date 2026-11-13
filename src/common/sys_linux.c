@@ -87,6 +87,15 @@ int hw_sys_random(void *buf, size_t len) {
 	return 0;
 }
 
+int hw_sys_has_mark(void) {
+	return 1;
+}
+
+int hw_sys_set_mark(int fd, uint32_t mark) {
+	unsigned int v = mark;
+	return setsockopt(fd, SOL_SOCKET, SO_MARK, &v, sizeof(v));
+}
+
 int hw_sys_has_crypt(void) {
 	return 1;
 }

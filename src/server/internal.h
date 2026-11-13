@@ -62,8 +62,13 @@ typedef struct hw_worker {
 	int index;
 	pthread_t thread;
 	int thread_started;
-	uint8_t *scratch;      // HW_READ_CHUNK bytes for remote reads
-	struct hw_conn *conns; // every live connection on this worker, for shutdown cleanup
+	uint8_t *scratch; // HW_READ_CHUNK bytes for remote reads
+	// The WARP tunnels this worker marks UDP streams for (udp-warp-marks): its own copy of what
+	// the maintenance thread last read, swapped in by a posted task, so the data path reads it
+	// without a lock. NULL: no usable state, UDP goes out unmarked.
+	struct hw_warp_state *warp;
+	uint64_t warp_warned_ms; // last "no healthy tunnel" warning, at most one a minute per worker
+	struct hw_conn *conns;   // every live connection on this worker, for shutdown cleanup
 	// Ingress batch (stream_on_data / stream_batch_flush): DATA payloads for one idle TCP stream,
 	// still sitting in the connection's read buffer, waiting to go out in one vectored write. It
 	// only ever exists inside a single pass over that buffer; conn.c flushes it before the buffer
@@ -150,6 +155,17 @@ struct hw_server {
 	int maint_stop;
 	uint64_t maint_last_slow; // last eviction/decay pass (ms)
 	uint64_t maint_last_save; // last reputation save (ms)
+	// UDP on WARP. warp_on: udp-warp-marks is set and this process may mark sockets. The rest is
+	// the maintenance thread's alone: the state file as last read (its identity, and what it held
+	// or NULL when it was unusable), and what the workers were last given.
+	int warp_on;
+	int warp_seen;                    // the file existed at the last look
+	int64_t warp_mtime;               // its identity at that look: rewritten atomically, it is a new
+	uint64_t warp_ino, warp_size;     // inode each time, so a change within one second still shows
+	struct hw_warp_state *warp_read;  // its content, restricted to udp-warp-marks; NULL: unusable
+	char warp_why[96];                // why it is unusable, for the log
+	struct hw_warp_state *warp_given; // what the workers were last given (NULL: unmarked)
+	int warp_published;               // whether every worker has warp_given
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
@@ -163,6 +179,9 @@ struct hw_server {
 	_Atomic uint64_t throttled_source;
 	_Atomic uint64_t throttled_dest;
 	_Atomic uint64_t throttled_syns;
+	_Atomic uint64_t udp_warp_marked;
+	_Atomic uint64_t udp_warp_direct;
+	_Atomic uint64_t udp_warp_refused;
 	_Atomic uint64_t syn_signatures;
 	_Atomic uint64_t ws_closed_violations;
 	_Atomic uint64_t auth_failures;
@@ -287,6 +306,11 @@ typedef struct hw_stream {
 
 // conn.c
 void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer);
+
+// Look at udp-warp-state again and give the workers what it now means (server.c). The maintenance
+// thread does this every second; running 0 means the workers have not started, so their copies
+// are set in place. Exposed for tests, which drive it by hand.
+void server_warp_refresh(hw_server *s, int running);
 // Queue one Wisp packet (already laid out) as a binary WebSocket frame.
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len);
 // Queue a DATA packet for stream_id with `len` payload bytes copied from `data`.

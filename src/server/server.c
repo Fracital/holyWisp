@@ -27,10 +27,12 @@
 
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 void hw_server_config_defaults(hw_server_config *cfg) {
 	memset(cfg, 0, sizeof(*cfg));
 	cfg->port = 6001;
+	cfg->udp_warp_state_max_age_s = 60;
 	cfg->workers = 0;
 	cfg->allow_tcp = 1;
 	cfg->allow_udp = 1;
@@ -138,6 +140,14 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 	}
 	if (cfg->enable_twisp && !cfg->enable_v2) {
 		snprintf(err, err_cap, "enable-twisp needs enable-v2");
+		return -1;
+	}
+	if ((cfg->udp_warp_mark_count > 0) != (cfg->udp_warp_state[0] != '\0')) {
+		snprintf(err, err_cap, "udp-warp-marks and udp-warp-state must both be set or both be empty");
+		return -1;
+	}
+	if (cfg->udp_warp_mark_count > 0 && !hw_sys_has_mark()) {
+		snprintf(err, err_cap, "udp-warp-marks: this platform cannot mark sockets");
 		return -1;
 	}
 	if ((cfg->connections_limit_per_ip == 0) != (cfg->connection_window_s == 0)) {
@@ -423,8 +433,182 @@ static void worker_destroy(hw_worker *w) {
 	inbox_drop(w);
 	pthread_mutex_destroy(&w->inbox_lock);
 	if (w->listen_fd >= 0) close(w->listen_fd);
-	hw_loop_free(w->loop);
+	hw_loop_free(w->loop); // runs any swap still posted, so the last copy is the one to free
+	free(w->warp);
+	w->warp = NULL;
 	free(w->scratch);
+}
+
+// ---------------------------------------------------------------------------------- UDP on WARP
+//
+// udp-warp-state is the edge router's list of the tunnels that are healthy, per address family.
+// The maintenance thread looks at it once a second (one stat), reads it only when it is another
+// file than last time (the router replaces it atomically, so a rewrite is a new inode), and gives
+// every worker a copy of what it now means whenever that changes, by a posted task: a worker only
+// ever reads its own copy, and the data path takes no lock. A file that is missing, unreadable,
+// malformed or older than udp-warp-state-max-age-s means no marks at all, which is UDP as it is
+// without these keys; the router rewrites the file on every probe round, so an old one means the
+// router is not running.
+
+#define WARP_STATE_MAX (64 * 1024)
+
+typedef struct {
+	hw_worker *w;
+	hw_warp_state *st;
+} warp_msg;
+
+static void warp_swap_task(hw_loop *loop, void *ud) {
+	(void)loop;
+	warp_msg *m = ud;
+	free(m->w->warp);
+	m->w->warp = m->st;
+	free(m);
+}
+
+// Every worker its own copy of st (NULL: unmarked): in place before the workers run, by a posted
+// task after. 0, or -1 when a copy or a post failed, and the next look tries again.
+static int warp_publish(hw_server *s, const hw_warp_state *st, int running) {
+	int rc = 0;
+	for (int i = 0; i < s->nworkers; i++) {
+		hw_worker *w = &s->workers[i];
+		hw_warp_state *copy = NULL;
+		if (st) {
+			copy = malloc(sizeof(*copy));
+			if (!copy) {
+				rc = -1;
+				continue;
+			}
+			memcpy(copy, st, sizeof(*copy));
+		}
+		if (!running) {
+			free(w->warp);
+			w->warp = copy;
+			continue;
+		}
+		warp_msg *m = malloc(sizeof(*m));
+		if (m) {
+			m->w = w;
+			m->st = copy;
+		}
+		if (!m || hw_loop_post(w->loop, warp_swap_task, m) != 0) {
+			free(m);
+			free(copy);
+			rc = -1;
+		}
+	}
+	return rc;
+}
+
+// The state file into s->warp_read, or NULL there and the reason in s->warp_why.
+static void warp_read_file(hw_server *s) {
+	free(s->warp_read);
+	s->warp_read = NULL;
+	s->warp_why[0] = '\0';
+	char *buf = malloc(WARP_STATE_MAX + 1);
+	hw_warp_state *st = malloc(sizeof(*st));
+	int fd = open(s->cfg.udp_warp_state, O_RDONLY);
+	if (!buf || !st || fd < 0) {
+		snprintf(s->warp_why, sizeof(s->warp_why), "%s", strerror(!buf || !st ? ENOMEM : errno));
+		goto done;
+	}
+	size_t len = 0;
+	for (;;) {
+		ssize_t n = read(fd, buf + len, WARP_STATE_MAX + 1 - len);
+		if (n < 0 && errno == EINTR) continue;
+		if (n < 0) {
+			snprintf(s->warp_why, sizeof(s->warp_why), "%s", strerror(errno));
+			goto done;
+		}
+		if (n == 0) break;
+		len += (size_t)n;
+		if (len > WARP_STATE_MAX) {
+			snprintf(s->warp_why, sizeof(s->warp_why), "larger than %d bytes", WARP_STATE_MAX);
+			goto done;
+		}
+	}
+	char err[64];
+	if (hw_warp_state_parse(buf, len, st, err, sizeof(err)) != 0) {
+		snprintf(s->warp_why, sizeof(s->warp_why), "not a tunnel list (%s)", err);
+		goto done;
+	}
+	int dropped = hw_warp_state_restrict(st, s->cfg.udp_warp_marks, s->cfg.udp_warp_mark_count);
+	if (dropped > 0) {
+		HW_WARN("warp", "udp-warp-state %s: %d tunnel%s with a mark not in udp-warp-marks ignored",
+		        s->cfg.udp_warp_state, dropped, dropped == 1 ? "" : "s");
+	}
+	s->warp_read = st;
+	st = NULL;
+done:
+	if (fd >= 0) close(fd);
+	free(buf);
+	free(st);
+}
+
+void server_warp_refresh(hw_server *s, int running) {
+	const hw_server_config *cfg = &s->cfg;
+	const hw_warp_state *want = NULL;
+	char why[160];
+	struct stat sb;
+	if (stat(cfg->udp_warp_state, &sb) != 0) {
+		snprintf(why, sizeof(why), "%s", strerror(errno));
+		s->warp_seen = 0;
+		free(s->warp_read);
+		s->warp_read = NULL;
+	} else {
+		if (!s->warp_seen || (int64_t)sb.st_mtime != s->warp_mtime || (uint64_t)sb.st_ino != s->warp_ino ||
+		    (uint64_t)sb.st_size != s->warp_size) {
+			s->warp_seen = 1;
+			s->warp_mtime = (int64_t)sb.st_mtime;
+			s->warp_ino = (uint64_t)sb.st_ino;
+			s->warp_size = (uint64_t)sb.st_size;
+			warp_read_file(s);
+		}
+		long long age = (long long)time(NULL) - (long long)sb.st_mtime;
+		if (!s->warp_read) {
+			snprintf(why, sizeof(why), "%s", s->warp_why);
+		} else if (cfg->udp_warp_state_max_age_s > 0 && age > cfg->udp_warp_state_max_age_s) {
+			snprintf(why, sizeof(why), "not rewritten for %lld s", age);
+		} else {
+			want = s->warp_read;
+		}
+	}
+	int same = want ? s->warp_given && memcmp(want, s->warp_given, sizeof(*want)) == 0 : !s->warp_given;
+	if (same && s->warp_published) return;
+	if (!same) {
+		hw_warp_state *next = NULL;
+		if (want) {
+			next = malloc(sizeof(*next));
+			if (!next) return; // the next look tries again
+			memcpy(next, want, sizeof(*next));
+			HW_INFO("warp", "udp-warp-state: UDP goes through %d IPv4 and %d IPv6 tunnel%s", want->n4, want->n6,
+			        want->n6 == 1 ? "" : "s");
+		} else {
+			HW_WARN("warp", "udp-warp-state %s: %s; UDP streams go out unmarked", cfg->udp_warp_state, why);
+		}
+		free(s->warp_given);
+		s->warp_given = next;
+	}
+	s->warp_published = warp_publish(s, s->warp_given, running) == 0;
+}
+
+// Marking takes CAP_NET_ADMIN. Without it the server still runs, and its UDP goes out unmarked, as
+// it did before these keys existed: refusing to start would take the whole relay down over its
+// UDP's exit address. The log says so once, loudly.
+static void warp_init(hw_server *s) {
+	if (s->cfg.udp_warp_mark_count == 0) return;
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	int ok = fd >= 0 && hw_sys_set_mark(fd, s->cfg.udp_warp_marks[0]) == 0;
+	int e = errno;
+	if (fd >= 0) close(fd);
+	if (!ok) {
+		HW_ERROR("warp",
+		         "udp-warp-marks: this process cannot mark sockets (%s; it needs CAP_NET_ADMIN), so UDP "
+		         "streams go out unmarked",
+		         strerror(e));
+		return;
+	}
+	s->warp_on = 1;
+	server_warp_refresh(s, 0);
 }
 
 // ---------------------------------------------------------------------------------- maintenance
@@ -465,6 +649,7 @@ static void *maint_main(void *arg) {
 				}
 			}
 		}
+		if (s->warp_on && !stop) server_warp_refresh(s, 1);
 		if (stop) return NULL;
 	}
 }
@@ -609,6 +794,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 			goto fail;
 		}
 	}
+	warp_init(s);
 	return s;
 fail: {
 	int saved = errno;
@@ -711,6 +897,8 @@ void hw_server_free(hw_server *s) {
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
 	for (int i = 0; i < s->nworkers; i++) worker_destroy(&s->workers[i]);
+	free(s->warp_read);
+	free(s->warp_given);
 	free(s->webclient_page);
 	free(s->workers);
 	free(s);
@@ -741,6 +929,9 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->throttled_source = atomic_load(&s->throttled_source);
 	out->throttled_dest = atomic_load(&s->throttled_dest);
 	out->throttled_syns = atomic_load(&s->throttled_syns);
+	out->udp_warp_marked = atomic_load(&s->udp_warp_marked);
+	out->udp_warp_direct = atomic_load(&s->udp_warp_direct);
+	out->udp_warp_refused = atomic_load(&s->udp_warp_refused);
 	out->syn_signatures = atomic_load(&s->syn_signatures);
 	out->ws_closed_violations = atomic_load(&s->ws_closed_violations);
 	out->auth_failures = atomic_load(&s->auth_failures);
