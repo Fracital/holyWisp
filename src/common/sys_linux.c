@@ -45,7 +45,8 @@ int hw_sys_relay_pipe(int fds[2], size_t want, size_t min, size_t *size) {
 	long sz = fcntl(fds[1], F_SETPIPE_SZ, (int)want);
 	if (sz < (long)min) sz = fcntl(fds[1], F_SETPIPE_SZ, (int)min);
 	if (sz < (long)min) {
-		int saved = sz < 0 ? errno : ENOBUFS;
+		// EPERM is the same limit refusing an unprivileged resize outright: ENOBUFS, as promised.
+		int saved = sz >= 0 || errno == EPERM ? ENOBUFS : errno;
 		close(fds[0]);
 		close(fds[1]);
 		errno = saved;
