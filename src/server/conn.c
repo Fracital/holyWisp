@@ -715,7 +715,7 @@ static void http_reply(hw_conn *c, int status, const char *reason, const char *c
 static void stats_json(hw_conn *c) {
 	hw_server_stats st;
 	hw_server_stats_get(c->w->server, &st);
-	char body[1536]; // every counter at 20 digits still fits
+	char body[2048]; // every counter at 20 digits still fits
 	snprintf(body, sizeof(body),
 	         "{\"uptimeSeconds\":%llu,"
 	         "\"connections\":{\"total\":%llu,\"active\":%llu},"
@@ -725,6 +725,8 @@ static void stats_json(hw_conn *c) {
 	         "\"blocked\":{\"filter\":%llu,\"egress\":%llu},"
 	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu},"
 	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu},"
+	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu},"
+	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
 	         "\"synSignatures\":%llu,\"wsClosedViolations\":%llu,\"authFailures\":%llu,"
 	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu}}\n",
 	         (unsigned long long)st.uptime_s, (unsigned long long)st.connections_total,
@@ -735,10 +737,12 @@ static void stats_json(hw_conn *c) {
 	         (unsigned long long)st.blocked_egress, (unsigned long long)st.throttled_source,
 	         (unsigned long long)st.throttled_dest, (unsigned long long)st.throttled_syns,
 	         (unsigned long long)st.udp_warp_marked, (unsigned long long)st.udp_warp_direct,
-	         (unsigned long long)st.udp_warp_refused, (unsigned long long)st.syn_signatures,
-	         (unsigned long long)st.ws_closed_violations, (unsigned long long)st.auth_failures,
-	         (unsigned long long)st.dns_cache_entries, (unsigned long long)st.reputation_sources,
-	         (unsigned long long)st.reputation_dests);
+	         (unsigned long long)st.udp_warp_refused, (unsigned long long)st.tcp_warp_marked,
+	         (unsigned long long)st.tcp_warp_direct, (unsigned long long)st.tcp_warp_refused,
+	         (unsigned long long)st.tcp_proxied, (unsigned long long)st.tcp_direct,
+	         (unsigned long long)st.syn_signatures, (unsigned long long)st.ws_closed_violations,
+	         (unsigned long long)st.auth_failures, (unsigned long long)st.dns_cache_entries,
+	         (unsigned long long)st.reputation_sources, (unsigned long long)st.reputation_dests);
 	http_reply(c, 200, "OK", "application/json", body);
 }
 

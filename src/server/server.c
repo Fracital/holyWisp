@@ -52,6 +52,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->client_recv_buffer = 8u * 1024 * 1024;
 	cfg->max_streams_per_conn = 2048;
 	cfg->connect_timeout_ms = 15000;
+	cfg->family_fallback_ms = 3000;
 	cfg->handshake_timeout_ms = 10000;
 	cfg->client_write_timeout_s = 120;
 	cfg->resolver_threads = 4;
@@ -153,6 +154,18 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 	if (cfg->proxy_client_key_secret[0] && strlen(cfg->proxy_client_key_secret) < 16) {
 		// Never the value: it is a secret.
 		snprintf(err, err_cap, "proxy-client-key-secret must be at least 16 characters");
+		return -1;
+	}
+	if (cfg->proxy_only_to_count > 0 && !cfg->proxy[0]) {
+		snprintf(err, err_cap, "proxy-only-to needs a proxy");
+		return -1;
+	}
+	if (cfg->tcp_warp && cfg->udp_warp_mark_count == 0) {
+		snprintf(err, err_cap, "tcp-warp needs udp-warp-marks and udp-warp-state: they are its tunnels");
+		return -1;
+	}
+	if (cfg->tcp_warp && cfg->proxy[0] && cfg->proxy_only_to_count == 0) {
+		snprintf(err, err_cap, "tcp-warp marks TCP dialled here, and with a proxy and no proxy-only-to there is none");
 		return -1;
 	}
 	if (cfg->udp_warp_mark_count > 0 && !hw_sys_has_mark()) {
@@ -612,8 +625,11 @@ static void warp_init(hw_server *s) {
 	if (!ok) {
 		HW_ERROR("warp",
 		         "udp-warp-marks: this process cannot mark sockets (%s; it needs CAP_NET_ADMIN), so UDP "
-		         "streams go out unmarked",
-		         strerror(e));
+		         "streams go out unmarked%s",
+		         strerror(e),
+		         !s->cfg.tcp_warp                  ? ""
+		         : s->cfg.tcp_warp_fallback_direct ? ", and so does TCP dialled here (tcp-warp-fallback direct)"
+		                                           : ", and TCP dialled here is refused (tcp-warp-fallback refuse)");
 		return;
 	}
 	s->warp_on = 1;
@@ -952,6 +968,11 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->udp_warp_marked = atomic_load(&s->udp_warp_marked);
 	out->udp_warp_direct = atomic_load(&s->udp_warp_direct);
 	out->udp_warp_refused = atomic_load(&s->udp_warp_refused);
+	out->tcp_warp_marked = atomic_load(&s->tcp_warp_marked);
+	out->tcp_warp_direct = atomic_load(&s->tcp_warp_direct);
+	out->tcp_warp_refused = atomic_load(&s->tcp_warp_refused);
+	out->tcp_proxied = atomic_load(&s->tcp_proxied);
+	out->tcp_direct = atomic_load(&s->tcp_direct);
 	out->syn_signatures = atomic_load(&s->syn_signatures);
 	out->ws_closed_violations = atomic_load(&s->ws_closed_violations);
 	out->auth_failures = atomic_load(&s->auth_failures);

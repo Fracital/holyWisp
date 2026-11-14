@@ -101,6 +101,16 @@ typedef struct hw_server_config {
 	// random one per process, and then a restart gives every client a new key.
 	int proxy_client_key;
 	char proxy_client_key_secret[128];
+	// With a proxy: only a TCP stream with a resolved address in this list goes through it (by
+	// name, as always); every other one is dialled here. Empty: every TCP stream takes the proxy.
+	// The edges list the address their router's name gate answers for names it must see itself.
+	hw_cidr proxy_only_to[HW_MAX_CIDRS];
+	int proxy_only_to_count;
+	// TCP streams dialled here (no proxy, or not in proxy-only-to) are marked for the WARP tunnel
+	// the udp-warp state gives, as UDP is. Unlike UDP, no usable state, no tunnel for the family
+	// and a mark that cannot be set all follow tcp-warp-fallback: refuse (0) or unmarked (1).
+	int tcp_warp;
+	int tcp_warp_fallback_direct;
 	// UDP through WARP tunnels (Linux, CAP_NET_ADMIN): a UDP socket is given the firewall mark of
 	// the tunnel the edge router would send its site through (holywisp/warp.h). The marks the
 	// state file may choose from, and the file the router publishes its healthy tunnels in. Both,
@@ -128,7 +138,10 @@ typedef struct hw_server_config {
 	size_t client_recv_buffer;  // SO_RCVBUF on client sockets when socket_buffer_size is 0; 0 = kernel
 	int max_streams_per_conn;   // 0 = unlimited
 	int connect_timeout_ms;     // remote TCP connect
-	int handshake_timeout_ms;   // HTTP upgrade + v2 INFO exchange
+	// An attempt with an address of the other family still to try gets at most this long, so a
+	// name whose IPv6 (or IPv4) is broken is not a connect-timeout-ms wait. 0: the full timeout.
+	int family_fallback_ms;
+	int handshake_timeout_ms; // HTTP upgrade + v2 INFO exchange
 	// A client whose send queue holds bytes and has taken none of them for this long is closed:
 	// it is not reading, and everything the server keeps for it is memory it will never free.
 	// 0 = never.
@@ -175,6 +188,11 @@ typedef struct hw_server_stats {
 	uint64_t udp_warp_marked;  // UDP streams dialled through a WARP tunnel
 	uint64_t udp_warp_direct;  // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
 	uint64_t udp_warp_refused; // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
+	uint64_t tcp_warp_marked;  // TCP streams dialled here through a WARP tunnel (tcp-warp)
+	uint64_t tcp_warp_direct;  // ... dialled unmarked under tcp-warp-fallback direct
+	uint64_t tcp_warp_refused; // ... refused under tcp-warp-fallback refuse
+	uint64_t tcp_proxied;      // TCP streams that went through the proxy
+	uint64_t tcp_direct;       // TCP streams dialled here although a proxy is set (proxy-only-to)
 	uint64_t syn_signatures;   // SYN-flood matches
 	uint64_t ws_closed_violations;
 	uint64_t auth_failures;

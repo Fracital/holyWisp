@@ -184,6 +184,11 @@ struct hw_server {
 	_Atomic uint64_t udp_warp_marked;
 	_Atomic uint64_t udp_warp_direct;
 	_Atomic uint64_t udp_warp_refused;
+	_Atomic uint64_t tcp_warp_marked;
+	_Atomic uint64_t tcp_warp_direct;
+	_Atomic uint64_t tcp_warp_refused;
+	_Atomic uint64_t tcp_proxied;
+	_Atomic uint64_t tcp_direct;
 	_Atomic uint64_t syn_signatures;
 	_Atomic uint64_t ws_closed_violations;
 	_Atomic uint64_t auth_failures;
@@ -299,6 +304,7 @@ typedef struct hw_stream {
 	char dest[HW_IP_STR_LEN + 8]; // "ip:port" of the address being tried
 	char host[256];
 	int literal_host; // host is an IP literal: a proxy gets the address, not a name
+	int via_proxy;    // TCP through the proxy (decided once the addresses are known, begin_dial)
 	uint16_t port;
 	// Upstream proxy handshake.
 	enum proxy_phase proxy_phase;
@@ -402,6 +408,10 @@ void stream_adopt(hw_stream *s, int fd);
 // Allocate and register a stream in state RESOLVING with no fd. NULL when the connection refused
 // it (a CLOSE has been sent).
 hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t host_len, uint16_t port);
+
+// How long a connect to sa may take: connect-timeout-ms, or family-fallback-ms while an address
+// of the other family is still to be tried.
+int stream_attempt_timeout_ms(const hw_stream *s, const struct sockaddr *sa);
 
 // proxy.c
 // Parse "socks5://[user:pass@]host[:port]" (socks5h:// is the same thing) / "http://..." into out.

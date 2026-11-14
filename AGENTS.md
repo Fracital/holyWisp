@@ -211,7 +211,10 @@ runs on. The defaults deny everything that is not public unicast and every chang
   resolves to one public and one private address connects to the public one only. A literal IP in
   CONNECT additionally needs `allow-direct-ip`. With an upstream `proxy`, the check still runs
   here first, but the proxy is then handed the *hostname* (SOCKS5 ATYP 3, CONNECT `host:port`) so
-  a classifying router can resolve it itself; only a literal IP is sent as an address.
+  a classifying router can resolve it itself; only a literal IP is sent as an address. With
+  `proxy-only-to`, only a TCP stream that resolved into that list takes the proxy at all
+  (`stream_route_proxy`, decided per stream in `begin_dial`); the egress check before it is the
+  same either way.
 - Hostnames are passed to the resolver as given, but a NUL inside the host, an empty host, a port
   of 0 or a host over 255 bytes is `0x41` before anything is looked up. So is a host with a byte
   outside `[A-Za-z0-9._:\[\]-]` and `_` (`host_chars_ok` in `conn.c`), and a name whose last
@@ -233,7 +236,7 @@ runs on. The defaults deny everything that is not public unicast and every chang
   networks has to check what *it* resolved. abulxt's `edge-router.py` does (it resolves once,
   refuses anything not public, and dials or forwards the address it checked).
 
-## UDP on WARP (do not regress)
+## UDP and TCP on WARP (do not regress)
 
 On the abulxt edges, TCP streams leave through the edge router (a SOCKS5 `proxy`), which sends
 each one out through one of several kernel WARP tunnels, chosen by rendezvous hashing of the
@@ -241,6 +244,20 @@ stream's site. UDP never goes through the router (`proxy-udp = direct`), so with
 `udp-warp-marks` and `udp-warp-state` holyWisp marks each UDP socket (`SO_MARK`,
 `hw_sys_set_mark`) for the tunnel the router would have chosen. Then a site's QUIC and WebRTC
 leave from the same exit address as its TCP.
+
+The router is one Python process, and every byte it relays costs it a core (about 0.5 GiB/s for
+a whole box, measured 2026-11-13). So with `tcp-warp` and `proxy-only-to`, clean TCP does not go
+through it either: the router's name gate answers the names it must handle itself (shady, adult)
+with one address, `proxy-only-to` sends only streams that resolved there to the router (by name,
+as before), and holyWisp dials the rest itself, marked by the same pick, spliced like any stream.
+
+- **TCP is not UDP when the state is unusable.** A missing, stale or unreadable state, no tunnel
+  for the family and a mark that will not take all follow `tcp-warp-fallback` (`refuse` by
+  default, `0x42`, the router's REP_UNREACH), never "unmarked" by default: the router is what
+  keeps the state fresh, and a dead router is also a dead name gate. A refused address goes on
+  to the next one (another family may have its tunnels up, as the router's `dial()` does), and a
+  stream that ends that way sent no SYN, so it is not a failed dial for the SYN signature.
+- `tcp-warp` needs the `udp-warp` pair (its tunnels), and with a proxy it needs `proxy-only-to`.
 
 - **The choice is the router's, to the bit.** `holywisp/warp.h` repeats `edge-router.py`'s
   `site_key` (the last two labels, or three under a two-letter TLD whose second level is on its
@@ -274,7 +291,7 @@ leave from the same exit address as its TCP.
   not read the key picks "none" and is unaffected: either side can go first. Never send the
   address itself, and never let the key be made without a secret: unconfigured, it is random per
   process.
-- **What stays unmarked:** TCP (the router marks it), DNS (`dns.c`, the resolver threads) and
+- **What stays unmarked:** TCP through the router (the router marks it), DNS (`dns.c`, the resolver threads) and
   everything holyWisp opens for itself. The egress policy runs before the mark, as it always does.
   `test_warp` holds the vectors and the reader. `test_udp_warp` holds the state tracking and the
   streams: run it also as `unshare -Urn sh -c 'ip link set lo up && build/debug/test_udp_warp'`,
@@ -330,7 +347,7 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 - **The tables are keyed by what clients choose** (addresses, destinations), so `hw_smap` hashes
   with SipHash under a key drawn once per process from `hw_sys_random`. Do not hash client data
   with anything unkeyed, and do not persist or send a hash. The one hash that leaves the process
-  is the client key of `proxy-client-key` (see "UDP on WARP"), which is BLAKE2b under a secret of
+  is the client key of `proxy-client-key` (see "UDP and TCP on WARP"), which is BLAKE2b under a secret of
   its own, not the table key, and is sent to the proxy on purpose.
 - **Logs.** `hw_log` writes every control byte of the tag and message as `\xNN`; callers pass
   client strings as they are. A failed login is logged without the user name it tried, and a
@@ -592,7 +609,7 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `include/holywisp/wisp.h`, `src/common/wisp.c` | Wisp packet codec and constants. The wire format lives here and nowhere else. |
 | `include/holywisp/map.h`, `src/common/map.c` | `uint32_t -> void *` open-addressing map (stream id to stream). |
 | `include/holywisp/sha1.h`, `base64.h` | Only for `Sec-WebSocket-Accept`. |
-| `include/holywisp/warp.h`, `src/common/warp.c`, `blake2b.h`, `blake2b.c` | UDP on WARP: the edge router's site key, score and tunnel choice, the state file's reader, the mark list. |
+| `include/holywisp/warp.h`, `src/common/warp.c`, `blake2b.h`, `blake2b.c` | UDP and TCP on WARP: the edge router's site key, score and tunnel choice, the state file's reader, the mark list. |
 | `include/holywisp/log.h`, `src/common/log.c` | Levelled logging, one `write(2)` per line. |
 | `include/holywisp/server.h` | Public server API: config struct, new/start/stop/free, stats. |
 | `src/server/internal.h` | `hw_server`, `hw_worker`, `hw_conn`, `hw_stream` and the functions conn.c/stream.c share. |
@@ -615,7 +632,7 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
 | `tests/test_warp.c`, `tests/warp_vectors.h`, `tests/gen_warp_vectors.py` | The WARP tunnel choice against vectors generated from `edge-router.py`. |
-| `tests/test_udp_warp.c` | The state file as the server tracks it, and UDP streams marked, unmarked and refused. |
+| `tests/test_udp_warp.c` | The state file as the server tracks it, and UDP and TCP streams marked, unmarked and refused. |
 | `tests/test_abuse.c` | End-to-end from the attacker's side: each case is something a hostile client or remote did to the server before it was fixed. |
 | `tests/test_client.c`, `tests/test_log.c` | The client library against servers that misbehave; log lines that hold client bytes. |
 | `node/src/index.ts` | The npm package's `holyWisp` class: spawn, readiness, `route()`, stop, orphan cleanup. |

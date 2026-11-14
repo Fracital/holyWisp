@@ -55,7 +55,29 @@ static uint8_t map_errno(int err) {
 }
 
 static int stream_uses_proxy(const hw_stream *s) {
-	return s->conn->w->server->proxy.kind != PROXY_NONE && s->type == HW_STREAM_TCP;
+	return s->via_proxy;
+}
+
+// Whether a TCP stream with these addresses goes through the proxy: always, unless proxy-only-to
+// names the addresses that do. One match is enough; addrs[0] is then made that address, which is
+// the one the destination limits are counted against (and a literal one is what the proxy gets).
+static int stream_route_proxy(hw_stream *s) {
+	const hw_server *srv = s->conn->w->server;
+	if (srv->proxy.kind == PROXY_NONE || s->type != HW_STREAM_TCP) return 0;
+	const hw_server_config *cfg = &srv->cfg;
+	if (cfg->proxy_only_to_count == 0) return 1;
+	for (int i = 0; i < s->naddrs; i++) {
+		if (!hw_cidr_any_contains(cfg->proxy_only_to, cfg->proxy_only_to_count,
+		                          (const struct sockaddr *)&s->addrs[i])) {
+			continue;
+		}
+		if (i > 0) {
+			memcpy(&s->addrs[0], &s->addrs[i], s->addr_lens[i]);
+			s->addr_lens[0] = s->addr_lens[i];
+		}
+		return 1;
+	}
+	return 0;
 }
 
 // A terminal stream's fd is a PTY master, not a socket, so it takes read()/write(), not
@@ -403,51 +425,85 @@ static void stream_dest_set(hw_stream *s, const struct sockaddr *sa) {
 	snprintf(s->dest, sizeof(s->dest), "%s:%u", ipbuf, s->port);
 }
 
-// UDP on WARP (udp-warp-marks): mark the socket for the tunnel the edge router sends this
-// stream's site through (holywisp/warp.h), so the site's UDP and TCP leave from one exit. The key
-// is the site of the name, or for an IP literal the address as inet_ntop writes it, which is what
-// the router is handed for one. 0: dial it (marked, or unmarked because there is no state to go by
-// or udp-warp-fallback is direct). -1: refuse it, no tunnel healthy for its family.
+// WARP (udp-warp-marks): mark the socket for the tunnel the edge router sends this stream's site
+// through (holywisp/warp.h), so a site's UDP and TCP leave from one exit. The key is the site of
+// the name, or for an IP literal the address as inet_ntop writes it, which is what the router is
+// handed for one; with a client key, "key/site". For UDP, no usable state (no file, a stale one,
+// no capability) is UDP as before: unmarked. For TCP (tcp-warp) it follows tcp-warp-fallback, as
+// a stream the router could not mark would: the router is the one that keeps the state fresh.
+// 0: dial it (marked, or unmarked by the fallback). -1: refuse it.
 static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
 	hw_worker *w = s->conn->w;
 	hw_server *srv = w->server;
-	const hw_warp_state *st = w->warp;
-	if (!st) {
+	int tcp = s->type == HW_STREAM_TCP;
+	const hw_warp_state *st = srv->warp_on ? w->warp : NULL;
+	if (!st && !tcp) {
 		HW_STAT_INC(srv, udp_warp_direct);
 		return 0;
 	}
-	char site[256], key[HW_WARP_CLIENT_KEY_LEN + 1 + sizeof(site)];
 	int v6 = sa->sa_family == AF_INET6;
-	if (s->literal_host) {
-		const void *a = v6 ? (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr
-		                   : (const void *)&((const struct sockaddr_in *)sa)->sin_addr;
-		if (!inet_ntop(sa->sa_family, a, site, sizeof(site))) site[0] = '\0';
-	} else if (hw_warp_site_key(s->host, site, sizeof(site)) != 0) {
-		site[0] = '\0'; // cannot happen: the host and its site fit in the same 256 bytes
+	const hw_warp_tunnel *t = NULL;
+	if (st) {
+		char site[256], key[HW_WARP_CLIENT_KEY_LEN + 1 + sizeof(site)];
+		if (s->literal_host) {
+			const void *a = v6 ? (const void *)&((const struct sockaddr_in6 *)sa)->sin6_addr
+			                   : (const void *)&((const struct sockaddr_in *)sa)->sin_addr;
+			if (!inet_ntop(sa->sa_family, a, site, sizeof(site))) site[0] = '\0';
+		} else if (hw_warp_site_key(s->host, site, sizeof(site)) != 0) {
+			site[0] = '\0'; // cannot happen: the host and its site fit in the same 256 bytes
+		}
+		hw_warp_stream_key(s->conn->client_key, site, key, sizeof(key)); // it fits: the buffer is sized for it
+		t = hw_warp_pick(st, v6, key);
 	}
-	hw_warp_stream_key(s->conn->client_key, site, key, sizeof(key)); // it fits: the buffer is sized for it
-	const hw_warp_tunnel *t = hw_warp_pick(st, v6, key);
 	if (t && hw_sys_set_mark(s->fd, t->mark) == 0) {
-		HW_STAT_INC(srv, udp_warp_marked);
+		if (tcp) {
+			HW_STAT_INC(srv, tcp_warp_marked);
+		} else {
+			HW_STAT_INC(srv, udp_warp_marked);
+		}
 		return 0;
 	}
+	const char *why = t ? "cannot mark a socket" : st ? "no healthy WARP tunnel" : "no usable WARP state";
+	const char *proto = tcp ? "TCP" : "UDP";
+	int direct = tcp ? srv->cfg.tcp_warp_fallback_direct : srv->cfg.udp_warp_fallback_direct;
 	uint64_t now = hw_now_ms();
 	int warn = now - w->warp_warned_ms >= 60000 || w->warp_warned_ms == 0;
 	if (warn) w->warp_warned_ms = now;
-	if (srv->cfg.udp_warp_fallback_direct) {
+	if (direct) {
 		if (warn) {
-			HW_WARN("warp", "%s for %s: UDP goes out unmarked (udp-warp-fallback direct)",
-			        t ? "cannot mark a socket" : "no healthy WARP tunnel", v6 ? "IPv6" : "IPv4");
+			HW_WARN("warp", "%s for %s: %s goes out unmarked (%s-warp-fallback direct)", why, v6 ? "IPv6" : "IPv4",
+			        proto, tcp ? "tcp" : "udp");
 		}
-		HW_STAT_INC(srv, udp_warp_direct);
+		if (tcp) {
+			HW_STAT_INC(srv, tcp_warp_direct);
+		} else {
+			HW_STAT_INC(srv, udp_warp_direct);
+		}
 		return 0;
 	}
 	if (warn) {
-		HW_WARN("warp", "%s for %s: UDP streams are refused (udp-warp-fallback refuse)",
-		        t ? "cannot mark a socket" : "no healthy WARP tunnel", v6 ? "IPv6" : "IPv4");
+		HW_WARN("warp", "%s for %s: %s streams are refused (%s-warp-fallback refuse)", why, v6 ? "IPv6" : "IPv4", proto,
+		        tcp ? "tcp" : "udp");
 	}
-	HW_STAT_INC(srv, udp_warp_refused);
+	if (tcp) {
+		HW_STAT_INC(srv, tcp_warp_refused);
+	} else {
+		HW_STAT_INC(srv, udp_warp_refused);
+	}
 	return -1;
+}
+
+// How long one connect may take: connect-timeout-ms, but no more than family-fallback-ms while an
+// address of the other family is still to be tried (the sequential, never racing, fallback the
+// edge router does: TCP and UDP must not land on two families).
+int stream_attempt_timeout_ms(const hw_stream *s, const struct sockaddr *sa) {
+	const hw_server_config *cfg = &s->conn->w->server->cfg;
+	int t = cfg->connect_timeout_ms;
+	if (s->via_proxy || cfg->family_fallback_ms <= 0 || cfg->family_fallback_ms >= t) return t;
+	for (int i = s->addr_idx; i < s->naddrs; i++) {
+		if (s->addrs[i].ss_family != sa->sa_family) return cfg->family_fallback_ms;
+	}
+	return t;
 }
 
 // Try the next resolved address. With the proxy on, "the address" is the proxy and we try it once.
@@ -458,6 +514,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 	hw_conn *c = s->conn;
 	hw_server *srv = c->w->server;
 	int proxying = stream_uses_proxy(s);
+	int warp_refused = 0; // the last address tried was refused for want of a WARP tunnel
 	for (;;) {
 		const struct sockaddr *sa;
 		socklen_t sl;
@@ -485,9 +542,17 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			last_errno = errno;
 			continue;
 		}
-		if (s->type == HW_STREAM_UDP && srv->warp_on && stream_warp_mark(s, sa) != 0) {
+		int mark = s->type == HW_STREAM_UDP ? srv->warp_on : !proxying && srv->cfg.tcp_warp;
+		if (mark && stream_warp_mark(s, sa) != 0) {
 			close(s->fd);
 			s->fd = -1;
+			if (s->type == HW_STREAM_TCP) {
+				// The next address may be of the other family, whose tunnels may be up: the router
+				// goes on to it too. Failing them all is 0x42, its REP_UNREACH.
+				last_errno = ENETUNREACH;
+				warp_refused = 1;
+				continue;
+			}
 			// 0x42, as a TCP stream gets then: the router answers REP_UNREACH when it cannot dial.
 			stream_close(s, HW_CLOSE_UNREACHABLE, 1);
 			return;
@@ -509,6 +574,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			}
 		}
 		s->denied = 0; // an address is being dialled: the stream ends with what the dial finds
+		warp_refused = 0;
 		int r = connect(s->fd, sa, sl);
 		last_errno = r == 0 ? 0 : errno;
 		if (r == 0 || last_errno == EINPROGRESS) {
@@ -521,7 +587,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 					return;
 				}
 				s->state = STREAM_CONNECTING;
-				s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)srv->cfg.connect_timeout_ms, 0,
+				s->connect_timer = hw_loop_add_timer(c->w->loop, (uint64_t)stream_attempt_timeout_ms(s, sa), 0,
 				                                     connect_timeout_cb, s);
 				return;
 			}
@@ -536,6 +602,12 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 		stream_close(s, s->denied, 1);
 		return;
 	}
+	if (warp_refused) {
+		// No SYN left for it: the tunnels are down, which is nothing the client did, so it is not
+		// a failed dial for the SYN signature either.
+		stream_close(s, HW_CLOSE_UNREACHABLE, 1);
+		return;
+	}
 	if (signature_record(s, 0)) return;
 	HW_DEBUG("stream", "%s: stream %u to %s:%u failed: %s", c->peer, s->id, s->host, s->port, strerror(last_errno));
 	if (srv->cfg.flood.log_blocked_dials) {
@@ -545,6 +617,14 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 }
 
 static void begin_dial(hw_stream *s) {
+	s->via_proxy = stream_route_proxy(s);
+	if (s->type == HW_STREAM_TCP && s->conn->w->server->proxy.kind != PROXY_NONE) {
+		if (s->via_proxy) {
+			HW_STAT_INC(s->conn->w->server, tcp_proxied);
+		} else {
+			HW_STAT_INC(s->conn->w->server, tcp_direct);
+		}
+	}
 	stream_connect_next(s, EHOSTUNREACH);
 }
 

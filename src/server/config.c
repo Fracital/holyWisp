@@ -120,6 +120,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	// Where streams go.
 	STR_KEY("proxy", proxy)
 	BOOL_KEY("proxy-client-key", proxy_client_key)
+	BOOL_KEY("tcp-warp", tcp_warp)
 	STR_KEY("proxy-client-key-secret", proxy_client_key_secret)
 	STR_KEY("udp-warp-state", udp_warp_state)
 	INT_KEY("udp-warp-state-max-age-s", udp_warp_state_max_age_s, 0, 86400)
@@ -133,6 +134,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("client-recv-buffer", client_recv_buffer, 0, 1LL << 30)
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
 	INT_KEY("connect-timeout-ms", connect_timeout_ms, 100, 600000)
+	INT_KEY("family-fallback-ms", family_fallback_ms, 0, 600000)
 	INT_KEY("handshake-timeout-ms", handshake_timeout_ms, 100, 600000)
 	INT_KEY("client-write-timeout-s", client_write_timeout_s, 0, 86400)
 	INT_KEY("idle-timeout-s", idle_timeout_s, 0, 86400 * 30)
@@ -170,6 +172,25 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		int count = hw_warp_marks_parse(value, cfg->udp_warp_marks, HW_WARP_MAX_TUNNELS);
 		if (count < 0) goto bad_value;
 		cfg->udp_warp_mark_count = count;
+		return 0;
+	}
+	if (!strcmp(key, "proxy-only-to")) {
+		if (cfg->proxy_only_to_count >= HW_MAX_CIDRS) {
+			snprintf(err, err_cap, "too many proxy-only-to entries");
+			return -1;
+		}
+		if (hw_cidr_parse(value, &cfg->proxy_only_to[cfg->proxy_only_to_count]) != 0) goto bad_value;
+		cfg->proxy_only_to_count++;
+		return 0;
+	}
+	if (!strcmp(key, "tcp-warp-fallback")) {
+		if (!strcmp(value, "direct")) {
+			cfg->tcp_warp_fallback_direct = 1;
+		} else if (!strcmp(value, "refuse")) {
+			cfg->tcp_warp_fallback_direct = 0;
+		} else {
+			goto bad_value;
+		}
 		return 0;
 	}
 	if (!strcmp(key, "udp-warp-fallback")) {
@@ -389,7 +410,7 @@ void hw_config_usage(const char *argv0) {
 	    "  bandwidth-limit-kbps                      per-IP bandwidth cap, each direction (0 = off)\n"
 	    "  flood-protection                          master switch for the limits below (on)\n",
 	    argv0);
-	// Two calls: one string literal may not be longer than 4095 bytes.
+	// Three calls: one string literal may not be longer than 4095 bytes.
 	printf(
 	    "  max-connects-per-source-per-second        per client IP (500)\n"
 	    "  max-connects-per-dest-per-second/-minute  per destination ip:port (100 / 3000)\n"
@@ -405,6 +426,8 @@ void hw_config_usage(const char *argv0) {
 	    "  reputation-weight EVENT:N, reputation-dest-weight EVENT:N\n"
 	    "  proxy URL                                 upstream socks5:// (socks5h://) or http:// for outbound TCP\n"
 	    "  proxy-udp direct|refuse                   with a proxy: relay UDP directly, or refuse it (refuse)\n"
+	    "  proxy-only-to CIDR                        with a proxy: only TCP that resolved into these goes through it;\n"
+	    "                                            the rest is dialled here (repeatable; none = all TCP proxied)\n"
 	    "  proxy-client-key BOOL                     give the proxy a key per client as its user name, and pick\n"
 	    "                                            a WARP tunnel for UDP by client and site (off)\n"
 	    "  proxy-client-key-secret S                 what the keys are made with, 16+ characters (random per start)\n"
@@ -412,29 +435,32 @@ void hw_config_usage(const char *argv0) {
 	    "  udp-warp-state PATH                       the router's healthy tunnels (JSON), re-read when it changes\n"
 	    "  udp-warp-state-max-age-s                  an older state file is ignored: UDP goes unmarked (60; 0 = never)\n"
 	    "  udp-warp-fallback direct|refuse           no healthy tunnel for the family: unmarked, or refuse (refuse)\n"
-	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
-	    "  buffer-remaining                          CONTINUE window in packets (128)\n"
-	    "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
-	    "                                            0x49), per client (256 MiB, pauses its reads)\n"
-	    "  max-message-size, ws-write-high-water, socket-buffer-size\n"
-	    "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
-	    "                                            it (8 MiB; 0 = leave to the kernel)\n"
-	    "  max-streams-per-conn                      0 = unlimited (2048)\n"
-	    "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
-	    "  client-write-timeout-s                    close a client that has read nothing of what is queued\n"
-	    "                                            for it for this long (120; 0 = never)\n"
-	    "  idle-timeout-s                            close a client with no streams that sent nothing for\n"
-	    "                                            this long (0 = never)\n"
-	    "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
-	    "                                            before sleeping: lower latency, more CPU (0 = off)\n"
-	    "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
-	    "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
-	    "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
-	    "  log-level                                 debug|info|warn|error|none (info)\n"
-	    "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
-	    "                                            holds a pipe to it, never under a service manager (off)\n"
-	    "\n"
-	    "  --version, --help\n");
+	    "  tcp-warp BOOL                             mark TCP dialled here (not proxied) from the same state (off)\n"
+	    "  tcp-warp-fallback direct|refuse           TCP with no tunnel, no usable state or no mark (refuse)\n"
+	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n");
+	printf("  buffer-remaining                          CONTINUE window in packets (128)\n"
+	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
+	       "                                            0x49), per client (256 MiB, pauses its reads)\n"
+	       "  max-message-size, ws-write-high-water, socket-buffer-size\n"
+	       "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
+	       "                                            it (8 MiB; 0 = leave to the kernel)\n"
+	       "  max-streams-per-conn                      0 = unlimited (2048)\n"
+	       "  connect-timeout-ms, handshake-timeout-ms  15000, 10000\n"
+	       "  family-fallback-ms                        a connect with the other family still to try: at most (3000)\n"
+	       "  client-write-timeout-s                    close a client that has read nothing of what is queued\n"
+	       "                                            for it for this long (120; 0 = never)\n"
+	       "  idle-timeout-s                            close a client with no streams that sent nothing for\n"
+	       "                                            this long (0 = never)\n"
+	       "  busy-poll-us                              after a busy loop iteration, poll this many microseconds\n"
+	       "                                            before sleeping: lower latency, more CPU (0 = off)\n"
+	       "  resolver-threads, tcp-nodelay, tcp-quickack, listen-backlog, non-ws-response\n"
+	       "  serve-webclient                           serve the built-in browser client on GET / (on)\n"
+	       "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
+	       "  log-level                                 debug|info|warn|error|none (info)\n"
+	       "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
+	       "                                            holds a pipe to it, never under a service manager (off)\n"
+	       "\n"
+	       "  --version, --help\n");
 }
 
 int hw_config_parse_args(hw_server_config *cfg, int argc, char **argv, char *err, size_t err_cap) {

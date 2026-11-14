@@ -833,6 +833,65 @@ static void test_proxy_client_key(void) {
 	CHECK(hw_server_new(&bad) == NULL, "a 5-character proxy-client-key-secret");
 }
 
+// proxy-only-to: with a proxy, only TCP whose resolved address is on the list goes through it;
+// the rest is dialled here. On the edges the list is the address the router's name gate answers
+// for the names it must see itself, so every other stream skips a hop through Python.
+static void test_proxy_only_to(void) {
+	int pfd;
+	uint16_t pport = start_listener(NULL, &pfd);
+	spawn(socks5_proxy_main, pfd);
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "socks5h://127.0.0.1:%u", pport);
+	hw_server_stats st;
+
+	// Not on the list: dialled here, the proxy never hears of it.
+	CHECK_EQ(hw_cidr_parse("192.0.2.1", &cfg.proxy_only_to[0]), 0);
+	cfg.proxy_only_to_count = 1;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	int before = atomic_load(&g_socks5_requests);
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	CHECK(echo_once(c, sid, "dialled-here"), "echo dialled here");
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	CHECK(echo_once(c, sid, "a-literal-dialled-here"), "a literal dialled here");
+	CHECK_EQ(atomic_load(&g_socks5_requests), before);
+	hw_client_free(c);
+	usleep(20000);
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.tcp_direct, 2);
+	CHECK_EQ(st.tcp_proxied, 0);
+	hw_server_free(s);
+
+	// On the list: through the proxy, by name, as before; and a name with an address on the list
+	// among others is the proxy's too.
+	CHECK_EQ(hw_cidr_parse("127.0.0.0/8", &cfg.proxy_only_to[0]), 0);
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	c = connect_plain(s);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	CHECK(echo_once(c, sid, "through-the-proxy"), "echo through the proxy");
+	CHECK_EQ(atomic_load(&g_socks5_requests), before + 1);
+	CHECK_EQ(atomic_load(&g_socks5_atyp), 3);
+	CHECK_STR(g_socks5_host, "localhost");
+	hw_client_free(c);
+	usleep(20000);
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.tcp_proxied, 1);
+	CHECK_EQ(st.tcp_direct, 0);
+	hw_server_free(s);
+	shutdown(pfd, SHUT_RDWR);
+
+	// A list with no proxy to send anything to is a mistake.
+	cfg.proxy[0] = '\0';
+	char err[256];
+	CHECK_EQ(hw_server_config_validate(&cfg, err, sizeof(err)), -1);
+}
+
 // The upstream SOCKS5 router classifies destinations by name, so a hostname must reach it as an
 // ATYP 3 domain, unresolved, and `socks5h://` (what the wispurr deployments use) must be accepted.
 // A literal IP still goes as ATYP 1, and the egress policy still runs on what the name resolves
@@ -1124,6 +1183,7 @@ int main(void) {
 	RUN(test_socks5_proxy);
 	RUN(test_socks5_proxy_hostname);
 	RUN(test_proxy_client_key);
+	RUN(test_proxy_only_to);
 	RUN(test_data_queued_during_proxy_connect);
 	RUN(test_proxy_reset_after_reply);
 	RUN(test_proxy_reply_without_status);
