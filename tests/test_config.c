@@ -132,6 +132,26 @@ static void test_proxy_client_key_keys(void) {
 	CHECK(strstr(err, "qqqq") == NULL, "the secret in the error: %s", err);
 }
 
+static void test_warp_bypass_host_key(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	// The edge router reads the same list: these are the spellings both take, and only these.
+	const char *good[] = {"youtube.com", "*.youtube.com", " .reddit.com", "Reddit.COM."};
+	for (size_t i = 0; i < sizeof(good) / sizeof(good[0]); i++) {
+		CHECK_EQ(hw_config_set(&cfg, "warp-bypass-host", good[i], err, sizeof(err)), 0);
+	}
+	CHECK_EQ(cfg.warp_bypass_hosts.count, 4);
+	CHECK(hw_hostlist_allows(&cfg.warp_bypass_hosts, "m.youtube.com", 13), "subdomain");
+	CHECK(hw_hostlist_allows(&cfg.warp_bypass_hosts, "reddit.com", 10), "exact");
+	CHECK(!hw_hostlist_allows(&cfg.warp_bypass_hosts, "notyoutube.com", 14), "suffix is not a subdomain");
+	const char *bad[] = {"", ".", "*.", "*", "you*tube.com", "*.*.youtube.com", "*youtube.com", "*. "};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		CHECK(hw_config_set(&cfg, "warp-bypass-host", bad[i], err, sizeof(err)) != 0, "accepted '%s'", bad[i]);
+	}
+	CHECK_EQ(cfg.warp_bypass_hosts.count, 4);
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -145,6 +165,7 @@ int main(void) {
 	RUN(test_busy_poll_key);
 	RUN(test_stop_on_stdin_eof_key);
 	RUN(test_proxy_client_key_keys);
+	RUN(test_warp_bypass_host_key);
 	RUN(test_shipped_configs);
 	return 0;
 }

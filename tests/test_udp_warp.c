@@ -221,7 +221,7 @@ static void test_state_tracking(void) {
 
 // One stream of this type to its echo service, by literal IP. 1 when the bytes came back, 0 when
 // the stream was closed (its reason in *reason).
-static int roundtrip(hw_server *s, uint8_t type, uint8_t *reason) {
+static int roundtrip_to(hw_server *s, uint8_t type, const char *host, uint8_t *reason) {
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
 	o.host = "127.0.0.1";
@@ -232,7 +232,7 @@ static int roundtrip(hw_server *s, uint8_t type, uint8_t *reason) {
 	CHECK(c != NULL, "connect: %s", err);
 	if (!c) return 0;
 	uint32_t sid;
-	CHECK_EQ(hw_client_open(c, type, "127.0.0.1", type == HW_STREAM_UDP ? g_udp_echo_port : g_tcp_echo_port, &sid), 0);
+	CHECK_EQ(hw_client_open(c, type, host, type == HW_STREAM_UDP ? g_udp_echo_port : g_tcp_echo_port, &sid), 0);
 	CHECK_EQ(hw_client_send(c, sid, "ping", 4), 0);
 	int got = 0;
 	*reason = 0;
@@ -253,6 +253,10 @@ static int roundtrip(hw_server *s, uint8_t type, uint8_t *reason) {
 	}
 	hw_client_free(c);
 	return got;
+}
+
+static int roundtrip(hw_server *s, uint8_t type, uint8_t *reason) {
+	return roundtrip_to(s, type, "127.0.0.1", reason);
 }
 
 static int udp_roundtrip(hw_server *s, uint8_t *reason) {
@@ -464,6 +468,51 @@ static void test_family_fallback(void) {
 	CHECK_EQ(stream_attempt_timeout_ms(&s, a6), 15000);
 }
 
+// warp-bypass-host: a listed name goes out unmarked whatever WARP would have said, UDP and TCP
+// dialled here alike; the same name's subdomain pattern does not take the apex.
+static void test_bypass_hosts(void) {
+	uint8_t reason;
+	hw_server_stats st;
+	// No tunnel for IPv4 and fallback refuse: everything else is refused.
+	write_state("{\"v4\": [], \"v6\": [{\"name\": \"warp0\", \"mark\": 30465}]}");
+	hw_server_config cfg;
+	base_config(&cfg, 0);
+	cfg.tcp_warp = 1;
+	cfg.dns_order = HW_DNS_IPV4_FIRST; // localhost's 127.0.0.1, where the echo services are
+	CHECK_EQ(hw_hostlist_add(&cfg.warp_bypass_hosts, "*.localhost"), 0);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	s->warp_on = 1;
+	server_warp_refresh(s, 0);
+	CHECK_EQ(hw_server_start(s), 0);
+	CHECK_EQ(roundtrip_to(s, HW_STREAM_UDP, "localhost", &reason), 0); // "*.localhost" is not localhost
+	CHECK_EQ(reason, HW_CLOSE_UNREACHABLE);
+	hw_server_free(s);
+
+	CHECK_EQ(hw_hostlist_add(&cfg.warp_bypass_hosts, "localhost"), 0);
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	s->warp_on = 1;
+	server_warp_refresh(s, 0);
+	CHECK_EQ(hw_server_start(s), 0);
+	CHECK_EQ(roundtrip_to(s, HW_STREAM_UDP, "localhost", &reason), 1);
+	CHECK_EQ(roundtrip_to(s, HW_STREAM_TCP, "LocalHost.", &reason), 1);
+	CHECK_EQ(roundtrip(s, HW_STREAM_TCP, &reason), 0); // the literal is not on the list
+	stats(s, &st);
+	CHECK_EQ(st.udp_warp_bypassed, 1);
+	CHECK_EQ(st.tcp_warp_bypassed, 1);
+	CHECK_EQ(st.udp_warp_marked + st.tcp_warp_marked, 0);
+	hw_server_free(s);
+	unlink(g_state);
+
+	// A list with no WARP to bypass is a mistake.
+	cfg.udp_warp_mark_count = 0;
+	cfg.udp_warp_state[0] = '\0';
+	cfg.tcp_warp = 0;
+	char err[256];
+	CHECK_EQ(hw_server_config_validate(&cfg, err, sizeof(err)), -1);
+}
+
 int main(void) {
 	hw_log_set_level(HW_LOG_NONE);
 	if (!hw_sys_has_mark()) {
@@ -483,6 +532,7 @@ int main(void) {
 	RUN(test_udp_streams);
 	RUN(test_tcp_streams);
 	RUN(test_family_fallback);
+	RUN(test_bypass_hosts);
 	unlink(g_state);
 	rmdir(dir);
 	return 0;

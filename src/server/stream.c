@@ -436,6 +436,16 @@ static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
 	hw_worker *w = s->conn->w;
 	hw_server *srv = w->server;
 	int tcp = s->type == HW_STREAM_TCP;
+	// A name kept off WARP goes out unmarked, whatever the state, the capability or the fallback
+	// say: the router dials its TCP the same way. An IP literal is never on the list.
+	if (!s->literal_host && hw_hostlist_allows(&srv->cfg.warp_bypass_hosts, s->host, strlen(s->host))) {
+		if (tcp) {
+			HW_STAT_INC(srv, tcp_warp_bypassed);
+		} else {
+			HW_STAT_INC(srv, udp_warp_bypassed);
+		}
+		return 0;
+	}
 	const hw_warp_state *st = srv->warp_on ? w->warp : NULL;
 	if (!st && !tcp) {
 		HW_STAT_INC(srv, udp_warp_direct);

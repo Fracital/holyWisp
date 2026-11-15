@@ -111,6 +111,10 @@ typedef struct hw_server_config {
 	// and a mark that cannot be set all follow tcp-warp-fallback: refuse (0) or unmarked (1).
 	int tcp_warp;
 	int tcp_warp_fallback_direct;
+	// Names whose streams never go through WARP: unmarked, whatever the state says, UDP and TCP
+	// dialled here alike ("youtube.com" exactly, "*.youtube.com" its subdomains). The router is
+	// given the same list for the TCP it dials, so such a site leaves from one address.
+	hw_hostlist warp_bypass_hosts;
 	// UDP through WARP tunnels (Linux, CAP_NET_ADMIN): a UDP socket is given the firewall mark of
 	// the tunnel the edge router would send its site through (holywisp/warp.h). The marks the
 	// state file may choose from, and the file the router publishes its healthy tunnels in. Both,
@@ -180,20 +184,22 @@ typedef struct hw_server_stats {
 	uint64_t refused_connection_rate;
 	uint64_t refused_connection_limit;
 	uint64_t refused_reputation;
-	uint64_t blocked_filter;   // host/port lists
-	uint64_t blocked_egress;   // address policy
-	uint64_t throttled_source; // per-source connect rate
-	uint64_t throttled_dest;   // per-destination connect rate
-	uint64_t throttled_syns;   // in-flight SYN cap
-	uint64_t udp_warp_marked;  // UDP streams dialled through a WARP tunnel
-	uint64_t udp_warp_direct;  // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
-	uint64_t udp_warp_refused; // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
-	uint64_t tcp_warp_marked;  // TCP streams dialled here through a WARP tunnel (tcp-warp)
-	uint64_t tcp_warp_direct;  // ... dialled unmarked under tcp-warp-fallback direct
-	uint64_t tcp_warp_refused; // ... refused under tcp-warp-fallback refuse
-	uint64_t tcp_proxied;      // TCP streams that went through the proxy
-	uint64_t tcp_direct;       // TCP streams dialled here although a proxy is set (proxy-only-to)
-	uint64_t syn_signatures;   // SYN-flood matches
+	uint64_t blocked_filter;    // host/port lists
+	uint64_t blocked_egress;    // address policy
+	uint64_t throttled_source;  // per-source connect rate
+	uint64_t throttled_dest;    // per-destination connect rate
+	uint64_t throttled_syns;    // in-flight SYN cap
+	uint64_t udp_warp_marked;   // UDP streams dialled through a WARP tunnel
+	uint64_t udp_warp_direct;   // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
+	uint64_t udp_warp_refused;  // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
+	uint64_t tcp_warp_marked;   // TCP streams dialled here through a WARP tunnel (tcp-warp)
+	uint64_t tcp_warp_direct;   // ... dialled unmarked under tcp-warp-fallback direct
+	uint64_t tcp_warp_refused;  // ... refused under tcp-warp-fallback refuse
+	uint64_t udp_warp_bypassed; // UDP streams to a warp-bypass-host name, sent unmarked
+	uint64_t tcp_warp_bypassed; // TCP streams dialled here to a warp-bypass-host name, unmarked
+	uint64_t tcp_proxied;       // TCP streams that went through the proxy
+	uint64_t tcp_direct;        // TCP streams dialled here although a proxy is set (proxy-only-to)
+	uint64_t syn_signatures;    // SYN-flood matches
 	uint64_t ws_closed_violations;
 	uint64_t auth_failures;
 	uint64_t dns_cache_entries;

@@ -156,6 +156,10 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "proxy-client-key-secret must be at least 16 characters");
 		return -1;
 	}
+	if (cfg->warp_bypass_hosts.count > 0 && cfg->udp_warp_mark_count == 0) {
+		snprintf(err, err_cap, "warp-bypass-host needs udp-warp-marks and udp-warp-state: there is no WARP to bypass");
+		return -1;
+	}
 	if (cfg->proxy_only_to_count > 0 && !cfg->proxy[0]) {
 		snprintf(err, err_cap, "proxy-only-to needs a proxy");
 		return -1;
@@ -971,6 +975,8 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->tcp_warp_marked = atomic_load(&s->tcp_warp_marked);
 	out->tcp_warp_direct = atomic_load(&s->tcp_warp_direct);
 	out->tcp_warp_refused = atomic_load(&s->tcp_warp_refused);
+	out->udp_warp_bypassed = atomic_load(&s->udp_warp_bypassed);
+	out->tcp_warp_bypassed = atomic_load(&s->tcp_warp_bypassed);
 	out->tcp_proxied = atomic_load(&s->tcp_proxied);
 	out->tcp_direct = atomic_load(&s->tcp_direct);
 	out->syn_signatures = atomic_load(&s->syn_signatures);

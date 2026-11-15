@@ -258,6 +258,11 @@ as before), and holyWisp dials the rest itself, marked by the same pick, spliced
   to the next one (another family may have its tunnels up, as the router's `dial()` does), and a
   stream that ends that way sent no SYN, so it is not a failed dial for the SYN signature.
 - `tcp-warp` needs the `udp-warp` pair (its tunnels), and with a proxy it needs `proxy-only-to`.
+- **`warp-bypass-host` comes first.** A listed name (the `hw_hostlist` patterns: `name` exactly,
+  `*.name` its subdomains, never an IP literal) is unmarked before any state, capability or
+  fallback is consulted, for UDP and for TCP dialled here. The router has its own copy of the
+  list (`warp_bypass` in edge-router.json, from the same Ansible variable) for the TCP it dials;
+  the two must be equal, or one site's TCP and UDP leave from two addresses.
 
 - **The choice is the router's, to the bit.** `holywisp/warp.h` repeats `edge-router.py`'s
   `site_key` (the last two labels, or three under a two-letter TLD whose second level is on its

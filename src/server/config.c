@@ -215,9 +215,17 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		}
 		return 0;
 	}
-	if (!strcmp(key, "allow-host") || !strcmp(key, "block-host")) {
-		hw_hostlist *l = key[0] == 'a' ? &cfg->allow_hosts : &cfg->block_hosts;
-		if (hw_hostlist_add(l, value) != 0) {
+	if (!strcmp(key, "allow-host") || !strcmp(key, "block-host") || !strcmp(key, "warp-bypass-host")) {
+		hw_hostlist *l = key[0] == 'a'   ? &cfg->allow_hosts
+		                 : key[0] == 'b' ? &cfg->block_hosts
+		                                 : &cfg->warp_bypass_hosts;
+		/* The edge router reads the same list and takes only a leading "*." as a wildcard; a
+		 * '*' anywhere else is refused on both sides, so the two cannot disagree about it. */
+		const char *star = strchr(value, '*');
+		int bad_star = l == &cfg->warp_bypass_hosts && star &&
+		               (star != value + strspn(value, " \t") || star[1] != '.' || strchr(star + 1, '*') ||
+		                strspn(star + 2, ". \t") == strlen(star + 2));
+		if (bad_star || hw_hostlist_add(l, value) != 0) {
 			snprintf(err, err_cap, "%s: list full or invalid host '%s'", key, value);
 			return -1;
 		}
@@ -437,6 +445,7 @@ void hw_config_usage(const char *argv0) {
 	    "  udp-warp-fallback direct|refuse           no healthy tunnel for the family: unmarked, or refuse (refuse)\n"
 	    "  tcp-warp BOOL                             mark TCP dialled here (not proxied) from the same state (off)\n"
 	    "  tcp-warp-fallback direct|refuse           TCP with no tunnel, no usable state or no mark (refuse)\n"
+	    "  warp-bypass-host NAME                     never through WARP: unmarked ('*.name' = its subdomains)\n"
 	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n");
 	printf("  buffer-remaining                          CONTINUE window in packets (128)\n"
 	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"

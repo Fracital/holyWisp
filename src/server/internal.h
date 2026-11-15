@@ -187,6 +187,8 @@ struct hw_server {
 	_Atomic uint64_t tcp_warp_marked;
 	_Atomic uint64_t tcp_warp_direct;
 	_Atomic uint64_t tcp_warp_refused;
+	_Atomic uint64_t udp_warp_bypassed;
+	_Atomic uint64_t tcp_warp_bypassed;
 	_Atomic uint64_t tcp_proxied;
 	_Atomic uint64_t tcp_direct;
 	_Atomic uint64_t syn_signatures;

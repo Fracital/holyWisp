@@ -724,8 +724,8 @@ static void stats_json(hw_conn *c) {
 	         "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},"
 	         "\"blocked\":{\"filter\":%llu,\"egress\":%llu},"
 	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu},"
-	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu},"
-	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu},"
+	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
+	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
 	         "\"synSignatures\":%llu,\"wsClosedViolations\":%llu,\"authFailures\":%llu,"
 	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu}}\n",
@@ -737,8 +737,9 @@ static void stats_json(hw_conn *c) {
 	         (unsigned long long)st.blocked_egress, (unsigned long long)st.throttled_source,
 	         (unsigned long long)st.throttled_dest, (unsigned long long)st.throttled_syns,
 	         (unsigned long long)st.udp_warp_marked, (unsigned long long)st.udp_warp_direct,
-	         (unsigned long long)st.udp_warp_refused, (unsigned long long)st.tcp_warp_marked,
-	         (unsigned long long)st.tcp_warp_direct, (unsigned long long)st.tcp_warp_refused,
+	         (unsigned long long)st.udp_warp_refused, (unsigned long long)st.udp_warp_bypassed,
+	         (unsigned long long)st.tcp_warp_marked, (unsigned long long)st.tcp_warp_direct,
+	         (unsigned long long)st.tcp_warp_refused, (unsigned long long)st.tcp_warp_bypassed,
 	         (unsigned long long)st.tcp_proxied, (unsigned long long)st.tcp_direct,
 	         (unsigned long long)st.syn_signatures, (unsigned long long)st.ws_closed_violations,
 	         (unsigned long long)st.auth_failures, (unsigned long long)st.dns_cache_entries,

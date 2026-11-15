@@ -106,6 +106,10 @@ reputation-strict = 81
 # proxy-only-to = 192.0.2.1
 # tcp-warp = off
 # tcp-warp-fallback = refuse                 # refuse | direct
+# Names kept off WARP altogether (UDP and TCP dialled here go out unmarked). The router must be
+# given the same list for the TCP it dials. "*.name" is its subdomains, "name" the name itself.
+# warp-bypass-host = example.com
+# warp-bypass-host = *.example.com
 # Exit per client and site rather than per site: the proxy's user name is a key for each client
 # (never its address), and the UDP pick above uses it too. Keep the secret, or a restart moves
 # every client to another exit.
