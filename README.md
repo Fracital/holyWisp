@@ -294,36 +294,45 @@ server in each row in bold.
 
 | scenario | holyWisp | finalwisp | wispurr C++23 | wispurr Go | epoxy-server | wisp-server-python |
 | --- | --- | --- | --- | --- | --- | --- |
-| wisp-js, 10 streams | **794** | 781 | 690 | 752 | 474 | 427 |
-| wisp-js, 5 connections x 10 streams | 3,217 | **3,248** | 2,715 | 3,098 | 2,153 | 1,634 |
-| native client, 1 stream | 2,588 | 2,583 | **2,856** | 1,843 | 581 | 420 |
-| native client, 10 streams | **2,204** | 2,105 | 2,142 | 1,510 | 615 | 389 |
-| native client, 10 streams, 1 MiB packets | 2,125 | 2,133 | **2,171** | 1,263 | 739 | did not finish |
-| native client, 8 connections x 4 streams | **9,746** | 9,533 | 8,534 | 5,178 | 5,773 | 2,715 |
-| native client, 16 connections x 4 streams | 8,378 | **9,055** | 6,844 | 4,693 | 6,289 | 3,137 |
-| 64 B round trip, p50 / p99 | **53 / 89 us** | 54 / 90.5 us | 53 / 90 us | 80 / 162 us | 58 / 92 us | 156 / 219 us |
-| stream churn, lifecycles/s (server cores) | **257,594** (7.0) | 251,411 (6.5) | 236,038 (6.8) | 137,431 (9.6) | 56,915 (6.1) | 37,283 (6.0) |
-| peak RSS under stream churn | 3.8 MiB | **3.4 MiB** | 53 MiB | 878 MiB | 2,085 MiB | 506 MiB |
+| wisp-js, 10 streams | 647 | **704** | 625 | 639 | 361 | 391 |
+| wisp-js, 5 connections x 10 streams | 3,345 | **3,351** | 2,794 | 3,236 | 2,229 | 1,676 |
+| native client, 1 stream | 2,591 | 2,330 | **2,914** | 1,678 | 484 | 443 |
+| native client, 10 streams | 1,936 | 1,963 | **2,210** | 1,067 | 505 | 302 |
+| native client, 10 streams, 1 MiB packets | 1,942 | 2,202 | **2,314** | 1,081 | 598 | did not finish |
+| native client, 8 connections x 4 streams | **10,475** | 9,972 | 9,098 | 5,395 | 5,990 | 2,969 |
+| native client, 16 connections x 4 streams | 8,744 | **9,413** | 7,143 | 4,886 | 6,608 | 3,317 |
+| 64 B round trip, p50 / p99 | **78.5 / 136 us** | 81 / 143 us | 80 / 142 us | 118 / 314 us | 85 / 152 us | 180 / 554 us |
+| stream churn, lifecycles/s (server cores) | **262,431** (7.0) | 229,821 (6.1) | 239,041 (6.8) | 131,966 (9.6) | 60,258 (6.3) | 37,884 (6.0) |
+| peak RSS under stream churn | 4.0 MiB | **3.4 MiB** | 55 MiB | 888 MiB | 2,208 MiB | 506 MiB |
 
 holyWisp, finalwisp and the C++23 wispurr are the three fastest servers here, and each leads
-somewhere. holyWisp leads with 8 connections by 2% and at opening and closing streams by 2% over
-finalwisp and 9% over the C++23 wispurr; the first is inside finalwisp's spread (9,051 to 10,196
-MiB/s). finalwisp leads with 16 connections by 8%, where all 16 cores are busy. The C++23 wispurr
-leads with one stream by 10%; holyWisp's runs there span 2,422 to 2,776 MiB/s and its 2,642 to
-2,993. With 10 streams, with 1 MiB packets and behind one wisp-js connection the three are within
-each other's spread; with five wisp-js connections holyWisp, finalwisp and the Go wispurr are, and
-the C++23 wispurr is 16% behind. holyWisp, finalwisp, the C++23 wispurr and epoxy-server are within
-5 us of each other on the median round trip, and holyWisp and finalwisp both stay under 4 MiB of
-memory under churn.
+somewhere. holyWisp leads with 8 connections by 5% over finalwisp and 15% over the C++23 wispurr,
+and at opening and closing streams by 10% over the C++23 wispurr and 14% over finalwisp. finalwisp
+leads with 16 connections by 8%. That row leaves no core idle on the host, and it measures how many
+of them a server's threads take from the 16 clients and the echo service as much as the server's
+cost per byte. holyWisp spreads the connections over all sixteen of its workers, and finalwisp's
+default leaves five or six of its sixteen threads without one. Measured afterwards on the same host,
+finalwisp with `--balance`, which spreads them as holyWisp does, relayed 13% less than holyWisp, and
+holyWisp with `--workers=12` 4% more than finalwisp ([bench/RESULTS.md](bench/RESULTS.md)). The
+C++23 wispurr leads on one native connection: by 12% with one stream, 13% with 10 streams and 5%
+with 1 MiB packets over the next server. Those rows are bimodal on this host (holyWisp's 10-stream
+runs span 1,667 to 2,242 MiB/s), and holyWisp's lower medians there than on 2026-11-12 are not a
+regression: eight alternating runs of this build and the one measured then gave overlapping ranges
+and medians within noise in every one-connection row. Behind five wisp-js connections finalwisp and
+holyWisp are within 1% of each other and the Go wispurr 3% behind them; behind one, the four fastest
+servers' runs overlap (holyWisp's span 519 to 908 MiB/s, finalwisp's 511 to 891). holyWisp,
+finalwisp, the C++23 wispurr and epoxy-server are within 7 us of each other on the median round
+trip, and holyWisp and finalwisp both stay under 4 MiB of memory under churn.
 
-epoxy-server, the Rust server that epoxy's Wisp client is made for, relays 59 to 69% of the
-leader's throughput with several connections, a fifth to a third of it on one connection, and a
-fifth of the leader's streams per second under churn. It relays 320 to 750 MiB per CPU-second
-where holyWisp relays 1,700 to 2,600, and its memory reached 2 GiB under churn.
+epoxy-server, the Rust server that epoxy's Wisp client is made for, relays 57 to 70% of the
+leader's throughput with several connections, a sixth to a quarter of it with the native client on
+one connection, and under a quarter of the leader's streams per second under churn. It relays 250 to
+770 MiB per CPU-second where holyWisp relays 1,550 to 2,630, and its memory passed 2 GiB under churn.
 
-The round-trip figure depends on where in the run order a server was measured;
-[bench/RESULTS.md](bench/RESULTS.md) breaks that down. Results move with the host: an earlier run
-on a desktop Ryzen 9 7950X ranked several of these rows differently.
+The round-trip figure depends on where in the run order a server was measured, and on the day: every
+server's median is 24 to 38 us longer than in the run of 2026-11-12, the servers that did not change
+included. [bench/RESULTS.md](bench/RESULTS.md) breaks that down. Results move with the host: an earlier
+run on a desktop Ryzen 9 7950X ranked several of these rows differently.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="bench/charts/throughput-dark.png">
