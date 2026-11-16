@@ -6,7 +6,7 @@
 %global debug_package %{nil}
 
 Name:           holywisp
-Version:        %{?hw_version}%{!?hw_version:0.5.3}
+Version:        %{?hw_version}%{!?hw_version:0.5.4}
 Release:        %{?hw_release}%{!?hw_release:2}%{?dist}
 Summary:        A Wisp v1/v2 server in C with no runtime dependencies
 
@@ -114,8 +114,11 @@ chown -h wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
 %{_bindir}/holywisp-client
 
 %changelog
-* Thu Nov 12 2026 holyWisp maintainers <noreply@example.com> - 0.5.3-2
+* Mon Nov 16 2026 David Reed <reedswork@proton.me> - 0.5.4-2
+- New upstream version (the tree after the 0.5.3 release).
+
+* Thu Nov 12 2026 David Reed <reedswork@proton.me> - 0.5.3-2
 - The client is its own package, holywisp-client; the server package no longer carries it.
 
-* Wed Nov 05 2025 holyWisp maintainers <noreply@example.com> - 0.1.0-1
+* Wed Nov 05 2025 David Reed <reedswork@proton.me> - 0.1.0-1
 - Initial package: hardened systemd service running as the dedicated wisp user.

@@ -22,11 +22,11 @@ starts a hardened systemd service listening on `127.0.0.1:6001`:
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.3-2_amd64.deb
-sudo apt install ./holywisp_0.5.3-2_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.4-2_amd64.deb
+sudo apt install ./holywisp_0.5.4-2_amd64.deb
 
 # Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.3-2.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.4-2.fc41.x86_64.rpm
 
 sudo systemctl status holywisp            # running as user "wisp", sandboxed
 sudoedit /etc/holywisp/holywisp.conf      # then: sudo systemctl restart holywisp
@@ -38,11 +38,11 @@ for both):
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.3-2_amd64.deb
-sudo apt install ./holywisp-client_0.5.3-2_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.4-2_amd64.deb
+sudo apt install ./holywisp-client_0.5.4-2_amd64.deb
 
 # Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.3-2.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.4-2.fc41.x86_64.rpm
 
 # Any glibc 2.35+ Linux (x64 or arm64)
 curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-linux-x64.tar.gz | tar xz
@@ -267,7 +267,7 @@ npm install holywisp@nightly    # the newest commit of master that passed its te
 ```
 
 A release is a `v<version>` tag. Master is published every night as `holywisp@nightly`: a version
-reads `0.5.3-nightly.202611110643.g1a2b3c4` (the version in `node/package.json`, the UTC time, the
+reads `0.5.4-nightly.202611110643.g1a2b3c4` (the version in `node/package.json`, the UTC time, the
 commit), and `holywisp --version` inside it says the same. A commit is published once, only after
 `Build` passed on it and the tarball was installed and run on every platform it carries. Both come
 from CI without a stored token (npm trusted publishing) and with provenance. Pin the exact nightly

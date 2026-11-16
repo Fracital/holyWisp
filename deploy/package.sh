@@ -15,7 +15,7 @@ out="$root/build/packages"
 # Version: an explicit HW_VERSION wins, but only if it looks like a version (starts with a digit);
 # otherwise, and by default, read it from CMakeLists. This keeps an untagged "master" build from
 # producing an invalid package version.
-default_version="$(grep -oE 'project\(holyWisp VERSION [0-9.]+' "$root/CMakeLists.txt" | grep -oE '[0-9.]+' || echo 0.5.3)"
+default_version="$(grep -oE 'project\(holyWisp VERSION [0-9.]+' "$root/CMakeLists.txt" | grep -oE '[0-9.]+' || echo 0.5.4)"
 version="${HW_VERSION:-}"
 case "$version" in
 	[0-9]*) ;;
@@ -105,7 +105,7 @@ build_deb_server() {
 Package: holywisp
 Version: $version-$pkg_release
 Architecture: $arch_deb
-Maintainer: holyWisp maintainers <noreply@example.com>
+Maintainer: David Reed <reedswork@proton.me>
 Installed-Size: $isize
 Depends: libc6, libcrypt1, adduser
 Suggests: holywisp-client
@@ -149,7 +149,7 @@ build_deb_client() {
 Package: holywisp-client
 Version: $version-$pkg_release
 Architecture: $arch_deb
-Maintainer: holyWisp maintainers <noreply@example.com>
+Maintainer: David Reed <reedswork@proton.me>
 Installed-Size: $isize
 Depends: libc6, libcrypt1
 Replaces: holywisp (<< $client_split)
