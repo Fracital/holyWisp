@@ -153,6 +153,8 @@ export type holyWispConfig = {
 	socketBufferSize?: number;
 	clientRecvBuffer?: number;
 	connectTimeoutMs?: number;
+	/** A connect with an address of the other family still to try gives up after this (default 3000, 0 off). */
+	familyFallbackMs?: number;
 	handshakeTimeoutSeconds?: number;
 	/** A client that takes nothing of what is queued for it this long is closed (default 120, 0 off). */
 	clientWriteTimeoutSeconds?: number;
@@ -495,6 +497,7 @@ export function workerArgs(
 	int("socket-buffer-size", "socketBufferSize", config.socketBufferSize);
 	int("client-recv-buffer", "clientRecvBuffer", config.clientRecvBuffer);
 	int("connect-timeout-ms", "connectTimeoutMs", config.connectTimeoutMs);
+	int("family-fallback-ms", "familyFallbackMs", config.familyFallbackMs);
 	int("handshake-timeout-ms", "handshakeTimeoutSeconds", config.handshakeTimeoutSeconds, 1000);
 	int("client-write-timeout-s", "clientWriteTimeoutSeconds", config.clientWriteTimeoutSeconds);
 	int("idle-timeout-s", "idleTimeoutSeconds", config.idleTimeoutSeconds);

@@ -147,10 +147,15 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `bufferRemainingLength`, `maxMessageSize` | `buffer-remaining`, `max-message-size` |
 | `wsWriteHighWater`, `streamQueueMax`, `connQueueMax` | `ws-write-high-water`, `stream-queue-max`, `conn-queue-max` |
 | `socketBufferSize`, `clientRecvBuffer`, `listenBacklog` | `socket-buffer-size`, `client-recv-buffer`, `listen-backlog` |
-| `connectTimeoutMs`, `handshakeTimeoutSeconds`, `clientWriteTimeoutSeconds`, `idleTimeoutSeconds` | `connect-timeout-ms`, `handshake-timeout-ms`, `client-write-timeout-s`, `idle-timeout-s` |
+| `connectTimeoutMs`, `familyFallbackMs`, `handshakeTimeoutSeconds`, `clientWriteTimeoutSeconds`, `idleTimeoutSeconds` | `connect-timeout-ms`, `family-fallback-ms`, `handshake-timeout-ms`, `client-write-timeout-s`, `idle-timeout-s` |
 | `resolverThreads`, `busyPollUs`, `tcpNoDelay`, `tcpQuickAck` | `resolver-threads`, `busy-poll-us`, `tcp-nodelay`, `tcp-quickack` |
 | `nonWSResponse`, `serveWebclient`, `webclientWispUrl` | `non-ws-response`, `serve-webclient`, `webclient-wisp-url` |
 | `logLevel` (default `warn`) | `log-level` |
+
+The keys for running behind a routing proxy on WARP tunnels (`proxy-only-to`, `proxy-client-key`,
+`udp-warp-*`, `tcp-warp*`, `warp-bypass-host`) have no option here: they are for an edge that runs
+the binary under its own service manager (the abulxt fleet), not for a server inside a Node
+process. Run `holywisp --config` for those.
 
 The egress defaults deny everything that is not a public address. `allowLoopbackIPs` and
 `allowPrivateIPs` open the machine and the network this runs on to every client: leave them off

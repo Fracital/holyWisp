@@ -133,6 +133,12 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   `trusted-header`, for a proxy that overwrites it), but only from trusted proxy CIDRs, taking the
   right-most untrusted address in the chain. `trusted-proxy-secret` additionally requires a
   shared secret on the request, for a proxy that shares its address with other local processes.
+- **Upstream proxy and WARP routing.** `proxy` sends TCP through a SOCKS5 or HTTP CONNECT proxy,
+  which is handed the hostname, after the egress check here. `proxy-only-to` sends only the
+  streams that resolved to the given addresses there and dials the rest directly. The
+  `udp-warp-*` and `tcp-warp*` keys mark each socket for the WARP tunnel an edge router would pick
+  for its site, and `warp-bypass-host` keeps named sites off WARP. These are what the
+  wisp.baby edges run.
 - **WebSocket strictness.** Client frames must be masked; reserved bits, text frames and oversize
   messages are rejected per RFC 6455.
 - **Hardened by default when installed.** The systemd unit runs as the unprivileged, shell-less
