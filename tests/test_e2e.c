@@ -491,6 +491,10 @@ static uint16_t closed_udp_port(void) {
 // A UDP stream to a closed port closes as unreachable at once, however its datagrams arrive. The
 // port unreachable for one datagram is a pending error that the next send can collect before the
 // read side sees it, so a client that sends two at a time (a QUIC Initial flight) is the case.
+// A closed UDP port reaches holyWisp as a pending ECONNREFUSED on Linux and macOS. On Windows
+// holyWisp turns that report off (SIO_UDP_CONNRESET in src/compat/win32/posix.c), so a datagram
+// to a closed port is simply lost there and the stream stays open, and this test does not apply.
+#ifndef _WIN32
 static void test_udp_port_unreachable(void) {
 	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
 	uint8_t dgram[1200];
@@ -509,6 +513,7 @@ static void test_udp_port_unreachable(void) {
 	hw_client_free(c);
 	wait_streams_idle(g_server);
 }
+#endif
 
 static void test_hostname_resolution(void) {
 	// "localhost" goes through the resolver thread pool; the echo server listens on 0.0.0.0,
@@ -879,7 +884,9 @@ int main(void) {
 	RUN(test_remote_eof_closes_stream);
 	RUN(test_close_toward_remote);
 	RUN(test_connection_refused);
+#ifndef _WIN32
 	RUN(test_udp_port_unreachable);
+#endif
 	RUN(test_hostname_resolution);
 	RUN(test_invalid_connect);
 	RUN(test_egress_blocked);
