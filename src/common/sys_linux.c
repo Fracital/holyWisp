@@ -87,6 +87,10 @@ int hw_sys_random(void *buf, size_t len) {
 	return 0;
 }
 
+int hw_sys_has_udp_unreachable(void) {
+	return 1;
+}
+
 int hw_sys_has_mark(void) {
 	return 1;
 }

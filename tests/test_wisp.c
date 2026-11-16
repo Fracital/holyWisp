@@ -3,6 +3,22 @@
 
 #include "test.h"
 
+// The 16-bit little-endian pair (a CONNECT's port) reads and writes exactly two bytes, low first.
+static void test_le16(void) {
+	static const uint16_t values[] = {0, 1, 0x00FF, 0x0100, 0x01BB, 0x8000, 0xFFFF};
+	for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		uint8_t b[4] = {0xA5, 0xA5, 0xA5, 0xA5};
+		hw_put_le16(b + 1, values[i]);
+		CHECK_EQ(b[1], values[i] & 0xFF);
+		CHECK_EQ(b[2], values[i] >> 8);
+		CHECK(b[0] == 0xA5 && b[3] == 0xA5, "wrote outside its two bytes for 0x%x", values[i]);
+		CHECK_EQ(hw_le16(b + 1), values[i]);
+	}
+	const uint8_t wire[] = {0x34, 0x12, 0xFF, 0x80};
+	CHECK_EQ(hw_le16(wire), 0x1234);
+	CHECK_EQ(hw_le16(wire + 2), 0x80FF); // a high bit in either byte is not a sign
+}
+
 static void test_header_roundtrip(void) {
 	uint8_t hdr[HW_WISP_HEADER_LEN];
 	hw_wisp_write_header(hdr, HW_WISP_DATA, 0xDEADBEEF);
@@ -110,6 +126,7 @@ static void test_info_client_password(void) {
 }
 
 int main(void) {
+	RUN(test_le16);
 	RUN(test_header_roundtrip);
 	RUN(test_connect);
 	RUN(test_continue_close);

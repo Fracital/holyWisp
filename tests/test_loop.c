@@ -82,6 +82,41 @@ static void *poster(void *arg) {
 	return NULL;
 }
 
+static void *stopper(void *arg) {
+	usleep(10000);
+	hw_loop_stop(arg);
+	return NULL;
+}
+
+// A loop is not stopped until hw_loop_stop, from its own thread or another, and then it stays so.
+static void test_loop_stopped(void) {
+	hw_loop *loop = hw_loop_new();
+	CHECK(loop != NULL, "loop");
+	CHECK_EQ(hw_loop_stopped(loop), 0);
+	CHECK_EQ(hw_loop_run_once(loop, 0), 0);
+	CHECK_EQ(hw_loop_stopped(loop), 0);
+	pthread_t th;
+	CHECK_EQ(pthread_create(&th, NULL, stopper, loop), 0);
+	CHECK_EQ(hw_loop_run(loop), 0);
+	pthread_join(th, NULL);
+	CHECK_EQ(hw_loop_stopped(loop), 1);
+	CHECK_EQ(hw_loop_run_once(loop, 0), 0);
+	CHECK_EQ(hw_loop_stopped(loop), 1);
+	// Running a stopped loop returns at once.
+	uint64_t start = hw_now_ms();
+	CHECK_EQ(hw_loop_run(loop), 0);
+	CHECK(hw_now_ms() - start < 1000, "run on a stopped loop returned after %llu ms",
+	      (unsigned long long)(hw_now_ms() - start));
+	hw_loop_free(loop);
+
+	loop = hw_loop_new();
+	hw_loop_stop(loop);
+	CHECK_EQ(hw_loop_stopped(loop), 1);
+	hw_loop_stop(loop);
+	CHECK_EQ(hw_loop_stopped(loop), 1);
+	hw_loop_free(loop);
+}
+
 static int g_pipe_bytes;
 
 static void pipe_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
@@ -238,6 +273,7 @@ int main(void) {
 	RUN(test_timers_fire_in_order);
 	RUN(test_repeating_timer_cancels_itself);
 	RUN(test_post_from_other_thread);
+	RUN(test_loop_stopped);
 	RUN(test_fd_events);
 	RUN(test_batch_end_hook);
 	RUN(test_busy_poll);

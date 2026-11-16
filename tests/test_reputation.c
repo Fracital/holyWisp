@@ -187,6 +187,78 @@ static void test_load_depth_is_bounded(void) {
 	unlink(path);
 }
 
+// Eviction drops an entry that is both stale (not seen for evict_after_days) and low, from either
+// table. A high score is kept however old, and a recent one however low. The old entries come
+// from a store file, since a score made here is seen now.
+static void test_evict(void) {
+	char path[512];
+	store_path(path, sizeof(path));
+	FILE *f = fopen(path, "w");
+	CHECK(f != NULL, "write %s", path);
+	// lastSeen 1000 is 1970: older than any number of days.
+	fputs("{\"sources\":{"
+	      "\"198.51.100.1\":{\"score\":0,\"firstSeen\":1000,\"lastSeen\":1000,\"events\":{}},"
+	      "\"198.51.100.2\":{\"score\":60,\"firstSeen\":1000,\"lastSeen\":1000,\"events\":{}}},"
+	      "\"destinations\":{"
+	      "\"192.0.2.1:80\":{\"score\":1,\"firstSeen\":1000,\"lastSeen\":1000,\"events\":{}},"
+	      "\"192.0.2.2:80\":{\"score\":90,\"firstSeen\":1000,\"lastSeen\":1000,\"events\":{}}}}",
+	      f);
+	fclose(f);
+
+	hw_reputation_config cfg;
+	hw_reputation_config_defaults(&cfg);
+	snprintf(cfg.store_path, sizeof(cfg.store_path), "%s", path);
+	hw_reputation *r = hw_reputation_new(&cfg);
+	CHECK_EQ(hw_reputation_load(r), 0);
+	hw_reputation_add_source(r, "198.51.100.3", HW_REP_SUCCESSFUL_STREAM); // seen now, score 0
+	hw_reputation_add_dest(r, "192.0.2.3:80", HW_REP_SUCCESSFUL_STREAM, NULL);
+	size_t sources, dests;
+	hw_reputation_counts(r, &sources, &dests);
+	CHECK_EQ(sources, 3);
+	CHECK_EQ(dests, 3);
+
+	hw_reputation_evict(r);
+	hw_reputation_counts(r, &sources, &dests);
+	CHECK_EQ(sources, 2);
+	CHECK_EQ(dests, 2);
+	CHECK_EQ(hw_reputation_source_score(r, "198.51.100.2"), 60);
+	CHECK_EQ(hw_reputation_dest_score(r, "192.0.2.2:80"), 90);
+	// An evicted source starts again from nothing: its first event is all it has.
+	hw_reputation_add_source(r, "198.51.100.1", HW_REP_BURST_RATE);
+	CHECK_EQ(hw_reputation_source_score(r, "198.51.100.1"), cfg.source_weights[HW_REP_BURST_RATE]);
+	hw_reputation_free(r);
+
+	// evict_after_days 0 turns eviction off.
+	cfg.evict_after_days = 0;
+	r = hw_reputation_new(&cfg);
+	CHECK_EQ(hw_reputation_load(r), 0);
+	hw_reputation_evict(r);
+	hw_reputation_counts(r, &sources, &dests);
+	CHECK_EQ(sources, 2);
+	CHECK_EQ(dests, 2);
+	hw_reputation_free(r);
+	hw_reputation_evict(NULL);
+	unlink(path);
+}
+
+// Each tier has a name of its own.
+static void test_tier_names(void) {
+	CHECK_STR(hw_rep_tier_name(HW_TIER_NORMAL), "normal");
+	CHECK_STR(hw_rep_tier_name(HW_TIER_WARN), "warn");
+	CHECK_STR(hw_rep_tier_name(HW_TIER_THROTTLE), "throttle");
+	CHECK_STR(hw_rep_tier_name(HW_TIER_STRICT), "strict");
+	// A threshold of 0 turns its tier off: the score falls to the next tier down.
+	hw_reputation_config cfg;
+	hw_reputation_config_defaults(&cfg);
+	cfg.throttle = 0;
+	hw_reputation *r = hw_reputation_new(&cfg);
+	CHECK_EQ(hw_reputation_tier(r, cfg.strict - 1), HW_TIER_WARN);
+	CHECK_EQ(hw_reputation_tier(r, cfg.strict), HW_TIER_STRICT);
+	CHECK_EQ(hw_reputation_tier(r, cfg.warn - 1), HW_TIER_NORMAL);
+	hw_reputation_free(r);
+	CHECK_EQ(hw_reputation_tier(NULL, 100), HW_TIER_NORMAL);
+}
+
 static void test_event_names(void) {
 	for (int i = 0; i < HW_REP_EVENT_COUNT; i++) {
 		const char *name = hw_rep_event_name(i);
@@ -202,5 +274,7 @@ int main(void) {
 	RUN(test_save_makes_its_own_temp_file);
 	RUN(test_load_depth_is_bounded);
 	RUN(test_event_names);
+	RUN(test_evict);
+	RUN(test_tier_names);
 	return 0;
 }

@@ -61,6 +61,12 @@ int hw_sys_has_close_reset(void);
 // dropped on its way to the peer. 1 when the connection was reset, 0 when it was closed.
 int hw_sys_close_reset(int fd);
 
+// Whether a datagram that a socket from hw_sys_socket sends to a port nothing listens on comes back
+// as an error on that socket (ECONNREFUSED from a later send or receive on a connected socket), so
+// a UDP stream to a closed port can be closed as unreachable. 0 where such a datagram is just lost
+// and the socket goes on as if it had been delivered.
+int hw_sys_has_udp_unreachable(void);
+
 // Whether hw_sys_set_mark can work at all here.
 int hw_sys_has_mark(void);
 // Give a socket a firewall mark (Linux SO_MARK), which policy routing can send out another way:

@@ -83,6 +83,30 @@ static void test_bandwidth(void) {
 	CHECK(hw_bandwidth_new(0) == NULL, "zero rate disables");
 }
 
+// Eviction forgets a key that has been idle for longer than asked, and with it what the key owed:
+// it is charged as a new key again. A key used more recently than that keeps its debt.
+static void test_bandwidth_evict(void) {
+	hw_bandwidth *b = hw_bandwidth_new(1024 * 1024);
+	CHECK(b != NULL, "new");
+	uint64_t wait = 0;
+	for (int i = 0; i < 8; i++) wait = hw_bandwidth_charge(b, "busy", 1024 * 1024);
+	CHECK(wait > 5000, "8 MiB at 1 MiB/s owes seconds, got %llu ms", (unsigned long long)wait);
+	for (int i = 0; i < 8; i++) wait = hw_bandwidth_charge(b, "kept", 1024 * 1024);
+	CHECK(wait > 5000, "and so does the other key");
+	usleep(20000);
+	// Idle for 20 ms is not idle for a minute: both keep what they owe.
+	hw_bandwidth_evict(b, 60000);
+	CHECK(hw_bandwidth_charge(b, "busy", 1) > 5000, "evicted a key that was not idle long enough");
+	usleep(200000);
+	hw_bandwidth_charge(b, "kept", 1);
+	// "busy" has now been idle for 200 ms, "kept" for none: only the first is forgotten.
+	hw_bandwidth_evict(b, 100);
+	CHECK_EQ(hw_bandwidth_charge(b, "busy", 1024), 0);
+	CHECK(hw_bandwidth_charge(b, "kept", 1) > 5000, "evicted a key that was just used");
+	hw_bandwidth_free(b);
+	hw_bandwidth_evict(NULL, 0); // no limit, nothing to evict
+}
+
 static void test_sigdet(void) {
 	hw_sigdet d;
 	memset(&d, 0, sizeof(d));
@@ -111,6 +135,7 @@ int main(void) {
 	RUN(test_semaphore);
 	RUN(test_gauge);
 	RUN(test_bandwidth);
+	RUN(test_bandwidth_evict);
 	RUN(test_sigdet);
 	return 0;
 }

@@ -154,6 +154,31 @@ static void test_cidr(void) {
 	CHECK_EQ(hw_cidr_parse("10.0.0.0/40", &bad), -1);
 }
 
+static int any_contains(const hw_cidr *list, int n, const char *ip) {
+	struct sockaddr_storage ss;
+	socklen_t sl;
+	CHECK_EQ(hw_addr_parse(ip, 0, &ss, &sl), 1);
+	return hw_cidr_any_contains(list, n, (struct sockaddr *)&ss);
+}
+
+// A list contains an address when any one of its entries does, of either family.
+static void test_cidr_any(void) {
+	hw_cidr list[3];
+	CHECK_EQ(hw_cidr_parse("10.0.0.0/8", &list[0]), 0);
+	CHECK_EQ(hw_cidr_parse("2001:db8::/32", &list[1]), 0);
+	CHECK_EQ(hw_cidr_parse("192.0.2.7", &list[2]), 0);
+	CHECK(any_contains(list, 3, "10.200.0.1"), "first entry");
+	CHECK(any_contains(list, 3, "2001:db8::5"), "middle entry");
+	CHECK(any_contains(list, 3, "192.0.2.7"), "last entry");
+	CHECK(any_contains(list, 3, "::ffff:192.0.2.7"), "mapped v4 in a v4 entry");
+	CHECK(!any_contains(list, 3, "192.0.2.8"), "in none");
+	CHECK(!any_contains(list, 3, "2001:db9::1"), "v6 in none");
+	// Only the first n entries count, and an empty list contains nothing.
+	CHECK(!any_contains(list, 2, "192.0.2.7"), "past n");
+	CHECK(!any_contains(list, 0, "10.0.0.1"), "empty list");
+	CHECK(!any_contains(NULL, 0, "10.0.0.1"), "no list");
+}
+
 static hw_cidr g_trusted[2];
 
 // hw_real_ip for a peer and one trusted header given as its instances (NULL-terminated).
@@ -312,6 +337,7 @@ int main(void) {
 	RUN(test_hostlist_long_names);
 	RUN(test_portset);
 	RUN(test_cidr);
+	RUN(test_cidr_any);
 	RUN(test_real_ip);
 	RUN(test_real_ip_ports);
 	RUN(test_real_ip_stops);

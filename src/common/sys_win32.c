@@ -112,6 +112,12 @@ int hw_sys_random(void *buf, size_t len) {
 	return 0;
 }
 
+// Winsock would report it, but the compat layer turns that off for every datagram socket
+// (SIO_UDP_CONNRESET in src/compat/win32/posix.c), so a datagram to a closed port is lost.
+int hw_sys_has_udp_unreachable(void) {
+	return 0;
+}
+
 // Windows has no socket marks for policy routing.
 int hw_sys_has_mark(void) {
 	return 0;

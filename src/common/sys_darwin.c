@@ -84,6 +84,10 @@ int hw_sys_random(void *buf, size_t len) {
 	return 0;
 }
 
+int hw_sys_has_udp_unreachable(void) {
+	return 1;
+}
+
 // macOS has no socket marks for policy routing.
 int hw_sys_has_mark(void) {
 	return 0;

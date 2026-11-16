@@ -198,6 +198,83 @@ static void test_order(void) {
 	CHECK_EQ(res.addrs[2].ss_family, AF_INET);
 }
 
+// Every address the result holds gets the port, whatever its family; the addresses themselves and
+// the slots past the count are left alone.
+static void test_set_port(void) {
+	hw_dns_result res;
+	memset(&res, 0, sizeof(res));
+	struct sockaddr_in *v4 = (struct sockaddr_in *)&res.addrs[0];
+	v4->sin_family = AF_INET;
+	v4->sin_addr.s_addr = htonl(0xC0000207); // 192.0.2.7
+	res.lens[0] = sizeof(*v4);
+	struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&res.addrs[1];
+	v6->sin6_family = AF_INET6;
+	CHECK_EQ(inet_pton(AF_INET6, "2001:db8::1", &v6->sin6_addr), 1);
+	res.lens[1] = sizeof(*v6);
+	struct sockaddr_in *spare = (struct sockaddr_in *)&res.addrs[2];
+	spare->sin_family = AF_INET;
+	spare->sin_port = htons(1);
+	res.count = 2;
+	hw_dns_set_port(&res, 443);
+	CHECK_EQ(ntohs(v4->sin_port), 443);
+	CHECK_EQ(ntohs(v6->sin6_port), 443);
+	CHECK_EQ(ntohl(v4->sin_addr.s_addr), 0xC0000207);
+	struct in6_addr want;
+	CHECK_EQ(inet_pton(AF_INET6, "2001:db8::1", &want), 1);
+	CHECK(memcmp(&v6->sin6_addr, &want, sizeof(want)) == 0, "the v6 address is as it was");
+	CHECK_EQ(ntohs(spare->sin_port), 1);
+	// A second call replaces the port, and the highest one is not mangled.
+	hw_dns_set_port(&res, 65535);
+	CHECK_EQ(ntohs(v4->sin_port), 65535);
+	CHECK_EQ(ntohs(v6->sin6_port), 65535);
+	res.count = 0;
+	hw_dns_set_port(&res, 80);
+	CHECK_EQ(ntohs(v4->sin_port), 65535);
+}
+
+// Expiry drops what has outlived its time, positive or negative, and keeps the rest. A full cache
+// makes room for a new name the same way.
+static void test_cache_expire(void) {
+	hw_dns_cache *c = hw_dns_cache_new(60, 1, 3); // negative answers live a second
+	hw_dns_result res;
+	memset(&res, 0, sizeof(res));
+	res.count = 1;
+	res.lens[0] = sizeof(struct sockaddr_in);
+	((struct sockaddr_in *)&res.addrs[0])->sin_family = AF_INET;
+	res.ttl_known = 1;
+	res.ttl_s = 1;
+	hw_dns_cache_put(c, "short.test", &res, 0); // its own TTL: a second
+	res.ttl_s = 3600;
+	hw_dns_cache_put(c, "long.test", &res, 0); // the configured 60 s
+	hw_dns_cache_put(c, "gone.test", NULL, EAI_NONAME);
+	CHECK_EQ(hw_dns_cache_count(c), 3);
+	hw_dns_cache_expire(c); // nothing is old yet
+	CHECK_EQ(hw_dns_cache_count(c), 3);
+	usleep(1100000);
+	hw_dns_cache_expire(c);
+	CHECK_EQ(hw_dns_cache_count(c), 1);
+	hw_dns_result got;
+	int err = -1;
+	CHECK(hw_dns_cache_get(c, "long.test", &got, &err), "the live entry was dropped");
+	CHECK_EQ(err, 0);
+	CHECK(!hw_dns_cache_get(c, "short.test", &got, &err), "an expired answer is still there");
+	CHECK(!hw_dns_cache_get(c, "gone.test", &got, &err), "an expired negative answer is still there");
+
+	// Full of entries of which one has expired: a new name takes its place.
+	hw_dns_cache_put(c, "a.test", &res, 0);
+	res.ttl_s = 1;
+	hw_dns_cache_put(c, "b.test", &res, 0);
+	CHECK_EQ(hw_dns_cache_count(c), 3);
+	usleep(1100000);
+	res.ttl_s = 3600;
+	hw_dns_cache_put(c, "new.test", &res, 0);
+	CHECK(hw_dns_cache_get(c, "new.test", &got, &err), "a full cache with an expired entry took nothing");
+	CHECK(!hw_dns_cache_get(c, "b.test", &got, &err), "the expired entry is still there");
+	CHECK_EQ(hw_dns_cache_count(c), 3);
+	hw_dns_cache_free(c);
+	hw_dns_cache_expire(NULL);
+}
+
 static void test_cache(void) {
 	hw_dns_cache *c = hw_dns_cache_new(60, 5, 4);
 	hw_dns_result res;
@@ -531,6 +608,8 @@ int main(void) {
 	RUN(test_ttl_zero_is_not_cached);
 	RUN(test_order);
 	RUN(test_cache);
+	RUN(test_set_port);
+	RUN(test_cache_expire);
 	RUN(test_pool_cached_name_skips_queue);
 	RUN(test_pool_skips_cancelled);
 	RUN(test_pool_queue_is_bounded);
