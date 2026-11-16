@@ -718,7 +718,7 @@ static void stats_json(hw_conn *c) {
 	char body[2048]; // every counter at 20 digits still fits
 	snprintf(body, sizeof(body),
 	         "{\"uptimeSeconds\":%llu,"
-	         "\"connections\":{\"total\":%llu,\"active\":%llu},"
+	         "\"connections\":{\"total\":%llu,\"active\":%llu,\"perWorkerMin\":%llu,\"perWorkerMax\":%llu},"
 	         "\"streams\":{\"total\":%llu,\"active\":%llu},"
 	         "\"bytes\":{\"in\":%llu,\"out\":%llu},"
 	         "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},"
@@ -730,7 +730,8 @@ static void stats_json(hw_conn *c) {
 	         "\"synSignatures\":%llu,\"wsClosedViolations\":%llu,\"authFailures\":%llu,"
 	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu}}\n",
 	         (unsigned long long)st.uptime_s, (unsigned long long)st.connections_total,
-	         (unsigned long long)st.connections_active, (unsigned long long)st.streams_total,
+	         (unsigned long long)st.connections_active, (unsigned long long)st.worker_connections_min,
+	         (unsigned long long)st.worker_connections_max, (unsigned long long)st.streams_total,
 	         (unsigned long long)st.streams_active, (unsigned long long)st.bytes_in, (unsigned long long)st.bytes_out,
 	         (unsigned long long)st.refused_connection_rate, (unsigned long long)st.refused_connection_limit,
 	         (unsigned long long)st.refused_reputation, (unsigned long long)st.blocked_filter,

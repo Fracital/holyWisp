@@ -146,7 +146,7 @@ handshake-timeout-ms = 10000
 # A client that takes nothing of what is queued for it for this long is closed. Its queue is bounded
 # either way (the server stops reading from it at twice ws-write-high-water); this ends the wait.
 client-write-timeout-s = 120     # 0 = never
-# A connection with no bytes in either direction for this long is closed with 1001. Off by default:
+# A connection with no open streams whose client has sent nothing for this long is closed with 1001. Off by default:
 # a client with an open tab and nothing to say is not misbehaving.
 idle-timeout-s = 0
 resolver-threads = 4

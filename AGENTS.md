@@ -343,7 +343,7 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   past twice `ws-write-high-water` the client is not read from either (`wr_stalled` in
   `conn_backpressure`, cleared at the mark). `conn_sweep` (a per-worker timer) closes a
   connection whose queue has not moved for `client-write-timeout-s`, and with `idle-timeout-s`
-  one that has been silent both ways (1001). Nothing a client can send may grow `wbuf` without
+  one with no open streams whose client has sent nothing for that long (1001). Nothing a client can send may grow `wbuf` without
   bound; a new server-made frame type has to be covered by this, not exempt from it.
 - **The client's address.** `hw_real_ip` reads every instance of the first trusted header the
   request carries, as one list, from the right, and stops at the first entry that is not a
@@ -648,6 +648,8 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `node/src/vite.ts`, `logger.ts`, `path.ts` | Vite plugin, log relay, where the platform's binary lives. |
 | `node/scripts/build.mjs` | `make npm`: static binaries per platform via zig, `tsc`, licence copy. A prerelease in `package.json`'s version becomes the suffix `holywisp --version` prints. |
 | `node/scripts/nightly-version.mjs` | The version a nightly of HEAD publishes as. |
+| `bench/` | The comparison harness (`run.py`, `charts.py`, `echo.c`, `pump.c`, `configs/`), its published results (`RESULTS.md`) and `charts/`; `make bench`. |
+| `examples/wisp-webclient.html` | The browser client, embedded into the server at build time (`CMakeLists.txt`) and served on `GET /` with `serve-webclient`. |
 | `node/tests/` | `node --test` suites: option mapping, and the wrapper against the real server. |
 | `cmake/zig-toolchain.cmake` | CMake toolchain for `zig cc` cross builds (Linux musl static, macOS, Windows). |
 | `deploy/systemd/holywisp.service` | The hardened unit (the sandbox is load-bearing; see "Security suite"). |

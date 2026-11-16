@@ -114,8 +114,8 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   failed-connect ratio per destination and drops the client on a match.
 - **Clients that stop reading.** A client that will not take what it asked for is no longer read
   from once its queue is at twice `ws-write-high-water`, and is closed after
-  `client-write-timeout-s` without progress. `idle-timeout-s` closes silent connections if you
-  want that.
+  `client-write-timeout-s` without progress. `idle-timeout-s` closes a connection that has no
+  open streams and has sent nothing for that long, if you want that.
 - **Origin allowlist.** `allow-origin` restricts which web pages may open a connection through a
   visitor's browser. Unset, any page may, as a public relay needs.
 - **Per-IP limits.** New-connection rate limiting per client IP and a per-IP bandwidth cap in both
@@ -159,12 +159,15 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `enable-twisp` | off | PTY terminal streams; needs v2 and an authenticated client |
 | `password-user USER:PASS`, `password-required` | none, off | v2 password auth (hash or plaintext); refuse unauthenticated clients |
 | `trusted-proxy`, `trusted-header`, `trusted-proxy-secret` | none, `X-Forwarded-For`, none | Whose proxy headers name the client, which header, and a secret the proxy must also send |
+| `parse-real-ip`, `trusted-headers-reset` | on, off | Read the client's address from a trusted proxy's header at all; empty the header list (`X-Forwarded-For`) before the `trusted-header` lines add theirs |
 | `allow-origin` | none | Origins (`scheme://host[:port]`) a browser may connect from; none means any |
 | `connections-limit-per-ip`, `connection-window-s` | 200, 10 | New WebSockets per IP per window |
+| `max-streams-per-conn` | 2048 | Open streams one connection may hold (0 = unlimited); past it a CONNECT is throttled (`0x49`) |
 | `max-concurrent-connections-per-ip`, `max-in-flight-syns-per-ip` | 5000, 512 | One client address's share of the server-wide connection and in-flight-connect caps |
-| `client-write-timeout-s`, `idle-timeout-s` | 120, 0 | Close a client that takes nothing queued for it for this long; close a connection silent in both directions for this long (0 = never) |
+| `client-write-timeout-s`, `idle-timeout-s` | 120, 0 | Close a client that takes nothing queued for it for this long; close a connection that has no open streams and has sent no frame for this long, with 1001 (0 = never) |
 | `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap, each direction |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |
+| `ws-close-after-violations`, `log-blocked-dials` | 64, off | Close a client after this many flood-limit hits of its own (0 = never); log every failed dial at `info`, with the client address |
 | `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence |
 | `proxy` | `""` | Upstream `socks5://` (or `socks5h://`) / `http://` proxy for outbound TCP; it is given the destination hostname |
 | `proxy-only-to` | none | With a proxy, only a TCP stream that resolved to one of these addresses or CIDRs goes through it (by name, as always); every other TCP stream is dialled here. Repeatable. None: every TCP stream takes the proxy. For a router whose DNS gate answers the names it must handle itself with one address |
@@ -178,10 +181,14 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `warp-bypass-host` | none | A name whose streams never go through WARP: UDP and TCP dialled here go out unmarked, whatever the state or the fallbacks say. `example.com` matches exactly, `*.example.com` its subdomains. Repeatable. Give the router the same list for the TCP it dials, or the site sees two addresses |
 | `tcp-warp-fallback` | `refuse` | A TCP stream with no usable state (missing, stale), no tunnel for its family, or a mark that cannot be set: `refuse` it (`0x42`; another address of the name is tried first), or send it `direct`, unmarked |
 | `dns-server`, `dns-ttl-s`, `dns-order`, `dns-timeout-ms` | system, 120, ipv4first, 3000 | Built-in resolver and cache |
+| `dns-negative-ttl-s`, `resolver-threads` | 10, 4 | How long a failed lookup is cached; threads that run lookups (`getaddrinfo`, or the built-in client with `dns-server`) |
 | `family-fallback-ms` | 3000 | A TCP connect that still has an address of the other family to try gives up after this, not after `connect-timeout-ms`, so a name with broken IPv6 is no 15 s wait. Families are tried in turn, never raced, so TCP and UDP land on one (0 = off) |
 | `buffer-remaining`, `max-message-size`, `ws-write-high-water` | 128, 1 MiB+5, 8 MiB | Flow control and the queue toward a slow client; the advertised window is capped so a full window of max-size packets fits in `stream-queue-max` |
 | `socket-buffer-size`, `client-recv-buffer` | 0, 8 MiB | `socket-buffer-size` sets `SO_RCVBUF`/`SO_SNDBUF` on every socket (0 leaves them to the kernel). Otherwise client sockets get a receive buffer of `client-recv-buffer`, but only when `net.core.rmem_max` grants at least 4 MiB (the kernel doubles the value, so `rmem_max` of 2 MiB or more); 0 turns that off |
 | `stream-queue-max`, `conn-queue-max` | 128 MiB, 256 MiB | Bytes queued toward slow remotes: per stream (the stream closes `0x49` beyond it) and per client (its reads pause beyond it and resume at half) |
+| `handshake-timeout-ms`, `listen-backlog` | 10000, 1024 | Time a new connection has to finish its upgrade (on Wisp v2, its INFO exchange too); the listen queue length |
+| `tcp-nodelay`, `tcp-quickack` | on, on | `TCP_NODELAY` and `TCP_QUICKACK` on client and remote TCP sockets |
+| `non-ws-response` | a one-line notice | Body for a plain HTTP request that is not an upgrade, `/health` or `/stats` (empty: 426) |
 | `busy-poll-us` | 0 | After a loop iteration that had events, poll this many microseconds before sleeping: lower round-trip latency under load, more CPU spent waiting. 0 always sleeps |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `webclient-wisp-url` | empty | `ws(s)://` URL the web client offers by default; empty means the page's own origin |
