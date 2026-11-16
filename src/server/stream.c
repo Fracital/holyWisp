@@ -778,7 +778,8 @@ static int stream_flush(hw_stream *s) {
 			stream_update_events(s);
 			return 0;
 		}
-		stream_close(s, map_errno(errno), 1);
+		// A datagram's ECONNREFUSED is a port unreachable for an earlier one, as on the read side.
+		stream_close(s, s->type == HW_STREAM_UDP && errno == ECONNREFUSED ? HW_CLOSE_UNREACHABLE : map_errno(errno), 1);
 		return -1;
 	}
 	stream_update_events(s);
@@ -889,8 +890,13 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 		// Fast path: the socket is idle, hand the bytes straight to the kernel.
 		ssize_t n = stream_send(s, data, len);
 		if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-			if (s->type == HW_STREAM_UDP && (errno == EMSGSIZE || errno == ECONNREFUSED)) {
-				n = (ssize_t)len; // the datagram is lost either way; the stream lives on
+			if (s->type == HW_STREAM_UDP && errno == EMSGSIZE) {
+				n = (ssize_t)len; // the datagram is lost; the stream lives on
+			} else if (s->type == HW_STREAM_UDP && errno == ECONNREFUSED) {
+				// An earlier datagram drew a port unreachable, and this send collected the error.
+				// It is the same answer the read side reports; dropped here, nothing would.
+				stream_close(s, HW_CLOSE_UNREACHABLE, 1);
+				return;
 			} else {
 				stream_close(s, map_errno(errno), 1);
 				return;

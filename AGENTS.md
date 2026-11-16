@@ -160,7 +160,10 @@ every test still passes, so each item has a test and a change to it needs a reas
   saving the server nothing (`test_egress_frames_capped`).
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
   CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x48` blocked
-  by egress policy, `0x49` throttled. A client's CLOSE for a stream gets no CLOSE back. A CONNECT
+  by egress policy, `0x49` throttled. A UDP stream whose remote port is closed gets `0x42` as soon
+  as the socket reports the port unreachable, whichever of a send or a read collects it: a client
+  sends a QUIC Initial two datagrams at a time, and the second send takes the error the first one
+  drew (`test_udp_port_unreachable`). A client's CLOSE for a stream gets no CLOSE back. A CONNECT
   on stream 0 gets no reply at all (a CLOSE on stream 0 would end the whole connection). A CONNECT
   for an id that is already open closes that stream with `0x41` and opens nothing: the id is the
   only name the two ends share for it, and two streams under one name is two ends that disagree.

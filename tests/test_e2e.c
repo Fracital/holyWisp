@@ -476,6 +476,40 @@ static void test_connection_refused(void) {
 	hw_client_free(c);
 }
 
+// A UDP port nothing listens on: bind, note the port, close.
+static uint16_t closed_udp_port(void) {
+	int fd = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(fd >= 0, "udp socket: %s", strerror(errno));
+	struct sockaddr_in sin = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+	CHECK_EQ(bind(fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
+	socklen_t sl = sizeof(sin);
+	CHECK_EQ(getsockname(fd, (struct sockaddr *)&sin, &sl), 0);
+	close(fd);
+	return ntohs(sin.sin_port);
+}
+
+// A UDP stream to a closed port closes as unreachable at once, however its datagrams arrive. The
+// port unreachable for one datagram is a pending error that the next send can collect before the
+// read side sees it, so a client that sends two at a time (a QUIC Initial flight) is the case.
+static void test_udp_port_unreachable(void) {
+	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
+	uint8_t dgram[1200];
+	fill_pattern(dgram, sizeof(dgram), 3);
+	for (int round = 0; round < 8; round++) {
+		uint32_t sid;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", closed_udp_port(), &sid), 0);
+		uint64_t start = hw_now_ms();
+		for (int i = 0; i < 2; i++) CHECK_EQ(hw_client_send(c, sid, dgram, sizeof(dgram)), 0);
+		hw_client_event ev;
+		CHECK_EQ(wait_event(c, sid, HW_CEV_CLOSE, &ev, 1000), 1);
+		CHECK_EQ(ev.reason, HW_CLOSE_UNREACHABLE);
+		CHECK(hw_now_ms() - start < 500, "round %d closed after %llu ms", round,
+		      (unsigned long long)(hw_now_ms() - start));
+	}
+	hw_client_free(c);
+	wait_streams_idle(g_server);
+}
+
 static void test_hostname_resolution(void) {
 	// "localhost" goes through the resolver thread pool; the echo server listens on 0.0.0.0,
 	// so a ::1 attempt fails and the server must fall back to 127.0.0.1.
@@ -845,6 +879,7 @@ int main(void) {
 	RUN(test_remote_eof_closes_stream);
 	RUN(test_close_toward_remote);
 	RUN(test_connection_refused);
+	RUN(test_udp_port_unreachable);
 	RUN(test_hostname_resolution);
 	RUN(test_invalid_connect);
 	RUN(test_egress_blocked);
