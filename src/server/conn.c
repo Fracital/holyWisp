@@ -29,10 +29,18 @@
 #define CONN_MAX_READ_PER_EVENT (1024 * 1024)
 #endif
 #define CONN_WINDOW_MIN 4 // packets granted per CONTINUE however many streams share a client
-// A busy client's recv room grows from HW_READ_CHUNK to about two of its frames: 128 KiB for
-// ordinary packets, more only for a client that sends very large ones. A big room on every
-// connection costs throughput as soon as many connections are busy at once.
-#define CONN_READ_CHUNK_BASE (128 * 1024)
+// A busy client's recv room grows from HW_READ_CHUNK to about two of its frames, and at least to
+// 256 KiB, more only for a client that sends very large ones. A big room on every connection
+// costs throughput as soon as many connections are busy at once.
+// Measured on the divide bench CT, 2026-11-17: 256 KiB instead of 128 KiB made one busy stream 5%
+// cheaper per server CPU second and ten streams 3.5 to 4%, and lost no row. The gain is in TCP
+// segments, not in the syscalls saved: a write to the remote carries about seven 64 KiB packets
+// instead of three, each write ends in a short segment, and the server sent 5% fewer segments per
+// MiB. 512 KiB and 1 MiB won the one-stream row the same and lost 5 to 6% with ten streams: their
+// half-megabyte writes per stream went out in more and smaller segments, apparently because they
+// outgrew the remotes' receive windows. A busy connection holds up to about 0.4 MiB more for it
+// (peak RSS at 8 connections x 4 streams: 7 to 10 MiB); an idle one nothing.
+#define CONN_READ_CHUNK_BASE (256 * 1024)
 #define CONN_READ_CHUNK_MAX  (2 * 1024 * 1024)
 // A DATA frame at least this large is forwarded piece by piece while it arrives instead of being
 // reassembled first: the stream sees the same bytes sooner and they stay cache-warm.

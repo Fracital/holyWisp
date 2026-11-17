@@ -474,10 +474,14 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   before `hw_buf_reserve`, before any non-DATA packet (a CLOSE must not overtake its stream's
   data), before reusing the fragment buffer and before `ws_process` returns; `hw_buf_consume`
   never moves or reallocates. `stream_close` drops a batch that belongs to the stream it frees.
-  A DATA frame of 128 KiB or more that is still arriving is not reassembled: `ws_frames` reads its
-  Wisp header, then unmasks and forwards each piece as it comes (`pt_left`, `stream_on_data_part`),
-  and only the last piece counts as a packet against the window. If the stream closes mid-frame
-  the rest of the frame is read and dropped.
+  A batch is at most one recv, and a busy client's recv room grows to two of its packets and at
+  least `CONN_READ_CHUNK_BASE` (256 KiB). That size is measured (divide bench CT, 2026-11-17):
+  against 128 KiB it made one busy stream 5% and ten streams 3.5 to 4% cheaper per CPU second,
+  through fewer and fuller TCP segments toward the remote; 512 KiB and 1 MiB lost 5 to 6% with
+  ten streams. A DATA frame of 128 KiB or more that is still arriving is not reassembled:
+  `ws_frames` reads its Wisp header, then unmasks and forwards each piece as it comes (`pt_left`,
+  `stream_on_data_part`), and only the last piece counts as a packet against the window. If the
+  stream closes mid-frame the rest of the frame is read and dropped.
 - **Busy polling.** `busy-poll-us` (0 by default) makes a worker poll that long before it sleeps,
   but only after an iteration that delivered events, so an idle server never spins
   (`hw_loop_set_busy_poll`). It trades CPU for round-trip latency and changes nothing else.
