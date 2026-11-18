@@ -197,7 +197,7 @@ async function freePort(from: number, host: string | undefined): Promise<number>
 		new Promise<number | undefined>((resolve, reject) => {
 			const probe = net.createServer();
 			probe.unref();
-			probe.once("error", (err: NodeJS.ErrnoException) => {
+			probe.on("error", (err: NodeJS.ErrnoException) => {
 				if (err.code === "EADDRINUSE" || err.code === "EACCES") resolve(undefined);
 				else reject(err);
 			});
@@ -228,7 +228,10 @@ function httpGet(host: string, port: number, path: string, timeoutMs: number): P
 			res.on("error", reject);
 		});
 		req.once("timeout", () => req.destroy(new Error("timed out")));
-		req.once("error", reject);
+		// on, not once: a request can emit a second error (a reset after the timeout destroyed
+		// it), and an 'error' with no listener throws in the process that embeds this wrapper.
+		// The promise settles once either way.
+		req.on("error", reject);
 		req.end();
 	});
 }
