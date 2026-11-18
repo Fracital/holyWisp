@@ -3,12 +3,14 @@
  *
  *   holywisp-client [-s ws://host:port/path] [--udp] [--v2] HOST PORT      stdin/stdout <-> HOST:PORT
  *   holywisp-client [-s ...] --bench BYTES HOST PORT                        echo throughput test
+ *   holywisp-client -s https://host:port/ --pin SHA256 ...                  the same over WebTransport
  */
 #include "holywisp/client.h"
 #include "holywisp/hw.h"
 #include "holywisp/wisp.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,7 +26,12 @@ static void usage(const char *argv0) {
 	        "\n"
 	        "Relay stdin/stdout to HOST:PORT through a Wisp server.\n"
 	        "\n"
-	        "  -s, --server URL     ws://host:port/path (default ws://127.0.0.1:6001/)\n"
+	        "  -s, --server URL     ws://host:port/path (default ws://127.0.0.1:6001/), or\n"
+	        "                       https://host:port/path for WebTransport (UDP; port 443 by default)\n"
+	        "      --pin HASH       WebTransport: the server certificate's SHA-256, base64 or hex\n"
+	        "                       (a value of the server's /webtransport.json)\n"
+	        "      --insecure       WebTransport: take any certificate (loopback tests only)\n"
+	        "      --origin ORIGIN  WebTransport: send this origin header\n"
 	        "  -u, --udp            open a UDP stream instead of TCP\n"
 	        "  -2, --v2             negotiate wisp-v2\n"
 	        "      --user U         v2 password auth username (with --pass)\n"
@@ -37,10 +44,15 @@ static void usage(const char *argv0) {
 	        argv0);
 }
 
-static int parse_url(const char *url, char *host, size_t host_cap, uint16_t *port, char *path, size_t path_cap) {
+static int parse_url(const char *url, char *host, size_t host_cap, uint16_t *port, char *path, size_t path_cap,
+                     int *webtransport) {
 	const char *p = url;
+	*webtransport = 0;
 	if (strncmp(p, "ws://", 5) == 0) {
 		p += 5;
+	} else if (strncmp(p, "https://", 8) == 0) {
+		p += 8;
+		*webtransport = 1;
 	} else if (strncmp(p, "wss://", 6) == 0) {
 		fprintf(stderr, "wss:// is not supported; terminate TLS in front of the server\n");
 		return -1;
@@ -53,7 +65,7 @@ static int parse_url(const char *url, char *host, size_t host_cap, uint16_t *por
 	char hp[256];
 	memcpy(hp, p, hp_len);
 	hp[hp_len] = '\0';
-	*port = 80;
+	*port = *webtransport ? 443 : 80;
 	char *colon;
 	if (hp[0] == '[') {
 		char *close = strchr(hp, ']');
@@ -72,6 +84,41 @@ static int parse_url(const char *url, char *host, size_t host_cap, uint16_t *por
 		*port = (uint16_t)n;
 	}
 	return 0;
+}
+
+// A certificate hash as /webtransport.json gives it (base64) or as sha256sum prints it (hex).
+static int parse_pin(const char *s, uint8_t out[32]) {
+	size_t n = strlen(s);
+	if (n == 64) {
+		static const char hex[] = "0123456789abcdef0123456789ABCDEF";
+		for (size_t i = 0; i < 64; i++) {
+			const char *q = s[i] ? strchr(hex, s[i]) : NULL;
+			if (!q) return -1;
+			int v = (int)(q - hex) & 15;
+			if (i % 2 == 0) {
+				out[i / 2] = (uint8_t)(v << 4);
+			} else {
+				out[i / 2] |= (uint8_t)v;
+			}
+		}
+		return 0;
+	}
+	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	uint32_t acc = 0;
+	int bits = 0;
+	size_t got = 0;
+	for (size_t i = 0; i < n && s[i] != '='; i++) {
+		const char *q = strchr(b64, s[i]);
+		if (!q || !s[i]) return -1;
+		acc = acc << 6 | (uint32_t)(q - b64);
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (got == 32) return -1;
+			out[got++] = (uint8_t)(acc >> bits);
+		}
+	}
+	return got == 32 ? 0 : -1;
 }
 
 static int g_verbose;
@@ -147,16 +194,30 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 	uint8_t buf[PIPE_CHUNK];
 	int stdin_open = 1;
 	int rc;
+	uint64_t idle_at = 0; // after stdin's EOF: when to stop if nothing has arrived
 	for (;;) {
 		struct pollfd pfds[2] = {{.fd = hw_client_fd(c), .events = POLLIN}, {.fd = STDIN_FILENO, .events = POLLIN}};
-		int r = poll(pfds, stdin_open ? 2 : 1, stdin_open ? -1 : idle_ms);
+		int wait = -1;
+		if (!stdin_open) {
+			uint64_t now = hw_now_ms();
+			if (now >= idle_at) return 0; // idle after EOF
+			wait = (int)HW_MIN(idle_at - now, (uint64_t)INT_MAX);
+		}
+		// Over WebTransport the client's timers run only when it is called.
+		int timers = hw_client_wait_ms(c);
+		if (timers >= 0 && (wait < 0 || timers < wait)) wait = timers;
+		int r = poll(pfds, stdin_open ? 2 : 1, wait);
 		if (r < 0 && errno == EINTR) continue;
 		if (r < 0) return 1;
-		if (r == 0) return 0; // idle after EOF
+		if (r == 0) {
+			if (pipe_drain(c, sid, &rc)) return rc;
+			continue;
+		}
 		if (stdin_open && (pfds[1].revents & (POLLIN | POLLHUP))) {
 			ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
 			if (n <= 0) {
 				stdin_open = 0;
+				idle_at = hw_now_ms() + (uint64_t)(idle_ms > 0 ? idle_ms : 0);
 			} else {
 				// A send that timed out sent nothing. The server holds its CONTINUE for as long as
 				// the remote is slow to take what it has, so like any pipe this one waits: it
@@ -171,7 +232,10 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 				}
 			}
 		}
-		if (pfds[0].revents && pipe_drain(c, sid, &rc)) return rc;
+		if (pfds[0].revents) {
+			if (!stdin_open) idle_at = hw_now_ms() + (uint64_t)(idle_ms > 0 ? idle_ms : 0);
+			if (pipe_drain(c, sid, &rc)) return rc;
+		}
 	}
 }
 
@@ -227,6 +291,9 @@ int main(int argc, char **argv) {
 	int udp = 0;
 	int idle_ms = 2000;
 	size_t bench = 0;
+	int insecure = 0;
+	const char *pin = NULL;
+	uint8_t pin_hash[32];
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
 	const char *positional[2] = {NULL, NULL};
@@ -254,6 +321,12 @@ int main(int argc, char **argv) {
 			idle_ms = (int)strtol(argv[++i], NULL, 10);
 		} else if (!strcmp(a, "--bench") && i + 1 < argc) {
 			bench = (size_t)strtoull(argv[++i], NULL, 10);
+		} else if (!strcmp(a, "--pin") && i + 1 < argc) {
+			pin = argv[++i];
+		} else if (!strcmp(a, "--insecure")) {
+			insecure = 1;
+		} else if (!strcmp(a, "--origin") && i + 1 < argc) {
+			o.origin = argv[++i];
 		} else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) {
 			g_verbose = 1;
 		} else if (a[0] == '-' && a[1]) {
@@ -273,8 +346,24 @@ int main(int argc, char **argv) {
 	}
 	char host[256], path[256];
 	uint16_t port;
-	if (parse_url(url, host, sizeof(host), &port, path, sizeof(path)) != 0) {
+	if (parse_url(url, host, sizeof(host), &port, path, sizeof(path), &o.webtransport) != 0) {
 		fprintf(stderr, "bad server URL: %s\n", url);
+		return 2;
+	}
+	if (o.webtransport) {
+		if (pin) {
+			if (parse_pin(pin, pin_hash) != 0) {
+				fprintf(stderr, "bad --pin: 32 bytes in base64 or hex\n");
+				return 2;
+			}
+			o.pin_sha256 = pin_hash;
+		} else if (!insecure) {
+			// There is no certificate authority check: a pin is all that tells the server apart.
+			fprintf(stderr, "an https:// server needs --pin (or --insecure, which takes any certificate)\n");
+			return 2;
+		}
+	} else if (pin || insecure || o.origin) {
+		fprintf(stderr, "--pin, --insecure and --origin are for an https:// (WebTransport) server\n");
 		return 2;
 	}
 	long target_port = strtol(positional[1], NULL, 10);

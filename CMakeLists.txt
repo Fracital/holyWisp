@@ -151,6 +151,23 @@ target_include_directories(holywisp PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(holywisp PRIVATE ${HW_PLATFORM_INCLUDES})
 target_link_libraries(holywisp PUBLIC hw_flags Threads::Threads ${HW_PLATFORM_LIBS})
 
+# The WebTransport stack (docs/webtransport.md), one library per layer, each linking only the
+# ones below it, so that a unit test of one layer builds and runs whatever state the layers above
+# it are in. ----------------------------------------------------------------------------------
+add_library(hw_crypto_sym STATIC src/common/sha256.c src/common/aead.c)
+target_link_libraries(hw_crypto_sym PUBLIC holywisp)
+add_library(hw_crypto_asym STATIC src/common/x25519.c src/common/p256.c src/common/cert.c)
+target_link_libraries(hw_crypto_asym PUBLIC hw_crypto_sym)
+add_library(hw_tls STATIC src/quic/tls13.c)
+target_link_libraries(hw_tls PUBLIC hw_crypto_asym)
+add_library(hw_quic_wire STATIC src/quic/quic_wire.c)
+target_link_libraries(hw_quic_wire PUBLIC hw_crypto_sym)
+target_include_directories(hw_quic_wire PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/quic)
+add_library(hw_quic STATIC src/quic/quic.c src/quic/quic_frame.c src/quic/quic_recovery.c src/quic/quic_stream.c)
+target_link_libraries(hw_quic PUBLIC hw_quic_wire hw_tls)
+add_library(hw_wt STATIC src/quic/webtransport.c src/quic/h3.c src/quic/qpack.c)
+target_link_libraries(hw_wt PUBLIC hw_quic)
+
 # libholywisp-server: the server as a library (the binary and the e2e test both link it). ---
 # Embed the browser client (examples/wisp-webclient.html) into the server so it can be served on
 # GET / with no on-disk asset. Regenerated whenever the HTML changes.
@@ -173,9 +190,10 @@ add_library(holywisp-server STATIC
   src/server/server.c
   src/server/stream.c
   src/server/twisp.c
+  src/server/wt_listener.c
   ${HW_WEBCLIENT_HDR}
 )
-target_link_libraries(holywisp-server PUBLIC holywisp)
+target_link_libraries(holywisp-server PUBLIC holywisp hw_wt)
 target_include_directories(holywisp-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 add_executable(holywisp-bin src/server/main.c)
@@ -183,8 +201,8 @@ set_target_properties(holywisp-bin PROPERTIES OUTPUT_NAME holywisp)
 target_link_libraries(holywisp-bin PRIVATE holywisp-server)
 
 # libholywisp-client + CLI ------------------------------------------------------------------
-add_library(holywisp-client STATIC src/client/client.c)
-target_link_libraries(holywisp-client PUBLIC holywisp)
+add_library(holywisp-client STATIC src/client/client.c src/client/wt_client.c)
+target_link_libraries(holywisp-client PUBLIC holywisp hw_wt)
 
 # The CLI relays stdin, and waits for it and the socket in one poll(2): not something a Windows
 # console can do. The library is built everywhere; the tests use it.
@@ -207,11 +225,28 @@ if(HW_BUILD_TESTS)
     # The end-to-end suites run a whole server plus client, echo and proxy threads in one process.
     # Under a parallel `ctest -j`, CPU contention starves those threads and their internal timeouts
     # flake. RUN_SERIAL keeps them from competing with the rest of the suite.
-    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_security OR ${name} STREQUAL test_flow OR
-       ${name} STREQUAL test_abuse)
+    if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_e2e_wt OR ${name} STREQUAL test_security OR
+       ${name} STREQUAL test_flow OR ${name} STREQUAL test_abuse)
       set_tests_properties(${name} PROPERTIES RUN_SERIAL ON)
     endif()
   endfunction()
+  # A unit test of one layer of the WebTransport stack, linking that layer and nothing above it.
+  function(hw_unit_test name)
+    add_executable(${name} tests/${name}.c)
+    target_link_libraries(${name} PRIVATE ${ARGN})
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES TIMEOUT 120)
+  endfunction()
+  hw_unit_test(test_sha256 hw_crypto_sym)
+  hw_unit_test(test_aead hw_crypto_sym)
+  hw_unit_test(test_ecc hw_crypto_asym)
+  hw_unit_test(test_cert hw_crypto_asym)
+  hw_unit_test(test_tls13 hw_tls)
+  hw_unit_test(test_quic_wire hw_quic_wire)
+  hw_unit_test(test_quic hw_quic)
+  hw_unit_test(test_webtransport hw_wt)
+  hw_unit_test(test_wt_quic hw_wt)
   hw_test(test_buf)
   hw_test(test_crypto)
   hw_test(test_warp)
@@ -232,6 +267,7 @@ if(HW_BUILD_TESTS)
   hw_test(test_dns)
   hw_test(test_reputation)
   hw_test(test_e2e)
+  hw_test(test_e2e_wt)
   hw_test(test_security)
   hw_test(test_abuse)
   hw_test(test_flow)

@@ -39,8 +39,9 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 - `~/src/Fracital` (TypeScript): `.github/workflows/format.yml` is the model for our format CI
   (auto-fix commits on `master`, failing checks on PRs) and its `AGENTS.md` is the model for this
   file.
-- `~/src/abulxt` (Ansible): production. `deploy/ansible/roles/edge_wisp` builds and installs
-  holyWisp on the edge fleet from a pinned commit and renders `/etc/abulxt/holywisp.conf`;
+- `~/src/infra` (Ansible; this was `~/src/abulxt` until 2026-11-18): production.
+  `ansible/roles/edge_wisp` builds and installs holyWisp on the edge fleet from a pinned commit
+  and renders `/etc/abulxt/holywisp.conf`;
   `roles/edge_relay` is the nginx in front of it. Not read-only: a config key or behaviour change
   that the fleet needs lands there too (see "Deployments and servers").
 
@@ -66,9 +67,9 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 
 - **Where the public relay runs.** `https://holywisp.fracit.al/` (page on `GET /`, Wisp relay
   on a WebSocket upgrade to the same `/`) is served by the abulxt edge fleet, not by this repo's
-  CI: each edge runs holyWisp built from the `holywisp_ref` pin in `~/src/abulxt`
-  (`deploy/ansible/roles/edge_wisp`), with the edge nginx route in `roles/edge_relay`. Shipping a
-  fix to the public relay means bumping that pin and running abulxt's `playbooks/edges.yml`;
+  CI: each edge runs holyWisp built from the `holywisp_ref` pin in `~/src/infra`
+  (`ansible/roles/edge_wisp`), with the edge nginx route in `roles/edge_relay`. Shipping a fix
+  to the public relay means bumping that pin and running infra's `ansible/playbooks/edges.yml`;
   pushing here does not change what the edges run. stomp.fracit.al uses the same public root
   (`STOMP_WISP_URL` on terp, not managed by any repo).
 - **This repo deploys nothing.** Its CI ships artefacts only: the rolling `latest` release
@@ -80,7 +81,7 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   Nothing bumps the number in `node/package.json` but a person, and after a `v*` tag it goes to the
   next version at once, or the nightlies sort below the release. There is no server this repo
   pushes to; a host that should run a new build is updated by whoever operates it (the edges:
-  abulxt's ansible pin).
+  infra's ansible pin).
 - Do not start, stop or reconfigure a `holywisp` process on a machine that is not the one you are
   developing on. Running `make run` locally against loopback is development; touching a host that
   serves users is deployment.
@@ -90,9 +91,12 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
 ### Dependencies and the build
 
 - **No third-party code.** No vendored libraries, no `FetchContent`, no `pkg-config` lookups.
-  SHA-1 and Base64 exist in-tree only because the WebSocket handshake needs them; TLS does not
-  exist in-tree because a reverse proxy does it better. If a change seems to need a library, it
-  needs a design conversation first.
+  SHA-1 and Base64 exist in-tree only because the WebSocket handshake needs them. TLS 1.3, QUIC
+  and the HTTP/3 that WebTransport needs exist in-tree for the WebTransport listener alone: the
+  owner decided so on 2026-11-18, because nothing can terminate QUIC in front of the server and
+  hand it Wisp (docs/webtransport.md). The WebSocket path still has no TLS, and a reverse proxy
+  still does it better there; do not add a `wss://` listener on the strength of this. If a
+  change seems to need a library, it needs a design conversation first.
 - Linux is the platform, by design: epoll, `accept4`, `eventfd`, `SO_REUSEPORT`, `splice`. macOS
   and Windows are ports for development machines (they are what lets the npm package run on a Mac
   or a PC), not production targets and not tuned: both copy where Linux splices and have their
@@ -103,9 +107,9 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   `CMakeLists.txt`. Windows alone has a third part, because it lacks the POSIX socket calls
   themselves: `src/compat/win32/` supplies them over Winsock under their POSIX names (headers in
   `include/`, all of the code in `posix.c`), so no other file knows it is not on POSIX. The one
-  platform `#if` in the tree is the pair of `send` flags in `sys.h` (the one architecture `#if` is
-  `__x86_64__` around the AVX2 unmask in `ws.c`, which is about the CPU, not the OS; see "The
-  unmask"). Do not add another, do not
+  platform `#if` in the tree is the pair of `send` flags in `sys.h` (the architecture `#if`s are
+  `__x86_64__` around the AVX2 unmask in `ws.c` and around the AVX2 ChaCha20 and Poly1305 kernels
+  in `aead.c`, which are about the CPU, not the OS; see "The unmask"). Do not add another, do not
   write `_WIN32` or a Winsock call outside the three Windows files, and do not call a
   kernel-specific function (`accept4`, `splice`, `pipe2`, `crypt_r`, `forkpty`, `MSG_NOSIGNAL`,
   ...) outside the platform files: add it to `sys.h`, implement it three times, and test the
@@ -529,6 +533,82 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   `auth_cancel` from `conn_close`, `auth_free`), and a third thing that leaves the loop for a
   thread should be a third copy of it, not a new idea.
 
+## WebTransport (do not regress)
+
+`webtransport` (off by default) opens a UDP listener beside the TCP one, on the same port number
+unless `webtransport-port` says otherwise, where a browser's `new WebTransport(url)` gets Wisp
+over HTTP/3 (docs/webtransport.md is the design). The stack is sans-IO and in layers, each with
+its own unit test: `src/common/sha256.c`, `aead.c`, `x25519.c`, `p256.c`, `cert.c`, then
+`src/quic/tls13.c`, `quic_wire.c`, `quic*.c`, `webtransport.c` with `h3.c` and `qpack.c`. The
+server's part is `src/server/wt_listener.c` (sockets, sessions, certificates) and a WebTransport
+branch in `conn.c`; the client library's is `src/client/wt_client.c`.
+
+- **One hw_conn, the same Wisp.** An admitted session gets an `hw_conn` with no socket
+  (`c->fd == -1`, `c->wt` set), and every packet goes through `handle_message` and
+  `handle_packet` as a WebSocket message would. So the egress policy, the limiters, reputation,
+  the Twisp gate and flow control are the WebSocket path's, at the same places in the code. A
+  branch for WebTransport sits where a frame meets the transport (`conn_send_packet`,
+  `conn_send_data`, `conn_flush`, `conn_queued`, `conn_apply_events`, `ws_fail`, `conn_close`)
+  and nowhere else; the WebSocket path through them is unchanged and must stay so (the loopback
+  bench before and after).
+- **What replaces the socket.** `hw_wt_queued` stands in for `wbuf` in `conn_queued`, so
+  `ws-write-high-water` pauses the remotes exactly as for a WebSocket; `conn_reads_stopped`
+  becomes `hw_wt_pause` (no QUIC credit for the client) in `conn_apply_events`. A WebTransport
+  connection never splices (`conn_splice_data` refuses, `stream_read` never sets `s->bulk` for
+  it): its bytes are copied into QUIC packets and encrypted anyway. `test_stalled_reader` in
+  `test_e2e_wt` holds the bound; it fails if `conn_queued` ignores the session.
+- **Datagrams carry UDP DATA only.** Toward the client, DATA for a UDP stream goes as a datagram
+  when it fits (`unreliable = 1`), everything else on the Wisp stream. From the client, a datagram
+  is acted on only when it is DATA for an open UDP stream after the handshake
+  (`conn_wt_packet`); anything else is dropped and counted (`wt_dropped`). A CONNECT, CLOSE or
+  TCP DATA must never be taken from a datagram: it can be lost or reordered.
+- **Admission at the CONNECT, in `http_process` order.** `conn_wt_admit` runs the origin list
+  (403), then `conn_admit` (per-IP connect rate 429, reputation 403, per-IP gauge 429, the
+  semaphore 503), shared with `http_process`; v2 iff `wt-available-protocols` is present and
+  `enable-v2` is on, and `wt-protocol` echoes its first member. The client's address is the UDP
+  peer's. **No proxy header is read on this listener**, whatever `trusted-proxies` says: nothing
+  proxies UDP to it. A refused CONNECT's answer is delivered before the connection closes
+  (`WT_REFUSE_MS`), or a browser sees a QUIC error instead of the status.
+- **Nothing is charged to an address before it is validated.** A UDP source address is a claim
+  until the handshake completes or an Initial returns a Retry token. Until then the only costs are
+  the per-worker and per-address handshake caps (`webtransport-max-handshakes`,
+  `WT_HS_PER_ADDR`), a 10 s expiry, and a Retry past `webtransport-retry-threshold`; the per-IP
+  limiters run at the CONNECT, after validation. Version negotiation and Retry answer only
+  datagrams of 1200 bytes or more and a stateless reset is shorter than what it answers
+  (quic_wire.c), so the listener never amplifies. Do not move a limiter before the handshake.
+- **Steering, and one thread per session.** Every connection ID the server issues starts with
+  its worker's index, and `hw_sys_udp_steer` attaches a reuseport CBPF program that picks the
+  socket by that byte (short header byte 1, long header byte 6), falling back to the kernel's
+  hash for anything else (a client's first Initial, a runt). So every datagram of a connection
+  reaches the worker that owns it, and a session, its `hw_quic_conn`, `hw_wt` and `hw_conn` are
+  touched by that worker alone. Where steering is missing (macOS, Windows, one worker, a failed
+  attach) there is one socket, on worker 0, never several unsteered ones: a client whose port
+  changed would land on a worker that does not know it. `test_udp_steer` in `test_sys` holds the
+  program and the fallback.
+- **Never free inside the stack.** QUIC and `hw_wt` call back synchronously, and those callbacks
+  reach `conn.c`, which may close. A session counts calls under way (`s->busy`); a close, a
+  resume, a flush or a free asked for meanwhile marks it dirty, and `session_settle` does it after
+  the call returns. `wt_conn_detach` is how `conn_close` lets go of the session; the session then
+  closes the WebTransport session with the code `ws_fail` left (`c->wt_code`). Only
+  `session_settle` and shutdown free a session.
+- **Certificates.** Without `webtransport-cert`/`-key`, the maintenance thread makes a P-256 key
+  and a self-signed certificate valid from an hour ago for 13 days at start and every 6 days
+  (Chrome's `serverCertificateHashes` takes at most 14), and posts each worker its own copy, as
+  `warp_publish` does. `GET /webtransport.json` on the TCP port lists the current and previous
+  hashes (`Access-Control-Allow-Origin: *`, `no-store`), so a page that fetched it just before a
+  rotation still connects. With operator files nothing rotates and no hash is listed; the key
+  must be P-256 and match the leaf, or the server does not start.
+- **The idle timeout is mandatory** (`webtransport-idle-timeout-s`, 1 to 3600), and the server
+  sends a keepalive after 20 s without sending (divide's conntrack forgets a UDP flow at 30 s).
+- **A session ends promptly, whoever ends it.** Chrome never sends CONNECTION_CLOSE and goes
+  silent once a session is over (measured on Chrome 157), so the server closes the QUIC
+  connection itself: when the client's capsule or FIN ends the session, and when the client ends
+  its Wisp stream (the WebSocket EOF case: the session closes with code 0 once every held packet
+  is handed over). After the server's own capsule, `WT_CLOSE_MS` (3 s) bounds a client that never
+  answers, even one that keeps sending. The close goes capsule, then FIN, then nothing that could
+  overtake it: Chrome reads a reset or STOP_SENDING before the capsule as "Connection lost.".
+  `test_wisp_stream_end`, `test_close_unanswered` and `test_client_close_then_silent` hold it.
+
 ## Verification before you hand work off
 
 - `make test` (Debug, ASan + UBSan) and `make test-release` both pass. If your machine's GCC has
@@ -548,6 +628,14 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   that resets while paused (it measures the server's CPU time), the per-IP caps, the origin
   list, bandwidth on downloads, hostile host bytes, raw CONNECTs, passwords on and off the loop.
   A fix for an abuse case is not done until this file fails without it.
+- If you touched `wt_listener.c`, the WebTransport branches of `conn.c`, `wt_client.c` or any
+  layer of the stack, run `test_e2e_wt` several times
+  (`for i in 1 2 3 4 5; do build/debug/test_e2e_wt || break; done`), and once by hand
+  `node tests/wt_interop.mjs build/release/holywisp`: `curl --http3-only` gets its 404, and
+  headless Chrome goes through `/webtransport.json` to a pinned session, a TCP echo, a UDP echo
+  by datagram and a v2 session (each skipped when the tool is missing; nothing in CI runs it).
+  A WebTransport throughput figure is
+  `holywisp-client -s https://127.0.0.1:<port>/ --insecure --bench 268435456 127.0.0.1 <echo port>`.
 - If you touched the proxy path, run `test_security` several times (it starts real SOCKS5 and HTTP
   CONNECT proxies in-process): `for i in $(seq 1 20); do build/debug/test_security || break; done`.
   A service a test runs on a thread of its own closes its listener on that thread (`accept_loop`):
@@ -626,6 +714,8 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `include/holywisp/wisp.h`, `src/common/wisp.c` | Wisp packet codec and constants. The wire format lives here and nowhere else. |
 | `include/holywisp/map.h`, `src/common/map.c` | `uint32_t -> void *` open-addressing map (stream id to stream). |
 | `include/holywisp/sha1.h`, `base64.h` | Only for `Sec-WebSocket-Accept`. |
+| `include/holywisp/sha256.h`, `aead.h`, `ecc.h`, `cert.h`, `src/common/sha256.c`, `aead.c`, `x25519.c`, `p256.c`, `cert.c` | The cryptography under TLS 1.3 for WebTransport: SHA-256 and HKDF, AES-128-GCM and ChaCha20-Poly1305, X25519 and P-256, X.509 and PEM for the certificate. |
+| `include/holywisp/tls13.h`, `quic.h`, `webtransport.h`, `src/quic/` | The WebTransport stack, sans-IO: TLS 1.3 (`tls13.c`), QUIC v1 (`quic_wire.c` packets and protection, `quic.c` connections, `quic_frame.c`, `quic_recovery.c`, `quic_stream.c`), HTTP/3, QPACK and WebTransport with Wisp on the session (`webtransport.c`, `h3.c`, `qpack.c`). |
 | `include/holywisp/warp.h`, `src/common/warp.c`, `blake2b.h`, `blake2b.c` | UDP and TCP on WARP: the edge router's site key, score and tunnel choice, the state file's reader, the mark list. |
 | `include/holywisp/log.h`, `src/common/log.c` | Levelled logging, one `write(2)` per line. |
 | `include/holywisp/server.h` | Public server API: config struct, new/start/stop/free, stats. |
@@ -637,6 +727,7 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `src/server/proxy.c` | Upstream SOCKS5 / HTTP CONNECT handshake, driven on the stream socket. |
 | `src/server/auth.c` | Hashed-password checks on two threads of their own, answered on the loop that asked. |
 | `src/server/twisp.c` | PTY terminal streams: shell-split the command, `hw_sys_pty_spawn`, relay the master. |
+| `src/server/wt_listener.c` | The WebTransport listener: steered UDP sockets, Retry and the handshake caps, sessions on the worker loops and their `hw_conn`, the rotating certificate and `/webtransport.json`. |
 | `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`, validation. |
 | `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM, or (`stop-on-stdin-eof`) when stdin closes. |
 | `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, per-key gauge, token-bucket bandwidth, SYN-signature ring. |
@@ -645,9 +736,11 @@ it, and on macOS, where that takes a second call, the child closes everything ab
 | `include/holywisp/dns.h`, `src/common/dns.c` | Built-in A/AAAA DNS client and the shared result cache. |
 | `include/holywisp/smap.h`, `src/common/smap.c` | String-keyed open-addressing map used by the limiters, reputation and DNS cache; SipHash under a per-process random key. |
 | `include/holywisp/client.h`, `src/client/client.c` | Blocking client library: connect, open, send, poll, read_exact. |
-| `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`. |
+| `src/client/wt_client.c`, `wt_client.h` | The client library's WebTransport transport (`hw_client_opts.webtransport`): QUIC on a connected UDP socket, the CONNECT, Wisp packets in order with a bounded queue. |
+| `src/client/main.c` | `holywisp-client`: stdin/stdout relay and `--bench`, over `ws://` or (`https://`, `--pin`) WebTransport. |
 | `tests/test.h` | `CHECK`, `CHECK_EQ`, `CHECK_STR`, `RUN`. The entire test framework. |
 | `tests/test_e2e.c`, `tests/test_security.c` | End-to-end: real server + real services + real client. The reference for the APIs. |
+| `tests/test_e2e_wt.c`, `tests/wt_interop.mjs` | End-to-end over WebTransport with the real client; the manual check against curl's HTTP/3 and headless Chrome. |
 | `tests/test_warp.c`, `tests/warp_vectors.h`, `tests/gen_warp_vectors.py` | The WARP tunnel choice against vectors generated from `edge-router.py`. |
 | `tests/test_udp_warp.c` | The state file as the server tracks it, and UDP and TCP streams marked, unmarked and refused. |
 | `tests/test_abuse.c` | End-to-end from the attacker's side: each case is something a hostile client or remote did to the server before it was fixed. |

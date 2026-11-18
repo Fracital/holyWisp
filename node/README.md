@@ -150,7 +150,17 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `connectTimeoutMs`, `familyFallbackMs`, `handshakeTimeoutSeconds`, `clientWriteTimeoutSeconds`, `idleTimeoutSeconds` | `connect-timeout-ms`, `family-fallback-ms`, `handshake-timeout-ms`, `client-write-timeout-s`, `idle-timeout-s` |
 | `resolverThreads`, `busyPollUs`, `tcpNoDelay`, `tcpQuickAck` | `resolver-threads`, `busy-poll-us`, `tcp-nodelay`, `tcp-quickack` |
 | `nonWSResponse`, `serveWebclient`, `webclientWispUrl` | `non-ws-response`, `serve-webclient`, `webclient-wisp-url` |
+| `webTransport` (`true`, or an object of the keys below) | `webtransport` |
+| `webTransport.host`, `webTransport.port`, `webTransport.url` | `webtransport-host`, `webtransport-port`, `webtransport-url` |
+| `webTransport.certFile`, `webTransport.keyFile` | `webtransport-cert`, `webtransport-key` |
+| `webTransport.idleTimeoutSeconds`, `webTransport.maxHandshakes`, `webTransport.retryThreshold` | `webtransport-idle-timeout-s`, `webtransport-max-handshakes`, `webtransport-retry-threshold` |
 | `logLevel` (default `warn`) | `log-level` |
+
+WebTransport is UDP, so `route()` has no part in it: the browser opens
+`new WebTransport("https://<webTransport.host>:<port>/")` against the server itself, which binds
+the wrapper's `host` (`127.0.0.1`) unless `webTransport.host` says otherwise. The page learns the
+certificate hashes to pin from `GET /webtransport.json` on the server's port; forward that path to
+it if the page is served from elsewhere.
 
 The keys for running behind a routing proxy on WARP tunnels (`proxy-only-to`, `proxy-client-key`,
 `udp-warp-*`, `tcp-warp*`, `warp-bypass-host`) have no option here: they are for an edge that runs

@@ -442,6 +442,353 @@ static void test_udp_unreachable(void) {
 	close(fd);
 }
 
+// A UDP socket on 127.0.0.1:port (0: an ephemeral one, written back), in the SO_REUSEPORT group
+// there when `group`.
+static int udp_bound(uint16_t *port, int group) {
+	int fd = hw_sys_socket(AF_INET, SOCK_DGRAM, 0, 1);
+	CHECK(fd >= 0, "socket: errno %d", errno);
+	int one = 1;
+	if (group) CHECK_EQ(setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)), 0);
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a.sin_port = htons(*port);
+	CHECK(bind(fd, (struct sockaddr *)&a, sizeof(a)) == 0, "bind: errno %d", errno);
+	socklen_t al = sizeof(a);
+	CHECK_EQ(getsockname(fd, (struct sockaddr *)&a, &al), 0);
+	*port = ntohs(a.sin_port);
+	return fd;
+}
+
+static struct sockaddr_in loopback_to(uint16_t port) {
+	struct sockaddr_in a;
+	memset(&a, 0, sizeof(a));
+	a.sin_family = AF_INET;
+	a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	a.sin_port = htons(port);
+	return a;
+}
+
+#define STEER_N 4
+
+// Which of the group's sockets the next datagram arrives on (its first 4 bytes after the header
+// bytes are a tag, checked against `tag`), or -1 when none gets one within the time.
+static int steer_which(const int fds[STEER_N], uint32_t tag, size_t tag_at) {
+	struct pollfd p[STEER_N];
+	for (int i = 0; i < STEER_N; i++) p[i] = (struct pollfd){fds[i], POLLIN, 0};
+	if (poll(p, STEER_N, 2000) <= 0) return -1;
+	for (int i = 0; i < STEER_N; i++) {
+		if (!(p[i].revents & POLLIN)) continue;
+		uint8_t buf[64];
+		ssize_t n = recv(fds[i], buf, sizeof(buf), 0);
+		CHECK(n >= (ssize_t)(tag_at + 4), "recv on %d: %zd errno %d", i, n, errno);
+		uint32_t got;
+		memcpy(&got, buf + tag_at, 4);
+		CHECK_EQ(got, tag);
+		return i;
+	}
+	return -1;
+}
+
+// The promise of hw_sys_udp_steer: a datagram whose connection ID starts with i reaches socket i,
+// for short headers and for long headers with an 8-byte DCID, and anything else (an index past the
+// group, a client's own longer DCID, a runt) reaches exactly one socket, the same one for every
+// datagram from one address, and the kernel's hash spreads different addresses over the group.
+// That fallback is the kernel's behaviour, not ours, so it is checked here on the kernel that runs.
+static void test_udp_steer(void) {
+	if (!hw_sys_has_udp_steer()) {
+		int fd = 3;
+		errno = 0;
+		CHECK_EQ(hw_sys_udp_steer(&fd, 1), -1);
+		CHECK_EQ(errno, ENOTSUP);
+		return;
+	}
+	uint16_t port = 0;
+	int fds[STEER_N];
+	for (int i = 0; i < STEER_N; i++) fds[i] = udp_bound(&port, 1);
+	CHECK(hw_sys_udp_steer(fds, STEER_N) == 0, "steer: errno %d", errno);
+	struct sockaddr_in to = loopback_to(port);
+	int tx = hw_sys_socket(AF_INET, SOCK_DGRAM, 0, 0);
+	CHECK(tx >= 0, "socket");
+	uint32_t tag = 1;
+	for (int round = 0; round < 3; round++) {
+		for (int i = 0; i < STEER_N; i++) {
+			uint8_t pkt[32];
+			memset(pkt, 0xab, sizeof(pkt));
+			// Short header: flags, DCID (8 bytes, the first the index), then the rest.
+			pkt[0] = 0x40;
+			pkt[1] = (uint8_t)i;
+			memcpy(pkt + 12, &tag, 4);
+			CHECK_EQ(sendto(tx, pkt, sizeof(pkt), 0, (struct sockaddr *)&to, sizeof(to)), (ssize_t)sizeof(pkt));
+			CHECK_EQ(steer_which(fds, tag, 12), i);
+			tag++;
+			// Long header: flags, version, DCID length 8, DCID.
+			uint8_t lh[1200];
+			memset(lh, 0, sizeof(lh));
+			lh[0] = 0xc0;
+			lh[4] = 1;
+			lh[5] = 8;
+			lh[6] = (uint8_t)i;
+			memcpy(lh + 12, &tag, 4);
+			CHECK_EQ(sendto(tx, lh, sizeof(lh), 0, (struct sockaddr *)&to, sizeof(to)), (ssize_t)sizeof(lh));
+			CHECK_EQ(steer_which(fds, tag, 12), i);
+			tag++;
+		}
+	}
+	close(tx);
+
+	// The fallback: senders on 32 ports, three kinds of datagram the program cannot steer, three
+	// of each per sender.
+	int seen[STEER_N] = {0};
+	for (int s = 0; s < 32; s++) {
+		int from = hw_sys_socket(AF_INET, SOCK_DGRAM, 0, 0);
+		CHECK(from >= 0, "socket");
+		int where = -1;
+		for (int k = 0; k < 9; k++) {
+			uint8_t pkt[1200];
+			memset(pkt, 0, sizeof(pkt));
+			size_t len = sizeof(pkt);
+			size_t tag_at = 24;
+			if (k % 3 == 0) { // a short header whose index is past the group
+				pkt[0] = 0x40;
+				pkt[1] = 0xff;
+				len = 64;
+			} else if (k % 3 == 1) { // an Initial with an 18-byte DCID of the client's choosing
+				pkt[0] = 0xc0;
+				pkt[4] = 1;
+				pkt[5] = 18;
+				pkt[6] = 1; // would be a valid index, were the DCID 8 bytes
+			} else {        // a runt: too short to read an index from
+				len = 6;
+				tag_at = 2;
+				pkt[0] = 0x40;
+				pkt[1] = 1;
+			}
+			memcpy(pkt + tag_at, &tag, len - tag_at < 4 ? len - tag_at : 4);
+			if (len - tag_at < 4) memset(pkt + tag_at, 0, 4); // runts carry no whole tag
+			CHECK_EQ(sendto(from, pkt, len, 0, (struct sockaddr *)&to, sizeof(to)), (ssize_t)len);
+			int got;
+			if (len - tag_at < 4) {
+				struct pollfd p[STEER_N];
+				for (int i = 0; i < STEER_N; i++) p[i] = (struct pollfd){fds[i], POLLIN, 0};
+				CHECK(poll(p, STEER_N, 2000) > 0, "runt delivered");
+				got = -1;
+				for (int i = 0; i < STEER_N && got < 0; i++) {
+					if (!(p[i].revents & POLLIN)) continue;
+					uint8_t buf[16];
+					CHECK_EQ(recv(fds[i], buf, sizeof(buf), 0), (ssize_t)len);
+					got = i;
+				}
+			} else {
+				got = steer_which(fds, tag, tag_at);
+			}
+			CHECK(got >= 0, "sender %d datagram %d delivered", s, k);
+			if (where < 0) where = got;
+			CHECK(got == where, "sender %d: datagram %d went to %d, earlier ones to %d", s, k, got, where);
+			tag++;
+		}
+		seen[where]++;
+		close(from);
+	}
+	int used = 0;
+	for (int i = 0; i < STEER_N; i++) used += seen[i] > 0;
+	CHECK(used >= 2, "32 senders all hashed to one socket: %d %d %d %d", seen[0], seen[1], seen[2], seen[3]);
+	// Nothing was delivered twice.
+	for (int i = 0; i < STEER_N; i++) {
+		uint8_t b[8];
+		CHECK(recv(fds[i], b, sizeof(b), MSG_DONTWAIT) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK),
+		      "socket %d holds a datagram nobody sent it", i);
+		close(fds[i]);
+	}
+}
+
+// hw_sys_send_batch sends in order and says how many went; hw_sys_recv_batch takes what is
+// waiting, with each sender's address, never waits, and reports a datagram cut by its buffer as
+// length 0.
+static void test_udp_batch(void) {
+	uint16_t rport = 0, sport = 0;
+	int rx = udp_bound(&rport, 0);
+	int tx = udp_bound(&sport, 0);
+	hw_sys_dgram d[HW_SYS_BATCH_MAX];
+	uint8_t bufs[8][256];
+	errno = 0;
+	d[0].buf = bufs[0];
+	d[0].cap = sizeof(bufs[0]);
+	CHECK_EQ(hw_sys_recv_batch(rx, d, 1), -1);
+	CHECK(errno == EAGAIN || errno == EWOULDBLOCK, "nothing waiting: errno %d", errno);
+
+	struct sockaddr_in to = loopback_to(rport);
+	for (int i = 0; i < 8; i++) {
+		memset(bufs[i], 'a' + i, sizeof(bufs[i]));
+		d[i].buf = bufs[i];
+		d[i].len = 10 + (size_t)i * 30; // 10 .. 220
+		memcpy(&d[i].addr, &to, sizeof(to));
+		d[i].addr_len = sizeof(to);
+	}
+	d[7].len = 200; // longer than the buffer it will be received into
+	int sent = 0;
+	while (sent < 8) {
+		int r = hw_sys_send_batch(tx, d + sent, (size_t)(8 - sent));
+		CHECK(r >= 1, "send_batch: %d errno %d", r, errno);
+		sent += r;
+	}
+	uint8_t in[8][256];
+	hw_sys_dgram rd[8];
+	int got = 0;
+	uint64_t until = hw_now_ms() + 2000;
+	while (got < 8 && hw_now_ms() < until) {
+		for (int i = got; i < 8; i++) {
+			rd[i].buf = in[i];
+			rd[i].cap = i == 7 ? 100 : sizeof(in[i]);
+			rd[i].len = 12345;
+		}
+		struct pollfd p = {rx, POLLIN, 0};
+		poll(&p, 1, 200);
+		int r = hw_sys_recv_batch(rx, rd + got, (size_t)(8 - got));
+		if (r < 0) {
+			CHECK(errno == EAGAIN || errno == EWOULDBLOCK, "recv_batch: errno %d", errno);
+			continue;
+		}
+		CHECK(r >= 1 && r <= 8 - got, "recv_batch: %d", r);
+		got += r;
+	}
+	CHECK_EQ(got, 8);
+	for (int i = 0; i < 7; i++) {
+		CHECK_EQ(rd[i].len, d[i].len);
+		CHECK(rd[i].buf[0] == 'a' + i && rd[i].buf[rd[i].len - 1] == 'a' + i, "datagram %d in order", i);
+		const struct sockaddr_in *from = (const struct sockaddr_in *)&rd[i].addr;
+		CHECK_EQ(rd[i].addr_len, (socklen_t)sizeof(*from));
+		CHECK_EQ(ntohs(from->sin_port), sport);
+	}
+	CHECK_EQ(rd[7].len, 0); // 200 bytes into 100: cut, and said so
+	close(rx);
+	close(tx);
+}
+
+#define CO_LEN   1000
+#define CO_TOTAL 32
+
+// The datagrams waiting on rx, taken apart where a read holds several (hw_sys_udp_gro), into
+// lens/tags (each datagram's first byte) in order. How many there were.
+static int coalesced_take(int rx, size_t cap, int want, size_t lens[], uint8_t tags[]) {
+	uint8_t *room = malloc(HW_SYS_BATCH_MAX * cap);
+	CHECK(room != NULL, "malloc");
+	hw_sys_dgram rd[HW_SYS_BATCH_MAX];
+	int got = 0;
+	uint64_t until = hw_now_ms() + 2000;
+	while (got < want && hw_now_ms() < until) {
+		for (int i = 0; i < HW_SYS_BATCH_MAX; i++) {
+			rd[i].buf = room + (size_t)i * cap;
+			rd[i].cap = cap;
+		}
+		struct pollfd p = {rx, POLLIN, 0};
+		poll(&p, 1, 200);
+		int r = hw_sys_recv_batch(rx, rd, HW_SYS_BATCH_MAX);
+		if (r < 0) {
+			CHECK(errno == EAGAIN || errno == EWOULDBLOCK, "recv_batch: errno %d", errno);
+			continue;
+		}
+		for (int i = 0; i < r; i++) {
+			CHECK(rd[i].len > 0 && rd[i].segment > 0 && rd[i].segment <= rd[i].len, "read %d: len %zu segment %zu", i,
+			      rd[i].len, rd[i].segment);
+			for (size_t off = 0; off < rd[i].len; off += rd[i].segment) {
+				CHECK(got < CO_TOTAL + 8, "more datagrams than were sent");
+				lens[got] = HW_MIN(rd[i].segment, rd[i].len - off);
+				tags[got] = rd[i].buf[off];
+				CHECK(rd[i].buf[off + lens[got] - 1] == tags[got], "datagram %d whole", got);
+				got++;
+			}
+		}
+	}
+	free(room);
+	return got;
+}
+
+// Whatever the kernel does with a run (one write cut up again, or a write per datagram) and with
+// what it receives (one read of several, or one each), the datagrams on the other side are the
+// ones sent: each whole, in order, to the address it was sent to. A batch that mixes addresses and
+// lengths, a run longer than the kernel may take as one, and a connected socket's send (addr_len 0)
+// all keep that promise.
+static void test_udp_coalesce(void) {
+	uint16_t rport = 0, r2port = 0, sport = 0;
+	int rx = udp_bound(&rport, 0);
+	int rx2 = udp_bound(&r2port, 0);
+	int tx = udp_bound(&sport, 0);
+	int gro = hw_sys_udp_gro(rx);
+	CHECK(gro == 0 || gro == 1, "gro %d", gro);
+	size_t cap = gro ? HW_SYS_GRO_SLOT : 2048;
+	struct sockaddr_in to = loopback_to(rport), to2 = loopback_to(r2port);
+
+	// 20 of CO_LEN and a shorter one to rx, 3 to rx2, then 8 more of CO_LEN to rx: 32 in one batch.
+	static uint8_t bufs[CO_TOTAL][CO_LEN];
+	hw_sys_dgram d[CO_TOTAL];
+	size_t want_len[CO_TOTAL];
+	int n1 = 0;
+	for (int i = 0; i < CO_TOTAL; i++) {
+		int second = i >= 21 && i < 24;
+		size_t len = i == 20 ? 300 : second ? 100 : CO_LEN;
+		memset(bufs[i], 'A' + i, len);
+		d[i].buf = bufs[i];
+		d[i].len = len;
+		memcpy(&d[i].addr, second ? &to2 : &to, sizeof(to));
+		d[i].addr_len = sizeof(to);
+		if (!second) want_len[n1++] = len;
+	}
+	int sent = 0;
+	while (sent < CO_TOTAL) {
+		int r = hw_sys_send_batch(tx, d + sent, (size_t)(CO_TOTAL - sent));
+		CHECK(r >= 1, "send_batch: %d errno %d", r, errno);
+		sent += r;
+	}
+	size_t lens[CO_TOTAL + 8];
+	uint8_t tags[CO_TOTAL + 8];
+	int got = coalesced_take(rx, cap, n1, lens, tags);
+	CHECK_EQ(got, n1);
+	for (int i = 0, k = 0; i < CO_TOTAL; i++) {
+		if (i >= 21 && i < 24) continue;
+		CHECK_EQ(lens[k], want_len[k]);
+		CHECK(tags[k] == 'A' + i, "datagram %d in order: got %c", k, tags[k]);
+		k++;
+	}
+	got = coalesced_take(rx2, 2048, 3, lens, tags);
+	CHECK_EQ(got, 3);
+	for (int i = 0; i < 3; i++) CHECK(lens[i] == 100 && tags[i] == 'A' + 21 + i, "rx2 datagram %d", i);
+
+	// A connected socket: no address at all.
+	struct sockaddr_in back = loopback_to(rport);
+	CHECK_EQ(connect(tx, (struct sockaddr *)&back, sizeof(back)), 0);
+	for (int i = 0; i < 10; i++) {
+		d[i].len = CO_LEN;
+		memset(bufs[i], 'a' + i, CO_LEN);
+		d[i].addr_len = 0;
+	}
+	sent = 0;
+	while (sent < 10) {
+		int r = hw_sys_send_batch(tx, d + sent, (size_t)(10 - sent));
+		CHECK(r >= 1, "connected send_batch: %d errno %d", r, errno);
+		sent += r;
+	}
+	got = coalesced_take(rx, cap, 10, lens, tags);
+	CHECK_EQ(got, 10);
+	for (int i = 0; i < 10; i++) CHECK(lens[i] == CO_LEN && tags[i] == 'a' + i, "connected datagram %d", i);
+	close(rx);
+	close(rx2);
+	close(tx);
+}
+
+// The buffers asked for are what the socket reports afterwards, whatever the cap made of them.
+static void test_udp_buffers(void) {
+	uint16_t port = 0;
+	int fd = udp_bound(&port, 0);
+	size_t got = hw_sys_udp_buffers(fd, 1024 * 1024);
+	int now = 0;
+	socklen_t nl = sizeof(now);
+	CHECK_EQ(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &now, &nl), 0);
+	CHECK(got > 0 && got == (size_t)now, "granted %zu, the socket says %d", got, now);
+	close(fd);
+}
+
 // A mark is set or refused, and a refused one leaves the socket as it was: with the capability the
 // mark takes; without it (the usual case here, an unprivileged test) the call says EPERM. Either
 // way the socket still sends. Without marks at all the answer is ENOTSUP.
@@ -535,6 +882,10 @@ int main(void) {
 	RUN(test_crypt);
 	RUN(test_random);
 	RUN(test_udp_unreachable);
+	RUN(test_udp_steer);
+	RUN(test_udp_batch);
+	RUN(test_udp_coalesce);
+	RUN(test_udp_buffers);
 	RUN(test_mark);
 	RUN(test_pty);
 	return 0;

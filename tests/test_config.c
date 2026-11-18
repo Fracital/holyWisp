@@ -152,6 +152,53 @@ static void test_warp_bypass_host_key(void) {
 	CHECK_EQ(cfg.warp_bypass_hosts.count, 4);
 }
 
+// The WebTransport keys, their defaults, and what validation refuses.
+static void test_webtransport_keys(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(cfg.webtransport, 0);
+	CHECK_EQ(cfg.webtransport_port, 0);
+	CHECK_EQ(cfg.webtransport_idle_timeout_s, 30);
+	CHECK_EQ(cfg.webtransport_max_handshakes, 1024);
+	CHECK_EQ(cfg.webtransport_retry_threshold, 64);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport", "on", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-host", "::1", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-port", "4433", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-url", "https://relay.example:4433/wt", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-idle-timeout-s", "45", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-max-handshakes", "256", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-retry-threshold", "0", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport, 1);
+	CHECK_STR(cfg.webtransport_host, "::1");
+	CHECK_EQ(cfg.webtransport_port, 4433);
+	CHECK_STR(cfg.webtransport_url, "https://relay.example:4433/wt");
+	CHECK_EQ(cfg.webtransport_idle_timeout_s, 45);
+	CHECK_EQ(cfg.webtransport_max_handshakes, 256);
+	CHECK_EQ(cfg.webtransport_retry_threshold, 0);
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "valid: %s", err);
+	// An idle timeout is not optional, and neither is a handshake cap.
+	CHECK(hw_config_set(&cfg, "webtransport-idle-timeout-s", "0", err, sizeof(err)) != 0, "idle timeout 0");
+	CHECK(hw_config_set(&cfg, "webtransport-max-handshakes", "0", err, sizeof(err)) != 0, "no handshakes");
+	CHECK(hw_config_set(&cfg, "webtransport-port", "65536", err, sizeof(err)) != 0, "port range");
+	// A certificate needs its key, and the other way round.
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-cert", "/etc/wt/chain.pem", err, sizeof(err)), 0);
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "cert without key");
+	CHECK(strstr(err, "webtransport-key") != NULL, "the error names it: %s", err);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-key", "/etc/wt/key.pem", err, sizeof(err)), 0);
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "cert and key: %s", err);
+	cfg.webtransport_cert[0] = '\0';
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "key without cert");
+	cfg.webtransport_key[0] = '\0';
+	// The URL goes into JSON as it is: https:// and nothing that would need escaping.
+	const char *bad[] = {"http://relay.example/", "wss://relay.example/", "https://", "https://a\"b", "https://a\\b",
+	                     "https://a b",           "https://r\xc3\xa9lay/"};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		snprintf(cfg.webtransport_url, sizeof(cfg.webtransport_url), "%s", bad[i]);
+		CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "accepted %s", bad[i]);
+	}
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -166,6 +213,7 @@ int main(void) {
 	RUN(test_stop_on_stdin_eof_key);
 	RUN(test_proxy_client_key_keys);
 	RUN(test_warp_bypass_host_key);
+	RUN(test_webtransport_keys);
 	RUN(test_shipped_configs);
 	return 0;
 }

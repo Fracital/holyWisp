@@ -56,7 +56,7 @@ curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywis
 cd holywisp-linux-x64 && ./holywisp --config holywisp.conf
 ```
 
-**Or build from source** (CMake 3.20+, a C11 compiler, Linux):
+**Or build from source** (CMake 3.20+, GCC 12+ or Clang, Linux):
 
 ```sh
 make release                              # -> build/release/holywisp, holywisp-client
@@ -74,7 +74,8 @@ Downloads and checksums for every release: **https://github.com/Fracital/holyWis
 
 ## Build and test
 
-Requires CMake 3.20+, a C11 compiler and Linux (epoll). Ninja is used when present. `crypt(3)` and
+Requires CMake 3.20+, GCC 12+ or Clang (the ChaCha20 kernels use `__builtin_shufflevector`) and
+Linux (epoll). Ninja is used when present. `crypt(3)` and
 `forkpty(3)` come from libc (`libcrypt-dev` / `libxcrypt-devel` on some distros).
 
 It also builds and runs on macOS (kqueue), as a port for development machines: the same server and
@@ -198,11 +199,20 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `busy-poll-us` | 0 | After a loop iteration that had events, poll this many microseconds before sleeping: lower round-trip latency under load, more CPU spent waiting. 0 always sleeps |
 | `serve-webclient` | on | Serve the built-in browser client on `GET /` |
 | `webclient-wisp-url` | empty | `ws(s)://` URL the web client offers by default; empty means the page's own origin |
+| `webtransport` | off | Also listen for [WebTransport](docs/webtransport.md) (HTTP/3 over QUIC, on UDP): Wisp over a session, the same packets, limits and policy, with UDP streams on QUIC datagrams. TLS 1.3 for this listener is in-tree |
+| `webtransport-host`, `webtransport-port` | `host`, `port` | UDP address and port the WebTransport listener binds (by default the TCP listener's own address and port number) |
+| `webtransport-url` | empty | `https://` URL that `GET /webtransport.json` names, for a page that should not derive it from its own origin |
+| `webtransport-cert`, `webtransport-key` | empty | PEM certificate chain and ECDSA P-256 key to use instead of the self-signed certificate. Without them the server makes a P-256 certificate valid for 13 days and renews it every 6, and `GET /webtransport.json` lists the SHA-256 of the current and the previous one for `serverCertificateHashes` |
+| `webtransport-idle-timeout-s` | 30 | QUIC idle timeout; the server sends a keepalive PING after 20 s without sending |
+| `webtransport-max-handshakes`, `webtransport-retry-threshold` | 1024, 64 | QUIC handshakes in progress per worker; past the threshold every new Initial gets a Retry, so the client must prove its address first |
 | `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
 | `stop-on-stdin-eof` | off | Shut down when standard input reaches end of file. For a program that runs `holywisp` as a child with a pipe on its stdin (the Node wrapper does): the server then never outlives its parent. Leave it off under systemd, where stdin is `/dev/null` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,
-streams, bytes, and every refusal/throttle/block tally), both on the same port.
+streams, bytes, and every refusal/throttle/block tally), both on the same port. With
+`webtransport`, `GET /webtransport.json` on that port is `{"url": ..., "hashes": [...]}`: the URL
+to open (`webtransport-url`, or `""`) and the certificate hashes a page passes to
+`new WebTransport(url, {serverCertificateHashes})`.
 
 ## Running as a service
 
@@ -236,10 +246,19 @@ build/release/holywisp-client -s ws://wisp.example:6001/ --udp --user me --pass 
 
 # throughput against a TCP echo service
 build/release/holywisp-client --bench 268435456 echo.example 7
+
+# the same over WebTransport, pinned to the certificate hash /webtransport.json lists
+build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-256> example.org 80
 ```
 
-The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events.
-`tests/test_e2e.c` and `tests/test_security.c` are the reference for using it.
+An `https://` server URL is WebTransport (UDP, port 443 unless the URL says otherwise). There is no
+certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what authenticates the
+server, and `--insecure` takes any certificate, for loopback tests. `--origin` sends an origin
+header, for a server with `allow-origin`.
+
+The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events
+(`hw_client_opts.webtransport` for WebTransport). `tests/test_e2e.c`, `tests/test_e2e_wt.c` and
+`tests/test_security.c` are the reference for using it.
 
 ## Browser demo
 
@@ -357,7 +376,9 @@ include/holywisp/   public headers
 src/common/         buffers, logging, event loop (epoll, kqueue, select), resolver, DNS client+cache, rate
                     limiters, reputation, string/int maps, filters, WebSocket + Wisp codecs
 src/compat/win32/   Windows only: the POSIX socket calls over Winsock, under their POSIX names
-src/server/         holywisp: config, workers, connections, streams, egress, upstream proxy, twisp
+src/server/         holywisp: config, workers, connections, streams, egress, upstream proxy, twisp,
+                    the WebTransport listener
+src/quic/           TLS 1.3, QUIC, HTTP/3 and WebTransport, sans-IO, for the WebTransport listener
 src/client/         libholywisp-client and the holywisp-client CLI
 tests/              one binary per module plus the end-to-end and security suites, run by ctest
 deploy/             systemd unit, Debian + RPM packaging, the package builder

@@ -86,6 +86,9 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	memcpy(cfg->non_ws_response, banner, sizeof(banner));
 	cfg->serve_webclient = 1;
 	cfg->log_level = HW_LOG_INFO;
+	cfg->webtransport_idle_timeout_s = 30;
+	cfg->webtransport_max_handshakes = 1024;
+	cfg->webtransport_retry_threshold = 64;
 }
 
 int hw_server_config_add_user(hw_server_config *cfg, const char *user, const char *pass) {
@@ -196,6 +199,34 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		for (const char *p = u; *p; p++) {
 			if ((unsigned char)*p <= ' ' || *p == '"' || *p == '\'' || *p == '\\' || *p == '<' || *p == '>') {
 				snprintf(err, err_cap, "webclient-wisp-url contains a character that cannot go into the page");
+				return -1;
+			}
+		}
+	}
+	if (!cfg->webtransport_cert[0] != !cfg->webtransport_key[0]) {
+		snprintf(err, err_cap, "webtransport-cert and webtransport-key must both be set or both be empty");
+		return -1;
+	}
+	if (cfg->webtransport && cfg->webtransport_idle_timeout_s < 1) {
+		// QUIC without an idle timeout keeps a vanished client's state forever (docs/webtransport.md).
+		snprintf(err, err_cap, "webtransport-idle-timeout-s must be at least 1");
+		return -1;
+	}
+	if (cfg->webtransport && cfg->webtransport_max_handshakes < 1) {
+		snprintf(err, err_cap, "webtransport-max-handshakes must be at least 1");
+		return -1;
+	}
+	if (cfg->webtransport_url[0]) {
+		const char *u = cfg->webtransport_url;
+		if (strncmp(u, "https://", 8) != 0 || !u[8]) {
+			snprintf(err, err_cap, "webtransport-url must start with https://");
+			return -1;
+		}
+		// It goes into a JSON string as it is: nothing that could end the string or need escaping.
+		for (const char *p = u; *p; p++) {
+			if ((unsigned char)*p <= ' ' || (unsigned char)*p >= 0x7f || *p == '"' || *p == '\\' || *p == '<' ||
+			    *p == '>') {
+				snprintf(err, err_cap, "webtransport-url contains a character that cannot go into the JSON");
 				return -1;
 			}
 		}
@@ -679,6 +710,7 @@ static void *maint_main(void *arg) {
 			}
 		}
 		if (s->warp_on && !stop) server_warp_refresh(s, 1);
+		if (!stop) wt_cert_tick(s, 1);
 		if (stop) return NULL;
 	}
 }
@@ -835,6 +867,17 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		}
 	}
 	warp_init(s);
+	if (wt_listener_init(s) != 0) {
+		for (int i = 0; i < s->nworkers; i++) {
+			wt_worker_free(&s->workers[i]);
+			worker_destroy(&s->workers[i]);
+		}
+		free(s->warp_read);
+		free(s->warp_given);
+		wt_cert_free(s->wt_cert_cur);
+		errno = EINVAL;
+		goto fail;
+	}
 	return s;
 fail: {
 	int saved = errno;
@@ -861,6 +904,18 @@ fail: {
 
 uint16_t hw_server_port(const hw_server *s) {
 	return s->port;
+}
+
+uint16_t hw_server_wt_port(const hw_server *s) {
+	return s->wt_port;
+}
+
+void hw_server_wt_renew(hw_server *s) {
+	if (!s->cfg.webtransport || s->cfg.webtransport_cert[0]) return;
+	s->wt_renew = 1;
+	pthread_mutex_lock(&s->maint_lock);
+	pthread_cond_signal(&s->maint_cond);
+	pthread_mutex_unlock(&s->maint_lock);
 }
 
 hw_reputation *hw_server_reputation(const hw_server *s) {
@@ -919,7 +974,9 @@ void hw_server_free(hw_server *s) {
 	server_join(s);
 	if (s->maint_started) pthread_join(s->maint_thread, NULL);
 	// The worker threads have joined, so any connection still open was never closed by its peer.
-	// Free them in place; nothing else touches these workers now.
+	// Free them in place; nothing else touches these workers now. WebTransport sessions first:
+	// their connections are then ordinary ones without a socket.
+	for (int i = 0; i < s->nworkers; i++) wt_worker_free(&s->workers[i]);
 	for (int i = 0; i < s->nworkers; i++) {
 		while (s->workers[i].conns) conn_shutdown_free(s->workers[i].conns);
 	}
@@ -939,6 +996,7 @@ void hw_server_free(hw_server *s) {
 	for (int i = 0; i < s->nworkers; i++) worker_destroy(&s->workers[i]);
 	free(s->warp_read);
 	free(s->warp_given);
+	wt_cert_free(s->wt_cert_cur);
 	free(s->webclient_page);
 	free(s->workers);
 	free(s);
@@ -983,6 +1041,12 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->ws_closed_violations = atomic_load(&s->ws_closed_violations);
 	out->auth_failures = atomic_load(&s->auth_failures);
 	out->dns_cache_entries = hw_dns_cache_count(s->dns_cache);
+	out->wt_sessions_total = atomic_load(&s->wt_sessions_total);
+	out->wt_sessions_active = atomic_load(&s->wt_sessions_active);
+	out->wt_handshakes = atomic_load(&s->wt_handshakes);
+	out->wt_retries = atomic_load(&s->wt_retries);
+	out->wt_refused_handshakes = atomic_load(&s->wt_refused_handshakes);
+	out->wt_dropped = atomic_load(&s->wt_dropped);
 	if (s->reputation) {
 		size_t src, dst;
 		hw_reputation_counts(s->reputation, &src, &dst);

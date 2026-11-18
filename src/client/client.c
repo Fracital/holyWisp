@@ -11,6 +11,8 @@
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
+#include "wt_client.h"
+
 #include <errno.h>
 #include <limits.h>
 #include <poll.h>
@@ -52,7 +54,8 @@ typedef struct ctimer {
 } ctimer;
 
 struct hw_client {
-	int fd;
+	int fd;     // the WebSocket's TCP socket; -1 over WebTransport
+	hw_wtc *wt; // the WebTransport session, NULL on a WebSocket
 	int closed;
 	int is_v2;
 	int server_udp;
@@ -173,10 +176,6 @@ static int send_frame(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t h
 	return send_all(c, p, hl + total);
 }
 
-static int send_packet(hw_client *c, const uint8_t *packet, size_t len) {
-	return send_frame(c, HW_WS_BINARY, packet, len, NULL, 0);
-}
-
 static cstream *stream_find(hw_client *c, uint32_t id) {
 	for (size_t i = 0; i < c->nstreams; i++) {
 		if (c->streams[i].id == id) return &c->streams[i];
@@ -207,6 +206,21 @@ static int timer_left(const ctimer *t) {
 	return (int)HW_MIN(t->deadline - now, (uint64_t)INT_MAX);
 }
 
+// One whole packet on the WebTransport session, waiting while its send queue is full for as long
+// as a send waits for a CONTINUE.
+static int wt_send(hw_client *c, const uint8_t *packet, size_t len, int unreliable) {
+	if (c->closed) return HW_ERR_CLOSED;
+	ctimer t = timer_start(c->timeout_ms);
+	int r = hw_wtc_send(c->wt, packet, len, unreliable, t.deadline);
+	if (r == HW_ERR_CLOSED) c->closed = 1;
+	return r;
+}
+
+static int send_packet(hw_client *c, const uint8_t *packet, size_t len) {
+	if (c->wt) return wt_send(c, packet, len, 0);
+	return send_frame(c, HW_WS_BINARY, packet, len, NULL, 0);
+}
+
 // Wait until the socket is readable or the timer runs out. 1 ready, 0 time is up, <0 error.
 static int wait_readable(hw_client *c, const ctimer *t) {
 	struct pollfd pfd = {.fd = c->fd, .events = POLLIN};
@@ -231,6 +245,12 @@ static int read_message(hw_client *c, ctimer *t, const uint8_t **data, size_t *l
 		c->pending_consume = 0;
 	}
 	if (c->closed) return HW_ERR_CLOSED;
+	if (c->wt) {
+		// One Wisp packet per message, framed by the session, which holds it to max_message.
+		int r = hw_wtc_next(c->wt, t->deadline, &t->has_read, data, len);
+		if (r < 0) c->closed = 1;
+		return r;
+	}
 	for (;;) {
 		hw_ws_frame f;
 		int r = hw_ws_parse_header(hw_buf_head(&c->rbuf), hw_buf_avail(&c->rbuf), &f);
@@ -566,6 +586,34 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 	}
 }
 
+// The WebTransport session, under do_upgrade's subprotocol rule: v2 is spoken only when it was
+// offered and the server answered with it.
+static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char *err, size_t err_cap) {
+	hw_wtc_opts wo = {
+	    .host = o->host,
+	    .port = o->port,
+	    .path = o->path,
+	    .origin = o->origin,
+	    .protocols = o->v2 ? "\"" HW_WISP_V2_PROTOCOL "\"" : NULL,
+	    .pin_sha256 = o->pin_sha256,
+	    .max_packet = c->max_message,
+	    .max_queue = c->max_queue_bytes,
+	};
+	c->wt = hw_wtc_connect(&wo, t->deadline, err, err_cap);
+	if (!c->wt) return -1;
+	const char *proto = hw_wtc_protocol(c->wt);
+	if (!o->v2 && proto[0]) {
+		snprintf(err, err_cap, "server chose a subprotocol that was not offered");
+		return -1;
+	}
+	c->is_v2 = o->v2 && strcmp(proto, HW_WISP_V2_PROTOCOL) == 0;
+	if (o->v2 && !c->is_v2) {
+		snprintf(err, err_cap, "server did not accept %s", HW_WISP_V2_PROTOCOL);
+		return -1;
+	}
+	return 0;
+}
+
 // ---------------------------------------------------------------------------------- public API
 
 hw_client *hw_client_connect(const hw_client_opts *o, char *err, size_t err_cap) {
@@ -590,6 +638,14 @@ hw_client *hw_client_connect(const hw_client_opts *o, char *err, size_t err_cap)
 	seed_rng(c);
 	// One deadline for the TCP connect, the upgrade and the Wisp handshake together.
 	ctimer t = timer_start(o->timeout_ms);
+	if (o->webtransport) {
+		c->fd = -1;
+		if (wt_open(c, o, &t, err, err_cap) != 0 || do_wisp_handshake(c, o, &t, err, err_cap) != 0) {
+			hw_client_free(c);
+			return NULL;
+		}
+		return c;
+	}
 	c->fd = hw_connect_tcp(o->host, o->port, o->timeout_ms);
 	if (c->fd < 0) {
 		snprintf(err, err_cap, "connect %s:%u: %s", o->host, o->port, strerror(errno));
@@ -611,6 +667,7 @@ void hw_client_free(hw_client *c) {
 		send_frame(c, HW_WS_CLOSE, reply, 2, NULL, 0);
 	}
 	if (c->fd >= 0) close(c->fd);
+	hw_wtc_free(c->wt);
 	hw_buf_free(&c->rbuf);
 	hw_buf_free(&c->frag);
 	hw_buf_free(&c->sbuf);
@@ -642,7 +699,11 @@ uint32_t hw_client_buffer_size(const hw_client *c) {
 }
 
 int hw_client_fd(const hw_client *c) {
-	return c->fd;
+	return c->wt ? hw_wtc_fd(c->wt) : c->fd;
+}
+
+int hw_client_wait_ms(const hw_client *c) {
+	return c->wt ? hw_wtc_wait_ms(c->wt) : -1;
 }
 
 int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t port, uint32_t *stream_id) {
@@ -697,6 +758,15 @@ int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t le
 	}
 	uint8_t hdr[HW_WISP_HEADER_LEN];
 	hw_wisp_write_header(hdr, HW_WISP_DATA, stream_id);
+	if (c->wt) {
+		// The session takes whole packets: header and payload in one piece.
+		hw_buf_clear(&c->sbuf);
+		if (hw_buf_reserve(&c->sbuf, sizeof(hdr) + len) != 0) return HW_ERR_NOMEM;
+		uint8_t *p = hw_buf_tail(&c->sbuf);
+		memcpy(p, hdr, sizeof(hdr));
+		if (len) memcpy(p + sizeof(hdr), data, len);
+		return wt_send(c, p, sizeof(hdr) + len, s->type == HW_STREAM_UDP);
+	}
 	return send_frame(c, HW_WS_BINARY, hdr, sizeof(hdr), data, len);
 }
 

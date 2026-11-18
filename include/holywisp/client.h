@@ -13,10 +13,16 @@
  * What the server says about itself (the MOTD, the text quoted in a connect error) is still its
  * own bytes: see hw_client_printable before writing any of it to a terminal or a log.
  *
- * There is no TLS here. On a ws:// URL everything, the v2 password included, travels in clear and
- * anyone on the path can read it or answer in the server's place. Put a TLS terminator in front
- * (a local stunnel or proxy on the client side, a reverse proxy on the server side) before giving
- * a client credentials that matter.
+ * There is no TLS on the WebSocket path. On a ws:// URL everything, the v2 password included,
+ * travels in clear and anyone on the path can read it or answer in the server's place. Put a TLS
+ * terminator in front (a local stunnel or proxy on the client side, a reverse proxy on the server
+ * side) before giving a client credentials that matter.
+ *
+ * With opts.webtransport the same client speaks Wisp over WebTransport instead (QUIC over UDP to
+ * the server's webtransport port, docs/webtransport.md). That path is encrypted, and it is
+ * authenticated only by pin_sha256: the certificate's SHA-256, as the server's
+ * /webtransport.json lists it. There is no certificate authority check; without a pin any
+ * certificate is taken, which is for tests on loopback and nothing else.
  */
 #ifndef HOLYWISP_CLIENT_H
 #define HOLYWISP_CLIENT_H
@@ -48,6 +54,12 @@ typedef struct hw_client_opts {
 	// than max_queue_bytes can never be queued.
 	size_t max_queue_bytes;
 	size_t max_queue_events;
+	// WebTransport instead of a WebSocket: port is then the server's UDP webtransport port and
+	// path the session's :path. A v2 request offers wt-available-protocols "wisp-v2". UDP stream
+	// DATA goes out as QUIC datagrams.
+	int webtransport;
+	const uint8_t *pin_sha256; // 32 bytes the server's certificate must hash to; NULL takes any
+	const char *origin;        // the origin header to send; NULL sends none
 } hw_client_opts;
 
 enum hw_client_event_type {
@@ -85,6 +97,10 @@ const char *hw_client_motd(const hw_client *c);
 int hw_client_server_has_udp(const hw_client *c);
 uint32_t hw_client_buffer_size(const hw_client *c); // the server's initial CONTINUE
 int hw_client_fd(const hw_client *c);               // for poll(2) alongside other fds
+// The longest a caller that polls hw_client_fd may wait before it calls hw_client_poll, in
+// milliseconds: QUIC's timers (retransmission, acknowledgements, keepalive) run only inside the
+// client's calls. -1 on a WebSocket, which has none.
+int hw_client_wait_ms(const hw_client *c);
 
 // Copy len bytes to out as printable ASCII for a terminal or a log line: every byte below 0x20 or
 // above 0x7e becomes \xNN (four characters), so no escape sequence, line break or UTF-8 encoded
@@ -102,7 +118,10 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 // client is intact, so the caller may poll and try again. HW_ERR_TOOBIG when what the server sent
 // during the wait passed max_queue_bytes or max_queue_events: the client is then closed, events
 // already queued can still be polled, and every later call returns HW_ERR_CLOSED. The timeout is
-// for the CONTINUE only; the write that follows is a blocking send(2).
+// for the CONTINUE only; the write that follows is a blocking send(2). Over WebTransport that
+// write waits instead while the session's send queue is full, within the same timeout
+// (HW_ERR_TIMEOUT, nothing sent), and a UDP stream's DATA is a datagram that may be lost, as UDP's
+// would be.
 int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t len);
 int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason);
 

@@ -51,7 +51,7 @@
 // megabyte packets (a relay pipe holds that much) made its buffer outgrow its cache and cost the
 // client and the echo behind it 20 to 40% more per byte, while the server saved nothing by them.
 // On the bench VM 128 KiB won the multi-connection rows by 8 to 9% and lost none.
-#define CONN_FRAME_MAX (128 * 1024)
+#define CONN_FRAME_MAX HW_FRAME_MAX
 // Frames are not written one by one while the queue is smaller than this: they wait for the end of
 // the loop's batch and leave in one send (conn_kick). Anything larger is worth its own write.
 #define CONN_DEFER_MAX (16 * 1024)
@@ -172,11 +172,19 @@ void conn_close(hw_conn *c) {
 		auth_cancel(c->auth_req);
 		c->auth_req = NULL;
 	}
-	hw_loop_del_fd(c->w->loop, c->fd);
-	close(c->fd);
-	c->fd = -1;
+	if (c->fd >= 0) {
+		hw_loop_del_fd(c->w->loop, c->fd);
+		close(c->fd);
+		c->fd = -1;
+	}
 	hw_map_each(&c->streams, close_stream_visit, NULL);
 	marks_free(c); // after the streams: every pipe still queued is an orphan now
+	if (c->wt) {
+		// What the streams' closing queued is on its way first: the session closes behind it.
+		wt_session *s = c->wt;
+		c->wt = NULL;
+		wt_conn_detach(s, c->wt_code);
+	}
 	if (c->conn_slot) {
 		hw_semaphore_release(&c->w->server->connections);
 		c->conn_slot = 0;
@@ -224,7 +232,13 @@ static int conn_reads_stopped(const hw_conn *c) {
 // The client socket's event mask follows that and one more bit: writes are wanted while wbuf (or
 // a pipe) has bytes.
 static void conn_apply_events(hw_conn *c) {
-	if (c->closing || c->fd < 0) return;
+	if (c->closing) return;
+	if (c->wt) {
+		// A session's reads are QUIC credit: withholding it is what not reading a socket is.
+		wt_conn_pause(c->wt, conn_reads_stopped(c));
+		return;
+	}
+	if (c->fd < 0) return;
 	unsigned ev = 0;
 	if (!conn_reads_stopped(c)) ev |= HW_EV_READ;
 	if (c->write_armed) ev |= HW_EV_WRITE;
@@ -404,6 +418,7 @@ static void marks_free(hw_conn *c) {
 
 // Everything queued toward the client: the write buffer plus the payloads still in pipes.
 static size_t conn_queued(const hw_conn *c) {
+	if (c->wt) return wt_conn_queued(c->wt); // the session's queue stands in for wbuf
 	return hw_buf_avail(&c->wbuf) + c->pipe_bytes;
 }
 
@@ -474,6 +489,11 @@ void conn_sweep(hw_worker *w) {
 // saves a whole trip through epoll_wait.
 void conn_flush(hw_conn *c) {
 	if (c->closing) return;
+	if (c->wt) {
+		wt_conn_flush(c->wt);
+		conn_backpressure(c);
+		return;
+	}
 	for (;;) {
 		size_t avail = hw_buf_avail(&c->wbuf);
 		hw_pipe_mark *m = c->mark_count ? &c->marks[c->mark_head] : NULL;
@@ -569,7 +589,7 @@ static size_t frame_payload_max(const hw_conn *c) {
 }
 
 ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
-	if (c->throttled) return -2;
+	if (c->throttled || c->wt) return -2; // a session's bytes are copied into QUIC packets, never spliced
 	hw_spipe *p = s->pipe;
 	if (!p) {
 		p = s->pipe = spipe_open(c->w, s);
@@ -622,6 +642,14 @@ static uint8_t *frame_begin(hw_conn *c, size_t len) {
 
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 	if (c->closing) return -1;
+	if (c->wt) {
+		if (wt_conn_send(c->wt, packet, len, 0) != 0) {
+			conn_close(c);
+			return -1;
+		}
+		conn_kick(c);
+		return 0;
+	}
 	uint8_t *p = frame_begin(c, len);
 	if (!p) return -1;
 	memcpy(p, packet, len);
@@ -629,8 +657,35 @@ int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 	return c->closing ? -1 : 0;
 }
 
+// The same over a WebTransport session: each packet laid out whole for hw_wt, and a UDP stream's
+// sent as a datagram where it fits one, so that a lost one is lost and holds nothing up.
+static int conn_wt_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
+	hw_stream *s = hw_map_get(&c->streams, stream_id);
+	int unreliable = s && s->type == HW_STREAM_UDP;
+	size_t max = frame_payload_max(c);
+	if (max > HW_WT_SCRATCH_LEN - HW_WISP_HEADER_LEN) max = HW_WT_SCRATCH_LEN - HW_WISP_HEADER_LEN;
+	size_t total = len;
+	do {
+		size_t n = len < max ? len : max;
+		uint8_t *p = wt_conn_scratch(c->wt);
+		hw_wisp_write_header(p, HW_WISP_DATA, stream_id);
+		memcpy(p + HW_WISP_HEADER_LEN, data, n);
+		if (wt_conn_send(c->wt, p, HW_WISP_HEADER_LEN + n, unreliable) != 0) {
+			conn_close(c);
+			return -1;
+		}
+		data += n;
+		len -= n;
+	} while (len > 0);
+	atomic_fetch_add(&c->w->bytes_out, total);
+	conn_charge_bandwidth(c, total);
+	conn_kick(c);
+	return c->closing ? -1 : 0;
+}
+
 int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
 	if (c->closing) return -1;
+	if (c->wt) return conn_wt_send_data(c, stream_id, data, len);
 	// One remote read may be larger than a packet may carry: it goes out as several DATA packets,
 	// each within max-message-size, so a strict peer never sees an oversize frame.
 	size_t max = frame_payload_max(c);
@@ -677,6 +732,11 @@ static void send_control(hw_conn *c, uint8_t opcode, const uint8_t *payload, siz
 }
 
 static void ws_fail(hw_conn *c, uint16_t code) {
+	if (c->wt) {
+		c->wt_code = code; // the session's close carries the code the WebSocket's would
+		conn_close(c);
+		return;
+	}
 	uint8_t payload[2] = {(uint8_t)(code >> 8), (uint8_t)code};
 	HW_DEBUG("conn", "%s: websocket close %u", c->peer, code);
 	uint8_t frame[HW_WS_MAX_HEADER + 2];
@@ -736,7 +796,9 @@ static void stats_json(hw_conn *c) {
 	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
 	         "\"synSignatures\":%llu,\"wsClosedViolations\":%llu,\"authFailures\":%llu,"
-	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu}}\n",
+	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu},"
+	         "\"webTransport\":{\"sessions\":{\"total\":%llu,\"active\":%llu},\"handshakes\":%llu,"
+	         "\"retries\":%llu,\"refusedHandshakes\":%llu,\"dropped\":%llu}}\n",
 	         (unsigned long long)st.uptime_s, (unsigned long long)st.connections_total,
 	         (unsigned long long)st.connections_active, (unsigned long long)st.worker_connections_min,
 	         (unsigned long long)st.worker_connections_max, (unsigned long long)st.streams_total,
@@ -752,7 +814,10 @@ static void stats_json(hw_conn *c) {
 	         (unsigned long long)st.tcp_proxied, (unsigned long long)st.tcp_direct,
 	         (unsigned long long)st.syn_signatures, (unsigned long long)st.ws_closed_violations,
 	         (unsigned long long)st.auth_failures, (unsigned long long)st.dns_cache_entries,
-	         (unsigned long long)st.reputation_sources, (unsigned long long)st.reputation_dests);
+	         (unsigned long long)st.reputation_sources, (unsigned long long)st.reputation_dests,
+	         (unsigned long long)st.wt_sessions_total, (unsigned long long)st.wt_sessions_active,
+	         (unsigned long long)st.wt_handshakes, (unsigned long long)st.wt_retries,
+	         (unsigned long long)st.wt_refused_handshakes, (unsigned long long)st.wt_dropped);
 	http_reply(c, 200, "OK", "application/json", body);
 }
 
@@ -871,6 +936,58 @@ int webclient_page_build(hw_server *s) {
 	return 0;
 }
 
+// A browser names the page that opened the connection, and cannot be made to lie about it. With
+// allow-origin set, a page that is not on the list may not use this relay from its visitors'
+// addresses (and so cannot spend their rate limits or their reputation). A client that sends
+// no Origin is not a browser, and is not stopped by this: it speaks for itself.
+static int origin_allowed(const hw_server_config *cfg, const char *origin) {
+	if (cfg->allow_origin_count == 0 || origin == NULL) return 1;
+	for (int i = 0; i < cfg->allow_origin_count; i++) {
+		if (strcasecmp(origin, cfg->allow_origins[i]) == 0) return 1;
+	}
+	return 0;
+}
+
+enum admit {
+	ADMIT_OK = 0,
+	ADMIT_RATE,       // connections-limit-per-ip in connection-window-s
+	ADMIT_REPUTATION, // a STRICT source
+	ADMIT_PER_IP,     // max-concurrent-connections-per-ip
+	ADMIT_CAPACITY    // max-concurrent-connections
+};
+
+// The connection-level checks after the origin and the client's address, in this order, for the
+// WebSocket upgrade and the WebTransport CONNECT alike. On ADMIT_OK the connection holds its slots.
+static enum admit conn_admit(hw_conn *c) {
+	hw_server *srv = c->w->server;
+	if (srv->conn_rate && !hw_window_allow(srv->conn_rate, c->ip)) {
+		HW_STAT_INC(srv, refused_connection_rate);
+		return ADMIT_RATE;
+	}
+	if (apply_reputation(c) != 0) return ADMIT_REPUTATION;
+	// Concurrent connections from one address, so that no single client can hold every slot of the
+	// server-wide cap below. Refused like the rate limit is.
+	int ip_slot = hw_gauge_acquire(srv->conns_per_ip, c->ip);
+	if (ip_slot == 0) {
+		HW_STAT_INC(srv, refused_connection_limit);
+		return ADMIT_PER_IP;
+	}
+	c->ip_slot = ip_slot == 1;
+	if (!hw_semaphore_try(&srv->connections)) {
+		HW_STAT_INC(srv, refused_connection_limit);
+		return ADMIT_CAPACITY;
+	}
+	c->conn_slot = 1;
+	return ADMIT_OK;
+}
+
+static void wt_json_reply(hw_conn *c) {
+	char body[512];
+	size_t n = wt_json(c->w, body, sizeof(body));
+	// Any page may read it: the hashes are what the server shows every client anyway.
+	http_reply_x(c, 200, "OK", "application/json", "Access-Control-Allow-Origin: *\r\n", body, n);
+}
+
 static int http_process(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
 	hw_server *srv = c->w->server;
@@ -888,6 +1005,8 @@ static int http_process(hw_conn *c) {
 			http_reply(c, 200, "OK", "application/json", "{\"status\":\"ok\"}\n");
 		} else if (strcmp(req.path, "/stats") == 0) {
 			stats_json(c);
+		} else if (c->w->wt && strcmp(req.path, "/webtransport.json") == 0) {
+			wt_json_reply(c);
 		} else if (cfg->serve_webclient && strcmp(req.path, "/") == 0) {
 			// Visiting the server in a browser shows the built-in web client (serve-webclient).
 			if (srv->webclient_page) {
@@ -903,18 +1022,9 @@ static int http_process(hw_conn *c) {
 		return 0;
 	}
 
-	// A browser names the page that opened the socket, and cannot be made to lie about it. With
-	// allow-origin set, a page that is not on the list may not use this relay from its visitors'
-	// addresses (and so cannot spend their rate limits or their reputation). A client that sends
-	// no Origin is not a browser, and is not stopped by this: it speaks for itself.
-	if (cfg->allow_origin_count > 0) {
-		const char *origin = hw_http_header_get(&req, "Origin");
-		int ok = origin == NULL;
-		for (int i = 0; i < cfg->allow_origin_count && !ok; i++) ok = strcasecmp(origin, cfg->allow_origins[i]) == 0;
-		if (!ok) {
-			http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "origin not allowed\n");
-			return 0;
-		}
+	if (!origin_allowed(cfg, hw_http_header_get(&req, "Origin"))) {
+		http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "origin not allowed\n");
+		return 0;
 	}
 
 	if (resolve_real_ip(c, &req) != 0) {
@@ -922,38 +1032,26 @@ static int http_process(hw_conn *c) {
 		return 0;
 	}
 
-	// Per-IP connection rate.
-	if (srv->conn_rate && !hw_window_allow(srv->conn_rate, c->ip)) {
-		HW_STAT_INC(srv, refused_connection_rate);
-		char retry[64];
+	char retry[64];
+	switch (conn_admit(c)) {
+	case ADMIT_OK:
+		break;
+	case ADMIT_RATE:
 		snprintf(retry, sizeof(retry), "Retry-After: %d\r\n", cfg->connection_window_s);
 		http_reply_x(c, 429, "Too Many Requests", "text/plain; charset=utf-8", retry, "rate limit\n", 11);
 		return 0;
-	}
-	// Reputation gate.
-	if (apply_reputation(c) != 0) {
+	case ADMIT_REPUTATION:
 		http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "blocked\n");
 		return 0;
-	}
-	// Concurrent connections from one address, so that no single client can hold every slot of the
-	// server-wide cap below. Refused like the rate limit is.
-	int ip_slot = hw_gauge_acquire(srv->conns_per_ip, c->ip);
-	if (ip_slot == 0) {
-		HW_STAT_INC(srv, refused_connection_limit);
-		char retry[64];
+	case ADMIT_PER_IP:
 		snprintf(retry, sizeof(retry), "Retry-After: %d\r\n",
 		         cfg->connection_window_s > 0 ? cfg->connection_window_s : 10);
 		http_reply_x(c, 429, "Too Many Requests", "text/plain; charset=utf-8", retry, "too many connections\n", 21);
 		return 0;
-	}
-	c->ip_slot = ip_slot == 1;
-	// Server-wide concurrent connection cap.
-	if (!hw_semaphore_try(&srv->connections)) {
-		HW_STAT_INC(srv, refused_connection_limit);
+	case ADMIT_CAPACITY:
 		http_reply(c, 503, "Service Unavailable", "text/plain; charset=utf-8", "at capacity\n");
 		return 0;
 	}
-	c->conn_slot = 1;
 
 	// Wisp v2 is opted into by offering any Sec-WebSocket-Protocol at all, not a fixed name: the
 	// spec does not name one, wispurr treats a non-empty header as v2, and epoxy sends a random
@@ -1448,4 +1546,103 @@ static void conn_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		HW_DEBUG("conn", "%s: hung up while paused", c->peer);
 		conn_close(c);
 	}
+}
+
+// ---------------------------------------------------------------------------------- WebTransport
+//
+// A session is a connection without a socket: wt_listener.c hands over each Wisp packet whole
+// (conn_wt_packet, the WebTransport ws_process), and what the connection sends goes to the
+// session (the c->wt branches of conn_send_packet, conn_send_data and conn_flush). Everything
+// between, from handle_message on, is the WebSocket path's.
+
+hw_conn *conn_wt_new(hw_worker *w, wt_session *s, const struct sockaddr *peer) {
+	hw_conn *c = calloc(1, sizeof(*c));
+	if (!c) return NULL;
+	c->w = w;
+	c->wt = s;
+	c->fd = -1;
+	c->state = CONN_HTTP;
+	c->stream_cap = w->server->cfg.max_streams_per_conn;
+	c->read_chunk = HW_READ_CHUNK;
+	hw_buf_init(&c->rbuf);
+	hw_buf_init(&c->wbuf);
+	hw_buf_init(&c->frag);
+	hw_map_init(&c->streams);
+	hw_smap_init(&c->sigdets);
+	memcpy(&c->peer_addr, peer, peer->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+	hw_addr_str(peer, c->peer, sizeof(c->peer));
+	// The UDP peer is the client: there is no proxy in front of this listener, and no header of
+	// the CONNECT is ever taken for an address.
+	hw_addr_ip_str(peer, c->ip, sizeof(c->ip));
+	// Until the opening is over, as on a WebSocket: a v2 client that never sends its INFO goes.
+	c->handshake_timer = hw_loop_add_timer(w->loop, (uint64_t)w->server->cfg.handshake_timeout_ms, 0,
+	                                       handshake_timeout_cb, c);
+	c->lnext = w->conns;
+	if (w->conns) w->conns->lprev = c;
+	w->conns = c;
+	atomic_fetch_add(&w->load, 1);
+	atomic_fetch_add(&w->server->connections_total, 1);
+	atomic_fetch_add(&w->server->connections_active, 1);
+	return c;
+}
+
+int conn_wt_admit(hw_conn *c, const char *origin, const char *protocols) {
+	const hw_server_config *cfg = &c->w->server->cfg;
+	hw_server *srv = c->w->server;
+	if (!origin_allowed(cfg, origin)) return 403;
+	switch (conn_admit(c)) {
+	case ADMIT_OK:
+		break;
+	case ADMIT_RATE:
+	case ADMIT_PER_IP:
+		return 429;
+	case ADMIT_REPUTATION:
+		return 403;
+	case ADMIT_CAPACITY:
+		return 503;
+	}
+	// The WebSocket rule: offering any protocol at all is the v2 opt-in.
+	int v2 = cfg->enable_v2 && protocols != NULL;
+	if (cfg->password_required && !v2) return 426;
+	c->state = CONN_WS;
+	c->is_v2 = v2;
+	if (cfg->proxy_client_key) {
+		hw_warp_client_key(srv->client_key_secret, srv->client_key_secret_len, c->ip, c->client_key);
+	}
+	HW_DEBUG("conn", "%s: webtransport %s", c->peer, v2 ? "wisp-v2" : "wisp-v1");
+	return 200;
+}
+
+void conn_wt_open(hw_conn *c) {
+	if (c->closing) return;
+	if (c->is_v2) {
+		send_server_info(c);
+	} else {
+		handshake_done(c);
+	}
+}
+
+void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int datagram) {
+	if (c->closing) return;
+	c->heard = 1;
+	if (datagram) {
+		// A datagram may be lost or overtake the stream, so only what tolerates that is taken
+		// from one: DATA for a UDP stream. A CLOSE or a CONNECT there would be a race.
+		hw_wisp_packet p;
+		hw_stream *s = NULL;
+		if (c->handshake_done && hw_wisp_parse(data, len, &p) == 0 && p.type == HW_WISP_DATA) {
+			s = hw_map_get(&c->streams, p.stream_id);
+		}
+		if (!s || s->type != HW_STREAM_UDP) {
+			atomic_fetch_add(&c->w->server->wt_dropped, 1);
+			return;
+		}
+	}
+	handle_message(c, data, len);
+	// The packet's bytes are the session's and only valid now: what was batched goes out first.
+	stream_batch_flush(c->w);
+}
+
+void conn_wt_progress(hw_conn *c) {
+	if (!c->closing) conn_backpressure(c);
 }

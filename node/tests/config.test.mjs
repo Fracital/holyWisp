@@ -24,6 +24,40 @@ test("an empty config passes only what the wrapper decides", () => {
 	assert.deepEqual(sensitive, []);
 });
 
+test("webTransport maps onto the webtransport keys, and false or absent passes none", () => {
+	const wtArgs = (config) => workerArgs(config, run).args.filter((arg) => arg.startsWith("--webtransport"));
+	assert.deepEqual(wtArgs({}), []);
+	assert.deepEqual(wtArgs({ webTransport: false }), []);
+	assert.deepEqual(wtArgs({ webTransport: true }), ["--webtransport=true"]);
+	assert.deepEqual(
+		wtArgs({
+			webTransport: {
+				host: "0.0.0.0",
+				port: 4433,
+				url: "https://relay.example:4433/",
+				certFile: "/etc/wt/chain.pem",
+				keyFile: "/etc/wt/key.pem",
+				idleTimeoutSeconds: 45,
+				maxHandshakes: 256,
+				retryThreshold: 16,
+			},
+		}),
+		[
+			"--webtransport=true",
+			"--webtransport-host=0.0.0.0",
+			"--webtransport-port=4433",
+			"--webtransport-url=https://relay.example:4433/",
+			"--webtransport-cert=/etc/wt/chain.pem",
+			"--webtransport-key=/etc/wt/key.pem",
+			"--webtransport-idle-timeout-s=45",
+			"--webtransport-max-handshakes=256",
+			"--webtransport-retry-threshold=16",
+		],
+	);
+	assert.throws(() => workerArgs({ webTransport: "yes" }, run), /webTransport must be a boolean or an object/);
+	assert.throws(() => workerArgs({ webTransport: { port: 1.5 } }, run), /webTransport.port must be an integer/);
+});
+
 test("the only header trusted by default is X-Forwarded-For, and a list of one's own replaces it", () => {
 	const headers = (config) => workerArgs(config, run).args.filter((arg) => arg.startsWith("--trusted-header="));
 	// CF-Connecting-IP is a client's to send unless a Cloudflare edge is what is in front.

@@ -17,6 +17,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 
 // <util.h> declares this, and the SDK subset a cross-compiler carries may not have that header.
@@ -89,6 +90,14 @@ int hw_sys_has_udp_unreachable(void) {
 }
 
 // macOS has no socket marks for policy routing.
+size_t hw_sys_udp_buffers(int fd, int bytes) {
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes));
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bytes, sizeof(bytes));
+	int got = 0;
+	socklen_t gl = sizeof(got);
+	return getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &gl) == 0 && got > 0 ? (size_t)got : 0;
+}
+
 int hw_sys_has_mark(void) {
 	return 0;
 }
@@ -98,6 +107,64 @@ int hw_sys_set_mark(int fd, uint32_t mark) {
 	(void)mark;
 	errno = ENOTSUP;
 	return -1;
+}
+
+// One socket, one worker: the kernel can only spread datagrams by their addresses here.
+int hw_sys_has_udp_steer(void) {
+	return 0;
+}
+
+int hw_sys_udp_steer(const int fds[], size_t n) {
+	(void)fds;
+	(void)n;
+	errno = ENOTSUP;
+	return -1;
+}
+
+int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n) {
+	if (n > HW_SYS_BATCH_MAX) n = HW_SYS_BATCH_MAX;
+	size_t got = 0;
+	while (got < n) {
+		struct iovec iov = {.iov_base = d[got].buf, .iov_len = d[got].cap};
+		struct msghdr mh;
+		memset(&mh, 0, sizeof(mh));
+		mh.msg_name = &d[got].addr;
+		mh.msg_namelen = sizeof(d[got].addr);
+		mh.msg_iov = &iov;
+		mh.msg_iovlen = 1;
+		ssize_t r = recvmsg(fd, &mh, MSG_DONTWAIT);
+		if (r < 0 && errno == EINTR) continue;
+		if (r < 0) break;
+		d[got].len = (mh.msg_flags & MSG_TRUNC) ? 0 : (size_t)r;
+		d[got].segment = d[got].len;
+		d[got].addr_len = mh.msg_namelen;
+		got++;
+	}
+	return got > 0 ? (int)got : -1;
+}
+
+int hw_sys_send_batch(int fd, const hw_sys_dgram *d, size_t n) {
+	if (n > HW_SYS_BATCH_MAX) n = HW_SYS_BATCH_MAX;
+	size_t sent = 0;
+	while (sent < n) {
+		ssize_t r = d[sent].addr_len ? sendto(fd, d[sent].buf, d[sent].len, MSG_DONTWAIT,
+		                                      (const struct sockaddr *)&d[sent].addr, d[sent].addr_len)
+		                             : send(fd, d[sent].buf, d[sent].len, MSG_DONTWAIT);
+		if (r < 0 && errno == EINTR) continue;
+		if (r < 0) break;
+		sent++;
+	}
+	return sent > 0 ? (int)sent : -1;
+}
+
+// No segmentation offload: every datagram is a write and a read of its own.
+int hw_sys_has_udp_gso(void) {
+	return 0;
+}
+
+int hw_sys_udp_gro(int fd) {
+	(void)fd;
+	return 0;
 }
 
 int hw_sys_has_crypt(void) {

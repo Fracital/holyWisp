@@ -67,6 +67,66 @@ int hw_sys_close_reset(int fd);
 // and the socket goes on as if it had been delivered.
 int hw_sys_has_udp_unreachable(void);
 
+// ---- UDP for the WebTransport listener (docs/webtransport.md, "Connection IDs and steering")
+
+// Whether hw_sys_udp_steer can work here. Where it cannot, the listener opens one UDP socket, on
+// one worker, and that worker owns every WebTransport connection.
+int hw_sys_has_udp_steer(void);
+// Steer the datagrams that reach a group of UDP sockets bound one after another with
+// SO_REUSEPORT to the same address, fds[0] first, by the QUIC connection ID they carry: a datagram
+// of at least 7 bytes goes to fds[i] when i is byte 1 (a short header, whose DCID starts there) or,
+// for a long header whose DCID is 8 bytes, byte 6 (where that DCID starts). Everything else, and an
+// index of n or more (a client's first Initial, whose DCID it chose itself), goes where the
+// kernel's hash of the addresses sends it, which is the same socket for every datagram of one
+// client address. The index holds while no socket of the group is closed. 0, or -1 with errno
+// (ENOTSUP without hw_sys_has_udp_steer).
+int hw_sys_udp_steer(const int fds[], size_t n);
+
+// One datagram of a batch. To receive: buf and cap are the caller's, and len, segment, addr and
+// addr_len come back (a read longer than cap comes back with len 0: it was cut, and is to be
+// dropped). buf then holds len bytes, which are one datagram, or on a socket with hw_sys_udp_gro
+// on several datagrams of one sender back to back: each `segment` bytes long but the last, which
+// may be shorter (segment == len for one). To send: buf, len, addr and addr_len are the caller's,
+// and an addr_len of 0 sends to a connected socket's peer.
+typedef struct hw_sys_dgram {
+	uint8_t *buf;
+	size_t cap;
+	size_t len;
+	size_t segment;
+	struct sockaddr_storage addr;
+	socklen_t addr_len;
+} hw_sys_dgram;
+
+#define HW_SYS_BATCH_MAX 32    // the most datagrams (or coalesced reads) one batch call moves
+#define HW_SYS_GRO_SLOT  65536 // the receive room a slot needs on a socket with hw_sys_udp_gro on
+
+// Receive up to n datagrams from a non-blocking UDP socket, never waiting (one recvmmsg on Linux,
+// one recvfrom after another elsewhere). The number of slots filled, at least 1, or -1 with errno
+// (EAGAIN: none were waiting).
+int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n);
+// Send d[0..n) in order from a non-blocking UDP socket, never waiting (one sendmmsg on Linux).
+// The number of datagrams sent from the front, at least 1, or -1 with errno when the first one
+// could not go (EAGAIN: the socket buffer is full). Where the kernel can (hw_sys_has_udp_gso), a
+// run of datagrams to one address, all of one length but the last, which may be shorter, is
+// handed to it as one write that it cuts up again (Linux UDP_SEGMENT): the datagrams on the wire
+// are the same, and a batch costs the kernel a few writes instead of one per datagram.
+int hw_sys_send_batch(int fd, const hw_sys_dgram *d, size_t n);
+// Whether hw_sys_send_batch coalesces runs at all here.
+int hw_sys_has_udp_gso(void);
+// Ask the kernel to hand a UDP socket the datagrams one sender sends back to back as one read
+// (Linux UDP_GRO), which hw_sys_recv_batch then reports with their segment size. 1 when that is
+// on, and from then on every slot given to hw_sys_recv_batch for this socket must have a cap of
+// at least HW_SYS_GRO_SLOT, or a coalesced read is cut and lost. 0 where it cannot be had: every
+// read is one datagram, as before.
+int hw_sys_udp_gro(int fd);
+
+// Ask for a receive and a send buffer of `bytes` each on a socket, past the system's cap where the
+// process may (Linux: SO_RCVBUFFORCE and SO_SNDBUFFORCE, which take CAP_NET_ADMIN; without it
+// net.core.rmem_max and wmem_max cap what is granted). Returns the receive buffer the socket now
+// has, as the kernel counts it (Linux counts double what it grants, for its bookkeeping), 0 when
+// it cannot say.
+size_t hw_sys_udp_buffers(int fd, int bytes);
+
 // Whether hw_sys_set_mark can work at all here.
 int hw_sys_has_mark(void);
 // Give a socket a firewall mark (Linux SO_MARK), which policy routing can send out another way:

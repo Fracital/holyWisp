@@ -147,6 +147,16 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	BOOL_KEY("serve-webclient", serve_webclient)
 	STR_KEY("webclient-wisp-url", webclient_wisp_url)
 	BOOL_KEY("stop-on-stdin-eof", stop_on_stdin_eof)
+	// WebTransport.
+	BOOL_KEY("webtransport", webtransport)
+	STR_KEY("webtransport-host", webtransport_host)
+	INT_KEY("webtransport-port", webtransport_port, 0, 65535)
+	STR_KEY("webtransport-url", webtransport_url)
+	STR_KEY("webtransport-cert", webtransport_cert)
+	STR_KEY("webtransport-key", webtransport_key)
+	INT_KEY("webtransport-idle-timeout-s", webtransport_idle_timeout_s, 1, 3600)
+	INT_KEY("webtransport-max-handshakes", webtransport_max_handshakes, 1, 1 << 20)
+	INT_KEY("webtransport-retry-threshold", webtransport_retry_threshold, 0, 1 << 20)
 #undef BOOL_KEY
 #undef INT_KEY
 #undef STR_KEY
@@ -469,7 +479,16 @@ void hw_config_usage(const char *argv0) {
 	       "  webclient-wisp-url URL                    ws(s):// URL the web client offers by default (its origin)\n"
 	       "  log-level                                 debug|info|warn|error|none (info)\n"
 	       "  stop-on-stdin-eof                         shut down when stdin closes: for a parent process that\n"
-	       "                                            holds a pipe to it, never under a service manager (off)\n"
+	       "                                            holds a pipe to it, never under a service manager (off)\n");
+	printf("  webtransport                              also listen for WebTransport (HTTP/3 over QUIC, UDP) (off)\n"
+	       "  webtransport-host, webtransport-port      UDP bind address and port (host, and port's number)\n"
+	       "  webtransport-url URL                      https:// URL GET /webtransport.json names (the page's origin)\n"
+	       "  webtransport-cert, webtransport-key       PEM chain and ECDSA P-256 key to use instead of the\n"
+	       "                                            rotating self-signed certificate (none)\n"
+	       "  webtransport-idle-timeout-s               QUIC idle timeout (30)\n"
+	       "  webtransport-max-handshakes               QUIC handshakes in progress per worker (1024)\n"
+	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"
+	       "                                            Retry (64)\n"
 	       "\n"
 	       "  --version, --help\n");
 }

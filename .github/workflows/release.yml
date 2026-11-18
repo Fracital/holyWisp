@@ -101,13 +101,16 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential cmake ninja-build libcrypt-dev
+          sudo apt-get install -y build-essential gcc-12 cmake ninja-build libcrypt-dev
 
+      # Ubuntu 22.04 keeps the binaries' glibc floor low, but its default GCC 11 has no
+      # __builtin_shufflevector, which the ChaCha20 and Poly1305 kernels (src/common/aead.c) use.
+      # GCC 12 is in the same release's archive and is what the edges build with.
       - name: Build (Release)
         env:
           HW_DESCRIBE: ${{ needs.meta.outputs.describe }}
           COMMIT12: ${{ needs.meta.outputs.commit12 }}
-        run: make release CMAKE_FLAGS="-DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX=+$COMMIT12"
+        run: make release CC=gcc-12 CMAKE_FLAGS="-DHW_BUILD_TESTS=OFF -DHW_VERSION_SUFFIX=+$COMMIT12"
 
       # What CMakeLists.txt's hardening block promises of a release binary: position-independent,
       # relocations bound at start, a stack canary and glibc's checked calls.

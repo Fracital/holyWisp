@@ -1039,7 +1039,8 @@ static void stream_read(hw_stream *s) {
 		s->heard = 1;
 		conn_send_data(c, s->id, scratch, (size_t)n);
 		if (c->closing) return;
-		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP) s->bulk = 1;
+		// A WebTransport session copies into QUIC packets: there is no pipe to relay through.
+		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP && !c->wt) s->bulk = 1;
 		if ((size_t)n < HW_READ_CHUNK && s->type != HW_STREAM_UDP) return; // drained
 	}
 }

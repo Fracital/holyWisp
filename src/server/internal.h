@@ -11,6 +11,7 @@
 #define HOLYWISP_SERVER_INTERNAL_H
 
 #include "holywisp/buf.h"
+#include "holywisp/cert.h"
 #include "holywisp/filter.h"
 #include "holywisp/limits.h"
 #include "holywisp/loop.h"
@@ -29,8 +30,10 @@
 #ifndef HW_READ_CHUNK
 #define HW_READ_CHUNK (64 * 1024) // one recv(2) from a remote or a client
 #endif
-#define HW_STREAM_MAX_ADDRS 8  // addresses tried per CONNECT, in resolver order
-#define HW_BATCH_MAX        64 // DATA payloads written to one remote with a single sendmsg
+#define HW_STREAM_MAX_ADDRS 8                   // addresses tried per CONNECT, in resolver order
+#define HW_BATCH_MAX        64                  // DATA payloads written to one remote with a single sendmsg
+#define HW_FRAME_MAX        (128 * 1024)        // the most payload one DATA packet toward a client carries (conn.c)
+#define HW_WT_SCRATCH_LEN   (HW_FRAME_MAX + 64) // wt_conn_scratch: one such packet with its Wisp header
 
 // A stream's relay pipe (conn.c). Remote bytes are spliced into it and from it into the client
 // socket, never through user space. `pending` bytes of one DATA payload are still in it, waiting
@@ -49,6 +52,22 @@ typedef struct hw_pipe_mark {
 	size_t n;
 	hw_spipe *p;
 } hw_pipe_mark;
+
+// wt_listener.c: the WebTransport listener. One wt_worker per worker (every worker has one, for
+// its copy of the certificate hashes that GET /webtransport.json serves; only the ones with a UDP
+// socket accept sessions), one wt_session per QUIC connection.
+typedef struct wt_worker wt_worker;
+typedef struct wt_session wt_session;
+// A certificate as the workers get it: the chain and key new handshakes use (chain_len 0: none
+// yet), and the SHA-256 of the current and previous self-signed leaf for /webtransport.json
+// (nhashes 0 with an operator's certificate, which browsers verify by the Web PKI).
+typedef struct wt_cert {
+	hw_der chain[HW_CERT_CHAIN_MAX];
+	size_t chain_len;
+	uint8_t key[HW_P256_PRIV_LEN];
+	uint8_t hashes[2][32];
+	int nhashes;
+} wt_cert;
 
 // auth.c: hashed-password checks on threads of their own.
 typedef struct hw_auth hw_auth;
@@ -96,6 +115,7 @@ typedef struct hw_worker {
 	_Atomic int load;
 	pthread_mutex_t inbox_lock;
 	struct hw_handoff *inbox;
+	wt_worker *wt; // NULL without webtransport
 } hw_worker;
 
 enum proxy_kind {
@@ -168,6 +188,16 @@ struct hw_server {
 	size_t client_key_secret_len;
 	struct hw_warp_state *warp_given; // what the workers were last given (NULL: unmarked)
 	int warp_published;               // whether every worker has warp_given
+	// WebTransport. The keys are drawn once and never change: Retry tokens are sealed with the
+	// first and stateless reset tokens derived from the second, and any worker must be able to
+	// answer for any other's connection IDs. The certificate is the maintenance thread's
+	// (wt_cert_rotate); workers have their copies.
+	uint16_t wt_port; // bound UDP port, 0 when off
+	uint8_t wt_token_key[32];
+	uint8_t wt_reset_key[32];
+	wt_cert *wt_cert_cur;  // maintenance thread only
+	_Atomic int wt_renew;  // hw_server_wt_renew asked for a new certificate before its time
+	uint64_t wt_cert_made; // wall-clock seconds the self-signed one was made, 0 for the operator's
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
@@ -194,6 +224,12 @@ struct hw_server {
 	_Atomic uint64_t syn_signatures;
 	_Atomic uint64_t ws_closed_violations;
 	_Atomic uint64_t auth_failures;
+	_Atomic uint64_t wt_sessions_total;
+	_Atomic uint64_t wt_sessions_active;
+	_Atomic uint64_t wt_handshakes;
+	_Atomic uint64_t wt_retries;
+	_Atomic uint64_t wt_refused_handshakes;
+	_Atomic uint64_t wt_dropped;
 };
 
 #define HW_STAT_INC(server, field) atomic_fetch_add(&(server)->field, 1)
@@ -205,9 +241,12 @@ enum conn_state {
 	CONN_CLOSED
 };
 
-// One WebSocket client. Owned by its worker's loop thread.
+// One Wisp client: a WebSocket, or a WebTransport session (wt set, fd -1: its packets come from
+// wt_listener.c and its frames go back there, and rbuf, wbuf and the pipes stay unused). Owned by
+// its worker's loop thread.
 typedef struct hw_conn {
 	hw_worker *w;
+	wt_session *wt;
 	int fd;
 	enum conn_state state;
 	hw_buf rbuf; // bytes from the client not yet parsed
@@ -251,10 +290,11 @@ typedef struct hw_conn {
 	uint64_t active_ms; // last frame from the client, for idle-timeout-s
 	int closing;
 	int violations;
-	int conn_slot;  // holds one of server->connections
-	int ip_slot;    // holds one of server->conns_per_ip for c->ip
-	int heard;      // a read from the client since the worker's last sweep
-	int stream_cap; // effective max streams (reputation THROTTLE tier lowers it)
+	int conn_slot;    // holds one of server->connections
+	int ip_slot;      // holds one of server->conns_per_ip for c->ip
+	uint32_t wt_code; // WebTransport: the session close code conn_close sends (ws_fail's code)
+	int heard;        // a read from the client since the worker's last sweep
+	int stream_cap;   // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
 	char peer[HW_ADDR_STR_LEN];                  // socket peer, with port, for logs
 	char ip[HW_IP_STR_LEN];                      // client IP after trusted-proxy headers, for policy
@@ -317,6 +357,47 @@ typedef struct hw_stream {
 
 // conn.c
 void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer);
+
+// conn.c, for wt_listener.c: the WebTransport side of a connection.
+// A connection for a WebTransport CONNECT from peer (the UDP address: no proxy header is ever
+// read there). NULL on allocation failure.
+hw_conn *conn_wt_new(hw_worker *w, wt_session *s, const struct sockaddr *peer);
+// The connection-level checks of the WebSocket upgrade, in its order, for the CONNECT's origin
+// and offered protocols. The HTTP status to answer: 200 admits the connection (it holds its slots,
+// and is v2 when protocols was offered and enable-v2 is on); anything else refuses it, and the
+// caller detaches and closes it.
+int conn_wt_admit(hw_conn *c, const char *origin, const char *protocols);
+// The session is open (the client's Wisp stream exists): the v1 or v2 opening, as after a 101.
+void conn_wt_open(hw_conn *c);
+// One whole Wisp packet from the Wisp stream, or from a datagram (only DATA for a UDP stream is
+// acted on there). The bytes are only valid during the call. May close the connection.
+void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int datagram);
+// Something may have left the send queue (an ACK, a flush): re-evaluate backpressure.
+void conn_wt_progress(hw_conn *c);
+
+// wt_listener.c
+// The UDP sockets, one per worker where datagrams can be steered (else one, on worker 0), and the
+// certificate. Called by hw_server_new after the workers exist. 0, or -1 (logged).
+int wt_listener_init(hw_server *s);
+// Every session of the worker, freed in place (shutdown, loops stopped), and the worker's state.
+void wt_worker_free(hw_worker *w);
+// The maintenance thread's look at the self-signed certificate: a new one every 6 days, or at once
+// after hw_server_wt_renew.
+void wt_cert_tick(hw_server *s, int running);
+void wt_cert_free(wt_cert *c);
+// The body of GET /webtransport.json from this worker's copy, into out. Its length, 0 when it
+// does not fit.
+size_t wt_json(const hw_worker *w, char *out, size_t cap);
+// For conn.c on a WebTransport connection.
+int wt_conn_send(wt_session *s, const uint8_t *pkt, size_t len, int unreliable);
+size_t wt_conn_queued(const wt_session *s);
+size_t wt_conn_datagram_max(const wt_session *s);
+void wt_conn_pause(wt_session *s, int paused);
+void wt_conn_flush(wt_session *s);
+// The connection is closing (conn_close): end the session with code and forget the connection.
+void wt_conn_detach(wt_session *s, uint32_t code);
+// A per-worker buffer of one frame's payload plus a Wisp header, to lay out a packet in.
+uint8_t *wt_conn_scratch(wt_session *s);
 
 // Look at udp-warp-state again and give the workers what it now means (server.c). The maintenance
 // thread does this every second; running 0 means the workers have not started, so their copies

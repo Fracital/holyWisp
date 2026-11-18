@@ -166,6 +166,20 @@ typedef struct hw_server_config {
 	// window.HOLYWISP_CONFIG.wisp; a value that cannot go into a script string is rejected.
 	char webclient_wisp_url[256];
 	int log_level;
+	// WebTransport (docs/webtransport.md): Wisp over HTTP/3 and QUIC, on a UDP port beside the TCP
+	// listener, with TLS 1.3 in-tree for this listener alone.
+	int webtransport;
+	char webtransport_host[256]; // UDP bind address; "" = host
+	uint16_t webtransport_port;  // 0 = the TCP listener's port number (the bound one when port is 0)
+	// The https:// URL GET /webtransport.json names; "" lets the page derive it from its origin.
+	char webtransport_url[256];
+	// PEM files of an ECDSA P-256 certificate chain and its key. Both empty: a self-signed P-256
+	// certificate valid for 13 days, renewed every 6, whose hashes /webtransport.json publishes.
+	char webtransport_cert[512];
+	char webtransport_key[512];
+	int webtransport_idle_timeout_s;  // QUIC idle timeout
+	int webtransport_max_handshakes;  // handshakes in progress per worker
+	int webtransport_retry_threshold; // handshakes in progress per worker past which an Initial gets a Retry
 	// For the `holywisp` binary when another program runs it: stop when standard input reaches end
 	// of file, which is what a child holding a pipe from its parent sees when the parent dies, however
 	// it dies. Not for a service manager, whose stdin is /dev/null and at end of file from the start.
@@ -210,6 +224,15 @@ typedef struct hw_server_stats {
 	// while connections only arrive.
 	uint64_t worker_connections_min;
 	uint64_t worker_connections_max;
+	// WebTransport: sessions opened (and still open), handshakes in progress, Retries sent, and
+	// what was refused before a session existed (the per-worker or per-address handshake cap) or
+	// dropped (datagrams for no connection, Wisp packets in datagrams that are not UDP DATA).
+	uint64_t wt_sessions_total;
+	uint64_t wt_sessions_active;
+	uint64_t wt_handshakes;
+	uint64_t wt_retries;
+	uint64_t wt_refused_handshakes;
+	uint64_t wt_dropped;
 } hw_server_stats;
 
 typedef struct hw_server hw_server;
@@ -223,6 +246,14 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 // Binds the listeners. NULL with errno on failure.
 hw_server *hw_server_new(const hw_server_config *cfg);
 uint16_t hw_server_port(const hw_server *s);
+// The UDP port the WebTransport listener is bound to, 0 when it is off.
+uint16_t hw_server_wt_port(const hw_server *s);
+// Renew the self-signed WebTransport certificate now, as six days would: the maintenance thread
+// makes the new one within a second (it is woken for it), new handshakes take it once each worker
+// has its copy, and /webtransport.json lists it and the one before it. Returns at once; from any
+// thread. A no-op without webtransport or with webtransport-cert. For tests, which cannot wait the
+// six days.
+void hw_server_wt_renew(hw_server *s);
 // Spawn the workers and return. 0 on success.
 int hw_server_start(hw_server *s);
 // Start, then block until stopped. Returns what hw_server_start returned.

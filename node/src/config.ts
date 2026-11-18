@@ -63,6 +63,27 @@ export type ReputationConfig = {
 
 export type LogLevel = "debug" | "info" | "warn" | "error" | "none";
 
+/**
+ * The WebTransport listener (HTTP/3 over QUIC, on UDP). A browser reaches it directly, not through
+ * `route()`, so its address must be one the browser can reach: by default it is `host`'s, which the
+ * wrapper makes `127.0.0.1`. `GET /webtransport.json` on the server's own port says which
+ * certificate hashes to pin.
+ */
+export type WebTransportConfig = {
+	/** UDP address to bind (default: `host`). */
+	host?: string;
+	/** UDP port (default: the server's TCP port number). */
+	port?: number;
+	/** The `https://` URL `/webtransport.json` names (default: none, the page derives it). */
+	url?: string;
+	/** PEM files of an ECDSA P-256 chain and key, instead of the rotating self-signed certificate. */
+	certFile?: string;
+	keyFile?: string;
+	idleTimeoutSeconds?: number;
+	maxHandshakes?: number;
+	retryThreshold?: number;
+};
+
 export type holyWispConfig = {
 	/**
 	 * Port the server listens on (default 6001). If it is taken, the next free one above it is
@@ -170,6 +191,8 @@ export type holyWispConfig = {
 	/** Serve the built-in browser client on `GET /` of the server's own port. */
 	serveWebclient?: boolean;
 	webclientWispUrl?: string;
+	/** Also listen for WebTransport: `true` with the defaults, or its settings. */
+	webTransport?: boolean | WebTransportConfig;
 	/** Default `warn`. Also the level the wrapper's own messages are filtered at. */
 	logLevel?: LogLevel;
 
@@ -510,6 +533,23 @@ export function workerArgs(
 	str("non-ws-response", "nonWSResponse", config.nonWSResponse);
 	bool("serve-webclient", "serveWebclient", config.serveWebclient);
 	str("webclient-wisp-url", "webclientWispUrl", config.webclientWispUrl);
+	const wt = config.webTransport;
+	if (wt !== undefined && wt !== false) {
+		if (wt !== true && (typeof wt !== "object" || wt === null || Array.isArray(wt))) {
+			fail("webTransport must be a boolean or an object");
+		}
+		flag("webtransport", true);
+		if (wt !== true) {
+			str("webtransport-host", "webTransport.host", wt.host);
+			int("webtransport-port", "webTransport.port", wt.port);
+			str("webtransport-url", "webTransport.url", wt.url);
+			str("webtransport-cert", "webTransport.certFile", wt.certFile);
+			str("webtransport-key", "webTransport.keyFile", wt.keyFile);
+			int("webtransport-idle-timeout-s", "webTransport.idleTimeoutSeconds", wt.idleTimeoutSeconds);
+			int("webtransport-max-handshakes", "webTransport.maxHandshakes", wt.maxHandshakes);
+			int("webtransport-retry-threshold", "webTransport.retryThreshold", wt.retryThreshold);
+		}
+	}
 	// `none` still has the server report errors: the wrapper drops them like everything else, but
 	// keeps the last lines so that a server that will not start can say why.
 	const level = config.logLevel ?? "warn";
