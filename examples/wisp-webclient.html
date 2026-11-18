@@ -6,8 +6,10 @@
 		<title>holyWisp</title>
 		<!--
   Single-file browser client for a Wisp server. No build step, no bundled assets: the Holo Web
-  theme (github.com/zmyaro/holo-web) is pulled from a pinned jsDelivr CDN, and the only local code
-  is the WispClient class below. Laid out like an Android settings screen, Holo dark.
+  theme (github.com/zmyaro/holo-web) is pulled from a pinned jsDelivr CDN, Roboto Mono for the
+  response and log from Google Fonts (Holo already loads Roboto from there; offline, both fall back
+  to the system stacks below), and the only local code is the WispClient class below. Laid out like
+  an Android settings screen, Holo dark.
   Set the Wisp server field to a local ws:// server or an external wss:// domain.
 -->
 		<link
@@ -26,10 +28,37 @@
 			rel="stylesheet"
 			href="https://cdn.jsdelivr.net/gh/zmyaro/holo-web@a20e0f843181c77970208b2695829a0b948c7a4c/holo-ics-dark-widgets.css"
 		/>
+		<link
+			rel="stylesheet"
+			href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&display=swap"
+		/>
 		<style>
-			/* Layout only. Colours, borders and controls are Holo's. */
+			/* Layout and type only. Colours, borders and controls are Holo's. */
+			:root {
+				--sans: Roboto, ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
+					'Helvetica Neue', Arial, sans-serif;
+				--mono: 'Roboto Mono', ui-monospace, 'SF Mono', 'Cascadia Code',
+					'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+			}
+			/* Hiding the log can drop the scrollbar; keep its gutter so the centred column (and
+			   the row under the pointer) does not shift sideways on a toggle. */
+			html {
+				scrollbar-gutter: stable;
+			}
 			body {
 				margin: 0;
+				font-family: var(--sans);
+				-webkit-font-smoothing: antialiased;
+				-moz-osx-font-smoothing: grayscale;
+				text-rendering: optimizeLegibility;
+			}
+			/* Form controls take the UA's small system font unless told otherwise. */
+			input,
+			textarea,
+			select {
+				font: inherit;
+				-webkit-font-smoothing: antialiased;
+				-moz-osx-font-smoothing: grayscale;
 			}
 			.wrap {
 				max-width: 720px;
@@ -39,14 +68,38 @@
 				display: block;
 			}
 			.holo-list li .summary {
+				display: block;
 				font-size: 12px;
 				opacity: 0.6;
 				margin-top: 2px;
 			}
+			/* A toggle row is one <label>: a click anywhere on it is a click on its checkbox,
+			   through the browser's own label activation, so the control's change listener runs
+			   once and the keyboard still works on the checkbox itself. */
 			.holo-list li.row {
+				padding: 0;
+			}
+			.holo-list li.row > label {
 				display: flex;
 				align-items: center;
 				gap: 14px;
+				padding: 16px;
+				cursor: pointer;
+				-webkit-user-select: none;
+				user-select: none;
+				-webkit-tap-highlight-color: transparent;
+				transition: background-color 0.12s ease;
+			}
+			.holo-list li.row input[type='checkbox'] {
+				cursor: pointer;
+			}
+			@media (hover: hover) {
+				.holo-list li.row > label:hover {
+					background-color: rgba(255, 255, 255, 0.04);
+				}
+			}
+			.holo-list li.row > label:active {
+				background-color: rgba(51, 181, 229, 0.18);
 			}
 			.holo-list li.row .grow {
 				flex: 1;
@@ -61,6 +114,12 @@
 			.holo-list li input[type='text'] {
 				width: 100%;
 				box-sizing: border-box;
+				padding: 7px 10px;
+				border: 1px solid #bdbdbd;
+				border-radius: 2px;
+				font-size: 15px;
+				line-height: 1.4;
+				letter-spacing: 0.01em;
 			}
 			.hint {
 				font-size: 11px;
@@ -68,7 +127,7 @@
 				margin-top: 5px;
 			}
 			.hint code {
-				font-family: monospace;
+				font-family: var(--mono);
 			}
 			.bar {
 				display: flex;
@@ -78,7 +137,7 @@
 				padding: 16px;
 			}
 			.status {
-				font-family: monospace;
+				font-family: var(--mono);
 				font-size: 12px;
 				opacity: 0.85;
 				display: flex;
@@ -115,8 +174,12 @@
 				margin: 0 16px;
 				box-sizing: border-box;
 				min-height: 140px;
-				font-family: monospace;
-				font-size: 12px;
+				padding: 8px 10px;
+				border: 1px solid #bdbdbd;
+				border-radius: 2px;
+				font-family: var(--mono);
+				font-size: 12.5px;
+				line-height: 1.55;
 				white-space: pre-wrap;
 				word-break: break-word;
 			}
@@ -171,18 +234,22 @@
 					</div>
 				</li>
 				<li class="row">
-					<div class="grow">
-						<span class="title">Wisp v2</span>
-						<div class="summary">Negotiate the wisp-v2 subprotocol</div>
-					</div>
-					<input id="v2" type="checkbox" />
+					<label>
+						<span class="grow">
+							<span class="title">Wisp v2</span>
+							<span class="summary">Negotiate the wisp-v2 subprotocol</span>
+						</span>
+						<input id="v2" type="checkbox" />
+					</label>
 				</li>
 				<li class="row">
-					<div class="grow">
-						<span class="title">Protocol log</span>
-						<div class="summary">Show the per-packet trace</div>
-					</div>
-					<input id="showlog" type="checkbox" checked />
+					<label>
+						<span class="grow">
+							<span class="title">Protocol log</span>
+							<span class="summary">Show the per-packet trace</span>
+						</span>
+						<input id="showlog" type="checkbox" checked />
+					</label>
 				</li>
 			</ul>
 
