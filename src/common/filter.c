@@ -36,7 +36,13 @@ int hw_hostlist_add(hw_hostlist *l, const char *pattern) {
 	// "*.x" and ".x" are the same wildcard; store as ".x".
 	if (norm[0] == '*' && norm[1] == '.') memmove(norm, norm + 1, strlen(norm));
 	if (norm[0] == '.' && !norm[1]) return -1;
-	snprintf(l->entries[l->count++], HW_FILTER_HOST_LEN, "%s", norm);
+	size_t n = strlen(norm);
+	if (l->used + n + 1 > sizeof(l->pool)) return -1;
+	memcpy(l->pool + l->used, norm, n + 1);
+	l->off[l->count] = (uint16_t)l->used;
+	l->len[l->count] = (uint8_t)n;
+	l->count++;
+	l->used += n + 1;
 	return 0;
 }
 
@@ -47,12 +53,12 @@ int hw_hostlist_match(const hw_hostlist *l, const char *host, size_t host_len) {
 	if (hw_hostname_normalize(norm, sizeof(norm), host, host_len) != 0) return -1;
 	size_t n = strlen(norm);
 	for (int i = 0; i < l->count; i++) {
-		const char *e = l->entries[i];
-		size_t el = strlen(e);
+		const char *e = l->pool + l->off[i];
+		size_t el = l->len[i];
 		if (e[0] == '.') {
 			// Suffix match on a label boundary: ".example.com" matches "a.example.com".
-			if (n > el && strcmp(norm + n - el, e) == 0) return 1;
-		} else if (n == el && strcmp(norm, e) == 0) {
+			if (n > el && memcmp(norm + n - el, e, el) == 0) return 1;
+		} else if (n == el && memcmp(norm, e, el) == 0) {
 			return 1;
 		}
 	}

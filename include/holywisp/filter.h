@@ -11,19 +11,26 @@
 
 #include <sys/socket.h>
 
-#define HW_MAX_FILTER_HOSTS 256
-#define HW_FILTER_HOST_LEN  256 // the longest host a CONNECT can carry (255 bytes), and its NUL
+#define HW_MAX_FILTER_HOSTS 1024
+#define HW_FILTER_HOST_LEN  256   // the longest host a CONNECT can carry (255 bytes), and its NUL
+#define HW_FILTER_POOL      65536 // bytes of names a list holds, NULs included
 #define HW_MAX_CIDRS        64
 
 // Hostnames, lowercased, trailing dot stripped. "*.example.com" and ".example.com" match every
-// subdomain (not the apex); "example.com" matches exactly.
+// subdomain (not the apex); "example.com" matches exactly. The names are packed into one pool, so
+// a list holds up to HW_MAX_FILTER_HOSTS names of ordinary length in what 256 slots of the longest
+// name used to take: the config is on the main thread's stack, and Windows gives that 1 MiB.
 typedef struct hw_hostlist {
-	char entries[HW_MAX_FILTER_HOSTS][HW_FILTER_HOST_LEN];
+	uint16_t off[HW_MAX_FILTER_HOSTS]; // where each entry starts in pool
+	uint8_t len[HW_MAX_FILTER_HOSTS];  // and its length without the NUL (1 to 255)
+	char pool[HW_FILTER_POOL];
+	size_t used; // bytes of pool taken
 	int count;
 } hw_hostlist;
 
-// -1 when the list is full or the pattern is empty or longer than an entry holds: a pattern is
-// never stored cut, because a cut pattern is another pattern.
+// -1 when the list is full (HW_MAX_FILTER_HOSTS entries, or no room left in the pool) or the
+// pattern is empty or longer than an entry holds: a pattern is never stored cut, because a cut
+// pattern is another pattern.
 int hw_hostlist_add(hw_hostlist *l, const char *pattern);
 // Whether host is on the list: 1 when an entry matches it, 0 when none does, and -1 when the
 // host is too long to be compared at all (more than HW_FILTER_HOST_LEN - 1 bytes once

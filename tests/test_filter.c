@@ -43,6 +43,44 @@ static void long_name(char out[NAME_MAX_LEN], size_t len, const char *tail, cons
 	snprintf(out + pad, NAME_MAX_LEN - pad, "%s%s", tail, more);
 }
 
+// A list holds HW_MAX_FILTER_HOSTS names of ordinary length (the edge lists every Google country
+// domain, twice each), and as many of the longest as fit its pool; past either it refuses the
+// next one whole, and every stored name still matches.
+static void test_hostlist_capacity(void) {
+	static hw_hostlist l;
+	memset(&l, 0, sizeof(l));
+	char name[64];
+	for (int i = 0; i < HW_MAX_FILTER_HOSTS; i++) {
+		snprintf(name, sizeof(name), i % 2 ? "*.google.tld%d" : "google.tld%d", i);
+		CHECK_EQ(hw_hostlist_add(&l, name), 0);
+	}
+	CHECK_EQ(hw_hostlist_add(&l, "one.more"), -1);
+	CHECK_EQ(match(&l, "google.tld0"), 1);
+	CHECK_EQ(match(&l, "www.google.tld1023"), 1);
+	CHECK_EQ(match(&l, "google.tld1023"), 0); // "*." is the subdomains, not the name
+	CHECK_EQ(match(&l, "www.google.tld1022"), 0);
+	CHECK_EQ(match(&l, "google.tld10230"), 0);
+
+	static hw_hostlist big;
+	memset(&big, 0, sizeof(big));
+	char longest[HW_FILTER_HOST_LEN];
+	int fitted = 0;
+	for (;; fitted++) {
+		memset(longest, 'a', HW_FILTER_HOST_LEN - 1);
+		longest[HW_FILTER_HOST_LEN - 1] = '\0';
+		snprintf(longest, 8, "%07d", fitted);
+		longest[7] = 'a';
+		if (hw_hostlist_add(&big, longest) != 0) break;
+	}
+	CHECK_EQ(fitted, HW_FILTER_POOL / HW_FILTER_HOST_LEN);
+	CHECK_EQ(hw_hostlist_add(&big, "short.example"), -1); // the longest names fill the pool exactly
+	memset(longest, 'a', HW_FILTER_HOST_LEN - 1);
+	snprintf(longest, 8, "%07d", fitted - 1);
+	longest[7] = 'a';
+	CHECK_EQ(match(&big, longest), 1);
+	CHECK_EQ(match(&big, "short.example"), 0);
+}
+
 // A host is compared whole. Cut at 127 bytes, a name whose first 127 bytes ended in an allowed
 // suffix was allowed whatever came after them, and a long subdomain of a blocked one was not
 // blocked.
@@ -335,6 +373,7 @@ static void test_real_ip_instances(void) {
 int main(void) {
 	RUN(test_hostlist);
 	RUN(test_hostlist_long_names);
+	RUN(test_hostlist_capacity);
 	RUN(test_portset);
 	RUN(test_cidr);
 	RUN(test_cidr_any);
