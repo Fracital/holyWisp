@@ -30,6 +30,7 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
 | `echo.c` | The counting echo service. One thread per connection; prints `ns bytes conns` every 100 ms. It listens on eight consecutive ports, which only the churn scenario uses (see below). |
 | `pump.c` | The native load generator, built on `libholywisp-client`. `tp` keeps N streams full while respecting CONTINUE, `rtt` measures latency with one message in flight, `churn` opens a stream, echoes one byte and closes it, over and over. Prints one JSON line when it finishes. |
 | `run.py` | Starts servers and clients, takes the measurements, and writes `results.json`, `runs.jsonl`, `results.csv` and `results.md`. |
+| `test_run.py` | Unit tests for scenario sizing, rotation, timing checks and cgroup memory reporting (`python3 -I -m unittest discover -s bench -p test_run.py`). |
 | `charts.py` | Reads a results directory and produces `charts/*.svg` (add `--png` for PNGs too) and `report.html`. |
 | `configs/` | The wispurr configs. Flood protection, reputation and connection limits are off; loopback and literal IPs are allowed. There are two files because the Go build rejects the `frameObfuscation` key, and the Go file also sets `bufferRemainingLength` to 128, since the Go server deadlocks within seconds at the 32768 its shipped speed config uses. |
 
@@ -71,13 +72,29 @@ python3 -I bench/run.py --duration 10 --repeats 12 --out bench/results/full
 python3 -I bench/charts.py bench/results/full --png
 ```
 
+The scenarios are sized for a host with 8 CPUs, which the servers, the clients and the echo
+service share, and `run.py` refuses to start on any other (`--any-cpus` overrides it, for numbers
+that compare with nothing). The widest row is 8 connections. Every server starts one worker per
+CPU it sees, and holyWisp and wisp-server-python count the online CPUs rather than their affinity,
+so the host has to be an 8-CPU VM or container: `taskset` on a bigger machine leaves those two with
+more workers than cores. The published run used one, CT 122 on divide (see
+[RESULTS.md](RESULTS.md)).
+
+The harness records cgroup memory use, socket memory and pressure before and after each run, and
+samples them during throughput runs. It stops if memory reaches 85% of the known limit or if a run
+encounters memory pressure. If a container hides its parent cgroup's limit, supply the container's
+visible aggregate cgroup and its actual limit, for example `--memory-cgroup /sys/fs/cgroup
+--memory-limit-mib 16384`. Verify the limit against the host; an incorrect value cannot protect the
+container. The harness also rejects a throughput sample if its echo and wall-clock intervals no
+longer agree. Completed runs remain in `runs.jsonl` if a run is stopped.
+
 Within a scenario the servers run one after another, and the order rotates by one each repeat
 (reversing after every full rotation). That matters more than it sounds: the first run of a
-scenario inherits the state the previous scenario left the host in. On the 16-vCPU VM the
-published numbers come from, the server that ran first after a light scenario was 6 to 10% slower
-with 8 connections for most of its window, and the one that ran first after the saturating
-16-connection scenario measured a 47 us median round trip against 75 to 87 us for the same server
-one slot later. So use a repeat count that is a multiple of the number of servers (with the six servers
+scenario inherits the state the previous scenario left the host in. On the 16-vCPU VM of an
+earlier run, the server that ran first after a light scenario was 6 to 10% slower with 8
+connections for most of its window, and the one that ran first after a scenario that saturated
+the host measured a 47 us median round trip against 75 to 87 us for the same server one slot
+later. So use a repeat count that is a multiple of the number of servers (with the six servers
 of the published run, 6 gives every server every slot once and 12, which it used, gives each slot
 twice and also balances which server it follows); with any other count the medians favour or
 penalise whoever held the first slot more often.

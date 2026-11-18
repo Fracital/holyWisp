@@ -9,7 +9,9 @@ client. On top of that the harness samples the server process's CPU time and pea
 measurement window, and runs latency and stream-churn scenarios with the native pump client.
 
     python3 -I bench/run.py [--duration 10] [--repeats 3] [--only SERVER,...] [--scenarios NAME,...]
-                            [--out bench/results/<timestamp>]
+                            [--out bench/results/<timestamp>] [--any-cpus]
+
+The scenarios are sized for an 8-CPU host (BENCH_CPUS); on any other the harness refuses to start.
 """
 import argparse
 import json
@@ -31,6 +33,14 @@ BENCH_BIN = ROOT / "build" / "bench"
 WISP_PORT = 16401
 ECHO_PORT = 16402
 ECHO_PORTS = 8  # the echo service listens on this many consecutive ports (see the churn scenario)
+# The scenarios are sized for a host with this many CPUs, which the servers, the clients and the
+# echo service share: the widest row is 8 connections. Every server starts one worker per CPU it
+# sees, and holyWisp and wisp-server-python count the online CPUs rather than their affinity, so an
+# 8-CPU host means an 8-CPU VM or container, not taskset on a bigger one.
+BENCH_CPUS = 8
+# Some container cgroup namespaces hide the parent's memory limit. An operator can supply it.
+BENCH_MEMORY_LIMIT = None
+BENCH_MEMORY_CGROUP = None
 
 # ------------------------------------------------------------------------------------- servers
 # Every server gets its "speed" profile: loopback + literal-IP egress allowed (the echo is at
@@ -129,8 +139,6 @@ SCENARIOS = {
                      "client": pump("tp", 1, streams=10, chunk=1048576)},
     "native-8x4": {"label": "native, 8 conns x 4 streams", "kind": "tp", "group": "native",
                    "client": pump("tp", 8, streams=4)},
-    "native-16x4": {"label": "native, 16 conns x 4 streams", "kind": "tp", "group": "native",
-                    "client": pump("tp", 16, streams=4)},
     "rtt-64": {"label": "round trip, 64 B", "kind": "rtt", "group": "latency", "client": pump("rtt", 1, chunk=64)},
     # Each connection churns against its own echo port. Against a single one every server tops out
     # near the same 15-18 thousand streams a second with almost all of its CPU time inside
@@ -143,6 +151,33 @@ SCENARIOS = {
 
 
 # -------------------------------------------------------------------------------------- helpers
+def memory_snapshot():
+    """Cgroup v2 memory use and pressure, when the host exposes them."""
+    try:
+        path = next(line.split("::", 1)[1] for line in pathlib.Path("/proc/self/cgroup").read_text().splitlines()
+                    if line.startswith("0::"))
+        root = BENCH_MEMORY_CGROUP or pathlib.Path("/sys/fs/cgroup") / path.lstrip("/")
+
+        def number(name):
+            text = (root / name).read_text().strip()
+            return int(text) if text != "max" else None
+        def fields(name):
+            return {k: int(v) for k, v in (line.split() for line in (root / name).read_text().splitlines())}
+        pressure = (root / "memory.pressure").read_text().splitlines()
+        full = next(int(part.split("=", 1)[1]) for line in pressure if line.startswith("full ")
+                    for part in line.split() if part.startswith("total="))
+        return {"current": number("memory.current"), "high_limit": number("memory.high"),
+                "max_limit": number("memory.max"), "sock": fields("memory.stat").get("sock", 0),
+                "high_events": fields("memory.events").get("high", 0), "full_us": full}
+    except (OSError, ValueError, StopIteration):
+        return None
+
+
+def measurement_interval_ok(duration, echo_elapsed, wall_elapsed):
+    """The echo counter and CPU samples must cover the same complete measurement window."""
+    return duration * 0.95 <= echo_elapsed <= duration * 1.2 and abs(wall_elapsed - echo_elapsed) <= 1.0
+
+
 def wait_http(port, timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -216,16 +251,23 @@ def kill(p):
     connections."""
     if p is None:
         return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(p.pid, sig)
-        except ProcessLookupError:
-            pass
-        try:
-            p.wait(3)
-            break
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        os.killpg(p.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        p.wait(3)
+    except subprocess.TimeoutExpired:
+        pass
+    # The leader can exit before its workers. Escalate for the whole group even then.
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    try:
+        p.wait(3)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"process group {p.pid} did not stop")
 
 
 class Echo:
@@ -267,7 +309,7 @@ def wait_port_open(port, timeout=5.0):
 
 
 # ------------------------------------------------------------------------------------- one run
-def run_once(server_key, scen_key, duration, echo, log_dir):
+def run_once(server_key, scen_key, duration, echo, log_dir, repeat):
     srv = SERVERS[server_key]
     scen = SCENARIOS[scen_key]
     slog = open(log_dir / f"server-{server_key}-{scen_key}.log", "a")
@@ -286,29 +328,47 @@ def run_once(server_key, scen_key, duration, echo, log_dir):
             if cmd[0] == PUMP:
                 cmd += ["--duration", str(duration + 4)]
             for i in range(client["procs"]):
-                clog = open(log_dir / f"client-{server_key}-{scen_key}-{i}.log", "a")
-                clients.append(subprocess.Popen(cmd, stdout=clog, stderr=subprocess.STDOUT, start_new_session=True))
+                with open(log_dir / f"client-{server_key}-{scen_key}-{repeat}-{i}.log", "w") as clog:
+                    clients.append(subprocess.Popen(cmd, stdout=clog, stderr=subprocess.STDOUT, start_new_session=True))
             time.sleep(1.5)  # warm up: connections open, windows fill, JIT settles
             ns0, b0, _ = echo.sample()
+            wall0 = time.monotonic()
             cpu0 = proc_cpu_seconds(sp.pid)
             # Sample the echo counter every 250 ms so the result carries a throughput-over-time
             # series (and so a mid-run stall is visible, not just averaged in).
             timeline = []
             t_end = time.monotonic() + duration
+            next_memory = time.monotonic()
             while True:
                 time.sleep(0.25)
                 ns, b, _ = echo.sample()
                 timeline.append([round((ns - ns0) / 1e9, 3), b - b0])
-                if time.monotonic() >= t_end:
+                now = time.monotonic()
+                if now >= next_memory:
+                    memory = memory_snapshot()
+                    if memory:
+                        result["memory_peak_sampled"] = max(result.get("memory_peak_sampled", 0), memory["current"])
+                        result["sock_peak_sampled"] = max(result.get("sock_peak_sampled", 0), memory["sock"])
+                        limit = BENCH_MEMORY_LIMIT or memory["high_limit"] or memory["max_limit"]
+                        if limit and memory["current"] >= limit * 0.85:
+                            result["error"] = "container memory reached 85% of its limit"
+                            result["abort_run"] = True
+                            return result
+                    next_memory = now + 1
+                if now >= t_end:
                     break
             ns1, b1, _ = echo.sample()
             cpu1 = proc_cpu_seconds(sp.pid)
+            wall_el = time.monotonic() - wall0
             el = (ns1 - ns0) / 1e9
             result["timeline"] = timeline
+            if not measurement_interval_ok(duration, el, wall_el):
+                result.update(abort_run=True, error=f"misaligned measurement: echo {el:.2f}s, wall {wall_el:.2f}s")
+                return result
             if el <= 0 or b1 == b0:
                 tails = []
                 for i in range(client["procs"]):
-                    lines = (log_dir / f"client-{server_key}-{scen_key}-{i}.log").read_text().strip().splitlines()
+                    lines = (log_dir / f"client-{server_key}-{scen_key}-{repeat}-{i}.log").read_text().strip().splitlines()
                     if lines and lines[-1] not in tails:
                         tails.append(lines[-1][-160:])
                 result["error"] = ("no traffic reached the echo port during the window"
@@ -324,15 +384,27 @@ def run_once(server_key, scen_key, duration, echo, log_dir):
                 "server_peak_rss_mib": proc_peak_rss_kib(sp.pid) / 1024,
                 "ok": True,
             })
-            for c in clients:
-                kill(c)
             if cmd[0] == PUMP:
+                # The pump emits its report only when its own duration ends. Let it finish after
+                # the echo measurement instead of terminating it and recording missing reports
+                # as zero stalls. Its duration includes the warmup and some extra margin.
                 stalls = 0
-                for i in range(client["procs"]):
-                    for line in (log_dir / f"client-{server_key}-{scen_key}-{i}.log").read_text().splitlines():
-                        if line.startswith("{"):
-                            stalls += json.loads(line).get("stalls", 0)
+                for i, c in enumerate(clients):
+                    try:
+                        rc = c.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        result.update(ok=False, error="throughput client did not finish")
+                        return result
+                    lines = (log_dir / f"client-{server_key}-{scen_key}-{repeat}-{i}.log").read_text().splitlines()
+                    reports = [line for line in lines if line.startswith("{")]
+                    if rc != 0 or not reports:
+                        result.update(ok=False, error=f"throughput client exit {rc} or missing report")
+                        return result
+                    stalls += json.loads(reports[-1])["stalls"]
                 result["client_stalls"] = stalls
+            elif any(c.poll() is not None for c in clients):
+                result.update(ok=False, error="throughput client exited during measurement")
+                return result
         else:
             cmd = list(client["cmd"]) + ["--duration", str(duration)]
             cpu0 = proc_cpu_seconds(sp.pid)
@@ -370,7 +442,8 @@ def run_once(server_key, scen_key, duration, echo, log_dir):
             kill(c)
         kill(sp)
         slog.close()
-        wait_port_free(WISP_PORT)
+        if not wait_port_free(WISP_PORT):
+            raise RuntimeError(f"server port {WISP_PORT} is still in use after cleanup")
 
 
 # ----------------------------------------------------------------------------------- aggregate
@@ -499,15 +572,30 @@ def run_order(servers, rep):
 
 
 def main():
+    global BENCH_MEMORY_CGROUP, BENCH_MEMORY_LIMIT
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--duration", type=int, default=10)
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--only", default=",".join(k for k in SERVERS if k != "holywisp-exp"))
+    ap.add_argument("--only", default=",".join(k for k in SERVERS if k not in ("holywisp-exp", "holywisp-sockbuf")))
     ap.add_argument("--scenarios", default=",".join(SCENARIOS))
     ap.add_argument("--out", default=None)
     ap.add_argument("--replace", action="store_true",
                     help="re-run only the servers in --only and splice them into an existing --out directory")
+    ap.add_argument("--any-cpus", action="store_true",
+                    help=f"run on a host that does not have {BENCH_CPUS} CPUs (its numbers do not compare)")
+    ap.add_argument("--memory-cgroup", type=pathlib.Path, help="cgroup v2 directory to monitor instead of this process's")
+    ap.add_argument("--memory-limit-mib", type=int, help="memory ceiling in MiB if hidden by a container namespace")
     a = ap.parse_args()
+    if a.memory_limit_mib is not None and a.memory_limit_mib <= 0:
+        ap.error("--memory-limit-mib must be positive")
+    BENCH_MEMORY_CGROUP = a.memory_cgroup
+    BENCH_MEMORY_LIMIT = a.memory_limit_mib * 1048576 if a.memory_limit_mib else None
+    if (a.memory_cgroup or a.memory_limit_mib) and memory_snapshot() is None:
+        ap.error("cannot read the selected cgroup's memory and pressure counters")
+    ncpu = os.cpu_count()
+    if not a.any_cpus and (ncpu != BENCH_CPUS or len(os.sched_getaffinity(0)) != BENCH_CPUS):
+        sys.exit(f"run.py: this host has {ncpu} CPUs ({len(os.sched_getaffinity(0))} usable); the scenarios are "
+                 f"sized for {BENCH_CPUS}. Run it in a VM or container with {BENCH_CPUS} CPUs, or pass --any-cpus.")
     servers = [s for s in a.only.split(",") if s]
     scenarios = [s for s in a.scenarios.split(",") if s]
     out = pathlib.Path(a.out) if a.out else ROOT / "bench/results" / time.strftime("%Y%m%d-%H%M%S")
@@ -539,7 +627,20 @@ def main():
             order = run_order(servers, rep)
             for scen in scenarios:
                 for slot, sv in enumerate(order):
-                    r = run_once(sv, scen, a.duration, echo, log_dir)
+                    started = time.time()
+                    before = memory_snapshot()
+                    r = run_once(sv, scen, a.duration, echo, log_dir, rep)
+                    after = memory_snapshot()
+                    r["started_unix"] = started
+                    r["finished_unix"] = time.time()
+                    r["memory_before"] = before
+                    r["memory_after"] = after
+                    if before and after:
+                        high = after["high_events"] - before["high_events"]
+                        full_us = after["full_us"] - before["full_us"]
+                        if high > 0 or full_us > 100000:
+                            r.update(ok=False, abort_run=True,
+                                     error=f"container memory pressure: {high} high events, {full_us} us full")
                     r["repeat"] = rep
                     r["slot"] = slot
                     runs.append(r)
@@ -549,6 +650,8 @@ def main():
                     print(f"[{rep + 1}/{a.repeats}] {sv:12s} {scen:12s} {msg}", flush=True)
                     with open(out / "runs.jsonl", "a") as f:
                         f.write(json.dumps(r) + "\n")
+                    if r.get("abort_run"):
+                        raise RuntimeError(f"benchmark stopped: {r['error']}; completed runs are in {out / 'runs.jsonl'}")
     finally:
         echo.close()
     summary = aggregate(runs)
