@@ -217,7 +217,12 @@ runs on. The defaults deny everything that is not public unicast and every chang
   a classifying router can resolve it itself; only a literal IP is sent as an address. With
   `proxy-only-to`, only a TCP stream that resolved into that list takes the proxy at all
   (`stream_route_proxy`, decided per stream in `begin_dial`); the egress check before it is the
-  same either way.
+  same either way, with one exception: a *resolved* address on that list is the router gate's
+  answer, not a destination, so it is not held to the address classes (`resolve_cb`). The stream
+  goes to the proxy by name and the proxy checks what it resolves. On divide that address is the
+  relay's private one, and checking it refused every name the gate routes (`0x48`). The same
+  address as a literal, UDP to it and every unlisted address are checked as before
+  (`test_proxy_only_to`). Never widen it to a stream that could be dialled here.
 - Hostnames are passed to the resolver as given, but a NUL inside the host, an empty host, a port
   of 0 or a host over 255 bytes is `0x41` before anything is looked up. So is a host with a byte
   outside `[A-Za-z0-9._:\[\]-]` and `_` (`host_chars_ok` in `conn.c`), and a name whose last

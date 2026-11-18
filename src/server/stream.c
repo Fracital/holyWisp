@@ -651,10 +651,25 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 		stream_close(s, HW_CLOSE_UNREACHABLE, 1);
 		return;
 	}
+	const hw_server *srv = c->w->server;
+	// An address on proxy-only-to that a name resolved to is not a destination: it is how a router's
+	// name gate says "this name is mine", the stream goes to the proxy by name (stream_route_proxy
+	// always takes it), and the proxy resolves the name itself and does its own check. So it is not
+	// held to the address classes here; on divide that address is the relay's, a private one, and
+	// checking it refused every name the gate answered with it (0x48). A literal IP never comes
+	// through here, and UDP and every other address still get the check.
+	int gate_sink = s->type == HW_STREAM_TCP && srv->proxy.kind != PROXY_NONE && srv->cfg.proxy_only_to_count > 0;
 	enum hw_addr_class blocked = HW_ADDR_PUBLIC;
 	int any_blocked = 0;
 	for (int i = 0; i < res->count && s->naddrs < HW_STREAM_MAX_ADDRS; i++) {
-		if (egress_allowed(&c->w->server->cfg, (const struct sockaddr *)&res->addrs[i], &blocked) != 0) {
+		const struct sockaddr *sa = (const struct sockaddr *)&res->addrs[i];
+		if (gate_sink && hw_cidr_any_contains(srv->cfg.proxy_only_to, srv->cfg.proxy_only_to_count, sa)) {
+			memcpy(&s->addrs[s->naddrs], &res->addrs[i], res->lens[i]);
+			s->addr_lens[s->naddrs] = res->lens[i];
+			s->naddrs++;
+			continue;
+		}
+		if (egress_allowed(&c->w->server->cfg, sa, &blocked) != 0) {
 			any_blocked = 1;
 			continue;
 		}

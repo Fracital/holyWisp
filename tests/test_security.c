@@ -884,6 +884,46 @@ static void test_proxy_only_to(void) {
 	CHECK_EQ(st.tcp_proxied, 1);
 	CHECK_EQ(st.tcp_direct, 0);
 	hw_server_free(s);
+
+	// The listed address is the gate's answer, not a destination: a name that resolves to it goes
+	// to the proxy even where its class is denied here (on divide it is the relay's private
+	// address). The proxy is handed the name and checks what it resolves. The same address as a
+	// literal, a denied address not on the list and UDP to the listed one are still refused.
+	cfg.allow_loopback = 0;
+	cfg.allow_udp = 1;
+	cfg.proxy_udp_direct = 1; // or UDP is refused for the proxy before any address is looked at
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	c = connect_plain(s);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	CHECK(echo_once(c, sid, "a-denied-sink-by-name"), "a name answered with the listed address reaches the proxy");
+	CHECK_EQ(atomic_load(&g_socks5_requests), before + 2);
+	CHECK_STR(g_socks5_host, "localhost");
+	uint8_t reason = 0;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	CHECK(wait_close(c, sid, &reason), "a literal of the listed address closes");
+	CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "localhost", g_echo_port, &sid), 0);
+	CHECK(wait_close(c, sid, &reason), "UDP to the listed address closes");
+	CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+	CHECK_EQ(atomic_load(&g_socks5_requests), before + 2);
+	hw_client_free(c);
+	hw_server_free(s);
+
+	CHECK_EQ(hw_cidr_parse("192.0.2.1", &cfg.proxy_only_to[0]), 0);
+	s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	hw_server_start(s);
+	c = connect_plain(s);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_echo_port, &sid), 0);
+	CHECK(wait_close(c, sid, &reason), "a denied address that is not listed closes");
+	CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+	CHECK_EQ(atomic_load(&g_socks5_requests), before + 2);
+	hw_client_free(c);
+	hw_server_free(s);
+	cfg.allow_loopback = 1;
+	cfg.proxy_udp_direct = 0;
 	shutdown(pfd, SHUT_RDWR);
 
 	// A list with no proxy to send anything to is a mistake.
