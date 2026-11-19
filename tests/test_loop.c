@@ -19,6 +19,21 @@ static void record_cb(hw_loop *loop, void *ud) {
 	if (g_norder == 3) hw_loop_stop(loop);
 }
 
+// The two clocks are one: microseconds over 1000 are the milliseconds, and they tick finer.
+static void test_clock_us(void) {
+	int fine = 0;
+	for (int i = 0; i < 1000; i++) {
+		uint64_t ms0 = hw_now_ms(), us = hw_now_us(), ms1 = hw_now_ms();
+		CHECK(ms0 <= us / 1000 && us / 1000 <= ms1, "%llu ms, %llu us, %llu ms", (unsigned long long)ms0,
+		      (unsigned long long)us, (unsigned long long)ms1);
+		fine |= us % 1000 != 0;
+	}
+	CHECK(fine, "every reading was a whole millisecond");
+	uint64_t a = hw_now_us(), b = a;
+	while (b - a < 2000) b = hw_now_us();
+	CHECK(b - a < 1000000, "2 ms took %llu us", (unsigned long long)(b - a));
+}
+
 static void test_timers_fire_in_order(void) {
 	hw_loop *loop = hw_loop_new();
 	CHECK(loop != NULL, "loop");
@@ -270,6 +285,7 @@ static void test_half_close_needs_read_interest(void) {
 }
 
 int main(void) {
+	RUN(test_clock_us);
 	RUN(test_timers_fire_in_order);
 	RUN(test_repeating_timer_cancels_itself);
 	RUN(test_post_from_other_thread);

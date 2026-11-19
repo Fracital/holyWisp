@@ -27,7 +27,7 @@ layer's unit tests build and run whatever state the layers above are in.
 | server | `src/server/wt_listener.c` (new), changes in `conn.c`, `server.c`, `config.c`, `sys*.c` | `src/server/internal.h` |
 
 Everything below the server is sans-IO and single-threaded: no sockets, no clock reads (the
-caller passes `now_ms`), no threads, no global state except constant tables. Randomness comes
+caller passes `now_ms`, or `now_us` to the calls that BBR's samples are timed by), no threads, no global state except constant tables. Randomness comes
 from `hw_sys_random` (key generation, connection IDs, the Retry token key).
 
 ## Cryptography
@@ -137,9 +137,17 @@ samples count: marked app-limited, a bulk download behind a full buffer stayed i
 pacing at 2.89 times the path. PROBE_RTT counts as app-limited until what was in flight is
 delivered (as Linux does), so its four-packet samples cannot replace an estimate that an
 app-limited stretch left stale: one did, on the edge, and the rate fell to 1 Mbit/s for seconds
-about 10 s into every download. The RTT the model sees
-is never under 1 ms, the clock's tick: below it a loopback path measured 0 and the window was 4
-packets. NewReno (RFC 9002 7, appendix B) remains selectable, and is what the window was until
+about 10 s into every download. The min RTT of the model
+is never under 1 ms, the timers' tick: below it a loopback path measured 0 and the window was 4
+packets. The clock under it is finer: the listener and the client pass microseconds
+(`hw_quic_input_us`, `_output_us`, `_on_timeout_us`), because a rate sample over a round trip of
+30 ms is known only to 3% on a clock of milliseconds, the max filter kept the samples the clock
+made high, and the sender paced 3% over the path. Behind a buffer of 5 ms that was a standing
+queue and 5 to 8% of the packets lost, at 440 Mbit/s and 30 ms, one download or two (netns,
+2026-11-19); on microseconds the estimate is the path's and the loss 3.5 to 5%, most of
+it startup's overshoot and the 1.25 probes. A rate sample is judged against the RTT as measured,
+never the floored one: against the floor, a loopback path kept only the samples that spanned a
+stall and ran at a fifth of its speed. NewReno (RFC 9002 7, appendix B) remains selectable, and is what the window was until
 2026-11-19: on the edge path, 45 ms and about 0.3% random loss, it halved its window 13 times in
 an 8 s download and ran at 4 Mbit/s where the same path's TCP (BBR) did 30. On a 40 Mbit/s netem
 link with that loss and RTT, NewReno moved 0.8 MiB/s and BBR 4.5.

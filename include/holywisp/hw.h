@@ -35,8 +35,10 @@ enum hw_err {
 	HW_ERR_IO = -8        // a system call failed; errno is set
 };
 
-// CLOCK_MONOTONIC in milliseconds.
+// CLOCK_MONOTONIC in milliseconds, and the same clock in microseconds (hw_now_us() / 1000 is
+// hw_now_ms() when both are read in the same millisecond).
 uint64_t hw_now_ms(void);
+uint64_t hw_now_us(void);
 int hw_set_nonblock(int fd);
 int hw_set_cloexec(int fd);
 

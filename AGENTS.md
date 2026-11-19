@@ -626,9 +626,15 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   marked so, a bulk download behind a full buffer never left startup and paced at 2.89 times the
   path (`test_bbr_buffer_limited`). PROBE_RTT counts as app-limited until what was in flight is
   delivered, as in Linux, or its four-packet sample replaced a stale estimate whole and the rate
-  fell to nothing for seconds (`test_bbr_probe_rtt_stale`). The RTT BBR
-  sees is never under 1 ms, the clock's tick: at 0 a loopback window was 4 packets and a 400 MiB/s
-  bench ran at 5. `test_bbr_*` in `test_quic` run it on a simulated lossy path, beside NewReno.
+  fell to nothing for seconds (`test_bbr_probe_rtt_stale`). The min RTT of BBR's
+  model is never under 1 ms, the timers' tick: at 0 a loopback window was 4 packets and a 400 MiB/s
+  bench ran at 5. But the stack's clock is in microseconds (`hw_quic_*_us`, which the listener and
+  the client call): on a clock of milliseconds a rate sample over 30 ms is known to 3%, the max
+  filter kept the high ones, and the sender paced 3% over the path, a standing queue that lost 5 to
+  8% of the packets behind a 5 ms buffer (`test_bbr_clock_tick`). A rate sample is judged against
+  the RTT as measured (`min_rtt_raw`), never the floored one, or a path shorter than a tick keeps
+  only the samples that spanned a stall (`test_bbr_sub_tick_rtt`). `test_bbr_*` in `test_quic` run
+  it on a simulated lossy path, beside NewReno.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
   lost, never sent in fragments that every later packet is then sent in too.
 - **Lanes and the server-opened stream** (docs/webtransport.md has the rules). A session may

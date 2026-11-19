@@ -213,11 +213,12 @@ static void tx_commit(wt_worker *ww, size_t len, const struct sockaddr *to, sock
 // Everything QUIC will send now for this connection, into the batch.
 static void session_output(wt_session *s) {
 	wt_worker *ww = s->ww;
-	uint64_t now = hw_now_ms();
+	// Microseconds: BBR's rate samples are only as good as the clock they are timed with (quic.h).
+	uint64_t now = hw_now_us();
 	for (;;) {
 		hw_sys_dgram *d = tx_slot(ww);
 		if (!d) return; // the socket is full; wt_writable comes back for it
-		size_t n = hw_quic_output(s->q, d->buf, HW_QUIC_MAX_DGRAM, &d->addr, &d->addr_len, now);
+		size_t n = hw_quic_output_us(s->q, d->buf, HW_QUIC_MAX_DGRAM, &d->addr, &d->addr_len, now);
 		if (n == 0) return;
 		tx_commit(ww, n, NULL, 0);
 		d->alone = hw_quic_output_alone(s->q);
@@ -356,7 +357,7 @@ static void session_timer_cb(hw_loop *loop, void *ud) {
 	ww->in_io = 1;
 	if (now >= hw_quic_timeout(s->q)) {
 		s->busy++;
-		hw_quic_on_timeout(s->q, now);
+		hw_quic_on_timeout_us(s->q, hw_now_us());
 		s->busy--;
 	}
 	session_settle(s);
@@ -774,9 +775,9 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	qc->reset_key = srv->wt_reset_key;
 }
 
-static void session_input(wt_session *s, hw_sys_dgram *d, uint64_t now) {
+static void session_input(wt_session *s, hw_sys_dgram *d) {
 	s->busy++;
-	hw_quic_input(s->q, d->buf, d->len, (struct sockaddr *)&d->addr, d->addr_len, now);
+	hw_quic_input_us(s->q, d->buf, d->len, (struct sockaddr *)&d->addr, d->addr_len, hw_now_us());
 	s->busy--;
 	session_touch(s);
 }
@@ -870,7 +871,7 @@ static void initial_new(wt_worker *ww, hw_sys_dgram *d, const hw_quic_header *h,
 	// Retransmissions of this Initial still carry the client's own DCID.
 	cid_key(h->dcid, h->dcid_len, s->odcid_key);
 	if (hw_smap_put(&ww->cids, s->odcid_key, s) != 0) s->odcid_key[0] = '\0';
-	session_input(s, d, now);
+	session_input(s, d);
 	// Nothing is kept for an Initial that does not decrypt: the bytes were anybody's.
 	hw_quic_stats st;
 	hw_quic_get_stats(s->q, &st);
@@ -891,7 +892,7 @@ static void datagram_in(wt_worker *ww, hw_sys_dgram *d, uint64_t now) {
 	cid_key(h.dcid, h.dcid_len, key);
 	wt_session *s = hw_smap_get(&ww->cids, key);
 	if (s) {
-		session_input(s, d, now);
+		session_input(s, d);
 		return;
 	}
 	const struct sockaddr *from = (const struct sockaddr *)&d->addr;

@@ -159,14 +159,14 @@ static void wtc_tx_flush(hw_wtc *t, size_t n) {
 
 // Everything QUIC will send now, in batches (the socket is connected, so the destination is known).
 static void wtc_output(hw_wtc *t) {
-	uint64_t now = hw_now_ms();
+	uint64_t now = hw_now_us(); // BBR times its rate samples with this clock (holywisp/quic.h)
 	size_t n = 0;
 	for (;;) {
 		hw_sys_dgram *d = &t->txd[n];
 		struct sockaddr_storage to;
 		socklen_t tl = sizeof(to);
 		d->buf = t->tx[n];
-		d->len = hw_quic_output(t->q, d->buf, sizeof(t->tx[n]), &to, &tl, now);
+		d->len = hw_quic_output_us(t->q, d->buf, sizeof(t->tx[n]), &to, &tl, now);
 		if (d->len == 0) break;
 		d->addr_len = 0;
 		d->alone = hw_quic_output_alone(t->q);
@@ -203,14 +203,14 @@ static int wtc_pump(hw_wtc *t, uint64_t deadline) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) break;
 				continue; // an ICMP error taken off the socket; the next receive goes on
 			}
-			now = hw_now_ms();
+			uint64_t now_us = hw_now_us();
 			for (int i = 0; i < n; i++) {
 				// A coalesced read is the server's datagrams back to back, each taken on its own.
 				hw_sys_dgram *d = &t->rxd[i];
 				size_t seg = d->segment ? d->segment : d->len;
 				for (size_t off = 0; off < d->len; off += seg) {
-					hw_quic_input(t->q, d->buf + off, HW_MIN(seg, d->len - off), (struct sockaddr *)&d->addr,
-					              d->addr_len, now);
+					hw_quic_input_us(t->q, d->buf + off, HW_MIN(seg, d->len - off), (struct sockaddr *)&d->addr,
+					                 d->addr_len, now_us);
 				}
 			}
 			did = 1;
@@ -219,7 +219,7 @@ static int wtc_pump(hw_wtc *t, uint64_t deadline) {
 	}
 	now = hw_now_ms();
 	if (now >= hw_quic_timeout(t->q)) {
-		hw_quic_on_timeout(t->q, now);
+		hw_quic_on_timeout_us(t->q, hw_now_us());
 		did = 1;
 	}
 	wtc_output(t);

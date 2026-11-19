@@ -204,6 +204,19 @@ int hw_quic_output_alone(const hw_quic_conn *q);
 uint64_t hw_quic_timeout(const hw_quic_conn *q);
 void hw_quic_on_timeout(hw_quic_conn *q, uint64_t now_ms);
 
+// hw_quic_input, hw_quic_output and hw_quic_on_timeout with the same clock in microseconds
+// (now_us / 1000 is the ms clock of the other calls; the timer is still hw_quic_timeout's, in ms).
+// A caller that has a finer clock than its timers passes it here: BBR measures the delivery rate
+// over intervals of a round trip, and on a clock of whole milliseconds a 30 ms interval is known
+// only to 3%. The bandwidth filter keeps the highest sample, so it kept the ones whose error made
+// them high, and the sender paced 3% over the path (a standing queue, and 5 to 8% of the packets
+// lost behind a shallow buffer). One connection keeps to one of the two clocks.
+int hw_quic_input_us(hw_quic_conn *q, uint8_t *dgram, size_t len, const struct sockaddr *from, socklen_t from_len,
+                     uint64_t now_us);
+size_t hw_quic_output_us(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
+                         uint64_t now_us);
+void hw_quic_on_timeout_us(hw_quic_conn *q, uint64_t now_us);
+
 // Open a stream of ours. Returns its id, or -1 while the peer's MAX_STREAMS forbids it.
 int64_t hw_quic_stream_open(hw_quic_conn *q, int bidi);
 

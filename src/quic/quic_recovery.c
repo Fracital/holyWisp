@@ -249,7 +249,7 @@ void hw_qc_cc_use_bbr(hw_qc_cc *c, uint64_t now) {
 	c->bbr = 1;
 	memset(&c->b, 0, sizeof(c->b));
 	c->b.init_cwnd = c->cwnd;
-	c->b.min_rtt = UINT64_MAX;
+	c->b.min_rtt = c->b.min_rtt_raw = UINT64_MAX;
 	c->b.min_rtt_stamp = now;
 	c->b.mode = HW_QC_BBR_STARTUP;
 	c->b.pacing_gain = c->b.cwnd_gain = BBR_HIGH_GAIN;
@@ -292,8 +292,12 @@ static void bbr_check_full_bw(hw_qc_cc *c) {
 	if (++c->b.full_bw_cnt >= BBR_FULL_BW_CNT) c->b.full_bw_reached = 1;
 }
 
-static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
+// rtt_raw is the sample as measured; the model's min RTT is never under a tick of the timers,
+// which pace and probe no finer than that (at 0 a loopback window was 4 packets).
+static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_raw, uint64_t now) {
 	int expired = now > c->b.min_rtt_stamp + BBR_MIN_RTT_US;
+	uint64_t rtt_us = rtt_raw ? HW_MAX(rtt_raw, (uint64_t)HW_QC_GRANULARITY_US) : 0;
+	if (rtt_raw && (rtt_raw < c->b.min_rtt_raw || expired)) c->b.min_rtt_raw = rtt_raw;
 	if (rtt_us && (rtt_us < c->b.min_rtt || expired)) {
 		c->b.min_rtt = rtt_us;
 		c->b.min_rtt_stamp = now;
@@ -382,12 +386,14 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 		return;
 	}
 	// The sample: bytes delivered over the longer of its send and ack intervals. One shorter
-	// than the min RTT is a burst of ACKs, not the path.
+	// than the min RTT is a burst of ACKs, not the path: the RTT as measured, not the model's,
+	// which is floored to a tick. Against the tick, a path shorter than one kept only the samples
+	// that spanned a stall, and a loopback session ran at a fifth of its speed.
 	uint64_t rate = 0;
 	if (c->rs.has) {
 		uint64_t delivered = c->delivered - c->rs.prior_delivered;
 		uint64_t interval = HW_MAX(c->rs.send_elapsed, c->rs.ack_elapsed);
-		uint64_t floor = c->b.min_rtt != UINT64_MAX ? c->b.min_rtt : (rtt_us ? rtt_us : 0);
+		uint64_t floor = c->b.min_rtt_raw != UINT64_MAX ? c->b.min_rtt_raw : rtt_us;
 		if (delivered && interval && interval >= floor) rate = delivered * 1000000 / interval;
 		// A round ends when a packet sent after the previous round began is acknowledged.
 		c->b.round_start = 0;

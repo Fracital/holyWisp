@@ -933,8 +933,7 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 			if (q->handshake_confirmed && ack_delay > q->peer_max_ack_delay) ack_delay = q->peer_max_ack_delay;
 		}
 		hw_qc_rtt_sample(&q->rtt, latest, ack_delay, q->now);
-		// The clock ticks in milliseconds: a sample is never taken for less than one tick.
-		rtt_sample = HW_MAX(latest, (uint64_t)HW_QC_GRANULARITY_US);
+		rtt_sample = latest ? latest : 1; // 0 is "no sample"; BBR floors its own model
 	}
 	if (!q->is_server && spi == HW_QC_SP_HANDSHAKE) q->peer_validated_addr = 1;
 	detect_lost(q, spi);
@@ -1699,10 +1698,15 @@ static void after_events(hw_quic_conn *q) {
 
 int hw_quic_input(hw_quic_conn *q, uint8_t *dgram, size_t len, const struct sockaddr *from, socklen_t from_len,
                   uint64_t now_ms) {
+	return hw_quic_input_us(q, dgram, len, from, from_len, now_ms * 1000);
+}
+
+int hw_quic_input_us(hw_quic_conn *q, uint8_t *dgram, size_t len, const struct sockaddr *from, socklen_t from_len,
+                     uint64_t now_us) {
 	int any = 0, migrate = 0, new_addr = 0;
 	rx_info ri;
 	memset(&ri, 0, sizeof(ri));
-	q->now = now_ms * 1000;
+	q->now = now_us;
 	fire_cid_initial(q);
 	if (q->state >= HW_QC_ST_DRAINING) goto done;
 	if (q->state == HW_QC_ST_CLOSING) {
@@ -2279,7 +2283,12 @@ static size_t output_pmtu_probe(hw_quic_conn *q, uint8_t *out, struct sockaddr_s
 
 size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
                       uint64_t now_ms) {
-	q->now = now_ms * 1000;
+	return hw_quic_output_us(q, out, cap, to, to_len, now_ms * 1000);
+}
+
+size_t hw_quic_output_us(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
+                         uint64_t now_us) {
+	q->now = now_us;
 	q->out_alone = 0;
 	conn_gc(q);
 	if (q->state >= HW_QC_ST_DRAINING) return 0;
@@ -2422,7 +2431,11 @@ uint64_t hw_quic_timeout(const hw_quic_conn *q) {
 }
 
 void hw_quic_on_timeout(hw_quic_conn *q, uint64_t now_ms) {
-	q->now = now_ms * 1000;
+	hw_quic_on_timeout_us(q, now_ms * 1000);
+}
+
+void hw_quic_on_timeout_us(hw_quic_conn *q, uint64_t now_us) {
+	q->now = now_us;
 	uint64_t now = q->now;
 	fire_cid_initial(q);
 	if (q->state == HW_QC_ST_DRAINED) goto done;

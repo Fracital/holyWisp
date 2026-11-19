@@ -318,10 +318,11 @@ typedef struct {
 	// is NewReno and leaves all of this alone.
 	int bbr;
 	struct {
-		int mode;                  // HW_QC_BBR_*
-		uint64_t bw;               // the max filter's answer, bytes per second
-		uint64_t bw_s[3], bw_t[3]; // the windowed max filter (Linux lib/minmax.c): value, round
-		uint64_t min_rtt, min_rtt_stamp;
+		int mode;                        // HW_QC_BBR_*
+		uint64_t bw;                     // the max filter's answer, bytes per second
+		uint64_t bw_s[3], bw_t[3];       // the windowed max filter (Linux lib/minmax.c): value, round
+		uint64_t min_rtt, min_rtt_stamp; // never under a tick of the timers (HW_QC_GRANULARITY_US)
+		uint64_t min_rtt_raw;            // the same window's least sample, unfloored
 		uint64_t round_count, next_round_delivered;
 		int round_start;
 		uint64_t full_bw;
@@ -414,7 +415,8 @@ void hw_qc_rs_on_acked(hw_qc_cc *c, const hw_qc_sent *s, uint64_t now);
 // in flight now is delivered says nothing about the path's bandwidth.
 void hw_qc_cc_app_limited(hw_qc_cc *c);
 // An ACK frame has been processed (its packets acknowledged, losses detected): BBR updates its
-// model, pacing rate and window from the sample. rtt_us is the RTT sample it made, 0 for none.
+// model, pacing rate and window from the sample. rtt_us is the RTT sample it made, as measured
+// (BBR floors its model to a tick itself), 0 for none.
 void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now);
 
 // What a sent frame needs to be sent again when it is lost, or forgotten when it is acked.

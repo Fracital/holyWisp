@@ -74,7 +74,7 @@ struct hw_loop {
 
 // ---------------------------------------------------------------------------------- hw.h helpers
 
-static uint64_t now_us(void) {
+uint64_t hw_now_us(void) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
@@ -370,10 +370,10 @@ int hw_loop_run_once(hw_loop *loop, int timeout_ms) {
 	int n = 0;
 	if (loop->busy_poll_us > 0 && loop->was_busy && timeout_ms != 0) {
 		// The peer that was just served usually answers before a sleep and a wakeup would be over.
-		uint64_t until = now_us() + loop->busy_poll_us;
+		uint64_t until = hw_now_us() + loop->busy_poll_us;
 		do {
 			n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, 0);
-		} while (n == 0 && now_us() < until && !atomic_load(&loop->stop));
+		} while (n == 0 && hw_now_us() < until && !atomic_load(&loop->stop));
 	}
 	if (n == 0) n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, timeout_ms);
 	if (n < 0) {

@@ -409,14 +409,21 @@ static void test_rtt_cc(void) {
 }
 
 // A path for the congestion controller alone: a bottleneck of CCSIM_RATE bytes per microsecond with
-// a queue of CCSIM_QUEUE_US, CCSIM_RTT_US of propagation, an ACK for every packet, a loss detected
-// when the packet three after it is acknowledged, and random loss of one packet in loss_in
-// (0: none). Time is in microseconds and the run is deterministic.
-#define CCSIM_RATE     5u // 5 MB/s
-#define CCSIM_RTT_US   40000u
-#define CCSIM_QUEUE_US 40000u
-#define CCSIM_MDS      1200u
-#define CCSIM_MAX      200000u
+// a queue of g_ccsim.queue_us, g_ccsim.rtt_us of propagation, an ACK for every packet, a loss
+// detected when the packet three after it is acknowledged, and random loss of one packet in
+// loss_in (0: none). Time is in microseconds and the run is deterministic. The sender's clock
+// ticks every g_ccsim.tick_us: what the controller is told is the time of the last tick, and it is
+// woken at a tick, as a caller of the hw_quic_* calls with a millisecond clock is.
+#define CCSIM_RATE 5u // 5 MB/s
+#define CCSIM_MDS  1200u
+#define CCSIM_MAX  200000u
+
+typedef struct {
+	uint64_t rtt_us, queue_us, tick_us;
+} ccsim_path;
+static const ccsim_path CCSIM_DEFAULT = {40000, 40000, 1};
+static ccsim_path g_ccsim = {40000, 40000, 1};
+#define CCSIM_RTT_US (g_ccsim.rtt_us)
 
 typedef struct {
 	hw_qc_sent rec;
@@ -428,7 +435,9 @@ typedef struct {
 	uint64_t delivered_after; // bytes acknowledged after t_measure
 	uint64_t max_cwnd, min_cwnd_late;
 	int saw_probe_rtt;
-	uint64_t bw_after_app_limited; // BBR's estimate when the app-limited stretch ended
+	uint64_t bw_after_app_limited;   // BBR's estimate when the app-limited stretch ended
+	uint64_t bw_max_after;           // BBR's highest estimate after t_measure
+	uint64_t sent_after, lost_after; // packets sent after t_measure, and how many of them the queue dropped
 } ccsim_result;
 
 static uint64_t ccsim_rand(uint64_t *x) {
@@ -443,6 +452,8 @@ static uint64_t ccsim_rand(uint64_t *x) {
 static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measure, uint64_t app_from, uint64_t app_to,
                       ccsim_result *out) {
 	static ccsim_pkt pk[CCSIM_MAX];
+	const uint64_t tick = g_ccsim.tick_us;
+#define CCSIM_CLOCK(t) ((t) / tick * tick)
 	memset(out, 0, sizeof(*out));
 	out->min_cwnd_late = UINT64_MAX;
 	hw_qc_cc c;
@@ -460,10 +471,12 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 			ccsim_pkt *p = &pk[next_ack++];
 			if (p->done || !p->ack_at) continue;
 			p->done = 1;
-			hw_qc_rs_on_acked(&c, &p->rec, p->ack_at);
+			uint64_t at = CCSIM_CLOCK(p->ack_at);
+			hw_qc_rs_on_acked(&c, &p->rec, at);
 			hw_qc_cc_on_acked(&c, p->rec.size, p->rec.time, 0);
-			uint64_t rtt = p->ack_at - p->rec.time;
-			hw_qc_rtt_sample(&r, rtt, 0, p->ack_at);
+			uint64_t rtt = at - p->rec.time;
+			if (!rtt) rtt = 1; // as quic.c: 0 is no sample
+			hw_qc_rtt_sample(&r, rtt, 0, at);
 			if (p->ack_at >= t_measure) out->delivered_after += p->rec.size;
 			// Packet threshold 3: what was sent three or more before this one and not acked is lost.
 			size_t me = (size_t)(p - pk);
@@ -472,11 +485,12 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 				if (!pk[scan].ack_at) {
 					pk[scan].done = 1;
 					hw_qc_cc_remove(&c, pk[scan].rec.size);
-					hw_qc_cc_congestion_event(&c, pk[scan].rec.time, 1, p->ack_at);
+					hw_qc_cc_congestion_event(&c, pk[scan].rec.time, 1, at);
 				}
 			}
-			hw_qc_cc_on_ack_done(&c, rtt, p->ack_at);
+			hw_qc_cc_on_ack_done(&c, rtt, at);
 		}
+		if (bbr && now >= t_measure && c.b.bw > out->bw_max_after) out->bw_max_after = c.b.bw;
 		if (bbr && c.b.mode == HW_QC_BBR_PROBE_RTT) out->saw_probe_rtt = 1;
 		if (c.cwnd > out->max_cwnd) out->max_cwnd = c.cwnd;
 		if (now > end / 2 && c.cwnd < out->min_cwnd_late) out->min_cwnd_late = c.cwnd;
@@ -490,9 +504,9 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 		app_last = now;
 		uint64_t wake = UINT64_MAX;
 		while (hw_qc_cc_can_send(&c) && n < CCSIM_MAX) {
-			uint64_t t = hw_qc_pacer_next(&c, &r, now);
-			if (t > now) {
-				wake = t;
+			uint64_t t = hw_qc_pacer_next(&c, &r, CCSIM_CLOCK(now));
+			if (t > CCSIM_CLOCK(now)) {
+				wake = (t + tick - 1) / tick * tick;
 				break;
 			}
 			if (app_limited && app_credit < CCSIM_MDS) {
@@ -503,15 +517,20 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 			if (app_limited) app_credit -= CCSIM_MDS;
 			ccsim_pkt *p = &pk[n++];
 			memset(p, 0, sizeof(*p));
-			p->rec.time = now;
+			p->rec.time = CCSIM_CLOCK(now);
 			p->rec.size = CCSIM_MDS;
-			hw_qc_rs_on_sent(&c, &p->rec, now);
+			hw_qc_rs_on_sent(&c, &p->rec, p->rec.time);
 			hw_qc_cc_on_sent(&c, CCSIM_MDS);
 			hw_qc_pacer_on_sent(&c, CCSIM_MDS);
 			uint64_t start = HW_MAX(now, link_free);
-			int dropped = start - now > CCSIM_QUEUE_US || (loss_in && ccsim_rand(&seed) % loss_in == 0);
-			if (start - now <= CCSIM_QUEUE_US) link_free = start + CCSIM_MDS / CCSIM_RATE;
+			int full = start - now > g_ccsim.queue_us;
+			int dropped = full || (loss_in && ccsim_rand(&seed) % loss_in == 0);
+			if (!full) link_free = start + CCSIM_MDS / CCSIM_RATE;
 			p->ack_at = dropped ? 0 : link_free + CCSIM_RTT_US;
+			if (now >= t_measure) {
+				out->sent_after++;
+				out->lost_after += (uint64_t)full;
+			}
 		}
 		// On to the next thing that happens.
 		uint64_t t = wake;
@@ -519,6 +538,7 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 		if (t == UINT64_MAX) t = now + 1000; // stalled: what is in flight is all lost
 		now = t > now ? t : now + 1;
 	}
+#undef CCSIM_CLOCK
 }
 
 // BBR on a path that drops one packet in a hundred at random: it fills the bottleneck, where
@@ -572,6 +592,49 @@ static void test_bbr_probe_rtt_stale(void) {
 	CHECK(b.saw_probe_rtt, "no PROBE_RTT");
 	CHECK(b.bw_after_app_limited > rate * 85 / 100, "bw %llu of %llu after the probe",
 	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+}
+
+// The sender's clock. BBR's rate sample is the bytes delivered over a round trip's interval; on a
+// clock of whole milliseconds a 30 ms interval is known to 3%, and the filter keeps the highest
+// sample, so it kept the ones the clock made high: the estimate sat 3% over the path, and behind
+// a queue of 5 ms that is a standing queue and loss at every round (5 to 8% of the packets of a
+// WebTransport download, netns 440 Mbit/s, 30 ms, 2026-11-19). The stack takes the time in
+// microseconds (hw_quic_*_us) for that reason: on that clock the estimate is the path's.
+static void test_bbr_clock_tick(void) {
+	ccsim_result us, ms;
+	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
+	g_ccsim = (ccsim_path){30000, 5000, 1};
+	ccsim_run(1, 0, 10000000, 3000000, 0, 0, &us);
+	g_ccsim.tick_us = 1000;
+	ccsim_run(1, 0, 10000000, 3000000, 0, 0, &ms);
+	g_ccsim = CCSIM_DEFAULT;
+	CHECK(us.bw_max_after <= rate * 101 / 100, "bw %llu of %llu on a microsecond clock",
+	      (unsigned long long)us.bw_max_after, (unsigned long long)rate);
+	CHECK(us.lost_after * 100 < us.sent_after * 2, "lost %llu of %llu on a microsecond clock",
+	      (unsigned long long)us.lost_after, (unsigned long long)us.sent_after);
+	CHECK(us.delivered_after > rate * 7 * 95 / 100, "delivered %llu", (unsigned long long)us.delivered_after);
+	// What the millisecond clock did, so that this test keeps showing it.
+	CHECK(ms.bw_max_after > rate * 102 / 100, "bw %llu of %llu on a millisecond clock",
+	      (unsigned long long)ms.bw_max_after, (unsigned long long)rate);
+	CHECK(ms.lost_after > 2 * us.lost_after, "lost %llu on a millisecond clock, %llu on a microsecond one",
+	      (unsigned long long)ms.lost_after, (unsigned long long)us.lost_after);
+}
+
+// A path shorter than a tick of the timers. The model's min RTT is floored to the tick (BBR paces
+// and probes no finer), but a rate sample is judged against the RTT as measured: judged against
+// the tick, every sample of a 200 us path with a queue of one packet was discarded but those
+// that spanned a stall: the estimate stayed at half the path (on loopback, WebTransport at a fifth
+// of its speed).
+static void test_bbr_sub_tick_rtt(void) {
+	ccsim_result b;
+	g_ccsim = (ccsim_path){200, 300, 1};
+	ccsim_run(1, 0, 3000000, 1000000, 0, 0, &b);
+	g_ccsim = CCSIM_DEFAULT;
+	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
+	CHECK(b.bw_max_after > rate * 90 / 100, "bw %llu of %llu", (unsigned long long)b.bw_max_after,
+	      (unsigned long long)rate);
+	CHECK(b.delivered_after > rate * 2 * 90 / 100, "delivered %llu of %llu", (unsigned long long)b.delivered_after,
+	      (unsigned long long)(rate * 2));
 }
 
 static void test_bbr_app_limited(void) {
@@ -1183,6 +1246,41 @@ static void bulk(sim *s, uint64_t c2s, uint64_t s2c, uint64_t max_ms) {
 	CHECK(sim_run(s, cond_xfer, &x, max_ms), "transfer: c2s %llu/%llu s2c %llu/%llu at %llu ms",
 	      (unsigned long long)s->sv.st[id].received, (unsigned long long)c2s, (unsigned long long)s->c.st[id].received,
 	      (unsigned long long)s2c, (unsigned long long)s->now);
+}
+
+// The microsecond calls: a round trip of 250 us is measured as 250 us, and BBR keeps it for its
+// rate samples while its model's min RTT stays at a tick (quic_recovery.c). On the millisecond
+// calls the same exchange is 0 or 1 ms, depending on where the ticks fall.
+static void test_clock_us(void) {
+	sim *s = sim_new(29);
+	sim_handshake(s);
+	sim_advance(s, 200);
+	CHECK_EQ(s->hn, 0);
+	int64_t id = hw_quic_stream_open(s->c.q, 1);
+	CHECK(id >= 0, "open");
+	app_send(&s->c, (uint64_t)id, 3000); // three datagrams: the server acknowledges at once
+	uint64_t t0 = (s->now + 1) * 1000 + 300;
+	uint8_t d[8][HW_QUIC_MAX_DGRAM];
+	size_t len[8], n = 0;
+	struct sockaddr_storage to;
+	socklen_t to_len;
+	while (n < 8 && (len[n] = hw_quic_output_us(s->c.q, d[n], sizeof(d[n]), &to, &to_len, t0)) > 0) n++;
+	CHECK(n >= 2, "client sent %zu datagrams", n);
+	for (size_t i = 0; i < n; i++) {
+		hw_quic_input_us(s->sv.q, d[i], len[i], (const struct sockaddr *)&s->caddr, sizeof(s->caddr), t0 + 100);
+	}
+	size_t acks = 0;
+	while (n < 8 && (len[n] = hw_quic_output_us(s->sv.q, d[n], sizeof(d[n]), &to, &to_len, t0 + 100)) > 0) {
+		hw_quic_input_us(s->c.q, d[n], len[n], (const struct sockaddr *)&s->saddr, sizeof(s->saddr), t0 + 250);
+		acks++;
+	}
+	CHECK(acks > 0, "the server answered");
+	CHECK_EQ(s->c.q->rtt.latest, 250);
+	CHECK_EQ(s->c.q->cc.b.min_rtt_raw, 250);
+	CHECK_EQ(s->c.q->cc.b.min_rtt, HW_QC_GRANULARITY_US);
+	hw_quic_on_timeout_us(s->c.q, t0 + 250); // nothing is due: a no-op on the same clock
+	CHECK(hw_quic_timeout(s->c.q) > (t0 + 250) / 1000, "a timer is due at once");
+	sim_free(s);
 }
 
 // A sender that waits for room in its send buffer (or for the peer's credit) is not app-limited:
@@ -1955,7 +2053,10 @@ int main(int argc, char **argv) {
 	RUN(test_bbr_random_loss);
 	RUN(test_bbr_model);
 	RUN(test_bbr_buffer_limited);
+	RUN(test_clock_us);
 	RUN(test_bbr_probe_rtt_stale);
+	RUN(test_bbr_clock_tick);
+	RUN(test_bbr_sub_tick_rtt);
 	RUN(test_bbr_app_limited);
 	RUN(test_smap);
 	RUN(test_handshake);
