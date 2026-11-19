@@ -133,6 +133,10 @@ typedef struct hw_server_config {
 	int dns_negative_ttl_s; // failed lookups
 	int dns_order;          // enum hw_dns_order
 	int dns_timeout_ms;
+	// Lookups one client address may have waiting for or in the resolver at once; one more is
+	// closed 0x49 and counts as a violation. 0 = no limit. Not part of flood protection: the
+	// resolver is shared whether or not the limiters are on.
+	int max_pending_lookups_per_ip;
 
 	// Limits and tuning.
 	uint32_t buffer_remaining;  // CONTINUE window in packets (Wisp "buffer size")
@@ -220,6 +224,7 @@ typedef struct hw_server_stats {
 	uint64_t throttled_source;  // per-source connect rate
 	uint64_t throttled_dest;    // per-destination connect rate
 	uint64_t throttled_syns;    // in-flight SYN cap
+	uint64_t throttled_lookups; // a client IP's share of the resolver (max-pending-lookups-per-ip)
 	uint64_t udp_warp_marked;   // UDP streams dialled through a WARP tunnel
 	uint64_t udp_warp_direct;   // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
 	uint64_t udp_warp_refused;  // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse

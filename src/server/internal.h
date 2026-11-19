@@ -237,6 +237,7 @@ struct hw_server {
 	_Atomic uint64_t throttled_source;
 	_Atomic uint64_t throttled_dest;
 	_Atomic uint64_t throttled_syns;
+	_Atomic uint64_t throttled_lookups;
 	_Atomic uint64_t udp_warp_marked;
 	_Atomic uint64_t udp_warp_direct;
 	_Atomic uint64_t udp_warp_refused;

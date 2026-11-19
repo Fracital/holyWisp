@@ -62,6 +62,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->dns_negative_ttl_s = 10;
 	cfg->dns_order = HW_DNS_IPV4_FIRST;
 	cfg->dns_timeout_ms = 3000;
+	cfg->max_pending_lookups_per_ip = 128;
 	cfg->tcp_nodelay = 1;
 	cfg->tcp_quickack = 1;
 	cfg->listen_backlog = 1024;
@@ -824,6 +825,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	memset(&rc, 0, sizeof(rc));
 	rc.threads = cfg->resolver_threads;
 	rc.timeout_ms = cfg->dns_timeout_ms;
+	rc.max_pending_per_key = cfg->max_pending_lookups_per_ip;
 	rc.order = cfg->dns_order;
 	rc.cache = s->dns_cache;
 	for (int i = 0; i < cfg->dns_server_count && rc.nservers < HW_DNS_MAX_SERVERS; i++) {
@@ -1036,6 +1038,7 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->throttled_source = atomic_load(&s->throttled_source);
 	out->throttled_dest = atomic_load(&s->throttled_dest);
 	out->throttled_syns = atomic_load(&s->throttled_syns);
+	out->throttled_lookups = atomic_load(&s->throttled_lookups);
 	out->udp_warp_marked = atomic_load(&s->udp_warp_marked);
 	out->udp_warp_direct = atomic_load(&s->udp_warp_direct);
 	out->udp_warp_refused = atomic_load(&s->udp_warp_refused);

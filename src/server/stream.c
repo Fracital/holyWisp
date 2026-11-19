@@ -761,9 +761,19 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 		return;
 	}
 	s->state = STREAM_RESOLVING;
-	s->resolve = hw_resolve(c->w->server->resolver, c->w->loop, s->host, port, resolve_cb, s);
+	// Counted under the client's address: the resolver's threads are everyone's, and one client's
+	// names that never resolve must not hold them all or fill their queue.
+	s->resolve = hw_resolve(c->w->server->resolver, c->w->loop, s->host, port, c->ip, resolve_cb, s);
 	if (!s->resolve) {
-		stream_close(s, HW_CLOSE_UNKNOWN, 1);
+		if (errno != EAGAIN) {
+			stream_close(s, HW_CLOSE_UNKNOWN, 1);
+			return;
+		}
+		// The client's own share of the resolver is full, which is its doing alone (as its share
+		// of the connects in progress is).
+		HW_STAT_INC(c->w->server, throttled_lookups);
+		if (conn_violation(c, "pending_lookups_per_ip")) return;
+		stream_close(s, HW_CLOSE_THROTTLED, 1);
 		return;
 	}
 	// The resolver has its own timeouts, but not for the time a request waits its turn.

@@ -868,7 +868,7 @@ static void stats_json(hw_conn *c) {
 	         "\"bytes\":{\"in\":%llu,\"out\":%llu},"
 	         "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},"
 	         "\"blocked\":{\"filter\":%llu,\"egress\":%llu},"
-	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu},"
+	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu,\"lookups\":%llu},"
 	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
@@ -884,17 +884,18 @@ static void stats_json(hw_conn *c) {
 	         (unsigned long long)st.refused_reputation, (unsigned long long)st.blocked_filter,
 	         (unsigned long long)st.blocked_egress, (unsigned long long)st.throttled_source,
 	         (unsigned long long)st.throttled_dest, (unsigned long long)st.throttled_syns,
-	         (unsigned long long)st.udp_warp_marked, (unsigned long long)st.udp_warp_direct,
-	         (unsigned long long)st.udp_warp_refused, (unsigned long long)st.udp_warp_bypassed,
-	         (unsigned long long)st.tcp_warp_marked, (unsigned long long)st.tcp_warp_direct,
-	         (unsigned long long)st.tcp_warp_refused, (unsigned long long)st.tcp_warp_bypassed,
-	         (unsigned long long)st.tcp_proxied, (unsigned long long)st.tcp_direct,
-	         (unsigned long long)st.syn_signatures, (unsigned long long)st.ws_closed_violations,
-	         (unsigned long long)st.auth_failures, (unsigned long long)st.dns_cache_entries,
-	         (unsigned long long)st.reputation_sources, (unsigned long long)st.reputation_dests,
-	         (unsigned long long)st.wt_sessions_total, (unsigned long long)st.wt_sessions_active,
-	         (unsigned long long)st.wt_handshakes, (unsigned long long)st.wt_retries,
-	         (unsigned long long)st.wt_refused_handshakes, (unsigned long long)st.wt_dropped);
+	         (unsigned long long)st.throttled_lookups, (unsigned long long)st.udp_warp_marked,
+	         (unsigned long long)st.udp_warp_direct, (unsigned long long)st.udp_warp_refused,
+	         (unsigned long long)st.udp_warp_bypassed, (unsigned long long)st.tcp_warp_marked,
+	         (unsigned long long)st.tcp_warp_direct, (unsigned long long)st.tcp_warp_refused,
+	         (unsigned long long)st.tcp_warp_bypassed, (unsigned long long)st.tcp_proxied,
+	         (unsigned long long)st.tcp_direct, (unsigned long long)st.syn_signatures,
+	         (unsigned long long)st.ws_closed_violations, (unsigned long long)st.auth_failures,
+	         (unsigned long long)st.dns_cache_entries, (unsigned long long)st.reputation_sources,
+	         (unsigned long long)st.reputation_dests, (unsigned long long)st.wt_sessions_total,
+	         (unsigned long long)st.wt_sessions_active, (unsigned long long)st.wt_handshakes,
+	         (unsigned long long)st.wt_retries, (unsigned long long)st.wt_refused_handshakes,
+	         (unsigned long long)st.wt_dropped);
 	http_reply(c, 200, "OK", "application/json", body);
 }
 

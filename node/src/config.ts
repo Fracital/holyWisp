@@ -175,6 +175,8 @@ export type holyWispConfig = {
 	dnsTtlSeconds?: number;
 	dnsNegativeTtlSeconds?: number;
 	dnsTimeoutMs?: number;
+	/** Lookups one client IP may have in the resolver at once; one more is closed 0x49 (default 128, 0 off). */
+	maxPendingLookupsPerIP?: number;
 
 	/** The CONTINUE window, in packets. */
 	bufferRemainingLength?: number;
@@ -525,6 +527,7 @@ export function workerArgs(
 	int("dns-ttl-s", "dnsTtlSeconds", config.dnsTtlSeconds);
 	int("dns-negative-ttl-s", "dnsNegativeTtlSeconds", config.dnsNegativeTtlSeconds);
 	int("dns-timeout-ms", "dnsTimeoutMs", config.dnsTimeoutMs);
+	int("max-pending-lookups-per-ip", "maxPendingLookupsPerIP", config.maxPendingLookupsPerIP);
 
 	int("buffer-remaining", "bufferRemainingLength", config.bufferRemainingLength);
 	int("max-message-size", "maxMessageSize", config.maxMessageSize);

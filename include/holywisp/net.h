@@ -59,6 +59,12 @@ void hw_tcp_tune(int fd, int nodelay);
 // Resolver: lookups on a small thread pool, completion delivered on the requesting loop's thread.
 // Behind it sits an hw_dns_cache and either the system resolver (getaddrinfo) or the built-in UDP
 // client when servers are configured. One resolver per process; every worker shares it.
+//
+// Every lookup names the key it is counted under (the server's is the client's address). The
+// keys take turns for the threads, oldest request first within a key and a key the pool was doing
+// nothing for ahead of those that have had a turn, and one key never holds more than all threads but
+// one at once (all of a pool of one): a key with a thousand slow names waiting delays another
+// key's lookup by at most one lookup.
 typedef struct hw_resolver hw_resolver;
 typedef struct hw_resolve_req hw_resolve_req;
 
@@ -69,7 +75,8 @@ typedef struct hw_resolver_config {
 	int nservers; // 0 = getaddrinfo
 	int timeout_ms;
 	enum hw_dns_order order;
-	hw_dns_cache *cache; // optional, not owned
+	hw_dns_cache *cache;     // optional, not owned
+	int max_pending_per_key; // lookups one key may hold at once (0 = no limit); see hw_resolve
 } hw_resolver_config;
 
 // gai_err is 0 and res holds the addresses (with the requested port set) on success; otherwise
@@ -82,11 +89,17 @@ typedef void (*hw_resolve_cb)(hw_loop *loop, int gai_err, const hw_dns_result *r
 hw_resolver *hw_resolver_new(const hw_resolver_config *cfg);
 // Joins the workers. Any request not yet delivered is dropped without a callback.
 void hw_resolver_free(hw_resolver *r);
-// Start a lookup from the loop's thread. The callback runs on that loop, always after this
-// returns, never from inside it. A name in the cache is answered without a thread; otherwise the
-// lookup waits for one, unless HW_RESOLVER_QUEUE_MAX are waiting already, and then it fails with
-// EAI_AGAIN. NULL (ENOMEM) on failure, and then there is no callback.
-hw_resolve_req *hw_resolve(hw_resolver *r, hw_loop *loop, const char *host, uint16_t port, hw_resolve_cb cb, void *ud);
+// Start a lookup from the loop's thread, counted under `key` (NULL or "": a key shared by every
+// caller without one, which has no max_pending_per_key). The callback runs on that loop, always
+// after this returns, never from inside it. A name in the cache is answered without a thread and
+// counts against nothing; otherwise the lookup waits for one, unless HW_RESOLVER_QUEUE_MAX are
+// waiting already, and then it fails with EAI_AGAIN. A key holds a lookup from here until its
+// answer is delivered, cancelled or not: a lookup a thread is still doing for a stream that is
+// gone counts until the thread is done. NULL on failure, and then there is
+// no callback: EAGAIN when the key already holds max_pending_per_key lookups, ENOMEM otherwise.
+// No memory to count a key lets the lookup through uncounted.
+hw_resolve_req *hw_resolve(hw_resolver *r, hw_loop *loop, const char *host, uint16_t port, const char *key,
+                           hw_resolve_cb cb, void *ud);
 // From the loop thread: the callback will not run. The request is released by the resolver, and
 // if it was still waiting for a thread it is not looked up at all.
 void hw_resolve_cancel(hw_resolve_req *req);

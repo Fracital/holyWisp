@@ -6,6 +6,7 @@
 
 #include "test.h"
 
+#include <errno.h>
 #include <netdb.h>
 #include <poll.h>
 #include <pthread.h>
@@ -300,7 +301,8 @@ static void test_cache(void) {
 // ---------------------------------------------------------------------------------- a DNS stub
 
 // A DNS server on a loopback UDP port: it notes every name it is asked for and, when `answer` is
-// set, answers A questions with 192.0.2.1 (a question for `slow_name` only after slow_ms).
+// set, answers A questions with 192.0.2.1 (a question for `slow_name` only after slow_ms), and
+// never a name that ends in `silent_suffix`.
 #define STUB_MAX_ASKED 64
 typedef struct dns_stub {
 	int fd;
@@ -308,6 +310,7 @@ typedef struct dns_stub {
 	int answer;
 	const char *slow_name;
 	int slow_ms;
+	const char *silent_suffix;
 	pthread_t thread;
 	atomic_int stop;
 	pthread_mutex_t lock;
@@ -315,6 +318,12 @@ typedef struct dns_stub {
 	uint16_t ids[STUB_MAX_ASKED];
 	int nasked;
 } dns_stub;
+
+static int stub_silent(const dns_stub *st, const char *name) {
+	if (!st->silent_suffix) return 0;
+	size_t n = strlen(name), sl = strlen(st->silent_suffix);
+	return n >= sl && strcmp(name + n - sl, st->silent_suffix) == 0;
+}
 
 static void *stub_main(void *arg) {
 	dns_stub *st = arg;
@@ -345,7 +354,7 @@ static void *stub_main(void *arg) {
 			st->nasked++;
 		}
 		pthread_mutex_unlock(&st->lock);
-		if (!st->answer) continue;
+		if (!st->answer || stub_silent(st, name)) continue;
 		if (st->slow_name && strcmp(name, st->slow_name) == 0) usleep((unsigned)st->slow_ms * 1000);
 		uint8_t resp[600];
 		size_t rlen = qend;
@@ -618,17 +627,24 @@ static void run_until(hw_loop *loop, const int *flag, int ms) {
 	while (!*flag && hw_now_ms() < deadline) hw_loop_run_once(loop, 10);
 }
 
-static hw_resolver *pool_new(const dns_stub *st, int timeout_ms, hw_dns_cache *cache) {
+static hw_resolver *pool_new_with(const dns_stub *st, int timeout_ms, hw_dns_cache *cache, int threads,
+                                  int max_per_key) {
 	hw_resolver_config rc;
 	memset(&rc, 0, sizeof(rc));
-	rc.threads = 1; // one thread: whatever is slow blocks everything behind it
+	rc.threads = threads;
 	stub_server(st, &rc.servers[0], &rc.server_lens[0]);
 	rc.nservers = 1;
 	rc.timeout_ms = timeout_ms;
 	rc.cache = cache;
+	rc.max_pending_per_key = max_per_key;
 	hw_resolver *r = hw_resolver_new(&rc);
 	CHECK(r != NULL, "resolver");
 	return r;
+}
+
+// One thread: whatever is slow blocks everything behind it.
+static hw_resolver *pool_new(const dns_stub *st, int timeout_ms, hw_dns_cache *cache) {
+	return pool_new_with(st, timeout_ms, cache, 1, 0);
 }
 
 // A name the cache knows does not wait for a thread. With the pool's only thread stuck on a
@@ -653,9 +669,9 @@ static void test_pool_cached_name_skips_queue(void) {
 	g_order = 0;
 
 	lookup slow = {0}, cached = {0}, gone = {0};
-	CHECK(hw_resolve(r, loop, "slow.test", 80, lookup_cb, &slow) != NULL, "queued");
-	CHECK(hw_resolve(r, loop, "Cached.Test", 443, lookup_cb, &cached) != NULL, "queued");
-	CHECK(hw_resolve(r, loop, "gone.test", 443, lookup_cb, &gone) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "slow.test", 80, NULL, lookup_cb, &slow) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "Cached.Test", 443, NULL, lookup_cb, &cached) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "gone.test", 443, NULL, lookup_cb, &gone) != NULL, "queued");
 	CHECK(!cached.done, "the callback never runs inside hw_resolve");
 	run_until(loop, &slow.done, 5000);
 	CHECK(slow.done && cached.done && gone.done, "all three answered");
@@ -688,10 +704,10 @@ static void test_pool_skips_cancelled(void) {
 	g_order = 0;
 
 	lookup slow = {0}, cancelled = {0}, after = {0};
-	CHECK(hw_resolve(r, loop, "slow.test", 80, lookup_cb, &slow) != NULL, "queued");
-	hw_resolve_req *req = hw_resolve(r, loop, "cancelme.test", 80, lookup_cb, &cancelled);
+	CHECK(hw_resolve(r, loop, "slow.test", 80, NULL, lookup_cb, &slow) != NULL, "queued");
+	hw_resolve_req *req = hw_resolve(r, loop, "cancelme.test", 80, NULL, lookup_cb, &cancelled);
 	CHECK(req != NULL, "queued");
-	CHECK(hw_resolve(r, loop, "after.test", 80, lookup_cb, &after) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "after.test", 80, NULL, lookup_cb, &after) != NULL, "queued");
 	hw_resolve_cancel(req);
 	run_until(loop, &after.done, 5000);
 	CHECK(slow.done && after.done, "the others are answered");
@@ -726,9 +742,9 @@ static void test_pool_queue_is_bounded(void) {
 	for (int i = 0; i < HW_RESOLVER_QUEUE_MAX + EXTRA; i++) {
 		char name[32];
 		snprintf(name, sizeof(name), "q%d.test", i);
-		CHECK(hw_resolve(r, loop, name, 80, lookup_cb, &lookups[i]) != NULL, "request %d", i);
+		CHECK(hw_resolve(r, loop, name, 80, NULL, lookup_cb, &lookups[i]) != NULL, "request %d", i);
 	}
-	// The one thread is in its first lookup for the next 600 ms. Whatever is answered before
+	// The one thread is in its first lookup for the next 300 ms. Whatever is answered before
 	// that was answered without it.
 	run_until(loop, &lookups[HW_RESOLVER_QUEUE_MAX + EXTRA - 1].done, 200);
 	int refused = 0;
@@ -743,6 +759,129 @@ static void test_pool_queue_is_bounded(void) {
 
 	hw_resolver_free(r); // drops the 4096 that still wait
 	hw_loop_free(loop);
+	stub_stop(&st, 1);
+}
+
+// Keys take turns for the threads. With one thread and one key's names that never resolve
+// queued first, another key's lookup used to wait for all of them (FIFO); it now waits for the
+// one under way.
+static void test_pool_keys_take_turns(void) {
+	dns_stub st;
+	stub_start(&st, 1);
+	st.silent_suffix = ".slow.test";
+	stub_run(&st);
+	hw_resolver *r = pool_new(&st, 400, NULL);
+	hw_loop *loop = hw_loop_new();
+	g_order = 0;
+
+	lookup slow[3] = {{0}}, other = {0};
+	CHECK(hw_resolve(r, loop, "a1.slow.test", 80, "a", lookup_cb, &slow[0]) != NULL, "queued");
+	// The thread is in the first key's first lookup before that key asks again, so the key has
+	// had its turn though it had nothing waiting: the other key, which the pool is doing nothing
+	// for, still goes first.
+	uint64_t deadline = hw_now_ms() + 2000;
+	while (stub_asked(&st, "a1.slow.test") == 0 && hw_now_ms() < deadline) usleep(1000);
+	CHECK(stub_asked(&st, "a1.slow.test") > 0, "the first lookup started");
+	CHECK(hw_resolve(r, loop, "a2.slow.test", 80, "a", lookup_cb, &slow[1]) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "a3.slow.test", 80, "a", lookup_cb, &slow[2]) != NULL, "queued");
+	CHECK(hw_resolve(r, loop, "fast.test", 80, "b", lookup_cb, &other) != NULL, "queued");
+	run_until(loop, &other.done, 5000);
+	CHECK(other.done, "the other key was answered");
+	CHECK_EQ(other.err, 0);
+	CHECK(other.order == 2, "the other key's lookup came %d., behind %d of the first key's", other.order,
+	      other.order - 1);
+	run_until(loop, &slow[2].done, 5000);
+	CHECK(slow[0].done && slow[1].done && slow[2].done, "the slow ones ran out their timeouts");
+
+	hw_resolver_free(r);
+	hw_loop_free(loop);
+	stub_stop(&st, 1);
+}
+
+// One key never holds every thread. With two threads and a key whose names never resolve, the
+// second thread stays for everyone else: another key's lookup is answered at once, not when the
+// first of the slow ones times out.
+static void test_pool_key_leaves_a_thread(void) {
+	dns_stub st;
+	stub_start(&st, 1);
+	st.silent_suffix = ".slow.test";
+	stub_run(&st);
+	hw_resolver *r = pool_new_with(&st, 600, NULL, 2, 0);
+	hw_loop *loop = hw_loop_new();
+	g_order = 0;
+
+	lookup slow[4] = {{0}}, other = {0};
+	for (int i = 0; i < 4; i++) {
+		char name[32];
+		snprintf(name, sizeof(name), "a%d.slow.test", i);
+		CHECK(hw_resolve(r, loop, name, 80, "a", lookup_cb, &slow[i]) != NULL, "queued");
+	}
+	run_until(loop, &slow[0].done, 100); // the threads take what they may
+	uint64_t t0 = hw_now_ms();
+	CHECK(hw_resolve(r, loop, "fast.test", 80, "b", lookup_cb, &other) != NULL, "queued");
+	run_until(loop, &other.done, 5000);
+	CHECK(other.done && other.err == 0, "the other key was answered");
+	CHECK_EQ(other.order, 1);
+	CHECK(hw_now_ms() - t0 < 400, "the other key waited %llu ms", (unsigned long long)(hw_now_ms() - t0));
+
+	hw_resolver_free(r);
+	hw_loop_free(loop);
+	stub_stop(&st, 1);
+}
+
+// A key holds at most max_pending_per_key lookups, from hw_resolve until delivered, cancelled or
+// not; one more is refused with EAGAIN at once, without a callback. Other keys, callers without a
+// key and names the cache knows are not affected.
+static void test_pool_key_cap(void) {
+	dns_stub st;
+	stub_start(&st, 1);
+	st.silent_suffix = ".slow.test";
+	stub_run(&st);
+	hw_dns_cache *cache = hw_dns_cache_new(60, 5, 16);
+	hw_dns_result known;
+	memset(&known, 0, sizeof(known));
+	CHECK_EQ(hw_addr_parse("192.0.2.7", 0, &known.addrs[0], &known.lens[0]), 1);
+	known.count = 1;
+	hw_dns_cache_put(cache, "cached.test", &known, 0);
+	hw_resolver *r = pool_new_with(&st, 200, cache, 1, 3);
+	hw_loop *loop = hw_loop_new();
+	g_order = 0;
+
+	lookup held[3] = {{0}}, over = {0}, b = {0}, anon[5] = {{0}}, cached = {0};
+	hw_resolve_req *reqs[3];
+	for (int i = 0; i < 3; i++) {
+		char name[32];
+		snprintf(name, sizeof(name), "h%d.slow.test", i);
+		reqs[i] = hw_resolve(r, loop, name, 80, "a", lookup_cb, &held[i]);
+		CHECK(reqs[i] != NULL, "within the cap");
+	}
+	errno = 0;
+	CHECK(hw_resolve(r, loop, "over.slow.test", 80, "a", lookup_cb, &over) == NULL, "past the cap");
+	CHECK_EQ(errno, EAGAIN);
+	CHECK(hw_resolve(r, loop, "cached.test", 80, "a", lookup_cb, &cached) != NULL, "a cached name is not counted");
+	CHECK(hw_resolve(r, loop, "b.slow.test", 80, "b", lookup_cb, &b) != NULL, "another key has its own cap");
+	for (int i = 0; i < 5; i++) {
+		CHECK(hw_resolve(r, loop, "anon.slow.test", 80, NULL, lookup_cb, &anon[i]) != NULL, "no key, no cap");
+	}
+	// Cancelled lookups still count until the resolver is done with them: a client that opens and
+	// closes streams must not get past its share that way.
+	for (int i = 0; i < 3; i++) hw_resolve_cancel(reqs[i]);
+	CHECK(hw_resolve(r, loop, "over.slow.test", 80, "a", lookup_cb, &over) == NULL, "cancelled, not yet released");
+	hw_resolve_req *again = NULL;
+	uint64_t deadline = hw_now_ms() + 5000;
+	while (!again && hw_now_ms() < deadline) {
+		hw_loop_run_once(loop, 10);
+		again = hw_resolve(r, loop, "again.test", 80, "a", lookup_cb, &over);
+	}
+	CHECK(again != NULL, "a share comes back as a cancelled lookup is done with");
+	run_until(loop, &over.done, 5000);
+	CHECK(over.done && over.err == 0, "and it is answered");
+	CHECK(cached.done && cached.err == 0, "the cached name was answered");
+	CHECK(!held[0].done && !held[1].done && !held[2].done, "cancelled lookups have no callback");
+
+	hw_resolver_free(r);
+	hw_loop_free(loop);
+	hw_dns_cache_free(cache);
 	stub_stop(&st, 1);
 }
 
@@ -761,5 +900,8 @@ int main(void) {
 	RUN(test_pool_cached_name_skips_queue);
 	RUN(test_pool_skips_cancelled);
 	RUN(test_pool_queue_is_bounded);
+	RUN(test_pool_keys_take_turns);
+	RUN(test_pool_key_leaves_a_thread);
+	RUN(test_pool_key_cap);
 	return 0;
 }

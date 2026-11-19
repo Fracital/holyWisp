@@ -145,6 +145,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `reputation.*` | `reputation`, `reputation-store`, `reputation-save-interval-s`, `reputation-decay-per-hour`, `reputation-evict-after-days`, `reputation-{warn,throttle,strict}`, `reputation-weight`, `reputation-dest-weight` |
 | `proxy`, `proxyUDP` | `proxy`, `proxy-udp` |
 | `dnsServers`, `dnsResultOrder`, `dnsTtlSeconds`, `dnsNegativeTtlSeconds`, `dnsTimeoutMs` | `dns-server`, `dns-order`, `dns-ttl-s`, `dns-negative-ttl-s`, `dns-timeout-ms` |
+| `maxPendingLookupsPerIP` | `max-pending-lookups-per-ip` |
 | `bufferRemainingLength`, `maxMessageSize` | `buffer-remaining`, `max-message-size` |
 | `wsWriteHighWater`, `uploadWindow`, `streamQueueMax`, `connQueueMax` | `ws-write-high-water`, `upload-window`, `stream-queue-max`, `conn-queue-max` |
 | `socketBufferSize`, `clientRecvBuffer`, `listenBacklog` | `socket-buffer-size`, `client-recv-buffer`, `listen-backlog` |

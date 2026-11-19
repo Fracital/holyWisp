@@ -1,9 +1,9 @@
 /*
  * End to end for what a hostile or broken client can do to the server and to its other clients:
  * a client that sends and never reads, a remote that goes away while its stream is paused or held
- * by its credit, one address taking every connection or every connect in progress, pages of other
- * origins, bytes in a hostname that are not a hostname's, a download past the bandwidth limit, a
- * duplicate CONNECT.
+ * by its credit, one address taking every connection, every connect in progress or the resolver,
+ * pages of other origins, bytes in a hostname that are not a hostname's, a download past the
+ * bandwidth limit, a duplicate CONNECT.
  * A real server on loopback, driven by the client library and, where the library is too well
  * behaved, by a raw socket.
  */
@@ -655,6 +655,147 @@ static void test_in_flight_syns_per_ip(void) {
 	}
 }
 
+// A DNS server on loopback that answers every A question with 127.0.0.1 and every AAAA question
+// with nothing, except that it never answers a name under .slow.test: what a resolver looks like
+// to names whose authority does not answer, which anyone can make up by the thousand.
+typedef struct slow_dns {
+	int fd;
+	uint16_t port;
+	atomic_int stop;
+	pthread_t thread;
+} slow_dns;
+
+static void *slow_dns_main(void *arg) {
+	slow_dns *d = arg;
+	while (!atomic_load(&d->stop)) {
+		struct pollfd pfd = {.fd = d->fd, .events = POLLIN};
+		if (poll(&pfd, 1, 20) <= 0) continue;
+		uint8_t q[512];
+		struct sockaddr_storage from;
+		socklen_t fl = sizeof(from);
+		ssize_t n = recvfrom(d->fd, q, sizeof(q), 0, (struct sockaddr *)&from, &fl);
+		if (n < 17) continue;
+		char name[256];
+		size_t o = 12, k = 0;
+		while (o < (size_t)n && q[o] != 0 && k + q[o] + 2 < sizeof(name)) {
+			if (k) name[k++] = '.';
+			memcpy(name + k, q + o + 1, q[o]);
+			k += q[o];
+			o += (size_t)q[o] + 1;
+		}
+		name[k] = '\0';
+		size_t qend = o + 5;
+		if (qend > (size_t)n) continue;
+		static const char slow[] = ".slow.test";
+		if (k >= sizeof(slow) - 1 && strcmp(name + k - (sizeof(slow) - 1), slow) == 0) continue;
+		uint8_t resp[600];
+		memcpy(resp, q, qend);
+		resp[2] = 0x81;
+		resp[3] = 0x80;
+		memset(resp + 6, 0, 6);
+		size_t rlen = qend;
+		if (q[o + 2] == 1) {
+			static const uint8_t a[16] = {0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1};
+			resp[7] = 1;
+			memcpy(resp + rlen, a, sizeof(a));
+			rlen += sizeof(a);
+		}
+		sendto(d->fd, resp, rlen, 0, (struct sockaddr *)&from, fl);
+	}
+	return NULL;
+}
+
+static void slow_dns_start(slow_dns *d) {
+	memset(d, 0, sizeof(*d));
+	d->fd = hw_sys_socket(AF_INET, SOCK_DGRAM, 0, 0);
+	CHECK(d->fd >= 0, "dns socket");
+	struct sockaddr_in sin = {.sin_family = AF_INET};
+	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	CHECK_EQ(bind(d->fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
+	socklen_t sl = sizeof(sin);
+	CHECK_EQ(getsockname(d->fd, (struct sockaddr *)&sin, &sl), 0);
+	d->port = ntohs(sin.sin_port);
+	CHECK_EQ(pthread_create(&d->thread, NULL, slow_dns_main, d), 0);
+}
+
+static void slow_dns_stop(slow_dns *d) {
+	atomic_store(&d->stop, 1);
+	pthread_join(d->thread, NULL);
+	close(d->fd);
+}
+
+// The resolver's threads and its queue are everyone's. One client asking for thousands of names
+// that never resolve used to fill the queue (every other client's lookup then failed at once,
+// 0x42) or, below that, to stand in front of everyone else's lookups for a timeout each. A
+// client address now has a share of the resolver of its own, past which its CONNECT is closed
+// 0x49 and counted against it, and the threads go to the addresses in turn.
+static void test_lookups_per_ip(void) {
+	enum {
+		FLOOD = HW_RESOLVER_QUEUE_MAX + 104
+	};
+	slow_dns dns;
+	slow_dns_start(&dns);
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.dns_servers[0], sizeof(cfg.dns_servers[0]), "127.0.0.1:%u", dns.port);
+	cfg.dns_server_count = 1;
+	cfg.resolver_threads = 2;
+	cfg.dns_timeout_ms = 2000;
+	cfg.connect_timeout_ms = 5000;
+	cfg.max_pending_lookups_per_ip = 8;
+	cfg.max_streams_per_conn = 0;
+	cfg.flood.ws_close_after_violations = 0; // keep the flood coming
+	cfg.reputation_enabled = 1;
+	cfg.reputation.store_path[0] = '\0';
+	CHECK_EQ(hw_cidr_parse("127.0.0.1", &cfg.trusted_proxies[0]), 0);
+	cfg.trusted_proxy_count = 1;
+	hw_server *s = start(&cfg);
+
+	// The flood comes from 203.0.113.9 (through the trusted proxy), the victim from 127.0.0.1.
+	char head[512];
+	int fd = raw_upgrade(s, "X-Forwarded-For: 203.0.113.9\r\n", head, sizeof(head));
+	CHECK(strncmp(head, "HTTP/1.1 101", 12) == 0, "status: %.20s", head);
+	for (uint32_t i = 1; i <= FLOOD; i++) {
+		char name[48];
+		int len = snprintf(name, sizeof(name), "s%u.slow.test", i);
+		uint8_t out[80];
+		size_t n = hw_wisp_build_connect(out, sizeof(out), i, HW_STREAM_TCP, 80, name, (size_t)len);
+		raw_send_packet(fd, out, n);
+	}
+	// The flood has been read once a CONNECT sent after it is answered.
+	hw_server_stats st;
+	uint64_t deadline = hw_now_ms() + 5000;
+	do {
+		sleep_ms(10);
+		hw_server_stats_get(s, &st);
+	} while (st.streams_total < FLOOD && hw_now_ms() < deadline);
+	CHECK_EQ(st.streams_total, FLOOD);
+
+	hw_client *c = connect_plain(s);
+	uint64_t t0 = hw_now_ms();
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "echo.test", g_echo_port, &sid), 0);
+	CHECK_EQ(hw_client_send(c, sid, "hello", 5), 0);
+	uint8_t buf[8];
+	int got = hw_client_read_exact(c, sid, buf, 5, 4000);
+	uint64_t took = hw_now_ms() - t0;
+	uint8_t reason = 0;
+	if (got != 5 && wait_close(c, sid, &reason, NULL)) {
+		CHECK(0, "the other client's stream was closed 0x%02x after %llu ms", reason, (unsigned long long)took);
+	}
+	CHECK(got == 5, "the other client's stream did not echo");
+	CHECK(took < 1000, "the other client waited %llu ms for its lookup", (unsigned long long)took);
+
+	hw_server_stats_get(s, &st);
+	CHECK(st.throttled_lookups >= FLOOD - 200, "only %llu lookups refused", (unsigned long long)st.throttled_lookups);
+	CHECK(hw_reputation_source_score(hw_server_reputation(s), "203.0.113.9") > 0, "the flood is held against it");
+	CHECK_EQ(hw_reputation_source_score(hw_server_reputation(s), "127.0.0.1"), 0);
+	hw_client_free(c);
+	close(fd);
+	hw_server_free(s);
+	slow_dns_stop(&dns);
+}
+
 // Opening more concurrent streams than the per-connection cap is a browser bursting its
 // subresources (a Cloudflare challenge fans out dozens of XHRs at once), not an attack: each
 // stream past the cap is refused with THROTTLED, but the connection stays up and the client keeps
@@ -913,6 +1054,7 @@ int main(void) {
 	RUN(test_forwarded_address);
 	RUN(test_connections_per_ip);
 	RUN(test_in_flight_syns_per_ip);
+	RUN(test_lookups_per_ip);
 	RUN(test_stream_cap_is_not_a_violation);
 	RUN(test_bandwidth_limits_downloads);
 	RUN(test_idle_timeout);

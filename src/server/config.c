@@ -120,6 +120,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("dns-ttl-s", dns_ttl_s, 0, 604800)
 	INT_KEY("dns-negative-ttl-s", dns_negative_ttl_s, 0, 604800)
 	INT_KEY("dns-timeout-ms", dns_timeout_ms, 100, 60000)
+	INT_KEY("max-pending-lookups-per-ip", max_pending_lookups_per_ip, 0, 1 << 24)
 	// Where streams go.
 	STR_KEY("proxy", proxy)
 	BOOL_KEY("proxy-client-key", proxy_client_key)
@@ -513,7 +514,9 @@ void hw_config_usage(const char *argv0) {
 	    "  tcp-warp BOOL                             mark TCP dialled here (not proxied) from the same state (off)\n"
 	    "  tcp-warp-fallback direct|refuse           TCP with no tunnel, no usable state or no mark (refuse)\n"
 	    "  warp-bypass-host NAME                     never through WARP: unmarked ('*.name' = its subdomains)\n"
-	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n");
+	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
+	    "  max-pending-lookups-per-ip                lookups one client IP may have in the resolver at once;\n"
+	    "                                            one more closes 0x49, a violation (128; 0 = no limit)\n");
 	printf("  buffer-remaining                          CONTINUE window in packets (128)\n"
 	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
 	       "                                            0x49), per client (256 MiB, pauses its reads)\n"

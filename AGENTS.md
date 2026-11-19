@@ -372,7 +372,12 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 - **A shared limit is shared by its users, not by one of them.** Every server-wide cap that one
   client could fill has a per-client share next to it (`hw_gauge`, keyed by client address):
   `max-in-flight-syns-per-ip` beside `max-in-flight-syns`, `max-concurrent-connections-per-ip`
-  beside `max-concurrent-connections`. A new server-wide cap needs one too. The SYN-signature
+  beside `max-concurrent-connections`, `max-pending-lookups-per-ip` beside the resolver's queue
+  (`HW_RESOLVER_QUEUE_MAX`; counted in `resolver.c` itself, keyed by `c->ip`, and on whether or
+  not `flood-protection` is). The resolver's threads are shared the same way: the client
+  addresses take turns for them, one the pool was doing nothing for first, and one address never holds
+  all of them (`pool_take`), so names that never resolve delay another client's lookup by one
+  lookup at most (`test_lookups_per_ip`). A new server-wide cap needs one too. The SYN-signature
   records a connection keeps are bounded (`SIGDET_MAX_PER_CONN`, oldest reused), and the
   resolver and the password pool have bounded queues that fail the newcomer (`EAI_AGAIN`,
   CLOSE `0x49`) instead of growing.
@@ -380,7 +385,8 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   all clients share (the per-destination windows, the server-wide SYN cap) closes the stream
   `0x49` and is not a violation and not a reputation event, for the client or the destination:
   it used to be, and one client could get a destination refused for everyone, or the others
-  closed for its flood. Its own cap (`max-in-flight-syns-per-ip`) is a violation.
+  closed for its flood. Its own caps (`max-in-flight-syns-per-ip`, `max-pending-lookups-per-ip`)
+  are a violation.
   `privateEgress` weighs 0 by default and Twisp-when-off is not scored at all, because any web
   page can make its visitor's browser send either; both are refused (`0x48`) and counted. The
   same reasoning is why `allow-origin` exists: without it, a page's rate-limit events land on
