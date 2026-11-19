@@ -1405,6 +1405,8 @@ struct sim {
 	int check_amp; // assert the server's 3x limit at every send
 	size_t mtu;    // datagrams longer than this vanish without a word (0 = none): ICMP that never comes back
 	uint64_t mtu_dropped;
+	int drop_s2c;     // drop the server's next datagram that is not a probe ...
+	uint64_t drop_pn; // ... and record the packet number of its last packet here
 	// Per side (0 client, 1 server): when its handshake was first seen confirmed, and when it sent
 	// its first datagram that goes alone (a PMTU probe). 0: not yet.
 	uint64_t confirmed_ms[2], first_alone_ms[2];
@@ -1469,6 +1471,11 @@ static void sim_send(sim *s, int to_server, const uint8_t *data, size_t len) {
 		s->s2c += len;
 	}
 	if ((to_server && s->block_c2s) || (!to_server && s->block_s2c)) return;
+	if (!to_server && s->drop_s2c && !hw_quic_output_alone(s->sv.q)) {
+		s->drop_s2c = 0;
+		s->drop_pn = s->sv.q->sp[HW_QC_SP_APP].ring.next - 1;
+		return;
+	}
 	if (s->mtu && len > s->mtu) {
 		s->mtu_dropped++;
 		return;
@@ -2346,6 +2353,61 @@ static int cond_server_got(sim *s, void *ud) {
 	return s->sv.st[h->id].received >= h->bytes;
 }
 
+// A peer that leaves one packet unacknowledged and names everything above it in every ACK frame,
+// as Chrome's ACKs do while a loss is remembered and as an attacker can for as long as the server
+// remembers it: the lost packet holds the base of the sent ring, and every frame covers the whole
+// ring above it. ACK processing costs what each frame newly acknowledges, not what the ring holds:
+// walking each range packet by packet took about 2.3 million steps here for 3,700 packets.
+static void test_ack_cost(void) {
+	sim *s = sim_new(81);
+	sim_handshake(s);
+	sim_advance(s, 100);
+	hw_quic_conn *sv = s->sv.q;
+	// A loss is remembered for two PTOs and the peer's max_ack_delay: seconds, the whole transfer.
+	sv->peer_max_ack_delay = 1000000;
+	const uint64_t bytes = 4u << 20;
+	s->sv.reply = bytes;
+	int64_t id = hw_quic_stream_open(s->c.q, 1);
+	CHECK(id >= 0, "open");
+	app_send(&s->c, (uint64_t)id, 1);
+	half h = {(uint64_t)id, 1};
+	CHECK(sim_run(s, cond_server_got, &h, 5000), "request");
+	sim_advance(s, 30);
+	// One datagram of the reply never arrives.
+	s->drop_s2c = 1;
+	while (s->drop_s2c && s->now < 10000) CHECK(sim_step(s), "the simulation ran dry");
+	CHECK(!s->drop_s2c, "a datagram to drop");
+	uint64_t hole = s->drop_pn;
+	uint8_t out[HW_QUIC_MAX_DGRAM];
+	struct sockaddr_storage to;
+	socklen_t tl;
+	hw_qc_space *csp = &s->c.q->sp[HW_QC_SP_APP];
+	uint64_t steps0 = sv->ack_steps;
+	hw_quic_stats st0;
+	hw_quic_get_stats(sv, &st0);
+	uint64_t end = s->now + 20000;
+	while (!s->c.st[id].fin_received && s->now < end) {
+		CHECK(sim_step(s), "the simulation ran dry");
+		if (csp->largest_rx <= (int64_t)hole) continue;
+		// Sixteen ACK-only datagrams after each delivery, each naming everything above the hole.
+		for (int k = 0; k < 16; k++) {
+			hw_qc_ranges_add(&csp->recv, hole + 1, (uint64_t)csp->largest_rx);
+			csp->ack_new = csp->ack_now = 1;
+			size_t n = hw_quic_output(s->c.q, out, sizeof(out), &to, &tl, s->now);
+			if (n) sim_send(s, 1, out, n);
+		}
+	}
+	CHECK(s->c.st[id].fin_received && s->c.st[id].received == bytes, "reply %llu of %llu",
+	      (unsigned long long)s->c.st[id].received, (unsigned long long)bytes);
+	CHECK(sv->sp[HW_QC_SP_APP].ring.base <= hole, "the lost packet was forgotten: the case tests nothing");
+	hw_quic_stats st;
+	hw_quic_get_stats(sv, &st);
+	uint64_t sent = st.packets_sent - st0.packets_sent, steps = sv->ack_steps - steps0;
+	CHECK(sent > 2000, "%llu packets", (unsigned long long)sent);
+	CHECK(steps <= 4 * sent, "%llu steps for %llu packets", (unsigned long long)steps, (unsigned long long)sent);
+	sim_free(s);
+}
+
 static void test_migration(void) {
 	sim *s = sim_new(5);
 	s->bw = 5000;
@@ -2848,6 +2910,7 @@ int main(int argc, char **argv) {
 	RUN(test_reassembly_refused);
 	RUN(test_bbr2_stack);
 	RUN(test_pmtu);
+	RUN(test_ack_cost);
 	RUN(test_bulk_64m);
 	hw_der_free(&g_cert);
 	return 0;

@@ -890,6 +890,52 @@ static void on_spurious(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, uint64_
 	if (s->flags & HW_QC_SENT_STAMPED) hw_qc_cc_spurious(&q->cc, s->loss_epoch);
 }
 
+// Whether an ACK can still change a sent packet: one not acknowledged, and not one declared lost
+// that was never in flight. A packet lost in flight stays open: acknowledged late, it shows its
+// loss spurious. Once closed, a packet stays closed (no flag that opens it is ever set again).
+static int sent_open(const hw_qc_sent *s) {
+	if (s->flags & HW_QC_SENT_ACKED) return 0;
+	return !(s->flags & HW_QC_SENT_LOST) || (s->flags & HW_QC_SENT_IN_FLIGHT);
+}
+
+// The packet a closed packet at pn sends the search on to: every packet between it and pn is closed.
+static uint64_t sent_below(const hw_qc_sent *s, uint64_t pn) {
+	return s->below < pn ? s->below : pn - 1;
+}
+
+// The highest open packet in [lo, pn] (sent_open), in *out; 0 when there is none. A closed
+// packet points below itself (hw_qc_sent.below), and every packet the search passes is then
+// pointed at where it ended, so a stretch already acknowledged costs a step or two however long
+// it is (a union-find with path compression). A peer that names the same ranges in every ACK
+// frame, as Chrome does while a loss is remembered and as anyone can with one packet left
+// unacknowledged at the base of the ring, costs what each frame newly acknowledges, not what the
+// ring holds: walking each range packet by packet was quadratic in the packets sent meanwhile.
+static int ack_next_open(hw_quic_conn *q, hw_qc_ring *r, uint64_t pn, uint64_t lo, uint64_t *out) {
+	uint64_t end = pn;
+	int found = 0;
+	for (;;) {
+		const hw_qc_sent *s = hw_qc_ring_get(r, end);
+		if (!s) break; // below the ring: nothing tracked is left there
+		q->ack_steps++;
+		if (sent_open(s)) {
+			found = 1;
+			break;
+		}
+		if (end == 0) break;
+		end = sent_below(s, end);
+		if (end < lo) break;
+	}
+	// Every closed packet passed has only closed ones down to end, end itself excluded.
+	for (uint64_t x = pn; x > end;) {
+		hw_qc_sent *s = hw_qc_ring_get(r, x);
+		uint64_t next = sent_below(s, x);
+		s->below = end;
+		x = next;
+	}
+	*out = end;
+	return found && end >= lo;
+}
+
 static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 	hw_qc_space *sp = &q->sp[spi];
 	if (f->ack_largest >= sp->ring.next) {
@@ -906,26 +952,25 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 		uint64_t lo = HW_MAX(it.lo, sp->ring.base);
 		if (it.hi < lo) continue;
 		uint64_t hi = HW_MIN(it.hi, sp->ring.next - 1);
-		for (uint64_t pn = hi + 1; pn-- > lo;) {
+		uint64_t pn;
+		for (uint64_t top = hi; ack_next_open(q, &sp->ring, top, lo, &pn); top = pn - 1) {
 			hw_qc_sent *s = hw_qc_ring_get(&sp->ring, pn);
-			if (!s) continue;
-			if ((s->flags & (HW_QC_SENT_LOST | HW_QC_SENT_ACKED | HW_QC_SENT_IN_FLIGHT)) ==
-			    (HW_QC_SENT_LOST | HW_QC_SENT_IN_FLIGHT)) {
-				on_spurious(q, sp, s, pn, f->ack_largest);
-				continue;
+			if (s->flags & HW_QC_SENT_LOST) {
+				on_spurious(q, sp, s, pn, f->ack_largest); // lost in flight: sent_open says no other
+			} else {
+				if (pn == f->ack_largest) {
+					largest_newly = 1;
+					largest_time = s->time;
+				}
+				if (s->flags & HW_QC_SENT_ACK_ELICITING) ae_newly = 1;
+				if (spi == HW_QC_SP_APP && ((s->flags & HW_QC_SENT_PHASE) ? 1 : 0) == q->tx_phase &&
+				    pn >= q->tx_phase_first_pn) {
+					q->tx_phase_acked = 1;
+				}
+				newly = 1;
+				packet_resolve(q, sp, s, 1);
 			}
-			if (s->flags & (HW_QC_SENT_ACKED | HW_QC_SENT_LOST)) continue;
-			if (pn == f->ack_largest) {
-				largest_newly = 1;
-				largest_time = s->time;
-			}
-			if (s->flags & HW_QC_SENT_ACK_ELICITING) ae_newly = 1;
-			if (spi == HW_QC_SP_APP && ((s->flags & HW_QC_SENT_PHASE) ? 1 : 0) == q->tx_phase &&
-			    pn >= q->tx_phase_first_pn) {
-				q->tx_phase_acked = 1;
-			}
-			newly = 1;
-			packet_resolve(q, sp, s, 1);
+			if (pn == lo) break;
 		}
 	} while (hw_qc_ack_iter_next(&it));
 	if (!newly) return;

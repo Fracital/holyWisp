@@ -460,6 +460,10 @@ typedef struct {
 	// then, itself included (bbr2 bounds the flight with it).
 	uint64_t delivered, delivered_time, first_sent_time;
 	uint64_t tx_in_flight;
+	// Once an ACK can no longer change it (acknowledged, or lost without being in flight): a
+	// packet number below it such that every packet between the two is so too, for ACK processing
+	// to skip them (quic.c, ack_next_open). Its own number until then.
+	uint64_t below;
 } hw_qc_sent;
 
 // Delivery rate estimation. An in-flight packet is being sent (before hw_qc_cc_on_sent counts
@@ -688,6 +692,7 @@ struct hw_quic_conn {
 	uint64_t peer_max_ack_delay;
 	uint64_t spurious_lost; // packets declared lost that were acknowledged later
 	uint64_t rx_refused;    // packets left unacknowledged: a fragment in them could not be held
+	uint64_t ack_steps;     // sent packets ACK processing has looked at (tests bound it)
 	uint64_t pkt_threshold; // adaptive packet threshold (RFC 9002 6.1.1), raised by spurious losses
 	unsigned time_shift;    // adaptive time threshold, see hw_qc_rtt_loss_delay
 

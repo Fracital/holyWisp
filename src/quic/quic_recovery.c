@@ -1056,7 +1056,9 @@ void hw_qc_ring_add_frame(hw_qc_ring *r, const hw_qc_frec *f) {
 }
 
 void hw_qc_ring_add_packet(hw_qc_ring *r, const hw_qc_sent *s) {
-	r->pk[r->next & (r->pcap - 1)] = *s;
+	hw_qc_sent *rec = &r->pk[r->next & (r->pcap - 1)];
+	*rec = *s;
+	rec->below = r->next;
 	r->next++;
 }
 
