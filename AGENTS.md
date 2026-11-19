@@ -163,7 +163,8 @@ every test still passes, so each item has a test and a change to it needs a reas
   is the budget: it never holds more than one window. Across a connection, `conn-queue-max` bounds
   the sum of those queues; past it the client's reads pause (`conn_queue_add`) and resume at half
   the mark. Nothing is closed for staying inside its window. The value a *refill* CONTINUE carries
-  is dynamic (`conn_window`): the connection's in-flight budget (`ws-write-high-water`) shared by
+  is dynamic (`conn_window`): the connection's in-flight budget (`upload-window`, by default
+  `ws-write-high-water`) shared by
   its live streams in packets of the size that client actually sends, clamped to [4, the advertised
   maximum], so one stream gets the whole window and ten streams do not make the server buffer ten
   windows. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are

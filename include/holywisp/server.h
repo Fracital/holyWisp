@@ -138,6 +138,7 @@ typedef struct hw_server_config {
 	uint32_t buffer_remaining;  // CONTINUE window in packets (Wisp "buffer size")
 	size_t max_message_size;    // largest WebSocket message accepted (1024 or more)
 	size_t ws_write_high_water; // pause remote reads when a client's send queue grows past this
+	size_t upload_window;       // bytes one client may have in flight toward its remotes; 0 = ws_write_high_water
 	size_t stream_queue_max;    // bytes queued toward a remote before the stream is throttled
 	size_t conn_queue_max;      // bytes queued toward remotes across one client before its reads pause
 	size_t socket_buffer_size;  // SO_RCVBUF/SO_SNDBUF; 0 = kernel default

@@ -512,6 +512,11 @@ void conn_charge_bandwidth(hw_conn *c, size_t bytes);
 // (ws-write-high-water) shared between its streams, in packets of the size this client sends,
 // never above the advertised maximum (server->window) and never below a few packets.
 uint32_t conn_window(const hw_conn *c);
+// What one client may have in flight toward its remotes across its streams: upload-window, or
+// ws-write-high-water when that is 0 (the budget the refill CONTINUE and QUIC's credit share out).
+static inline size_t cfg_upload_window(const hw_server_config *cfg) {
+	return cfg->upload_window ? cfg->upload_window : cfg->ws_write_high_water;
+}
 // Bytes entered or left a stream's queue toward its remote. Past conn-queue-max the connection
 // stops reading the client (never closes anything) and resumes at half the mark.
 void conn_queue_add(hw_conn *c, size_t n);

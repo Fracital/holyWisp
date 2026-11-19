@@ -180,6 +180,8 @@ export type holyWispConfig = {
 	bufferRemainingLength?: number;
 	maxMessageSize?: number;
 	wsWriteHighWater?: number;
+	/** Bytes one client may have in flight toward its remotes, across its streams (default: wsWriteHighWater). */
+	uploadWindow?: number;
 	streamQueueMax?: number;
 	connQueueMax?: number;
 	socketBufferSize?: number;
@@ -527,6 +529,7 @@ export function workerArgs(
 	int("buffer-remaining", "bufferRemainingLength", config.bufferRemainingLength);
 	int("max-message-size", "maxMessageSize", config.maxMessageSize);
 	int("ws-write-high-water", "wsWriteHighWater", config.wsWriteHighWater);
+	int("upload-window", "uploadWindow", config.uploadWindow);
 	int("stream-queue-max", "streamQueueMax", config.streamQueueMax);
 	int("conn-queue-max", "connQueueMax", config.connQueueMax);
 	int("socket-buffer-size", "socketBufferSize", config.socketBufferSize);

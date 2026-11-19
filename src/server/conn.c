@@ -294,13 +294,15 @@ void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
 
 // One stream on a connection may have the whole advertised window in flight; ten streams with
 // the whole window each would make the server buffer tens of megabytes toward slow remotes and
-// pay for it in copies. The budget keeps the sum near the client's own send-queue mark, which is
-// plenty of pipeline for one stream and keeps many streams on the fast path.
+// pay for it in copies. The budget (upload-window, by default the client's own send-queue mark)
+// keeps the sum near one pipeline, which is plenty for one stream and keeps many streams on the
+// fast path. It is its own key because the mark is also how long a small reply waits behind a
+// download, and a short queue there is not a reason for a slow upload.
 uint32_t conn_window(const hw_conn *c) {
 	const hw_server *srv = c->w->server;
 	size_t streams = hw_map_count(&c->streams);
 	size_t pkt = c->pkt_avg ? c->pkt_avg : 64 * 1024;
-	size_t w = srv->cfg.ws_write_high_water / (streams ? streams : 1) / pkt;
+	size_t w = cfg_upload_window(&srv->cfg) / (streams ? streams : 1) / pkt;
 	if (w < CONN_WINDOW_MIN) w = CONN_WINDOW_MIN;
 	if (w > srv->window) w = srv->window;
 	return (uint32_t)w;

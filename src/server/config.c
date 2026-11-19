@@ -131,6 +131,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
 	INT_KEY("max-message-size", max_message_size, 1024, 1LL << 30)
 	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1LL << 31)
+	INT_KEY("upload-window", upload_window, 0, 1LL << 31)
 	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1LL << 31)
 	INT_KEY("conn-queue-max", conn_queue_max, 4096, 1LL << 31)
 	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1LL << 30)
@@ -517,6 +518,8 @@ void hw_config_usage(const char *argv0) {
 	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
 	       "                                            0x49), per client (256 MiB, pauses its reads)\n"
 	       "  max-message-size, ws-write-high-water, socket-buffer-size\n"
+	       "  upload-window                             bytes a client may have in flight toward its remotes,\n"
+	       "                                            shared by its streams (0 = ws-write-high-water)\n"
 	       "  client-recv-buffer                        SO_RCVBUF for client sockets when the host's rmem_max allows\n"
 	       "                                            it (8 MiB; 0 = leave to the kernel)\n"
 	       "  max-streams-per-conn                      0 = unlimited (2048)\n"

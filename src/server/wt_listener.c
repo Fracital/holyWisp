@@ -766,8 +766,8 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	// The client's credit: what it may have in flight toward the server before the server reads
 	// it. The Wisp stream carries every stream's uploads, so it gets the whole connection's. At
 	// least WT_RX_WINDOW_MIN, a gigabit at 138 ms: a TCP socket's receive buffer grows to the path,
-	// and this is what stands in for it.
-	size_t window = cfg->ws_write_high_water;
+	// and this is what stands in for it. The Wisp budget for the same bytes is upload-window.
+	size_t window = cfg_upload_window(cfg);
 	if (window < WT_RX_WINDOW_MIN) window = WT_RX_WINDOW_MIN;
 	if (window > WT_RX_WINDOW_MAX) window = WT_RX_WINDOW_MAX;
 	qc->initial_max_data = window;

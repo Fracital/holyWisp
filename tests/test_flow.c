@@ -408,6 +408,57 @@ static void test_ingress_window_stalled_upstream(void) {
 	hw_server_free(s);
 }
 
+// The refill CONTINUE grants the connection's upload budget in packets of the size the client
+// sends: ws-write-high-water by default, upload-window when set. The mark bounds how long a reply
+// waits behind a download; with only it, a short mark capped every upload too.
+static uint32_t refill_after_window(size_t mark, size_t upload) {
+	enum {
+		PKT = 16 * 1024
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.ws_write_high_water = mark;
+	cfg.upload_window = upload;
+	hw_server *s = start_server(&cfg);
+
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "sink listen");
+	hw_client *c = connect_plain(s, 0);
+	uint32_t window = hw_client_buffer_size(c);
+	CHECK(window > 32, "advertised window %u leaves room for the budgets below", window);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sid), 0);
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 5000), 1);
+	int sink = accept(lfd, NULL, NULL);
+	CHECK(sink >= 0, "accept");
+	set_blocking(sink);
+
+	size_t total = (size_t)window * PKT;
+	uint8_t *data = malloc(total);
+	fill_pattern(data, total, 9);
+	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, sid, data + (size_t)i * PKT, PKT), 0);
+	uint8_t *back = malloc(total);
+	CHECK_EQ(read_full(sink, back, total), 0);
+	CHECK(memcmp(data, back, total) == 0, "window intact");
+	hw_client_event ev;
+	CHECK_EQ(wait_event(c, sid, HW_CEV_CONTINUE, &ev, 5000), 1);
+	free(data);
+	free(back);
+	close(sink);
+	close(lfd);
+	hw_client_free(c);
+	hw_server_free(s);
+	return ev.buffer_remaining;
+}
+
+static void test_upload_window(void) {
+	CHECK_EQ(refill_after_window(256 * 1024, 0), 16);          // the mark: 256 KiB / 16 KiB
+	CHECK_EQ(refill_after_window(256 * 1024, 512 * 1024), 32); // upload-window: 512 KiB / 16 KiB
+	CHECK_EQ(refill_after_window(256 * 1024, 64 * 1024), 4);   // never under 4 packets
+}
+
 // A sender thread for the connection-budget test: hw_client_send blocks once the server stops
 // reading, which is exactly what the test wants to observe, so it cannot run on the test thread.
 static struct {
@@ -559,5 +610,6 @@ int main(void) {
 	RUN(test_slow_client_backpressure);
 	RUN(test_ingress_window_stalled_upstream);
 	RUN(test_conn_queue_pauses_reads);
+	RUN(test_upload_window);
 	return 0;
 }
