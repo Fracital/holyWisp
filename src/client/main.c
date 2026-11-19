@@ -4,10 +4,12 @@
  *   holywisp-client [-s ws://host:port/path] [--udp] [--v2] HOST PORT      stdin/stdout <-> HOST:PORT
  *   holywisp-client [-s ...] --bench BYTES HOST PORT                        echo throughput test
  *   holywisp-client -s https://host:port/ --pin SHA256 ...                  the same over WebTransport
+ *   holywisp-client -s https://host/ --pin-key SHA256 ...                   pinned to the server's key
  */
 #include "holywisp/client.h"
 #include "holywisp/hw.h"
 #include "holywisp/sys.h"
+#include "holywisp/tls13.h"
 #include "holywisp/wisp.h"
 
 #include <errno.h>
@@ -33,6 +35,11 @@ static void usage(const char *argv0) {
 	        "                       https://host:port/path for WebTransport (UDP; port 443 by default)\n"
 	        "      --pin HASH       WebTransport: the server certificate's SHA-256, base64 or hex\n"
 	        "                       (a value of the server's /webtransport.json)\n"
+	        "      --pin-key HASH   WebTransport: the SHA-256 of the server certificate's public key\n"
+	        "                       (SubjectPublicKeyInfo), base64, hex or sha256//base64; it holds\n"
+	        "                       across renewals that keep the key. Up to 4, any one matching:\n"
+	        "                       openssl x509 -in cert.pem -noout -pubkey | openssl pkey -pubin\n"
+	        "                       -outform der | openssl dgst -sha256 -binary | base64\n"
 	        "      --insecure       WebTransport: take any certificate (loopback tests only)\n"
 	        "      --origin ORIGIN  WebTransport: send this origin header\n"
 	        "      --connect-to A   WebTransport: connect to address or name A, the URL's host still\n"
@@ -453,6 +460,8 @@ int main(int argc, char **argv) {
 	const char *pass_file = NULL;
 	char pass_buf[PASS_READ + 1];
 	uint8_t pin_hash[32];
+	uint8_t key_pins[32 * HW_TLS_KEY_PINS_MAX];
+	size_t key_pin_count = 0;
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
 	const char *positional[2] = {NULL, NULL};
@@ -509,6 +518,14 @@ int main(int argc, char **argv) {
 			}
 		} else if (!strcmp(a, "--pin") && i + 1 < argc) {
 			pin = argv[++i];
+		} else if (!strcmp(a, "--pin-key") && i + 1 < argc) {
+			const char *k = argv[++i];
+			if (!strncmp(k, "sha256//", 8)) k += 8; // curl's --pinnedpubkey form
+			if (key_pin_count == HW_TLS_KEY_PINS_MAX || parse_pin(k, key_pins + 32 * key_pin_count) != 0) {
+				fprintf(stderr, "bad --pin-key: 32 bytes in base64 or hex, at most %d of them\n", HW_TLS_KEY_PINS_MAX);
+				return 2;
+			}
+			key_pin_count++;
 		} else if (!strcmp(a, "--udp-buffer") && i + 1 < argc) {
 			o.wt_udp_buffer = (size_t)strtoull(argv[++i], NULL, 10);
 		} else if (!strcmp(a, "--insecure")) {
@@ -566,14 +583,23 @@ int main(int argc, char **argv) {
 				return 2;
 			}
 			o.pin_sha256 = pin_hash;
-		} else if (!insecure) {
+		}
+		if (key_pin_count) {
+			o.key_pins_sha256 = key_pins;
+			o.key_pin_count = key_pin_count;
+		}
+		if (!pin && !key_pin_count && !insecure) {
 			// There is no certificate authority check: a pin is all that tells the server apart.
-			fprintf(stderr, "an https:// server needs --pin (or --insecure, which takes any certificate)\n");
+			fprintf(stderr, "an https:// server needs --pin or --pin-key (or --insecure, which takes any "
+			                "certificate)\n");
 			return 2;
 		}
-	} else if (pin || insecure || o.origin || connect_to || o.wt_lanes || o.wt_server_stream || o.wt_udp_buffer) {
-		fprintf(stderr, "--pin, --insecure, --origin, --connect-to, --lanes, --server-stream and --udp-buffer are for "
-		                "an https:// (WebTransport) server\n");
+	} else if (pin || key_pin_count || insecure || o.origin || connect_to || o.wt_lanes || o.wt_server_stream ||
+	           o.wt_udp_buffer) {
+		fprintf(
+		    stderr,
+		    "--pin, --pin-key, --insecure, --origin, --connect-to, --lanes, --server-stream and --udp-buffer are for "
+		    "an https:// (WebTransport) server\n");
 		return 2;
 	}
 	long target_port = strtol(positional[1], NULL, 10);

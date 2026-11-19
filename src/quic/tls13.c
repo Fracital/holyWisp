@@ -95,6 +95,8 @@ struct hw_tls {
 	size_t tp_len;
 	uint8_t pin[TLS_HASH];
 	int has_pin;
+	uint8_t key_pins[HW_TLS_KEY_PINS_MAX][TLS_HASH];
+	size_t key_pin_count;
 	int omit_share; // tests: the first ClientHello carries no key share
 	// What was negotiated or learnt from the peer.
 	char alpn_sel[256];
@@ -1030,6 +1032,17 @@ static int client_on_certificate(hw_tls *t, const uint8_t *msg, size_t len) {
 		hw_sha256(leaf.p, leaf.n, h);
 		if (memcmp(h, t->pin, TLS_HASH) != 0) return tls_fail(t, HW_TLS_ALERT_BAD_CERTIFICATE);
 	}
+	if (t->key_pin_count) {
+		// The key the CertificateVerify below must have signed with: any certificate for it.
+		const uint8_t *spki;
+		size_t spki_len;
+		uint8_t h[TLS_HASH];
+		if (hw_cert_spki(leaf.p, leaf.n, &spki, &spki_len) != 0) return tls_fail(t, HW_TLS_ALERT_BAD_CERTIFICATE);
+		hw_sha256(spki, spki_len, h);
+		int match = 0;
+		for (size_t i = 0; i < t->key_pin_count; i++) match |= memcmp(h, t->key_pins[i], TLS_HASH) == 0;
+		if (!match) return tls_fail(t, HW_TLS_ALERT_BAD_CERTIFICATE);
+	}
 	if (hw_cert_p256_pubkey(leaf.p, leaf.n, t->leaf_pub)) return tls_fail(t, HW_TLS_ALERT_BAD_CERTIFICATE);
 	hw_sha256_update(&t->th, msg, len);
 	t->state = ST_CLIENT_WAIT_CV;
@@ -1130,6 +1143,10 @@ hw_tls *hw_tls_new(const hw_tls_config *cfg, const hw_tls_callbacks *cb) {
 			memcpy(t->pin, cfg->pin_sha256, sizeof t->pin);
 			t->has_pin = 1;
 		}
+		if (cfg->key_pin_count > HW_TLS_KEY_PINS_MAX || (cfg->key_pin_count && !cfg->key_pins_sha256)) goto fail;
+		for (size_t i = 0; i < cfg->key_pin_count; i++)
+			memcpy(t->key_pins[i], cfg->key_pins_sha256 + i * TLS_HASH, TLS_HASH);
+		t->key_pin_count = cfg->key_pin_count;
 	}
 	return t;
 fail:

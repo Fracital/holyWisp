@@ -21,8 +21,10 @@ hw_client_try_send, which never waits.
  *
  * With opts.webtransport the same client speaks Wisp over WebTransport instead (QUIC over UDP to
  * the server's webtransport port, docs/webtransport.md). That path is encrypted, and it is
- * authenticated only by pin_sha256: the certificate's SHA-256, as the server's
- * /webtransport.json lists it. There is no certificate authority check; without a pin any
+ * authenticated only by a pin: pin_sha256, the certificate's SHA-256, as the server's
+ * /webtransport.json lists it for its own rotating certificates, or key_pins_sha256, the SHA-256 of
+ * the certificate's public key, which stays the same across the renewals of a certificate whose
+ * key is kept (certbot --reuse-key). There is no certificate authority check; without a pin any
  * certificate is taken, which is for tests on loopback and nothing else.
  */
 #ifndef HOLYWISP_CLIENT_H
@@ -60,7 +62,12 @@ typedef struct hw_client_opts {
 	// DATA goes out as QUIC datagrams.
 	int webtransport;
 	const uint8_t *pin_sha256; // 32 bytes the server's certificate must hash to; NULL takes any
-	const char *origin;        // the origin header to send; NULL sends none
+	// key_pin_count values of 32 bytes, back to back, one of which the SHA-256 of the certificate's
+	// SubjectPublicKeyInfo must be (the key in use and the one that replaces it, say); at most
+	// HW_TLS_KEY_PINS_MAX (4), or the connect fails. With pin_sha256 as well, both must hold.
+	const uint8_t *key_pins_sha256;
+	size_t key_pin_count;
+	const char *origin; // the origin header to send; NULL sends none
 	// WebTransport: the name to send as SNI and as the :authority's host instead of host, which
 	// is then only where to connect (an address, or another name), as curl's --connect-to.
 	// NULL: host.

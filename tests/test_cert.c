@@ -393,6 +393,50 @@ static void test_openssl_fixtures(void) {
 	CHECK(hw_cert_load_p256_key(chain, strlen(chain), priv) == 0, "key out of a combined file");
 }
 
+// The key pin is SHA-256 over the SubjectPublicKeyInfo as encoded, which is what openssl hashes in
+// `openssl x509 -pubkey -noout | openssl pkey -pubin -outform der | openssl dgst -sha256` (the
+// vectors below), for any key type. A self-signed certificate's is the 91 bytes of its P-256 key,
+// and two certificates for one key have one pin.
+static void test_spki(void) {
+	static const char *const ec_pin = "12dc539043981bfe5eacd6c9092f360e528186f79c4f2526edeca9050b6f7ad6";
+	static const char *const rsa_pin = "5e1356e77d9334657b5ea899c294111f1e13db640c01afd6c1d155a60b3c4402";
+	uint8_t want[32], got[32];
+	const uint8_t *spki = NULL;
+	size_t spki_len = 0;
+	hw_der d;
+	load_one(EC_CERT, &d);
+	CHECK_EQ(hw_cert_spki(d.der, d.len, &spki, &spki_len), 0);
+	CHECK(spki > d.der && spki + spki_len <= d.der + d.len, "points into the certificate");
+	hw_sha256(spki, spki_len, got);
+	hex(ec_pin, want, 32);
+	CHECK(memcmp(got, want, 32) == 0, "openssl's pin of the P-256 fixture");
+	for (size_t cut = 0; cut < d.len; cut += 7) {
+		CHECK_EQ(hw_cert_spki(d.der, cut, &spki, &spki_len), -1);
+	}
+	hw_der_free(&d);
+	load_one(RSA_CERT, &d);
+	CHECK_EQ(hw_cert_spki(d.der, d.len, &spki, &spki_len), 0);
+	hw_sha256(spki, spki_len, got);
+	hex(rsa_pin, want, 32);
+	CHECK(memcmp(got, want, 32) == 0, "openssl's pin of the RSA fixture");
+	hw_der_free(&d);
+
+	uint8_t priv[32], pub[65];
+	CHECK_EQ(hw_p256_keygen(priv, pub), 0);
+	hw_der a, b;
+	CHECK_EQ(hw_cert_selfsigned(priv, pub, "a.example", 1700000000, 1700086400, &a), 0);
+	CHECK_EQ(hw_cert_selfsigned(priv, pub, "b.example", 1700000000, 1700172800, &b), 0);
+	const uint8_t *sa, *sb;
+	size_t la, lb;
+	CHECK(hw_cert_spki(a.der, a.len, &sa, &la) == 0 && hw_cert_spki(b.der, b.len, &sb, &lb) == 0, "parse");
+	CHECK(la == 91 && memcmp(sa + 26, pub, 65) == 0, "a P-256 SubjectPublicKeyInfo of %zu bytes", la);
+	CHECK(la == lb && memcmp(sa, sb, la) == 0, "one key, one pin");
+	CHECK(a.len != b.len || memcmp(a.der, b.der, a.len) != 0, "two certificates");
+	hw_der_free(&a);
+	hw_der_free(&b);
+	CHECK_EQ(hw_cert_spki(NULL, 0, &spki, &spki_len), -1);
+}
+
 static void test_refusals(void) {
 	uint8_t pub[65], priv[32];
 	hw_der d;
@@ -522,6 +566,7 @@ int main(void) {
 	RUN(test_selfsigned_times);
 	RUN(test_selfsigned_pinned);
 	RUN(test_openssl_fixtures);
+	RUN(test_spki);
 	RUN(test_refusals);
 	RUN(test_truncated_and_corrupted);
 	return 0;

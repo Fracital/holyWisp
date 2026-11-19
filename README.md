@@ -303,11 +303,22 @@ TCP stream are counted in bytes against the limit the server raises as its remot
 instead of CONTINUE's window of packets.
 
 An `https://` server URL is WebTransport (UDP, port 443 unless the URL says otherwise). There is no
-certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what authenticates the
-server, and `--insecure` takes any certificate, for loopback tests. `--origin` sends an origin
-header, for a server with `allow-origin`. `--connect-to ADDR` sends the datagrams to `ADDR` while the
-URL's host stays the SNI and `:authority`, as curl's option of that name does: one host of a server
-with `webtransport-cert-dir`, reached by its address. `--udp-buffer N` sets the UDP socket's buffers
+certificate authority check: `--pin` (the certificate's SHA-256 in base64 or hex) or `--pin-key`
+(its public key's, as curl's `--pinnedpubkey` takes it, up to four, any one matching) is what
+authenticates the server, and `--insecure` takes any certificate, for loopback tests. A server's
+own rotating certificates are pinned with `--pin` and `/webtransport.json`; an operator's (a
+Let's Encrypt one, say) with `--pin-key`, which outlives a renewal that keeps the key (certbot's
+`--reuse-key`):
+
+```sh
+openssl x509 -in cert.pem -noout -pubkey | openssl pkey -pubin -outform der \
+  | openssl dgst -sha256 -binary | base64      # the value for --pin-key
+```
+
+`--origin` sends an origin header, for a server with `allow-origin`. `--connect-to ADDR` sends the
+datagrams to `ADDR` while the URL's host stays the SNI and `:authority`, as curl's option of that
+name does: one host of a server with `webtransport-cert-dir`, reached by its address. Every address
+a name resolves to is tried in turn. `--udp-buffer N` sets the UDP socket's buffers
 (4 MiB by default); `--udp-buffer 212992` receives as a browser does on a Linux with stock settings,
 which is how a server's bursts are tested against a receive buffer that small.
 

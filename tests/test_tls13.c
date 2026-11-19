@@ -1157,6 +1157,93 @@ static void tamper_sh_ext(side *s) {
 	sv[-3] = 42; // early_data, which the client never offered
 }
 
+// The server's flight with cert as its leaf (g_priv's key) to a client holding a leaf pin and key
+// pins. Returns the client's input result; *alert is its alert.
+static int key_pin_flight(const hw_der *cert, const uint8_t *pin, const uint8_t *keys, size_t nkeys, uint8_t *alert) {
+	side c, s;
+	memset(&s, 0, sizeof s);
+	hw_tls_config scfg = {
+	    .is_server = 1,
+	    .chain = cert,
+	    .chain_len = 1,
+	    .key = g_priv,
+	    .alpn = H3,
+	    .alpn_count = 1,
+	    .transport_params = SERVER_TP,
+	    .transport_params_len = sizeof SERVER_TP,
+	};
+	hw_tls_callbacks scb = {.ud = &s, .emit = emit_cb, .secret = secret_cb};
+	s.t = hw_tls_new(&scfg, &scb);
+	CHECK(s.t != NULL, "server new");
+	memset(&c, 0, sizeof c);
+	hw_tls_config ccfg = {
+	    .alpn = H3,
+	    .alpn_count = 1,
+	    .transport_params = CLIENT_TP,
+	    .transport_params_len = sizeof CLIENT_TP,
+	    .server_name = "wt.example",
+	    .pin_sha256 = pin,
+	    .key_pins_sha256 = keys,
+	    .key_pin_count = nkeys,
+	};
+	hw_tls_callbacks ccb = {.ud = &c, .emit = emit_cb, .secret = secret_cb};
+	c.t = hw_tls_new(&ccfg, &ccb);
+	CHECK(c.t != NULL, "client new");
+	CHECK_EQ(hw_tls_start(c.t), 0);
+	CHECK_EQ(deliver(&c, &s, 0), 1);
+	int r = deliver(&s, &c, 0) < 0 ? -1 : 0;
+	if (r == 0) CHECK(hw_tls_done(c.t), "client done");
+	*alert = hw_tls_alert(c.t);
+	side_clear(&c);
+	side_clear(&s);
+	return r;
+}
+
+// A key pin is the SHA-256 of the leaf's SubjectPublicKeyInfo: it holds across certificates for one
+// key (a renewal that keeps it), where the leaf pin does not, and any of several may match.
+static void test_key_pins(void) {
+	const uint8_t *spki;
+	size_t spki_len;
+	uint8_t keys[5 * 32];
+	CHECK_EQ(hw_cert_spki(g_cert.der, g_cert.len, &spki, &spki_len), 0);
+	hw_sha256(spki, spki_len, keys + 32);
+	memcpy(keys, keys + 32, 32);
+	keys[0] ^= 0x01; // a pin for another key, first
+	uint8_t pub[HW_P256_PUB_LEN];
+	CHECK_EQ(hw_p256_public(g_priv, pub), 0);
+	int64_t now = (int64_t)time(NULL);
+	hw_der renewed;
+	CHECK_EQ(hw_cert_selfsigned(g_priv, pub, "wt.example", now - 60, now + 6 * 86400, &renewed), 0);
+	uint8_t alert = 0;
+
+	CHECK_EQ(key_pin_flight(&g_cert, NULL, keys + 32, 1, &alert), 0);
+	CHECK_EQ(key_pin_flight(&renewed, NULL, keys + 32, 1, &alert), 0);
+	CHECK_EQ(key_pin_flight(&renewed, g_pin, NULL, 0, &alert), -1); // the leaf pin is the old certificate's
+	CHECK_EQ(alert, HW_TLS_ALERT_BAD_CERTIFICATE);
+	CHECK_EQ(key_pin_flight(&g_cert, NULL, keys, 2, &alert), 0); // the second of two
+	CHECK_EQ(key_pin_flight(&g_cert, NULL, keys, 1, &alert), -1);
+	CHECK_EQ(alert, HW_TLS_ALERT_BAD_CERTIFICATE);
+	CHECK_EQ(key_pin_flight(&g_cert, g_pin, keys + 32, 1, &alert), 0);
+	CHECK_EQ(key_pin_flight(&renewed, g_pin, keys + 32, 1, &alert), -1); // both must hold
+	CHECK_EQ(alert, HW_TLS_ALERT_BAD_CERTIFICATE);
+
+	// No more pins than the client holds.
+	hw_tls_config cfg = {
+	    .alpn = H3,
+	    .alpn_count = 1,
+	    .key_pins_sha256 = keys,
+	    .key_pin_count = HW_TLS_KEY_PINS_MAX + 1,
+	};
+	side c;
+	memset(&c, 0, sizeof c);
+	hw_tls_callbacks cb = {.ud = &c, .emit = emit_cb, .secret = secret_cb};
+	CHECK(hw_tls_new(&cfg, &cb) == NULL, "%d key pins taken", HW_TLS_KEY_PINS_MAX + 1);
+	cfg.key_pin_count = 1;
+	cfg.key_pins_sha256 = NULL;
+	CHECK(hw_tls_new(&cfg, &cb) == NULL, "a count without pins");
+	hw_der_free(&renewed);
+}
+
 static void test_client_refusals(void) {
 	side c, s;
 	uint8_t wrong[32];
@@ -1694,6 +1781,7 @@ int main(void) {
 	RUN(test_reassembly_memory);
 	RUN(test_alpn_mismatch);
 	RUN(test_client_refusals);
+	RUN(test_key_pins);
 	RUN(test_tampered_client_finished);
 	RUN(test_post_handshake);
 	RUN(test_callback_failure);

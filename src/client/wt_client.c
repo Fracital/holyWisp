@@ -293,6 +293,8 @@ static int wtc_attempt(hw_wtc *t, const hw_wtc_opts *o, const struct addrinfo *a
 	qc.tls.alpn_count = 1;
 	qc.tls.server_name = sni;
 	qc.tls.pin_sha256 = o->pin_sha256;
+	qc.tls.key_pins_sha256 = o->key_pins_sha256;
+	qc.tls.key_pin_count = o->key_pin_count;
 	qc.max_idle_ms = WTC_IDLE_MS;
 	qc.initial_max_data = WTC_WINDOW;
 	qc.initial_max_stream_data = WTC_WINDOW;
@@ -354,7 +356,7 @@ static int wtc_attempt(hw_wtc *t, const hw_wtc_opts *o, const struct addrinfo *a
 			    t->close_error <= HW_QUIC_CRYPTO_ERROR(255)) {
 				snprintf(err, err_cap, "TLS handshake failed (alert %u)%s",
 				         (unsigned)(t->close_error - HW_QUIC_CRYPTO_ERROR(0)),
-				         o->pin_sha256 ? ": the certificate may not match the pin" : "");
+				         o->pin_sha256 || o->key_pin_count ? ": the certificate may not match the pin" : "");
 			} else {
 				snprintf(err, err_cap, "the connection closed during the handshake (error 0x%llx)",
 				         (unsigned long long)t->close_error);

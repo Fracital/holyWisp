@@ -441,9 +441,10 @@ static int r_p256_alg(der_r *r) {
 	return r_done(&alg) ? 0 : -1;
 }
 
-// A certificate's validity and SubjectPublicKeyInfo. The outer structure must be exactly
-// Certificate { TBSCertificate, AlgorithmIdentifier, BIT STRING } and fill the buffer.
-static int cert_parse(const uint8_t *der, size_t len, der_r *validity, der_r *spki) {
+// A certificate's validity and SubjectPublicKeyInfo (its content, and with spki_whole its whole
+// TLV). The outer structure must be exactly Certificate { TBSCertificate, AlgorithmIdentifier,
+// BIT STRING } and fill the buffer.
+static int cert_parse_spki(const uint8_t *der, size_t len, der_r *validity, der_r *spki, der_r *spki_whole) {
 	if (!der) return -1;
 	der_r all = {der, der + len}, cert, tbs;
 	if (r_tlv(&all, TAG_SEQUENCE, &cert) != 0 || !r_done(&all)) return -1;
@@ -457,7 +458,25 @@ static int cert_parse(const uint8_t *der, size_t len, der_r *validity, der_r *sp
 	if (r_tlv(&tbs, TAG_SEQUENCE, NULL) != 0) return -1;                       // issuer
 	if (r_tlv(&tbs, TAG_SEQUENCE, validity) != 0) return -1;
 	if (r_tlv(&tbs, TAG_SEQUENCE, NULL) != 0) return -1; // subject
-	return r_tlv(&tbs, TAG_SEQUENCE, spki);
+	const uint8_t *start = tbs.p;
+	if (r_tlv(&tbs, TAG_SEQUENCE, spki) != 0) return -1;
+	if (spki_whole) {
+		spki_whole->p = start;
+		spki_whole->end = tbs.p;
+	}
+	return 0;
+}
+
+static int cert_parse(const uint8_t *der, size_t len, der_r *validity, der_r *spki) {
+	return cert_parse_spki(der, len, validity, spki, NULL);
+}
+
+int hw_cert_spki(const uint8_t *der, size_t len, const uint8_t **spki, size_t *spki_len) {
+	der_r validity, content, whole;
+	if (cert_parse_spki(der, len, &validity, &content, &whole) != 0) return -1;
+	*spki = whole.p;
+	*spki_len = (size_t)(whole.end - whole.p);
+	return 0;
 }
 
 int hw_cert_p256_pubkey(const uint8_t *der, size_t len, uint8_t pub[HW_P256_PUB_LEN]) {

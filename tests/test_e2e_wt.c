@@ -172,6 +172,7 @@ typedef struct {
 	int v2;
 	const char *origin;
 	const uint8_t *pin;
+	const uint8_t *key_pin; // one key pin (the leaf's SubjectPublicKeyInfo's SHA-256)
 	size_t max_queue;
 	const char *name; // SNI and :authority, the server still reached at 127.0.0.1
 	const char *path;
@@ -188,6 +189,8 @@ static hw_client *wt_try(hw_server *s, const wt_opts *w, char *err, size_t err_c
 	o.v2 = w ? w->v2 : 0;
 	o.origin = w ? w->origin : NULL;
 	o.pin_sha256 = w ? w->pin : NULL;
+	o.key_pins_sha256 = w ? w->key_pin : NULL;
+	o.key_pin_count = w && w->key_pin ? 1 : 0;
 	if (w && w->max_queue) o.max_queue_bytes = w->max_queue;
 	if (w && w->name) o.server_name = w->name;
 	if (w && w->path) o.path = w->path;
@@ -689,6 +692,20 @@ static void test_operator_certificate(void) {
 	wt_opts pinned = {.pin = pin};
 	hw_client *c = wt_connect(s, &pinned);
 	hw_client_free(c);
+	// A key pin: the hash of the certificate's key, which a renewal with the same key keeps.
+	const uint8_t *spki;
+	size_t spki_len;
+	CHECK_EQ(hw_cert_spki(cert.der, cert.len, &spki, &spki_len), 0);
+	uint8_t key_pin[32];
+	hw_sha256(spki, spki_len, key_pin);
+	wt_opts key_pinned = {.key_pin = key_pin};
+	c = wt_connect(s, &key_pinned);
+	hw_client_free(c);
+	key_pin[31] ^= 1;
+	err[0] = 0;
+	c = wt_try(s, &key_pinned, err, sizeof(err));
+	CHECK(c == NULL, "connected with another key's pin");
+	CHECK(strstr(err, "TLS handshake failed (alert 42)") != NULL, "error: %s", err);
 	hw_server_free(s);
 
 	// Another key: refused at start, not at the first handshake.

@@ -1,7 +1,8 @@
 /*
  * holywisp/cert.h - the X.509 the WebTransport listener needs, and no more: loading an operator's
  * ECDSA P-256 certificate chain and key from PEM, and making the short-lived self-signed
- * certificate whose SHA-256 a browser pins with WebTransport's serverCertificateHashes.
+ * certificate whose SHA-256 a browser pins with WebTransport's serverCertificateHashes. The
+ * client takes a leaf's public key out of it, for the signature and for a key pin.
  *
  * Chrome accepts a pinned certificate only when it is X.509 v3, ECDSA (P-256), and valid for at
  * most 14 days (docs/webtransport.md, "Certificates"). The server makes a new one before the old
@@ -48,6 +49,12 @@ int hw_cert_load_p256_key(const char *pem, size_t len, uint8_t priv[HW_P256_PRIV
 // The P-256 public key in a certificate's SubjectPublicKeyInfo. Returns 0, or -1 when the
 // certificate does not parse or its key is not an uncompressed P-256 point on the curve.
 int hw_cert_p256_pubkey(const uint8_t *der, size_t len, uint8_t pub[HW_P256_PUB_LEN]);
+
+// A certificate's SubjectPublicKeyInfo as it is encoded there, tag and length included: the bytes
+// whose SHA-256 is a key pin (RFC 7469's, curl's --pinnedpubkey), which stays the same across
+// certificates for one key. *spki points into der. Any key type. Returns 0, or -1 when the
+// certificate does not parse.
+int hw_cert_spki(const uint8_t *der, size_t len, const uint8_t **spki, size_t *spki_len);
 
 // The notAfter of a certificate, Unix seconds. Returns 0, or -1 when it does not parse
 // (including a time that is not YYMMDDHHMMSSZ or YYYYMMDDHHMMSSZ, or is before 1950).

@@ -21,12 +21,14 @@ typedef struct {
 	const char *server_name; // SNI and :authority; NULL: host
 	uint16_t port;
 	const char *path;
-	const char *origin;        // NULL: none sent
-	const char *protocols;     // wt-available-protocols as sent; NULL: none (Wisp v1)
-	const uint8_t *pin_sha256; // the server's leaf must hash to this; NULL accepts any (tests)
-	size_t max_packet;         // the largest Wisp packet accepted from the server
-	size_t max_queue;          // bytes of packets held before the server is paused
-	size_t udp_buffer;         // the socket's buffers (hw_sys_udp_buffers); 0: WTC_SOCKET_BUFFER
+	const char *origin;             // NULL: none sent
+	const char *protocols;          // wt-available-protocols as sent; NULL: none (Wisp v1)
+	const uint8_t *pin_sha256;      // the server's leaf must hash to this; NULL accepts any (tests)
+	const uint8_t *key_pins_sha256; // key_pin_count SHA-256 values of the leaf's key (tls13.h)
+	size_t key_pin_count;
+	size_t max_packet; // the largest Wisp packet accepted from the server
+	size_t max_queue;  // bytes of packets held before the server is paused
+	size_t udp_buffer; // the socket's buffers (hw_sys_udp_buffers); 0: WTC_SOCKET_BUFFER
 } hw_wtc_opts;
 
 // Connect and open the session by deadline (hw_now_ms clock, UINT64_MAX for none). NULL with a

@@ -21,7 +21,8 @@
  *   absence is a missing_extension alert. Its contents are holywisp/quic.h's business.
  *
  * The client role exists for holyWisp's own tests and client; it verifies the server by the
- * SHA-256 of its leaf certificate (pin) and the CertificateVerify signature, not by a CA chain.
+ * SHA-256 of its leaf certificate (pin), or of the leaf's public key (a key pin, which survives a
+ * renewal that keeps the key), and the CertificateVerify signature, not by a CA chain.
  */
 #ifndef HOLYWISP_TLS13_H
 #define HOLYWISP_TLS13_H
@@ -37,6 +38,8 @@ typedef enum {
 	HW_TLS_HANDSHAKE = 1,
 	HW_TLS_APP = 2,
 } hw_tls_level;
+
+#define HW_TLS_KEY_PINS_MAX 4 // key pins a client may hold at once (the key in use and its successors)
 
 #define HW_TLS_CIPHER_AES128GCM 0x1301 // only ever the Initial level's, which TLS does not choose
 #define HW_TLS_CIPHER_CHACHA20  0x1303
@@ -90,6 +93,11 @@ typedef struct {
 	// accept any leaf, for tests only).
 	const char *server_name;
 	const uint8_t *pin_sha256;
+	// Client: key pins, key_pin_count SHA-256 values of 32 bytes each, back to back: the leaf's
+	// SubjectPublicKeyInfo (hw_cert_spki) must hash to one of them. With pin_sha256 as well, both
+	// must hold. 0: none. More than HW_TLS_KEY_PINS_MAX is a config hw_tls_new cannot use.
+	const uint8_t *key_pins_sha256;
+	size_t key_pin_count;
 } hw_tls_config;
 
 typedef struct hw_tls hw_tls;
@@ -98,7 +106,7 @@ typedef struct hw_tls hw_tls;
 // or for a config it cannot use: no emit callback, no ALPN or a name that is empty or over 255
 // bytes, transport parameters over 65535 bytes, an SNI that is empty or over 255 bytes, or a
 // server without a key or a chain of 1 to HW_CERT_CHAIN_MAX certificates whose Certificate
-// message fits in 64 KiB.
+// message fits in 64 KiB, or a client with more than HW_TLS_KEY_PINS_MAX key pins.
 hw_tls *hw_tls_new(const hw_tls_config *cfg, const hw_tls_callbacks *cb);
 void hw_tls_free(hw_tls *t);
 

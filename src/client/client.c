@@ -763,6 +763,8 @@ static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char 
 	                 : o->wt_server_stream ? "\"" HW_WISP_V2_PROTOCOL "\", \"" HW_WT_SERVER_STREAM "\""
 	                                       : "\"" HW_WISP_V2_PROTOCOL "\"",
 	    .pin_sha256 = o->pin_sha256,
+	    .key_pins_sha256 = o->key_pins_sha256,
+	    .key_pin_count = o->key_pin_count,
 	    .max_packet = c->max_message,
 	    .max_queue = c->max_queue_bytes,
 	    .udp_buffer = o->wt_udp_buffer,
