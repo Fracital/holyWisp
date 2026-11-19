@@ -33,9 +33,16 @@
  * HW_QUIC_MAX_DGRAM and the peer's max_udp_payload_size; a new path starts again at the floor.
  * Starting at 1452 instead lost every full-size packet on a path under 1480 (a VPN, PPPoE) whose
  * ICMP does not come back, and a datagram of that size is most of what a busy session sends.
+ * A path whose MTU shrinks later (a route change, a tunnel) is noticed (RFC 8899 4.3, black hole
+ * detection, pmtu_bh_acked): HW_QC_PMTU_BH_LOST packets above the base size lost, none at least
+ * as large acknowledged since, a smaller packet sent after them acknowledged, and larger ones sent
+ * after that lost too. The size falls back to the base and the search starts again under what
+ * was lost. From the second PTO in a row on, probes go at the base size, or a session whose every
+ * full-size packet is lost would never send the smaller packet that tells a black hole from a
+ * dead path.
  *
  * Not implemented (docs/webtransport.md, "QUIC"): 0-RTT, active migration and preferred_address,
- * ECN, and noticing a path MTU that shrinks after the search (black-hole detection).
+ * and ECN.
  */
 #include "holywisp/quic.h"
 
@@ -804,6 +811,57 @@ static void packet_resolve(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, int 
 	}
 }
 
+// ---- PMTU black holes ----------------------------------------------------------------------------
+
+static void pmtu_bh_clear(hw_quic_conn *q) {
+	q->bh_lost = 0;
+	q->bh_min = 0;
+	q->bh_last = 0;
+	q->bh_small = 0;
+}
+
+// A 1-RTT packet above the base size was declared lost.
+static void pmtu_bh_lost(hw_quic_conn *q, uint64_t pn, uint64_t size) {
+	if (!q->bh_lost || size < q->bh_min) q->bh_min = size;
+	if (pn > q->bh_last) q->bh_last = pn;
+	q->bh_lost++;
+}
+
+// An ACK frame newly acknowledged 1-RTT packets, the largest of them at most `largest_size` bytes
+// and the newest `top_pn` of `top_size`, and (declared) its losses have been declared. A packet
+// as large as the smallest one lost shows the path carries that size: the losses were the path's
+// ordinary ones. With none such, a smaller packet sent after every one of them that arrived says
+// the size may be what the path lost, and large packets sent after that one and lost too say it
+// is: the size falls to the base, and the search starts again below what failed. Random loss
+// never takes HW_QC_PMTU_BH_LOST large packets with no large one acknowledged between. After an
+// outage the first packet through is often a small probe (HW_QC_PMTU_BH_PTOS), which is why one
+// small packet is not enough: what follows it arrives, large or small, and clears the suspicion.
+static void pmtu_bh_acked(hw_quic_conn *q, uint64_t largest_size, uint64_t top_pn, uint64_t top_size, int declared) {
+	if (!q->bh_lost) return;
+	if (largest_size >= q->bh_min) {
+		pmtu_bh_clear(q);
+		return;
+	}
+	if (!declared || q->bh_lost < HW_QC_PMTU_BH_LOST || top_pn <= q->bh_last || top_size >= q->bh_min) return;
+	if (!q->bh_small || q->bh_last < q->bh_small) {
+		q->bh_small = top_pn;
+		return;
+	}
+	if (q->mds <= HW_QUIC_MIN_DGRAM) {
+		pmtu_bh_clear(q);
+		return;
+	}
+	q->pmtu_bad = q->bh_min;
+	q->mds = HW_QUIC_MIN_DGRAM;
+	q->cc.mds = HW_QUIC_MIN_DGRAM;
+	q->pmtu_probe = 0;
+	q->pmtu_deadline = 0;
+	q->pmtu_tries = 0;
+	q->pmtu_next = q->now + pto_base(q);
+	q->pmtu_black_holes++;
+	pmtu_bh_clear(q);
+}
+
 // How long a packet declared lost is remembered for a late acknowledgment to prove the loss
 // spurious: packets sent since the returned time are kept. Two PTOs cover a reordering delay
 // that the adaptive thresholds have not caught up with yet, and the peer's ACK delay.
@@ -840,6 +898,7 @@ static void detect_lost(hw_quic_conn *q, int spi) {
 				last_lost = pn;
 				if (s->time > latest_lost) latest_lost = s->time;
 				hw_qc_cc_on_lost(&q->cc, s, pn);
+				if (spi == HW_QC_SP_APP && s->size > HW_QUIC_MIN_DGRAM) pmtu_bh_lost(q, pn, s->size);
 			}
 			if (s->flags & HW_QC_SENT_ACK_ELICITING) {
 				if (!run) {
@@ -948,6 +1007,7 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 	int newly = 0, ae_newly = 0;
 	uint64_t largest_time = 0;
 	int largest_newly = 0;
+	uint64_t acked_size = 0, top_pn = 0, top_size = 0; // 1-RTT: for black hole detection
 	do {
 		uint64_t lo = HW_MAX(it.lo, sp->ring.base);
 		if (it.hi < lo) continue;
@@ -955,6 +1015,11 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 		uint64_t pn;
 		for (uint64_t top = hi; ack_next_open(q, &sp->ring, top, lo, &pn); top = pn - 1) {
 			hw_qc_sent *s = hw_qc_ring_get(&sp->ring, pn);
+			if (s->size > acked_size) acked_size = s->size;
+			if (!top_size) {
+				top_pn = pn; // the walk goes down from the largest
+				top_size = s->size;
+			}
 			if (s->flags & HW_QC_SENT_LOST) {
 				on_spurious(q, sp, s, pn, f->ack_largest); // lost in flight: sent_open says no other
 			} else {
@@ -973,6 +1038,7 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 			if (pn == lo) break;
 		}
 	} while (hw_qc_ack_iter_next(&it));
+	if (spi == HW_QC_SP_APP) pmtu_bh_acked(q, acked_size, top_pn, top_size, 0);
 	if (!newly) return;
 	uint64_t rtt_sample = 0;
 	if (largest_newly && ae_newly) {
@@ -988,6 +1054,7 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 	}
 	if (!q->is_server && spi == HW_QC_SP_HANDSHAKE) q->peer_validated_addr = 1;
 	detect_lost(q, spi);
+	if (spi == HW_QC_SP_APP) pmtu_bh_acked(q, acked_size, top_pn, top_size, 1);
 	hw_qc_cc_on_ack_done(&q->cc, rtt_sample, q->now);
 	if (peer_validated(q)) q->pto_count = 0;
 	hw_qc_ring_trim(&sp->ring, lost_keep_since(q));
@@ -1685,6 +1752,7 @@ static void pmtu_restart(hw_quic_conn *q) {
 	q->pmtu_deadline = 0;
 	q->pmtu_next = 0;
 	q->pmtu_tries = 0;
+	pmtu_bh_clear(q);
 }
 
 static void path_migrate(hw_quic_conn *q, const struct sockaddr *from, socklen_t from_len, size_t dgram_len) {
@@ -2365,6 +2433,11 @@ size_t hw_quic_output_us(hw_quic_conn *q, uint8_t *out, size_t cap, struct socka
 		}
 	}
 	size_t dmax = (size_t)HW_MIN((uint64_t)cap, q->mds);
+	// Probes after a PTO went unanswered go at the base size: if larger packets are what the path
+	// drops (black hole detection, pmtu_bh_acked), this one gets through and says so.
+	if (q->sp[HW_QC_SP_APP].probes && q->pto_count >= HW_QC_PMTU_BH_PTOS && dmax > HW_QUIC_MIN_DGRAM) {
+		dmax = HW_QUIC_MIN_DGRAM;
+	}
 	if (q->is_server && !q->path_validated) {
 		uint64_t left = 3 * q->amp_rx > q->amp_tx ? 3 * q->amp_rx - q->amp_tx : 0;
 		if (left < dmax) dmax = (size_t)left;
@@ -2939,4 +3012,5 @@ void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out) {
 	out->congestion_events = q->cc.epoch;
 	out->spurious_lost = q->spurious_lost;
 	out->bandwidth = q->cc.bbr ? q->cc.b.bw : 0;
+	out->pmtu_black_holes = q->pmtu_black_holes;
 }

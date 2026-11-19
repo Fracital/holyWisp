@@ -45,6 +45,8 @@
 #define HW_QC_ACK_ONLY_PING     16u     // ACK-only packets in a row before one carries a PING
 #define HW_QC_PMTU_TRIES        3u      // RFC 8899 MAX_PROBES: lost probes before a size counts as too big
 #define HW_QC_PMTU_STEP         32u     // the search ends when the bounds are this close
+#define HW_QC_PMTU_BH_LOST      3u      // packets above the base size lost before a black hole is believed
+#define HW_QC_PMTU_BH_PTOS      2u      // from this PTO in a row on, probes go at the base size
 #define HW_QC_SENT_RING_MAX     65536u  // packets tracked per space before ACK-only ones are forgotten
 // RFC 9001 6.6: packets that may fail authentication in a connection, across all keys, under
 // ChaCha20-Poly1305 (the AEAD TLS selects; AES-128-GCM, Initial packets only, allows 2^52).
@@ -689,6 +691,11 @@ struct hw_quic_conn {
 	uint64_t pmtu_deadline; // it counts as lost if not acknowledged by then
 	uint64_t pmtu_next;     // no probe before then
 	unsigned pmtu_tries;    // probes of the current size lost
+	// Black hole detection: packets above the base size declared lost since none at least as
+	// large as the smallest of them was acknowledged, that smallest size, the newest of them, and
+	// a smaller packet sent after them that was acknowledged (0: none yet).
+	uint64_t bh_lost, bh_min, bh_last, bh_small;
+	uint64_t pmtu_black_holes; // times the size fell back to the base
 	uint64_t peer_max_ack_delay;
 	uint64_t spurious_lost; // packets declared lost that were acknowledged later
 	uint64_t rx_refused;    // packets left unacknowledged: a fragment in them could not be held

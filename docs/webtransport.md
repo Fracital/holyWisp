@@ -109,7 +109,7 @@ which is how backpressure reaches a client; stream limits (MAX_STREAMS); NEW_CON
 RETIRE_CONNECTION_ID; path validation on a peer address change (NAT rebinding: the client's
 port changes, and the connection survives); key update; idle timeout; stateless reset;
 Retry; datagram packetization layer PMTU discovery (RFC 8899). Not implemented: 0-RTT, server
-migration, preferred_address, ECN, QUIC v2, and noticing a path MTU that shrinks later.
+migration, preferred_address, ECN and QUIC v2.
 
 Datagram size: a connection starts at 1200 bytes, which every QUIC path must carry, and once the
 handshake is confirmed it probes for more: a PING padded to the size, alone in a datagram, first
@@ -124,6 +124,18 @@ full-size packet: the handshake went through and the session then carried nothin
 Until 2026-11-19 the sockets kept Linux's default: once an ICMP "fragmentation needed" had put a
 1360 MTU in the route cache, the edge sent every 1452-byte probe, and then every packet, as two
 fragments, and a lost fragment lost the packet.
+
+A path whose MTU shrinks after the search (a route change, a tunnel set up under the session) is
+noticed (black hole detection, RFC 8899 4.3): three packets above 1200 bytes lost with none at
+least as large acknowledged since, a smaller packet sent after them acknowledged, and then larger
+packets sent after that one lost too. The size falls back to 1200 and the search starts again
+below the smallest size that was lost. From the second PTO in a row on, the probes go at 1200
+bytes, or a session whose every full-size packet is lost would never send the small packet that
+tells a black hole from a dead path. One small packet through is not enough on its own: after an
+outage the first packet through is often such a probe, and what follows it then arrives too.
+Random loss never takes three large packets with no large one acknowledged between. Until
+2026-11-19 the size only ever rose, and a session on such a path stalled for good while the ACKs
+and keepalives, all small, kept it from timing out (`test_pmtu_black_hole`).
 
 **Congestion control** is BBR by default (`webtransport-congestion-control`), version 1 as Linux's
 `tcp_bbr` has it, in `quic_recovery.c`. Every packet in flight records the delivery state when it

@@ -2079,6 +2079,61 @@ static void test_pmtu(void) {
 	sim_free(s);
 }
 
+// A path whose MTU shrinks after the search (a route change, a tunnel) and whose ICMP never comes
+// back: every full-size datagram is lost from then on, small ones still arrive. Both sides notice,
+// fall back to the base size, finish the transfer and search again below what was lost. Without
+// it the transfer stalled for good while the ACKs and keepalives kept the connection alive.
+static void test_pmtu_black_hole(void) {
+	sim *s = sim_new(73);
+	s->delay_ms = 20;
+	sim_handshake(s);
+	bulk(s, 1u << 20, 1u << 20, 60000);
+	sim_advance(s, 2000);
+	CHECK_EQ(s->c.q->mds, HW_QUIC_MAX_DGRAM);
+	CHECK_EQ(s->sv.q->mds, HW_QUIC_MAX_DGRAM);
+	s->mtu = 1300;
+	bulk(s, 2u << 20, 2u << 20, 60000);
+	sim_advance(s, 5000);
+	hw_quic_stats cs, ss;
+	hw_quic_get_stats(s->c.q, &cs);
+	hw_quic_get_stats(s->sv.q, &ss);
+	CHECK(cs.pmtu_black_holes >= 1 && ss.pmtu_black_holes >= 1, "black holes: client %llu server %llu",
+	      (unsigned long long)cs.pmtu_black_holes, (unsigned long long)ss.pmtu_black_holes);
+	CHECK(cs.mds > 1300 - HW_QC_PMTU_STEP && cs.mds <= 1300, "client mds %llu", (unsigned long long)cs.mds);
+	CHECK(ss.mds > 1300 - HW_QC_PMTU_STEP && ss.mds <= 1300, "server mds %llu", (unsigned long long)ss.mds);
+	// Found again, the size stays: nothing full-size is sent into the hole any more.
+	uint64_t dropped = s->mtu_dropped;
+	bulk(s, 1u << 20, 1u << 20, 60000);
+	CHECK_EQ(s->mtu_dropped, dropped);
+	sim_free(s);
+
+	// What is not a black hole: random loss, and an outage that takes every size alike.
+	s = sim_new(74);
+	s->delay_ms = 20;
+	s->loss_ppm = 20000;
+	sim_handshake(s);
+	bulk(s, 4u << 20, 4u << 20, 120000);
+	sim_advance(s, 2000);
+	s->block_c2s = s->block_s2c = 1;
+	s->sv.reply = 1u << 20;
+	int64_t id = hw_quic_stream_open(s->c.q, 1);
+	CHECK(id >= 0, "open");
+	app_send(&s->c, (uint64_t)id, 1u << 20);
+	sim_advance(s, 3000);
+	s->block_c2s = s->block_s2c = 0;
+	xfer x = {(uint64_t)id, 1u << 20, 1u << 20};
+	CHECK(sim_run(s, cond_xfer, &x, 120000), "transfer after the outage");
+	hw_quic_get_stats(s->c.q, &cs);
+	hw_quic_get_stats(s->sv.q, &ss);
+	CHECK(cs.packets_lost > 50 && ss.packets_lost > 50, "lost %llu and %llu", (unsigned long long)cs.packets_lost,
+	      (unsigned long long)ss.packets_lost);
+	CHECK_EQ(cs.pmtu_black_holes, 0);
+	CHECK_EQ(ss.pmtu_black_holes, 0);
+	CHECK_EQ(s->c.q->mds, HW_QUIC_MAX_DGRAM);
+	CHECK_EQ(s->sv.q->mds, HW_QUIC_MAX_DGRAM);
+	sim_free(s);
+}
+
 // A HelloRetryRequest: two ClientHellos in the Initial space, under loss.
 static void test_handshake_hrr(void) {
 	for (uint64_t seed = 30; seed < 36; seed++) {
@@ -2911,6 +2966,7 @@ int main(int argc, char **argv) {
 	RUN(test_bbr2_stack);
 	RUN(test_pmtu);
 	RUN(test_ack_cost);
+	RUN(test_pmtu_black_hole);
 	RUN(test_bulk_64m);
 	hw_der_free(&g_cert);
 	return 0;

@@ -288,6 +288,7 @@ typedef struct {
 	uint64_t acked_limited;     // bytes acknowledged that the window did not grow by (sent app-limited)
 	uint64_t ptos;              // probe timeouts
 	uint64_t bandwidth;         // BBR's estimate of the path, bytes per second (0: NewReno, or none yet)
+	uint64_t pmtu_black_holes;  // times larger datagrams stopped arriving and the size fell back to 1200
 } hw_quic_stats;
 void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out);
 
