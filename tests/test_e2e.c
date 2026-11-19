@@ -801,6 +801,123 @@ static size_t http_get_path(hw_server *s, const char *path, char *buf, size_t ca
 	return n;
 }
 
+// A remote that speaks first and then hangs up: accepts one connection on its own thread, writes
+// "bye" and closes.
+static void *bye_main(void *arg) {
+	int lfd = (int)(intptr_t)arg;
+	int fd = accept(lfd, NULL, NULL);
+	if (fd >= 0) {
+		ssize_t w = write(fd, "bye", 3);
+		(void)w;
+		close(fd);
+	}
+	close(lfd);
+	return NULL;
+}
+
+static uint16_t start_bye(void) {
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "listen");
+	int fl = fcntl(lfd, F_GETFL, 0);
+	fcntl(lfd, F_SETFL, fl & ~O_NONBLOCK);
+	pthread_t th;
+	pthread_create(&th, NULL, bye_main, (void *)(intptr_t)lfd);
+	pthread_detach(th);
+	return port;
+}
+
+// /stats says why each stream ended, on which side and whether it had opened, and how long its
+// steps took. One stream of each kind on a server of its own, so every count is exact.
+static void test_stream_end_stats(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.log_level = HW_LOG_NONE;
+	cfg.allow_loopback = 1;
+	cfg.allow_direct_ip = 1;
+	cfg.reputation_enabled = 0;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	hw_client *c = connect_to(s, 1, NULL, NULL, 0);
+	hw_client_event ev;
+	uint8_t buf[8];
+
+	// By name, to the echo: resolved, connected, answered; then the client closes it.
+	uint32_t echo;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "localhost", g_tcp_echo_port, &echo), 0);
+	CHECK_EQ(hw_client_send(c, echo, "ping", 4), 0);
+	CHECK_EQ(hw_client_read_exact(c, echo, buf, 4, 5000), 4);
+	CHECK_EQ(hw_client_close_stream(c, echo, HW_CLOSE_VOLUNTARY), 0);
+	// A remote that is not there: the server ends it before it opened.
+	uint32_t gone;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", closed_port(), &gone), 0);
+	CHECK_EQ(wait_event(c, gone, HW_CEV_CLOSE, &ev, 5000), 1);
+	CHECK_EQ(ev.reason, HW_CLOSE_REFUSED);
+	// Port 0 is refused before it is a stream at all.
+	uint32_t bad;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", 0, &bad), 0);
+	CHECK_EQ(wait_event(c, bad, HW_CEV_CLOSE, &ev, 5000), 1);
+	CHECK_EQ(ev.reason, HW_CLOSE_INVALID_INFO);
+	// The remote speaks first and hangs up: open, a first byte, the remote's end.
+	uint32_t bye;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", start_bye(), &bye), 0);
+	CHECK_EQ(hw_client_read_exact(c, bye, buf, 3, 5000), 3);
+	CHECK_EQ(wait_event(c, bye, HW_CEV_CLOSE, &ev, 5000), 1);
+	CHECK_EQ(ev.reason, HW_CLOSE_VOLUNTARY);
+	// UDP, answered, and still open when the connection ends.
+	uint32_t udp;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", g_udp_echo_port, &udp), 0);
+	CHECK_EQ(hw_client_send(c, udp, "dgram", 5), 0);
+	CHECK_EQ(wait_event(c, udp, HW_CEV_DATA, &ev, 5000), 1);
+	hw_client_free(c);
+	wait_streams_idle(s);
+
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.streams_total, 4);
+	CHECK_EQ(st.streams_client_closed[1], 1);
+	CHECK_EQ(st.streams_client_closed[0], 0);
+	CHECK_EQ(st.streams_failed[HW_STATS_REASON_REFUSED], 1);
+	CHECK_EQ(st.streams_refused[HW_STATS_REASON_INVALID], 1);
+	CHECK_EQ(st.streams_ended[HW_STATS_REASON_VOLUNTARY], 1);
+	CHECK_EQ(st.streams_conn_closed[1], 1);
+	uint64_t ended = 0, failed = 0, refused = 0;
+	for (int i = 0; i < HW_STATS_REASONS; i++) {
+		ended += st.streams_ended[i];
+		failed += st.streams_failed[i];
+		refused += st.streams_refused[i];
+	}
+	CHECK_EQ(ended, 1);
+	CHECK_EQ(failed, 1);
+	CHECK_EQ(refused, 1);
+	// Every stream that was one ended exactly once.
+	CHECK_EQ(ended + failed + st.streams_client_closed[0] + st.streams_client_closed[1] + st.streams_conn_closed[0] +
+	             st.streams_conn_closed[1],
+	         st.streams_total);
+	// One name resolved; two TCP streams connected and heard from (the refused one is neither);
+	// one UDP answer; nothing through a proxy.
+	CHECK_EQ(st.resolve.count, 1);
+	CHECK_EQ(st.tcp_connect.count, 2);
+	CHECK_EQ(st.tcp_first_byte.count, 2);
+	CHECK_EQ(st.udp_first_byte.count, 1);
+	CHECK_EQ(st.proxied_connect.count + st.proxied_first_byte.count, 0);
+	CHECK_EQ(st.warp_tunnel_count, 0);
+	const hw_stats_hist *hists[] = {&st.resolve, &st.tcp_connect, &st.tcp_first_byte, &st.udp_first_byte};
+	for (size_t h = 0; h < sizeof(hists) / sizeof(hists[0]); h++) {
+		uint64_t n = 0;
+		for (int i = 0; i < HW_STATS_HIST_BUCKETS; i++) n += hists[h]->buckets[i];
+		CHECK_EQ(n, hists[h]->count);
+		// On loopback, well under the last bucket's 10 s, and no more than that per stream.
+		CHECK_EQ(hists[h]->buckets[HW_STATS_HIST_BUCKETS - 1], 0);
+		CHECK(hists[h]->sum_us <= hists[h]->count * 10000000u, "sum %llu", (unsigned long long)hists[h]->sum_us);
+	}
+	hw_server_free(s);
+}
+
 // GET /stats is JSON however much it says, and its length is what it says it is. The fields that
 // were there before stay where they were.
 static void test_stats_json(void) {
@@ -820,6 +937,10 @@ static void test_stats_json(void) {
 	CHECK(strstr(body, "\"warpState\":{\"configured\":false,\"canMark\":false,\"usable\":false,\"state\":\"off\","
 	                   "\"ageSeconds\":null,\"tunnels\":{\"v4\":0,\"v6\":0}}") != NULL,
 	      "warpState: %s", body);
+	CHECK(strstr(body, "\"streamEnds\":{\"ended\":{\"voluntary\":") != NULL, "streamEnds: %s", body);
+	CHECK(strstr(body, "\"timing\":{\"boundsMs\":[1,2,5,10,20,50,100,200,500,1000,2000,5000,10000],") != NULL,
+	      "timing: %s", body);
+	CHECK(strstr(body, "\"warpTunnels\":[]") != NULL, "warpTunnels: %s", body);
 }
 
 static size_t http_get_root(hw_server *s, char *buf, size_t cap) {
@@ -1005,6 +1126,7 @@ int main(void) {
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
 	RUN(test_stats_json);
+	RUN(test_stream_end_stats);
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);

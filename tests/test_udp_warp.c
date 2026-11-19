@@ -172,6 +172,24 @@ static void check_stat(hw_server *s, int status, int n4, int n6) {
 	}
 }
 
+// What the per-tunnel stats hold, summed over the tunnels: the pick is the router's hash, so which
+// one of them a stream went to is not this test's business.
+static void tunnel_sums(const hw_server_stats *st, uint64_t *tcp, uint64_t *tcp_connects, uint64_t *tcp_firsts,
+                        uint64_t *udp, uint64_t *udp_firsts) {
+	*tcp = *tcp_connects = *tcp_firsts = *udp = *udp_firsts = 0;
+	CHECK_EQ(st->warp_tunnel_count, 4);
+	for (int i = 0; i < st->warp_tunnel_count; i++) {
+		const hw_stats_tunnel *t = &st->warp_tunnels[i];
+		*tcp += t->tcp_streams;
+		*tcp_connects += t->tcp_connect.count;
+		*tcp_firsts += t->tcp_first_byte.count;
+		*udp += t->udp_streams;
+		*udp_firsts += t->udp_first_byte.count;
+		// The marks are 0x7701 and 0x7702 for warp0 and warp1 (STATE_TWO): only those two are used.
+		if (i >= 2) CHECK_EQ(t->tcp_streams + t->udp_streams, 0);
+	}
+}
+
 static const char *const STATE_TWO =
     "{\"v4\": [{\"name\": \"warp0\", \"mark\": 30465}, {\"name\": \"warp1\", \"mark\": 30466},"
     " {\"name\": \"rogue\", \"mark\": 1}], \"v6\": [{\"name\": \"warp0\", \"mark\": 30465}]}";
@@ -341,10 +359,17 @@ static void test_udp_streams(void) {
 	CHECK_EQ(hw_server_start(s), 0);
 	int ok = udp_roundtrip(s, &reason);
 	stats(s, &st);
+	uint64_t tcp, tcp_connects, tcp_firsts, udp, udp_firsts;
+	tunnel_sums(&st, &tcp, &tcp_connects, &tcp_firsts, &udp, &udp_firsts);
 	if (g_can_mark) {
 		CHECK_EQ(ok, 1);
 		CHECK_EQ(st.udp_warp_marked, 1);
+		// The tunnel it went through has it, and the time its answer took.
+		CHECK_EQ(udp, 1);
+		CHECK_EQ(udp_firsts, 1);
+		CHECK_EQ(st.udp_first_byte.count, 1);
 	} else {
+		CHECK_EQ(udp, 0);
 		CHECK_EQ(ok, 0);
 		CHECK_EQ(reason, HW_CLOSE_UNREACHABLE);
 		CHECK_EQ(st.udp_warp_refused, 1);
@@ -432,10 +457,19 @@ static void test_tcp_streams(void) {
 	CHECK_EQ(hw_server_start(s), 0);
 	int ok = roundtrip(s, HW_STREAM_TCP, &reason);
 	stats(s, &st);
+	uint64_t tcp, tcp_connects, tcp_firsts, udp, udp_firsts;
+	tunnel_sums(&st, &tcp, &tcp_connects, &tcp_firsts, &udp, &udp_firsts);
 	if (g_can_mark) {
 		CHECK_EQ(ok, 1);
 		CHECK_EQ(st.tcp_warp_marked, 1);
+		CHECK_EQ(tcp, 1);
+		CHECK_EQ(tcp_connects, 1);
+		CHECK_EQ(tcp_firsts, 1);
+		CHECK_EQ(st.tcp_connect.count, 1);
+		CHECK_EQ(st.tcp_first_byte.count, 1);
+		for (int i = 0; i < st.warp_tunnel_count; i++) CHECK_EQ(st.warp_tunnels[i].tcp_connect_failed, 0);
 	} else {
+		CHECK_EQ(tcp, 0);
 		CHECK_EQ(ok, 0);
 		CHECK_EQ(reason, HW_CLOSE_UNREACHABLE);
 		CHECK_EQ(st.tcp_warp_refused, 1);

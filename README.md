@@ -232,7 +232,16 @@ socket, `/health` and `/stats` polls included; `connections.webSocket` and
 `connections.webTransport` count the Wisp clients by transport and `connections.httpReplies` the
 plain HTTP answers. `webTransport.quic` sums what QUIC counted over the sessions that have ended
 (packets sent, received and lost, spurious losses, bytes, congestion events, PTOs, and the sum of
-each session's last smoothed RTT). Fields are only ever added. With
+each session's last smoothed RTT). `streamEnds` says why streams ended, by the close reason the
+server sent: `ended` once open (the remote's end, an error, a full queue), `failed` before they
+opened (resolving, the egress policy, the destination limits, the dial, the proxy), `refused` for
+a CONNECT turned away before it was a stream, and the client's own `clientClose` and
+`connectionEnd`, each `beforeOpen` and `afterOpen`. `timing` holds histograms (`count`, `sumUs`,
+and `buckets` up to each of `boundsMs`, the last for the rest) of resolving, of connecting (from
+the first dial to open, the proxy's handshake included) and of the first remote byte (from the
+later of open and the client's first DATA), for TCP dialled here, TCP through the proxy and UDP.
+`warpTunnels` has the same per `udp-warp-marks` tunnel, by its position there and the router's
+name for it (never the mark), with the TCP connects that failed. Fields are only ever added. With
 `webtransport`, `GET /webtransport.json` on that port is `{"url": ..., "hashes": [...]}`: the URL
 to open (`webtransport-url`, or `""`) and the certificate hashes a page passes to
 `new WebTransport(url, {serverCertificateHashes})`.

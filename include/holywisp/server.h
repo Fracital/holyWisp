@@ -231,6 +231,41 @@ enum hw_warp_status {
 	HW_WARP_STATUS_STALE       // not rewritten for longer than udp-warp-state-max-age-s
 };
 
+// Why streams ended, by the CLOSE reason the server sent (hw_server_stats.streams_ended and the
+// two beside it).
+enum hw_stats_reason {
+	HW_STATS_REASON_VOLUNTARY = 0, // 0x02: the remote ended it
+	HW_STATS_REASON_NETWORK,       // 0x03
+	HW_STATS_REASON_INVALID,       // 0x41
+	HW_STATS_REASON_UNREACHABLE,   // 0x42
+	HW_STATS_REASON_NO_RESPONSE,   // 0x43
+	HW_STATS_REASON_REFUSED,       // 0x44
+	HW_STATS_REASON_BLOCKED,       // 0x48
+	HW_STATS_REASON_THROTTLED,     // 0x49
+	HW_STATS_REASON_OTHER,         // 0x01, and anything else
+	HW_STATS_REASONS
+};
+
+// A timing histogram: how many, their sum, and how many fell in each bucket. Every bucket but the
+// last holds the times up to its bound in HW_STATS_HIST_BOUNDS_MS (inclusive, and above the bound
+// before it); the last holds the rest.
+#define HW_STATS_HIST_BUCKETS 14
+extern const uint32_t HW_STATS_HIST_BOUNDS_MS[HW_STATS_HIST_BUCKETS - 1]; // 1, 2, 5, 10, ... 10000
+typedef struct hw_stats_hist {
+	uint64_t count;
+	uint64_t sum_us;
+	uint64_t buckets[HW_STATS_HIST_BUCKETS];
+} hw_stats_hist;
+
+// One udp-warp-marks tunnel, as the streams marked for it found it. TCP is what is dialled here
+// (tcp-warp); TCP through the proxy is marked by the router and not in these.
+typedef struct hw_stats_tunnel {
+	uint64_t tcp_streams;        // TCP connects started marked for it
+	uint64_t tcp_connect_failed; // ... of which failed (refused, unreachable, timed out)
+	uint64_t udp_streams;        // UDP streams marked for it
+	hw_stats_hist tcp_connect, tcp_first_byte, udp_first_byte;
+} hw_stats_tunnel;
+
 typedef struct hw_server_stats {
 	uint64_t uptime_s;
 	uint64_t connections_total; // every accepted socket and WebTransport CONNECT, polls included
@@ -298,6 +333,26 @@ typedef struct hw_server_stats {
 	int64_t warp_state_age_s;
 	uint64_t warp_tunnels_v4;
 	uint64_t warp_tunnels_v6;
+	// How streams ended, by enum hw_stats_reason: closed by the server once open (the remote ended
+	// it, an error, a full queue), closed by the server before it opened (resolving, the egress
+	// policy, the destination limits, the dial, the proxy), or a CONNECT refused before there was a
+	// stream (invalid, filters, the per-client limits). [0] is before the stream opened, [1] after,
+	// for the ends the client made: its CLOSE, or its connection's end.
+	uint64_t streams_ended[HW_STATS_REASONS];
+	uint64_t streams_failed[HW_STATS_REASONS];
+	uint64_t streams_refused[HW_STATS_REASONS];
+	uint64_t streams_client_closed[2];
+	uint64_t streams_conn_closed[2];
+	// How long streams took. Resolving a name (a cached one too); connecting, from the first dial to
+	// open, a failed address and the proxy's handshake included; the first remote byte, from the
+	// later of open and the client's first DATA. TCP dialled here and through the proxy apart.
+	hw_stats_hist resolve;
+	hw_stats_hist tcp_connect, tcp_first_byte;
+	hw_stats_hist proxied_connect, proxied_first_byte;
+	hw_stats_hist udp_first_byte;
+	// The same per WARP tunnel, in udp-warp-marks order (warp_tunnel_count of them).
+	int warp_tunnel_count;
+	hw_stats_tunnel warp_tunnels[HW_WARP_MAX_TUNNELS];
 } hw_server_stats;
 
 typedef struct hw_server hw_server;

@@ -182,9 +182,24 @@ static int stream_may_reset(const hw_stream *s, int send_close) {
 	return !send_close && s->type == HW_STREAM_TCP && s->heard && hw_buf_avail(&s->out) == 0 && !stream_uses_proxy(s);
 }
 
+// Why the stream ended, for /stats: the reason the server sends, before or after the stream opened,
+// or the client's own doing (send_close 0: its CLOSE, or its connection ending, which has set
+// c->closing before it closes its streams).
+static void stream_count_end(const hw_stream *s, int was_open, uint8_t reason, int send_close) {
+	hw_worker_stats *ws = &s->conn->w->st;
+	_Atomic uint64_t *n;
+	if (!send_close) {
+		n = s->conn->closing ? &ws->stream_conn_closed[was_open] : &ws->stream_client_closed[was_open];
+	} else {
+		n = was_open ? &ws->stream_ended[stats_reason(reason)] : &ws->stream_failed[stats_reason(reason)];
+	}
+	HW_WSTAT_ADD(*n, 1);
+}
+
 void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	hw_conn *c = s->conn;
 	if (s->state == STREAM_CLOSED) return;
+	stream_count_end(s, s->state == STREAM_OPEN, reason, send_close);
 	s->state = STREAM_CLOSED;
 	if (s->connect_timer) {
 		hw_loop_cancel_timer(c->w->loop, s->connect_timer);
@@ -316,6 +331,59 @@ HW_MUST_USE static int signature_record(hw_stream *s, int ok) {
 	return 1;
 }
 
+// ---------------------------------------------------------------------------------- timing
+//
+// Each stream is timed through its steps for /stats, with one clock reading per step and none per
+// packet but a flag test: s->t_us is when the step being timed began. Resolving runs from the
+// lookup to its answer; connecting from the first dial to open (the addresses that failed and the
+// proxy's handshake included); the first remote byte from open or, when the client's first DATA
+// comes later, from that DATA, so that a remote that only answers is not charged for the client's
+// silence. A terminal is not timed.
+
+static void stream_time_data(hw_stream *s) {
+	s->timed |= STREAM_TIMED_DATA;
+	if (s->state == STREAM_OPEN && !(s->timed & STREAM_TIMED_FIRST)) s->t_us = hw_now_us();
+}
+
+void stream_time_first(hw_stream *s) {
+	if (s->timed & STREAM_TIMED_FIRST) return;
+	s->timed |= STREAM_TIMED_FIRST;
+	hw_worker_stats *ws = &s->conn->w->st;
+	uint64_t took = hw_now_us() - s->t_us;
+	int slot = s->warp_slot - 1;
+	if (s->type == HW_STREAM_UDP) {
+		stats_hist_add(&ws->udp_first, took);
+		if (slot >= 0) stats_hist_add(&ws->tun[slot].udp_first, took);
+	} else {
+		stats_hist_add(s->via_proxy ? &ws->proxied_first : &ws->tcp_first, took);
+		if (slot >= 0) stats_hist_add(&ws->tun[slot].tcp_first, took);
+	}
+}
+
+// The stream is open: how long its connect took, and from now on the wait for the first byte.
+static void stream_time_open(hw_stream *s) {
+	if (s->type == HW_STREAM_TERM) {
+		s->timed |= STREAM_TIMED_FIRST;
+		return;
+	}
+	uint64_t now = hw_now_us();
+	if (s->type == HW_STREAM_TCP) {
+		hw_worker_stats *ws = &s->conn->w->st;
+		uint64_t took = now - s->t_us;
+		stats_hist_add(s->via_proxy ? &ws->proxied_connect : &ws->tcp_connect, took);
+		if (s->warp_slot) stats_hist_add(&ws->tun[s->warp_slot - 1].tcp_connect, took);
+	}
+	s->t_us = now;
+}
+
+// A TCP connect toward one address failed (refused, unreachable, timed out): held against the
+// tunnel its socket was marked for, if any.
+static void stream_dial_failed(const hw_stream *s) {
+	if (s->type == HW_STREAM_TCP && s->warp_slot) {
+		HW_WSTAT_ADD(s->conn->w->st.tun[s->warp_slot - 1].tcp_connect_failed, 1);
+	}
+}
+
 // ---------------------------------------------------------------------------------- connecting
 
 void stream_adopt(hw_stream *s, int fd) {
@@ -336,6 +404,7 @@ int stream_connected(hw_stream *s) {
 		s->connect_timer = NULL;
 	}
 	s->state = STREAM_OPEN;
+	stream_time_open(s);
 	if (s->type == HW_STREAM_TCP) server_tune_socket(c->w->server, s->fd, 1);
 	s->read_armed = !conn_stream_paused(c, s);
 	// With client data already queued, stream_flush below sets the event mask once it knows what
@@ -388,6 +457,7 @@ static void connect_succeeded(hw_stream *s) {
 static void connect_timeout_cb(hw_loop *loop, void *ud) {
 	hw_stream *s = ud;
 	s->connect_timer = NULL;
+	stream_dial_failed(s);
 	syn_release(s);
 	hw_loop_del_fd(loop, s->fd);
 	close(s->fd);
@@ -478,6 +548,14 @@ static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
 		} else {
 			HW_STAT_INC(srv, udp_warp_marked);
 		}
+		// Which of udp-warp-marks it is, for the per-tunnel stats: the state holds no other marks
+		// (hw_warp_state_restrict).
+		for (int i = 0; i < srv->cfg.udp_warp_mark_count && i < HW_WARP_MAX_TUNNELS; i++) {
+			if (srv->cfg.udp_warp_marks[i] != t->mark) continue;
+			s->warp_slot = (uint8_t)(i + 1);
+			HW_WSTAT_ADD(*(tcp ? &w->st.tun[i].tcp_streams : &w->st.tun[i].udp_streams), 1);
+			break;
+		}
 		return 0;
 	}
 	const char *why = t ? "cannot mark a socket" : st ? "no healthy WARP tunnel" : "no usable WARP state";
@@ -535,6 +613,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 	for (;;) {
 		const struct sockaddr *sa;
 		socklen_t sl;
+		s->warp_slot = 0; // this attempt's socket is marked for no tunnel until stream_warp_mark says
 		if (proxying) {
 			if (s->addr_idx >= 1) break; // one shot at the proxy
 			s->addr_idx = 1;             // target for proxy_start is addrs[0]
@@ -610,6 +689,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 			}
 			last_errno = errno;
 		}
+		stream_dial_failed(s);
 		syn_release(s);
 		close(s->fd);
 		s->fd = -1;
@@ -634,6 +714,7 @@ static void stream_connect_next(hw_stream *s, int last_errno) {
 }
 
 static void begin_dial(hw_stream *s) {
+	s->t_us = hw_now_us();
 	s->via_proxy = stream_route_proxy(s);
 	if (s->type == HW_STREAM_TCP && s->conn->w->server->proxy.kind != PROXY_NONE) {
 		if (s->via_proxy) {
@@ -649,6 +730,7 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 	hw_stream *s = ud;
 	hw_conn *c = s->conn;
 	s->resolve = NULL;
+	stats_hist_add(&c->w->st.resolve, hw_now_us() - s->t_us);
 	if (s->connect_timer) {
 		hw_loop_cancel_timer(loop, s->connect_timer);
 		s->connect_timer = NULL;
@@ -764,6 +846,7 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 	s->state = STREAM_RESOLVING;
 	// Counted under the client's address: the resolver's threads are everyone's, and one client's
 	// names that never resolve must not hold them all or fill their queue.
+	s->t_us = hw_now_us();
 	s->resolve = hw_resolve(c->w->server->resolver, c->w->loop, s->host, port, c->ip, resolve_cb, s);
 	if (!s->resolve) {
 		if (errno != EAGAIN) {
@@ -904,6 +987,7 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 	const hw_server_config *cfg = &w->server->cfg;
 	if (s->state == STREAM_CLOSED) return;
 	s->heard = 0;
+	if (!(s->timed & STREAM_TIMED_DATA)) stream_time_data(s);
 
 	if (w->batch_n > 0 && w->batch_stream != s) {
 		stream_batch_flush(w);
@@ -1038,6 +1122,7 @@ static void stream_read(hw_stream *s) {
 				return;
 			}
 			s->heard = 1;
+			if (!(s->timed & STREAM_TIMED_FIRST)) stream_time_first(s);
 			done += (size_t)n;
 			s->credit_sent += (uint64_t)n;
 			// One small splice does not end bulk mode: right after a switch the remote's data is
@@ -1082,6 +1167,7 @@ static void stream_read(hw_stream *s) {
 			return;
 		}
 		s->heard = 1;
+		if (!(s->timed & STREAM_TIMED_FIRST)) stream_time_first(s);
 		s->credit_sent += (uint64_t)n;
 		conn_send_data(c, s->id, scratch, (size_t)n);
 		if (c->closing) return;
@@ -1114,6 +1200,7 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 			s->connect_timer = NULL;
 		}
 		if (err != 0) {
+			stream_dial_failed(s);
 			syn_release(s);
 			hw_loop_del_fd(loop, fd);
 			close(fd);

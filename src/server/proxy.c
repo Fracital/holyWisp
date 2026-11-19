@@ -385,6 +385,7 @@ int proxy_on_data(hw_stream *s, const uint8_t *data, size_t len) {
 				// Counted against stream credit like any read. One receive of the handshake is
 				// smaller than the smallest window (HW_WISP_CREDIT_MIN), so it always fits.
 				s->credit_sent += rest;
+				stream_time_first(s);
 				conn_send_data(c, s->id, hw_buf_head(&s->pin), rest);
 				if (c->closing) return -1;
 			}

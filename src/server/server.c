@@ -1066,8 +1066,19 @@ void hw_server_free(hw_server *s) {
 	free(s);
 }
 
+// A worker's histogram added to a sum of them.
+static void hist_sum(hw_stats_hist *out, const hw_whist *h) {
+	for (int i = 0; i < HW_STATS_HIST_BUCKETS; i++) {
+		uint64_t n = atomic_load(&h->n[i]);
+		out->buckets[i] += n;
+		out->count += n;
+	}
+	out->sum_us += atomic_load(&h->sum_us);
+}
+
 void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	memset(out, 0, sizeof(*out));
+	out->warp_tunnel_count = s->cfg.udp_warp_mark_count;
 	out->uptime_s = (hw_now_ms() - s->started_ms) / 1000;
 	out->connections_total = atomic_load(&s->connections_total);
 	out->connections_active = atomic_load(&s->connections_active);
@@ -1091,6 +1102,30 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 		out->wt_quic_congestion_events += atomic_load(&ws->quic_congestion_events);
 		out->wt_quic_ptos += atomic_load(&ws->quic_ptos);
 		out->wt_quic_srtt_us += atomic_load(&ws->quic_srtt_us);
+		for (int r = 0; r < HW_STATS_REASONS; r++) {
+			out->streams_ended[r] += atomic_load(&ws->stream_ended[r]);
+			out->streams_failed[r] += atomic_load(&ws->stream_failed[r]);
+			out->streams_refused[r] += atomic_load(&ws->stream_refused[r]);
+		}
+		for (int k = 0; k < 2; k++) {
+			out->streams_client_closed[k] += atomic_load(&ws->stream_client_closed[k]);
+			out->streams_conn_closed[k] += atomic_load(&ws->stream_conn_closed[k]);
+		}
+		hist_sum(&out->resolve, &ws->resolve);
+		hist_sum(&out->tcp_connect, &ws->tcp_connect);
+		hist_sum(&out->tcp_first_byte, &ws->tcp_first);
+		hist_sum(&out->proxied_connect, &ws->proxied_connect);
+		hist_sum(&out->proxied_first_byte, &ws->proxied_first);
+		hist_sum(&out->udp_first_byte, &ws->udp_first);
+		for (int t = 0; t < s->cfg.udp_warp_mark_count && t < HW_WARP_MAX_TUNNELS; t++) {
+			hw_stats_tunnel *o = &out->warp_tunnels[t];
+			o->tcp_streams += atomic_load(&ws->tun[t].tcp_streams);
+			o->tcp_connect_failed += atomic_load(&ws->tun[t].tcp_connect_failed);
+			o->udp_streams += atomic_load(&ws->tun[t].udp_streams);
+			hist_sum(&o->tcp_connect, &ws->tun[t].tcp_connect);
+			hist_sum(&o->tcp_first_byte, &ws->tun[t].tcp_first);
+			hist_sum(&o->udp_first_byte, &ws->tun[t].udp_first);
+		}
 		int load = atomic_load(&s->workers[i].load);
 		uint64_t n = load > 0 ? (uint64_t)load : 0;
 		if (n < out->worker_connections_min) out->worker_connections_min = n;

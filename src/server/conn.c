@@ -1034,6 +1034,9 @@ int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining) {
 }
 
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason) {
+	// For a stream other than 0, this is a CONNECT refused before it was a stream: a stream's own
+	// CLOSE goes through conn_send_close_lane, and is counted by stream_close.
+	if (stream_id != 0) HW_WSTAT_ADD(c->w->st.stream_refused[stats_reason(reason)], 1);
 	uint8_t pkt[HW_WISP_HEADER_LEN + 1];
 	return conn_send_packet(c, pkt, hw_wisp_build_close(pkt, stream_id, reason));
 }

@@ -95,8 +95,26 @@ typedef void (*hw_auth_cb)(hw_loop *loop, int ok, void *ud);
 	atomic_store_explicit(&(field), atomic_load_explicit(&(field), memory_order_relaxed) + (uint64_t)(n), \
 	                      memory_order_relaxed)
 
+// A timing histogram as a worker keeps it (hw_stats_hist without the count, which is the sum).
+typedef struct hw_whist {
+	_Atomic uint64_t n[HW_STATS_HIST_BUCKETS];
+	_Atomic uint64_t sum_us;
+} hw_whist;
+
 // The counters a worker keeps for /stats. Bumped once per session or stream, never per packet.
 typedef struct hw_worker_stats {
+	// How its streams ended (hw_server_stats.streams_*), and how long they took.
+	_Atomic uint64_t stream_ended[HW_STATS_REASONS];
+	_Atomic uint64_t stream_failed[HW_STATS_REASONS];
+	_Atomic uint64_t stream_refused[HW_STATS_REASONS];
+	_Atomic uint64_t stream_client_closed[2];
+	_Atomic uint64_t stream_conn_closed[2];
+	hw_whist resolve, tcp_connect, tcp_first, proxied_connect, proxied_first, udp_first;
+	// Per udp-warp-marks tunnel, by its index there.
+	struct {
+		_Atomic uint64_t tcp_streams, tcp_connect_failed, udp_streams;
+		hw_whist tcp_connect, tcp_first, udp_first;
+	} tun[HW_WARP_MAX_TUNNELS];
 	// WebTransport sessions that have ended on this worker, and what QUIC counted over their lives
 	// (folded in at the end, so a long session shows only once it is over). srtt_us is the sum of
 	// each one's last smoothed RTT.
@@ -219,15 +237,15 @@ struct hw_server {
 	uint64_t warp_ino, warp_size;    // inode each time, so a change within one second still shows
 	struct hw_warp_state *warp_read; // its content, restricted to udp-warp-marks; NULL: unusable
 	char warp_why[96];               // why it is unusable, for the log
-	int warp_why_code;               // ... and as an enum hw_warp_status, for the stats
 	uint8_t client_key_secret[128];  // proxy-client-key's secret (the configured one, or random)
 	size_t client_key_secret_len;
 	struct hw_warp_state *warp_given; // what the workers were last given (NULL: unmarked)
 	int warp_published;               // whether every worker has warp_given
+	int warp_why_code;                // why warp_read is NULL, as an enum hw_warp_status
 	// The same for /stats, written at every look and read from any thread (hw_server_stats_get):
 	// an enum hw_warp_status, the file's mtime in wall-clock seconds (0: none), the tunnels given.
-	_Atomic int warp_stat_status;
 	_Atomic int64_t warp_stat_mtime;
+	_Atomic int warp_stat_status;
 	_Atomic int warp_stat_n4, warp_stat_n6;
 	// WebTransport. The keys are drawn once and never change: Retry tokens are sealed with the
 	// first and stateless reset tokens derived from the second, and any worker must be able to
@@ -451,7 +469,17 @@ typedef struct hw_stream {
 	// (UDP, or credit off), which therefore never reaches it.
 	uint64_t credit_sent;
 	uint64_t credit_limit;
+	// Timing for /stats: when the phase being timed began (resolve, dial, open or the client's
+	// first DATA, hw_now_us), which of the client's first DATA and the remote's first byte have been
+	// seen (STREAM_TIMED_*), and the udp-warp-marks tunnel the socket is marked for, plus one (0:
+	// none).
+	uint64_t t_us;
+	uint8_t timed;
+	uint8_t warp_slot;
 } hw_stream;
+
+#define STREAM_TIMED_DATA  1 // the client has sent DATA
+#define STREAM_TIMED_FIRST 2 // the remote's first byte is counted (or never will be: a terminal)
 
 // Stream credit spent: the stream may not read its remote until a CREDIT raises the limit.
 static inline int stream_credit_held(const hw_stream *s) {
@@ -533,6 +561,13 @@ void wt_conn_detach(wt_session *s, uint32_t code);
 // A per-worker buffer of one frame's payload plus a Wisp header, to lay out a packet in.
 uint8_t *wt_conn_scratch(wt_session *s);
 
+// stats.c: a time into a worker's histogram.
+void stats_hist_add(hw_whist *h, uint64_t us);
+// The enum hw_stats_reason of a CLOSE reason.
+int stats_reason(uint8_t reason);
+// The remote's first byte has reached the client: its time goes into the histograms (stream.c;
+// proxy.c for what arrived with the proxy's answer). A no-op after the first.
+void stream_time_first(hw_stream *s);
 // stats.c: the body of GET /stats, appended to out, for a connection on worker w (whose own copy
 // of the WARP state names the tunnels). 0, or -1 when out could not grow.
 int stats_json(const hw_worker *w, hw_buf *out);
@@ -555,6 +590,7 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max);
 // The stream is closing: free its pipe, or leave it to the queue when a payload is still in it.
 void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
+// A CLOSE for a CONNECT refused before it was a stream (counted so in the stats), or for stream 0.
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason);
 // The same for a stream that is gone already, on the lane it rode (WebTransport; a WebSocket has
 // one): stream_close's CLOSE.
