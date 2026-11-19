@@ -115,12 +115,14 @@ BENCH_DIR := build/bench
 # What libholywisp.a needs from the system besides libc, as CMakeLists.txt's HW_PLATFORM_LIBS has
 # it: crypt(3) and forkpty(3) are their own libraries on Linux and part of libSystem on macOS.
 BENCH_LIBS := $(if $(filter Darwin,$(shell uname -s)),,-lcrypt -lutil)
+# The client's WebTransport transport (wt_client.c) and the stack under it, in link order.
+BENCH_WT_LIBS := $(addprefix $(RELEASE_DIR)/lib,$(addsuffix .a,hw_wt hw_quic hw_quic_wire hw_tls hw_crypto_asym hw_crypto_sym))
 
 bench: release ## build the benchmark tools (bench/echo, bench/pump) into build/bench
 	mkdir -p $(BENCH_DIR)
 	$(CC) -O2 -Wall -Wextra -pthread -o $(BENCH_DIR)/echo bench/echo.c
 	$(CC) -O2 -Wall -Wextra -pthread -I include -o $(BENCH_DIR)/pump bench/pump.c \
-		$(RELEASE_DIR)/libholywisp-client.a $(RELEASE_DIR)/libholywisp.a $(BENCH_LIBS)
+		$(RELEASE_DIR)/libholywisp-client.a $(BENCH_WT_LIBS) $(RELEASE_DIR)/libholywisp.a $(BENCH_LIBS)
 
 # ---------------------------------------------------------------------------------- npm
 
