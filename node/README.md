@@ -38,6 +38,9 @@ No dependencies, no install script, nothing compiled on your machine. Node 20 or
   password, proxy credential or other secret that message quotes is replaced by `[redacted]`, in
   the Error and in the log.
 - `route(req, socket, head)`: the handler for an HTTP server's `upgrade` event.
+- `routeRequest(req, res)`: with `webTransport`, answers `GET /webtransport.json` on your server's
+  origin and returns `true`; any other request (or no `webTransport`) returns `false` and is
+  yours. See "WebTransport" below.
 - `stop(timeoutMs = 10000)`: ask it to shut down (SIGTERM; on Windows, by closing its stdin), then
   kill it if it has not exited in time.
 - `kill()`: kill it now.
@@ -166,8 +169,20 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 WebTransport is UDP, so `route()` has no part in it: the browser opens
 `new WebTransport("https://<webTransport.host>:<port>/")` against the server itself, which binds
 the wrapper's `host` (`127.0.0.1`) unless `webTransport.host` says otherwise. The page learns the
-certificate hashes to pin from `GET /webtransport.json` on the server's port; forward that path to
-it if the page is served from elsewhere.
+certificate hashes to pin, and that URL, from `GET /webtransport.json` at the root of the origin
+its WebSocket goes to, which behind `route()` is your server's. `routeRequest()` answers it there
+(the Vite plugin does so by itself):
+
+```ts
+const server = createServer((req, res) => {
+	if (wisp.routeRequest(req, res)) return;
+	// ... the app
+});
+```
+
+It passes the server's description on, with the listener's own address as its `url` when
+`webTransport.url` is not set (the request's host name when the listener binds a wildcard
+address), and sends nothing of the request to the server.
 
 The keys for running behind a routing proxy on WARP tunnels (`proxy-only-to`, `proxy-client-key`,
 `udp-warp-*`, `tcp-warp*`, `warp-bypass-host`) have no option here: they are for an edge that runs
@@ -190,7 +205,8 @@ export default {
 
 Starts a server with the dev and preview servers (`apply: "serve" | "preview" | "both"`), routes
 upgrades whose path starts with `path` (or a predicate over the request), and stops it when Vite
-closes.
+closes. With `config.webTransport` it also answers `GET /webtransport.json` on the dev server's
+origin (`routeRequest()`), so a page there finds the WebTransport listener.
 
 ## Platforms
 

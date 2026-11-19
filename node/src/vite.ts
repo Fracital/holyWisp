@@ -1,15 +1,17 @@
 /*
- * Vite plugin: run holyWisp next to the dev (and preview) server and route a path to it.
+ * Vite plugin: run holyWisp next to the dev (and preview) server and route a path to it, and with
+ * `config.webTransport` its `/webtransport.json` too.
  *
  *   import { holyWispVite } from "holywisp/vite";
  *   export default { plugins: [holyWispVite({ path: "/wisp/" })] };
  */
-import type { IncomingMessage, Server } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import type { Http2SecureServer } from "node:http2";
 import { holyWisp, type holyWispOptions } from "./index.js";
 
 type ViteServer = {
 	httpServer: Server | Http2SecureServer | null;
+	middlewares?: { use(fn: (req: IncomingMessage, res: ServerResponse, next: () => void) => void): void };
 	config: { logger: { warn(msg: string): void } };
 };
 
@@ -59,6 +61,13 @@ export function holyWispVite(options: holyWispViteOptions): holyWispVitePlugin {
 		httpServer.on("upgrade", (req, socket, head) => {
 			if (matches(req)) wisp.route(req, socket, head);
 		});
+		// With webTransport on, the page's GET /webtransport.json on the dev server's origin is the
+		// server's (holyWisp.routeRequest); every other request goes on to Vite.
+		if (options.config?.webTransport) {
+			server.middlewares?.use((req, res, next) => {
+				if (!wisp.routeRequest(req, res)) next();
+			});
+		}
 		httpServer.once("close", () => {
 			if (wisp.isRunning) void wisp.stop();
 		});

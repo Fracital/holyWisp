@@ -199,6 +199,61 @@ test("route() answers 503 when the server is not running", async (t) => {
 	assert.equal(status, 503);
 });
 
+/** An app on loopback whose requests go to `wisp.routeRequest()` first. Resolves to its port. */
+async function app(t, wisp) {
+	const server = createServer((req, res) => {
+		if (!wisp.routeRequest(req, res)) res.writeHead(404).end("app");
+	});
+	server.listen(0, "127.0.0.1");
+	await once(server, "listening");
+	t.after(() => {
+		server.closeAllConnections();
+		return new Promise((resolve) => server.close(resolve));
+	});
+	return server.address().port;
+}
+
+test("routeRequest() serves the server's /webtransport.json on the app's origin, naming the listener", async (t) => {
+	const wisp = await started(t, { webTransport: true });
+	const port = await app(t, wisp);
+	const direct = await (await fetch(`http://127.0.0.1:${wisp.port}/webtransport.json`)).json();
+	assert.equal(direct.url, "", "the server leaves the URL to the page");
+
+	const res = await fetch(`http://127.0.0.1:${port}/webtransport.json?t=1`);
+	assert.equal(res.status, 200);
+	assert.equal(res.headers.get("cache-control"), "no-store");
+	assert.equal(res.headers.get("access-control-allow-origin"), "*");
+	const info = await res.json();
+	// The app's origin is not where the listener is: the page is given the listener itself.
+	assert.equal(info.url, `https://127.0.0.1:${wisp.port}/`);
+	assert.ok(info.hashes.length >= 1);
+	assert.deepEqual(info.hashes, direct.hashes);
+
+	const head = await fetch(`http://127.0.0.1:${port}/webtransport.json`, { method: "HEAD" });
+	assert.equal(head.status, 200);
+	assert.equal(await head.text(), "");
+	const post = await fetch(`http://127.0.0.1:${port}/webtransport.json`, { method: "POST" });
+	assert.equal(post.status, 405);
+	const other = await fetch(`http://127.0.0.1:${port}/webtransport.jsonx`);
+	assert.equal(await other.text(), "app");
+
+	await wisp.stop();
+	assert.equal((await fetch(`http://127.0.0.1:${port}/webtransport.json`)).status, 503);
+});
+
+test("routeRequest() passes a configured webTransport.url on, and takes nothing without webTransport", async (t) => {
+	const url = "https://relay.example:4433/";
+	const wisp = await started(t, { webTransport: { url } });
+	const port = await app(t, wisp);
+	assert.equal((await (await fetch(`http://127.0.0.1:${port}/webtransport.json`)).json()).url, url);
+
+	const plain = await started(t);
+	const plainPort = await app(t, plain);
+	const res = await fetch(`http://127.0.0.1:${plainPort}/webtransport.json`);
+	assert.equal(res.status, 404);
+	assert.equal(await res.text(), "app");
+});
+
 // The per-IP connection limit shows which address the server believed: with a limit of two per
 // window, a third upgrade from the same client is refused, and one from a new client is not.
 const limited = { connectionsLimitPerIP: 2, connectionWindowSeconds: 60 };
@@ -533,6 +588,35 @@ const named = (head, name) => head.filter((line) => line.toLowerCase().startsWit
 const junk = (count) => Array.from({ length: count }, (_, i) => `X-Junk-${i}: ${i}`);
 // The lines rawUpgrade() sends before a test's own.
 const fixed = 5;
+
+test("the Vite plugin with webTransport serves /webtransport.json and passes everything else on", async (t) => {
+	const stack = [];
+	const httpServer = createServer((req, res) => {
+		const run = (i) => (i < stack.length ? stack[i](req, res, () => run(i + 1)) : res.writeHead(404).end("vite"));
+		run(0);
+	});
+	httpServer.listen(0, "127.0.0.1");
+	await once(httpServer, "listening");
+	const vite = { httpServer, middlewares: { use: (fn) => stack.push(fn) }, config: { logger: { warn() {} } } };
+	await holyWispVite({ path: "/wisp/", config: { ...base, webTransport: true } }).configureServer(vite);
+	assert.equal(stack.length, 1);
+	const port = httpServer.address().port;
+	const info = await (await fetch(`http://127.0.0.1:${port}/webtransport.json`)).json();
+	assert.match(info.url, /^https:\/\/127\.0\.0\.1:\d+\/$/);
+	assert.ok(info.hashes.length >= 1);
+	assert.equal(await (await fetch(`http://127.0.0.1:${port}/index.html`)).text(), "vite");
+	// Closing the dev server stops the wisp server with it.
+	httpServer.closeAllConnections();
+	await new Promise((resolve) => httpServer.close(resolve));
+
+	// Without webTransport the plugin adds no middleware.
+	const quiet = createServer();
+	quiet.listen(0, "127.0.0.1");
+	await once(quiet, "listening");
+	await holyWispVite({ path: "/wisp/", config: base }).configureServer({ ...vite, httpServer: quiet });
+	assert.equal(stack.length, 1);
+	await new Promise((resolve) => quiet.close(resolve));
+});
 
 test("what route() says about the client is written first, and a client's copy of it never arrives", async (t) => {
 	// The server keeps a bounded number of headers and reads the first of a name. Neither helps a

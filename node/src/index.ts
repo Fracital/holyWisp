@@ -13,7 +13,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import * as fs from "node:fs";
-import { request, type IncomingMessage } from "node:http";
+import { request, type IncomingMessage, type ServerResponse } from "node:http";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -69,6 +69,10 @@ const READY_TIMEOUT_MS = 10_000;
 const READY_SETTLE_MS = 30;
 const MAX_WORKERS = 1024;
 const PROXY_SECRET_BYTES = 32;
+// Where a page looks for the WebTransport listener's description: the root of the origin that
+// serves the relay's WebSocket (examples/wisp-webclient.html, STomp).
+const WT_JSON_PATH = "/webtransport.json";
+const WT_JSON_TIMEOUT_MS = 5000;
 const SECRET_HEADER = PROXY_SECRET_HEADER.toLowerCase();
 // The server keeps 511 bytes of a header value and drops the rest without a word, so a list that
 // is cut loses its right-hand end: the entries the proxies wrote. See forwardedList().
@@ -650,6 +654,78 @@ export class holyWisp {
 			socket.pipe(upstream);
 			upstream.pipe(socket);
 		});
+	}
+
+	/**
+	 * Answer `GET /webtransport.json` on the app's own origin with the running server's: a handler
+	 * for an HTTP server's `request` event (or connect and Express middleware) that returns true
+	 * when it took the request and false when the request is for the app. A page looks for the
+	 * description at the root of the origin that serves the WebSocket, which behind route() is the
+	 * app's, not the server's port; without this it finds none and stays on the WebSocket.
+	 *
+	 * The server's answer is passed on whole, except an empty `url` (no `webTransport.url`), which
+	 * means "this host, over HTTPS" to the page and would name the app's port: it becomes the
+	 * listener's own address, `https://<webTransport.host or host>:<its port>/`, with the request's
+	 * host name in place of a wildcard address. Nothing of the request is sent to the server, so
+	 * there is no client address here to vouch for. Without `webTransport` it takes nothing.
+	 */
+	routeRequest(req: IncomingMessage, res: ServerResponse): boolean {
+		if (!this.config.webTransport) return false;
+		let pathname: string;
+		try {
+			pathname = new URL(req.url ?? "/", "http://localhost").pathname;
+		} catch {
+			return false;
+		}
+		if (pathname !== WT_JSON_PATH) return false;
+		const reply = (status: number, body: string, extra: Record<string, string> = {}) => {
+			if (res.headersSent || res.destroyed) return;
+			res.writeHead(status, {
+				"Content-Type": status === 200 ? "application/json" : "text/plain",
+				"Cache-Control": "no-store",
+				"Access-Control-Allow-Origin": "*",
+				...extra,
+			});
+			res.end(req.method === "HEAD" ? undefined : body);
+		};
+		if (req.method !== "GET" && req.method !== "HEAD") {
+			reply(405, "", { Allow: "GET, HEAD" });
+			return true;
+		}
+		const port = this.boundPort;
+		if (port === undefined) {
+			reply(503, "");
+			return true;
+		}
+		const listener = this.webTransportUrl(req, port);
+		httpGet(this.workerHost, port, WT_JSON_PATH, WT_JSON_TIMEOUT_MS)
+			.then(({ status, body }) => {
+				if (status !== 200) throw new Error(`the server answered ${status}`);
+				const info = JSON.parse(body) as { url?: unknown; hashes?: unknown };
+				if (typeof info.url !== "string" || !Array.isArray(info.hashes)) throw new Error("not a description");
+				if (info.url === "") info.url = listener;
+				reply(200, JSON.stringify(info) + "\n");
+			})
+			.catch((err: Error) => {
+				this.logger.error(`${WT_JSON_PATH}: ${err.message}`);
+				reply(502, "");
+			});
+		return true;
+	}
+
+	/** The listener as a page reaches it: its bound address, or the name the page used for this one. */
+	private webTransportUrl(req: IncomingMessage, port: number): string {
+		const wt = typeof this.config.webTransport === "object" ? this.config.webTransport : {};
+		let host = wt.host || bindHost(this.config);
+		if (host === "0.0.0.0" || host === "::") {
+			try {
+				host = new URL(`http://${req.headers.host ?? ""}`).hostname || this.workerHost;
+			} catch {
+				host = this.workerHost;
+			}
+		}
+		if (net.isIPv6(host)) host = `[${host}]`;
+		return `https://${host}:${wt.port || port}/`;
 	}
 
 	/** The server's counters (`GET /stats`). */
