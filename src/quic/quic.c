@@ -1177,6 +1177,9 @@ static void after_tls(hw_quic_conn *q) {
 		q->handshake_complete = 1;
 		if (q->is_server) {
 			q->handshake_confirmed = 1;
+			// The first probe waits a PTO: what follows the handshake (HANDSHAKE_DONE, SETTINGS,
+			// the CONNECT's answer) is what the session is waiting for.
+			q->pmtu_next = q->now + pto_base(q);
 			q->hsd_pending = 1;
 			q->hs_discard_pending = 1;
 			q->state = HW_QC_ST_ACTIVE;
@@ -1184,9 +1187,35 @@ static void after_tls(hw_quic_conn *q) {
 	}
 }
 
+// RFC 9002 6.2.3: a client Initial that carries CRYPTO bytes the server already has is a client
+// that has not heard the server's Initial, so the server's flight was lost. It goes again now,
+// within the amplification limit, instead of at the PTO: without a round trip measured that is
+// a second, and on the edge it made the 3 to 6 s sessions. Twice at most per connection, and only
+// for the frame at offset 0: a ClientHello in two Initials (a post-quantum key share is more than
+// one datagram) or in several frames is one retransmission, not several.
+#define HW_QC_HS_RESENDS 2u
+
+static int space_can_send(const hw_quic_conn *q, int spi);
+
+static void handshake_resend(hw_quic_conn *q) {
+	if (q->hs_resends >= HW_QC_HS_RESENDS) return;
+	int any = 0;
+	for (int spi = HW_QC_SP_INITIAL; spi <= HW_QC_SP_HANDSHAKE; spi++) {
+		hw_qc_space *sp = &q->sp[spi];
+		if (!space_can_send(q, spi) || sp->crypto_tx.sent <= sp->crypto_tx.base) continue;
+		pto_fire(q, spi);
+		any = 1;
+	}
+	if (any) q->hs_resends++;
+}
+
 static void handle_crypto(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 	hw_qc_space *sp = &q->sp[spi];
 	hw_qc_recvbuf *rb = &sp->crypto_rx;
+	if (q->is_server && spi == HW_QC_SP_INITIAL && f->len && f->offset + f->len <= rb->off && !q->handshake_complete) {
+		if (f->offset == 0) handshake_resend(q);
+		return; // nothing in it is new
+	}
 	if (f->offset + f->len > rb->off + HW_QC_CRYPTO_MAX) {
 		conn_error(q, HW_QUIC_CRYPTO_BUFFER_EXCEEDED, f->type, "CRYPTO past the buffer");
 		return;
@@ -1237,6 +1266,7 @@ static void handle_close_frame(hw_quic_conn *q, const hw_qc_frame *f) {
 static void handle_handshake_done(hw_quic_conn *q) {
 	if (q->handshake_confirmed) return;
 	q->handshake_confirmed = 1;
+	q->pmtu_next = q->now + pto_base(q); // as the server's: the session's first packets go first
 	q->peer_validated_addr = 1;
 	q->state = HW_QC_ST_ACTIVE;
 	space_discard(q, HW_QC_SP_INITIAL);
@@ -2250,6 +2280,7 @@ static size_t output_pmtu_probe(hw_quic_conn *q, uint8_t *out, struct sockaddr_s
 size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
                       uint64_t now_ms) {
 	q->now = now_ms * 1000;
+	q->out_alone = 0;
 	conn_gc(q);
 	if (q->state >= HW_QC_ST_DRAINING) return 0;
 	if (q->probe_pending) {
@@ -2258,7 +2289,10 @@ size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr
 	}
 	if (pmtu_due(q, cap)) {
 		size_t n = output_pmtu_probe(q, out, to, to_len);
-		if (n) return n;
+		if (n) {
+			q->out_alone = 1;
+			return n;
+		}
 	}
 	size_t dmax = (size_t)HW_MIN((uint64_t)cap, q->mds);
 	if (q->is_server && !q->path_validated) {
@@ -2780,6 +2814,10 @@ size_t hw_quic_queued(const hw_quic_conn *q) {
 
 size_t hw_quic_unsent(const hw_quic_conn *q) {
 	return q->tx_unsent;
+}
+
+int hw_quic_output_alone(const hw_quic_conn *q) {
+	return q->out_alone;
 }
 
 int hw_quic_is_drained(const hw_quic_conn *q) {

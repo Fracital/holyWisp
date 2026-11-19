@@ -648,6 +648,9 @@ struct sim {
 	int check_amp; // assert the server's 3x limit at every send
 	size_t mtu;    // datagrams longer than this vanish without a word (0 = none): ICMP that never comes back
 	uint64_t mtu_dropped;
+	// Per side (0 client, 1 server): when its handshake was first seen confirmed, and when it sent
+	// its first datagram that goes alone (a PMTU probe). 0: not yet.
+	uint64_t confirmed_ms[2], first_alone_ms[2];
 	uint64_t steps;
 };
 
@@ -791,6 +794,12 @@ static void sim_flush(sim *s) {
 		size_t n;
 		while ((n = hw_quic_output(a->q, out, sizeof(out), &to, &to_len, s->now)) > 0) {
 			CHECK(n <= sizeof(out), "datagram size");
+			// A probe, and only a probe, is larger than the datagram size in use, and only it goes alone.
+			int alone = hw_quic_output_alone(a->q);
+			CHECK(alone == (n > a->q->mds), "side %d: %zu bytes (mds %llu) alone %d", side, n,
+			      (unsigned long long)a->q->mds, alone);
+			if (a->q->handshake_confirmed && !s->confirmed_ms[side]) s->confirmed_ms[side] = s->now ? s->now : 1;
+			if (alone && !s->first_alone_ms[side]) s->first_alone_ms[side] = s->now;
 			if (side) {
 				CHECK(to.ss_family == AF_INET, "server destination");
 				sim_send(s, 0, out, n);
@@ -1201,6 +1210,15 @@ static void test_pmtu(void) {
 		hw_quic_get_stats(s->c.q, &cs);
 		CHECK(cs.mds <= HW_QUIC_MAX_DGRAM, "mds bounded");
 		bulk(s, 2u << 20, 2u << 20, 120000);
+		// Neither side probes before a round trip (40 ms) has passed since its handshake was
+		// confirmed: what follows the handshake goes first. On the edge a probe sent at once
+		// shared a write with HANDSHAKE_DONE and SETTINGS, and a hop too narrow for it dropped both.
+		for (int side = 0; side < 2 && paths[i].mtu != HW_QUIC_MIN_DGRAM; side++) {
+			CHECK(s->first_alone_ms[side] && s->confirmed_ms[side] &&
+			          s->first_alone_ms[side] >= s->confirmed_ms[side] + 40,
+			      "path %zu side %d: confirmed at %llu, first probe at %llu", paths[i].mtu, side,
+			      (unsigned long long)s->confirmed_ms[side], (unsigned long long)s->first_alone_ms[side]);
+		}
 		sim_advance(s, 2000);
 		hw_quic_get_stats(s->c.q, &cs);
 		hw_quic_get_stats(s->sv.q, &ss);
@@ -1754,6 +1772,26 @@ static void test_amplification(void) {
 	sim_free(s);
 }
 
+// The server's first flight is lost and the client sends its Initial again at its PTO, which in
+// Chrome is about 300 ms in (a 100 ms initial RTT): the server sends its flight again at once, not
+// at its own PTO, which without a round trip measured is a second away (RFC 9002 6.2.3).
+static void test_handshake_resend(void) {
+	sim *s = sim_new(19);
+	s->delay_ms = 20;
+	uint64_t t0 = s->now;
+	sim_start(s);
+	s->c.q->rtt.smoothed = 100000; // Chrome's kInitialRtt
+	s->c.q->rtt.var = 50000;
+	s->block_s2c = 1;
+	sim_advance(s, 30); // the Initial reaches the server, its answer is lost
+	CHECK(s->sv.q && s->s2c > 0, "the server answered");
+	s->block_s2c = 0;
+	CHECK(sim_run(s, cond_established, NULL, 20000), "handshake");
+	CHECK(s->now - t0 < 500, "established after %llu ms", (unsigned long long)(s->now - t0));
+	CHECK_EQ(s->sv.q->hs_resends, 1);
+	sim_free(s);
+}
+
 static void test_retry(void) {
 	sim *s = sim_new(19);
 	s->retry = 1;
@@ -1886,6 +1924,7 @@ int main(int argc, char **argv) {
 	RUN(test_idle_timeout);
 	RUN(test_stateless_reset);
 	RUN(test_aead_limit);
+	RUN(test_handshake_resend);
 	RUN(test_amplification);
 	RUN(test_retry);
 	RUN(test_flow_control_holds);

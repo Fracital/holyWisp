@@ -26,7 +26,7 @@
 #define WTC_RX_SLOT       4096
 #define WTC_RX_GRO        16                  // receive slots with GRO, HW_SYS_GRO_SLOT each
 #define WTC_SOCKET_BUFFER (4 * 1024 * 1024)   // the server's flight, and ours, without drops (wt_listener.c)
-#define WTC_WINDOW        (16u * 1024 * 1024) // the server's credit, and the client's own send buffer
+#define WTC_WINDOW        (32u * 1024 * 1024) // the server's credit, and the client's own send buffer
 #define WTC_SEND_MAX      (8u * 1024 * 1024)  // queued in hw_wt before a send waits
 #define WTC_IDLE_MS       30000
 #define WTC_KEEPALIVE     15000
@@ -162,6 +162,7 @@ static void wtc_output(hw_wtc *t) {
 		d->len = hw_quic_output(t->q, d->buf, sizeof(t->tx[n]), &to, &tl, now);
 		if (d->len == 0) break;
 		d->addr_len = 0;
+		d->alone = hw_quic_output_alone(t->q);
 		if (++n == HW_SYS_BATCH_MAX) {
 			wtc_tx_flush(t, n);
 			n = 0;

@@ -618,6 +618,8 @@ struct hw_quic_conn {
 	uint64_t pmtu_max;      // HW_QUIC_MAX_DGRAM, or the peer's max_udp_payload_size if smaller
 	uint64_t pmtu_bad;      // the smallest size that failed HW_QC_PMTU_TRIES probes (0: none)
 	uint64_t pmtu_probe;    // the size of the probe awaiting its answer (0: none)
+	int out_alone;          // the datagram hw_quic_output returned last was a probe
+	unsigned hs_resends;    // server: flights resent early for a client Initial's repeated CRYPTO
 	uint64_t pmtu_pn;       // its packet number
 	uint64_t pmtu_deadline; // it counts as lost if not acknowledged by then
 	uint64_t pmtu_next;     // no probe before then

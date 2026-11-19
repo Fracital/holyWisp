@@ -554,7 +554,10 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 - **What replaces the socket.** `hw_wt_queued` stands in for `wbuf` in `conn_queued`, so
   `ws-write-high-water` pauses the remotes exactly as for a WebSocket. It counts what is not sent
   yet (`hw_quic_unsent`), never what is in flight, as `wbuf` never counts the kernel's: BBR's
-  window is two BDPs, and counting it paused the remotes whenever the window was full; `conn_reads_stopped`
+  window is two BDPs, and counting it paused the remotes whenever the window was full. What QUIC
+  may hold is that mark plus `WT_INFLIGHT_MAX` (32 MiB, two BDPs of a gigabit at 138 ms) for the
+  bytes in flight, the kernel's send buffer on a WebSocket: the mark alone capped a session at
+  2 MiB in flight, 120 Mbit/s on the edge's path; `conn_reads_stopped`
   becomes `hw_wt_pause` (no QUIC credit for the client) in `conn_apply_events`. A WebTransport
   connection never splices (`conn_splice_data` refuses, `stream_read` never sets `s->bulk` for
   it): its bytes are copied into QUIC packets and encrypted anyway. `test_stalled_reader` in

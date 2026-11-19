@@ -611,6 +611,7 @@ static void test_udp_batch(void) {
 	int rx = udp_bound(&rport, 0);
 	int tx = udp_bound(&sport, 0);
 	hw_sys_dgram d[HW_SYS_BATCH_MAX];
+	memset(d, 0, sizeof(d));
 	uint8_t bufs[8][256];
 	errno = 0;
 	d[0].buf = bufs[0];
@@ -736,6 +737,7 @@ static void test_udp_coalesce(void) {
 	// 20 of CO_LEN and a shorter one to rx, 3 to rx2, then 8 more of CO_LEN to rx: 32 in one batch.
 	static uint8_t bufs[CO_TOTAL][CO_LEN];
 	hw_sys_dgram d[CO_TOTAL];
+	memset(d, 0, sizeof(d));
 	size_t want_len[CO_TOTAL];
 	int n1 = 0;
 	for (int i = 0; i < CO_TOTAL; i++) {
@@ -808,6 +810,7 @@ static void test_udp_gro_then_single(void) {
 	struct sockaddr_in to = loopback_to(rport);
 	static uint8_t bufs[8][CO_LEN];
 	hw_sys_dgram d[8];
+	memset(d, 0, sizeof(d));
 	for (int i = 0; i < 8; i++) {
 		memset(bufs[i], 'A' + i, CO_LEN);
 		d[i].buf = bufs[i];

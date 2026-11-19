@@ -203,6 +203,13 @@ skipping them. A header block that refers to the dynamic table is a QPACK_DECOMP
   `wbuf`: past `ws-write-high-water` the remotes pause. Toward the server, a connection whose reads
   would pause (`conn_queue_add`, `wr_stalled`, the bandwidth limit) calls `hw_wt_pause`, which
   stops granting the client QUIC credit, which is what not reading a TCP socket does.
+- **Windows are sized for a gigabit at 138 ms** (17 MB), because a TCP socket's buffers grow to
+  the path and nothing grows these. QUIC may hold `ws-write-high-water` unsent plus
+  `WT_INFLIGHT_MAX` (32 MiB, twice that BDP: BBR's window) in flight; with the mark alone, 2 MiB on
+  the edge, a session never had more than 2 MiB in flight, 120 Mbit/s at 138 ms. The client's
+  credit toward the server is `ws-write-high-water` within [16, 32] MiB. Only bytes the client
+  acknowledges can fill the allowance, at the rate BBR measured, so a client that does not read
+  costs the unsent mark and the window it has, as before.
 - **No zero copy.** Bytes toward a WebTransport client are copied into QUIC packets and
   encrypted; the splice path is the WebSocket listener's alone. A WebTransport `hw_conn` never
   opens a relay pipe.

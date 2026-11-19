@@ -64,13 +64,17 @@
 #define WT_REFUSE_MS    2000  // a refused CONNECT's answer gets this long to be delivered before the close
 #define WT_CLOSE_MS     3000  // after the server's close capsule, this long for the client's answer, then QUIC goes
 #define WT_KEEPALIVE_MS 20000 // a PING after this long without sending: divide's conntrack keeps a flow 30 s
-#define WT_CERT_LIFE_S  (13 * 86400)
-#define WT_CERT_RENEW_S (6 * 86400)
-#define WT_CERT_EARLY_S 3600 // valid from an hour ago, for clocks that are a little behind
-#define WT_CERT_CN      "holywisp"
-#define WT_PEM_MAX      (256 * 1024)
-#define WT_WHY_LEN      1200 // why a pair did not load: both paths (512 each) and what is wrong
-#define WT_KEY_HEX      41   // hex of a CID of up to 20 bytes, NUL included
+// Sized for a gigabit at 138 ms (17 MB): BBR's window is twice that, the receive credit once.
+#define WT_INFLIGHT_MAX  (32u * 1024 * 1024) // what QUIC may hold beyond the unsent high-water mark
+#define WT_RX_WINDOW_MIN (16u * 1024 * 1024)
+#define WT_RX_WINDOW_MAX (32u * 1024 * 1024)
+#define WT_CERT_LIFE_S   (13 * 86400)
+#define WT_CERT_RENEW_S  (6 * 86400)
+#define WT_CERT_EARLY_S  3600 // valid from an hour ago, for clocks that are a little behind
+#define WT_CERT_CN       "holywisp"
+#define WT_PEM_MAX       (256 * 1024)
+#define WT_WHY_LEN       1200 // why a pair did not load: both paths (512 each) and what is wrong
+#define WT_KEY_HEX       41   // hex of a CID of up to 20 bytes, NUL included
 // The UDP socket buffers unless socket-buffer-size says otherwise. A QUIC flight is many datagrams
 // at once, and with GRO one queued read is up to 64 KiB: measured on loopback, the kernel's
 // default (net.core.rmem_max 212992) dropped bursts and held one session at 230 MiB/s, 4 MiB
@@ -193,6 +197,7 @@ static hw_sys_dgram *tx_slot(wt_worker *ww) {
 static void tx_commit(wt_worker *ww, size_t len, const struct sockaddr *to, socklen_t to_len) {
 	hw_sys_dgram *d = &ww->txd[ww->ntx];
 	d->len = len;
+	d->alone = 0;
 	if (to) {
 		memcpy(&d->addr, to, to_len);
 		d->addr_len = to_len;
@@ -210,6 +215,7 @@ static void session_output(wt_session *s) {
 		size_t n = hw_quic_output(s->q, d->buf, HW_QUIC_MAX_DGRAM, &d->addr, &d->addr_len, now);
 		if (n == 0) return;
 		tx_commit(ww, n, NULL, 0);
+		d->alone = hw_quic_output_alone(s->q);
 	}
 }
 
@@ -710,17 +716,23 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	qc->max_idle_ms = (uint64_t)cfg->webtransport_idle_timeout_s * 1000;
 	qc->congestion = cfg->webtransport_congestion;
 	// The client's credit: what it may have in flight toward the server before the server reads
-	// it. The Wisp stream carries every stream's uploads, so it gets the whole connection's.
+	// it. The Wisp stream carries every stream's uploads, so it gets the whole connection's. At
+	// least WT_RX_WINDOW_MIN, a gigabit at 138 ms: a TCP socket's receive buffer grows to the path,
+	// and this is what stands in for it.
 	size_t window = cfg->ws_write_high_water;
-	if (window < 1024 * 1024) window = 1024 * 1024;
-	if (window > 16u * 1024 * 1024) window = 16u * 1024 * 1024;
+	if (window < WT_RX_WINDOW_MIN) window = WT_RX_WINDOW_MIN;
+	if (window > WT_RX_WINDOW_MAX) window = WT_RX_WINDOW_MAX;
 	qc->initial_max_data = window;
 	qc->initial_max_stream_data = window;
 	qc->initial_max_streams_bidi = 16; // the CONNECT and the Wisp stream; the rest are refused
 	qc->initial_max_streams_uni = 16;  // control, the QPACK pair, and whatever is refused
 	qc->max_datagram_frame_size = 65535;
-	qc->stream_send_max = cfg->ws_write_high_water;
-	qc->conn_send_max = cfg->ws_write_high_water;
+	// What QUIC holds counts bytes in flight as well as unsent ones, and only the unsent are the
+	// high-water mark's (hw_wt_queued): in flight is the kernel's send buffer on a WebSocket, and
+	// here is BBR's window, up to WT_INFLIGHT_MAX. With the mark alone, 2 MiB on the edge, a
+	// session never had more than that in flight: 120 Mbit/s at 138 ms, less behind any loss.
+	qc->stream_send_max = cfg->ws_write_high_water + WT_INFLIGHT_MAX;
+	qc->conn_send_max = cfg->ws_write_high_water + WT_INFLIGHT_MAX;
 	qc->datagram_queue_max = 256;
 	qc->keepalive_ms = WT_KEEPALIVE_MS;
 	qc->cid_prefix = (uint8_t)ww->w->index;

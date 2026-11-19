@@ -195,6 +195,10 @@ int hw_quic_input(hw_quic_conn *q, uint8_t *dgram, size_t len, const struct sock
 size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
                       uint64_t now_ms);
 
+// Whether the datagram hw_quic_output returned last must be sent by itself (hw_sys_dgram.alone):
+// a PMTU probe, which a hop narrower than it drops whole, with whatever shared its write.
+int hw_quic_output_alone(const hw_quic_conn *q);
+
 // The absolute time (ms, the caller's clock) of the next timer: loss detection, PTO, ACK delay,
 // pacing, idle, keepalive, draining. UINT64_MAX when there is none.
 uint64_t hw_quic_timeout(const hw_quic_conn *q);

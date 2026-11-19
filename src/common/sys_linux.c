@@ -219,11 +219,13 @@ int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n) {
 }
 
 // How many datagrams from d[0] the kernel may take as one write: the same address, the same
-// length, and the last of them no longer than the others.
+// length, and the last of them no longer than the others; one that goes alone, by itself.
 static size_t gso_run(const hw_sys_dgram *d, size_t n) {
 	size_t seg = d[0].len, total = seg, k = 1;
-	while (k < n && k < GSO_SEGMENTS_MAX && d[k].len <= seg && d[k].len > 0 && total + d[k].len <= GSO_BYTES_MAX &&
-	       d[k].addr_len == d[0].addr_len && memcmp(&d[k].addr, &d[0].addr, d[0].addr_len) == 0) {
+	if (d[0].alone) return 1;
+	while (k < n && k < GSO_SEGMENTS_MAX && !d[k].alone && d[k].len <= seg && d[k].len > 0 &&
+	       total + d[k].len <= GSO_BYTES_MAX && d[k].addr_len == d[0].addr_len &&
+	       memcmp(&d[k].addr, &d[0].addr, d[0].addr_len) == 0) {
 		total += d[k].len;
 		k++;
 		if (d[k - 1].len < seg) break; // a shorter one ends the run

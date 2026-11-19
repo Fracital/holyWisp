@@ -86,8 +86,8 @@ int hw_sys_udp_steer(const int fds[], size_t n);
 // addr_len come back (a read longer than cap comes back with len 0: it was cut, and is to be
 // dropped). buf then holds len bytes, which are one datagram, or on a socket with hw_sys_udp_gro
 // on several datagrams of one sender back to back: each `segment` bytes long but the last, which
-// may be shorter (segment == len for one). To send: buf, len, addr and addr_len are the caller's,
-// and an addr_len of 0 sends to a connected socket's peer.
+// may be shorter (segment == len for one). To send: buf, len, addr, addr_len and alone are the
+// caller's, and an addr_len of 0 sends to a connected socket's peer.
 typedef struct hw_sys_dgram {
 	uint8_t *buf;
 	size_t cap;
@@ -95,6 +95,9 @@ typedef struct hw_sys_dgram {
 	size_t segment;
 	struct sockaddr_storage addr;
 	socklen_t addr_len;
+	// Sending: never in one write with others (Linux UDP_SEGMENT). A QUIC PMTU probe is one: a
+	// hop that cannot carry it drops the whole write, and the packets that shared it with it.
+	int alone;
 } hw_sys_dgram;
 
 #define HW_SYS_BATCH_MAX 32    // the most datagrams (or coalesced reads) one batch call moves
