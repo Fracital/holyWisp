@@ -178,6 +178,7 @@ struct hw_server {
 	hw_semaphore connections;
 	hw_gauge *syns_per_ip;   // TCP connects in progress per client IP
 	hw_gauge *conns_per_ip;  // WebSocket clients per client IP
+	hw_gauge *heads_per_ip;  // connections still in their HTTP head, per socket peer address
 	hw_budget *queue_budget; // server-queue-max and its per-IP share (conn_budget_sync)
 	hw_bandwidth *bandwidth;
 	hw_reputation *reputation;
@@ -336,9 +337,11 @@ typedef struct hw_conn {
 	uint64_t active_ms; // last frame from the client, for idle-timeout-s
 	int closing;
 	int violations;
-	int conn_slot;    // holds one of server->connections
-	int ip_slot;      // holds one of server->conns_per_ip for c->ip
-	uint32_t wt_code; // WebTransport: the session close code conn_close sends (ws_fail's code)
+	int conn_slot;       // holds one of server->connections
+	int ip_slot;         // holds one of server->conns_per_ip for c->ip
+	int head_slot;       // holds one of server->heads_per_ip for c->ip, the peer's until the head is read
+	size_t head_scanned; // bytes of rbuf already searched for the end of the HTTP head
+	uint32_t wt_code;    // WebTransport: the session close code conn_close sends (ws_fail's code)
 	// WebTransport lanes: the lane of the packet being handled, which a stream it opens rides, and
 	// the lanes whose streams' remotes are paused for their own queue (conn_backpressure).
 	int rx_lane;

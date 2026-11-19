@@ -78,6 +78,12 @@ const char *hw_http_header_get(const hw_http_request *req, const char *name);
 // value is missing its end, which for a forwarded-for list is the part the proxy wrote.
 int hw_http_header_all(const hw_http_request *req, const char *name, const char **values, int cap, int *cut);
 
+// Where a request head in data[0..len) ends: the length through its blank line, or 0 while it has
+// not all arrived. `from` is the len of an earlier call over the same, longer-growing buffer (0 the
+// first time): what it looked at is not looked at again, so a head that arrives a few bytes per
+// read costs one scan in all, not one per read.
+size_t hw_http_head_end(const uint8_t *data, size_t len, size_t from);
+
 // Parse a request head. Returns the bytes consumed (through the blank line) when complete,
 // HW_ERR_AGAIN when the head is not all there, HW_ERR_PROTOCOL when it is malformed. Malformed
 // includes everything that would make the table differ from what was sent: more than

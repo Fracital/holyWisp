@@ -172,6 +172,7 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `connections-limit-per-ip`, `connection-window-s` | 200, 10 | New WebSockets per IP per window |
 | `max-streams-per-conn` | 2048 | Open streams one connection may hold (0 = unlimited); past it a CONNECT is throttled (`0x49`) |
 | `max-concurrent-connections-per-ip`, `max-in-flight-syns-per-ip` | 5000, 512 | One client address's share of the server-wide connection and in-flight-connect caps |
+| `max-handshakes-per-ip` | 128 | Connections from one address that have not yet sent their whole HTTP request head; one more is answered 429 and closed at accept. Counted by the socket's peer, so connections from a `trusted-proxy` are never counted (0 = unlimited; with `flood-protection`) |
 | `client-write-timeout-s`, `idle-timeout-s` | 120, 0 | Close a client that takes nothing queued for it for this long; close a connection that has no open streams and has sent no frame for this long, with 1001 (0 = never) |
 | `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap, each direction |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |

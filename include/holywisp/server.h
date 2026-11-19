@@ -36,6 +36,9 @@ typedef struct hw_flood_config {
 	int max_in_flight_syns_per_ip;         // ... and per client IP, so one client cannot hold them all
 	int max_concurrent_connections;        // WebSocket clients, server-wide
 	int max_concurrent_connections_per_ip; // ... and per client IP
+	// Connections from one address that have not finished their HTTP request head, counted from
+	// accept, before anything is read (a trusted proxy's are not counted). 0 = unlimited.
+	int max_handshakes_per_ip;
 	int syn_signature_enabled;
 	int syn_signature_window_ms;
 	int syn_signature_min_samples;

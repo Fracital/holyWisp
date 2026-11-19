@@ -30,6 +30,9 @@
 #define CONN_MAX_READ_PER_EVENT (1024 * 1024)
 #endif
 #define CONN_WINDOW_MIN 4 // packets granted per CONTINUE however many streams share a client
+// What a connection offers each recv until its HTTP head is complete: a head is at most
+// HW_HTTP_MAX_REQUEST, and a connection that has sent none of it should not hold 64 KiB.
+#define CONN_HEAD_CHUNK 4096
 // A busy client's recv room grows from HW_READ_CHUNK to about two of its frames, and at least to
 // 256 KiB, more only for a client that sends very large ones. A big room on every connection
 // costs throughput as soon as many connections are busy at once.
@@ -111,6 +114,32 @@ static void handshake_timeout_cb(hw_loop *loop, void *ud) {
 	conn_close(c);
 }
 
+// Connections that have not sent their whole HTTP head are counted by nothing at upgrade time, and
+// a client that opens them and sends nothing holds a descriptor each until the handshake timeout:
+// enough of them push accept into EMFILE for everyone. max-handshakes-per-ip bounds how many one
+// address holds at once. It is counted by the socket's peer, from accept, before a byte is read,
+// so a trusted proxy (every client behind it has its address) is not counted at all. 0: refused.
+static int conn_head_admit(hw_conn *c) {
+	hw_server *srv = c->w->server;
+	const hw_server_config *cfg = &srv->cfg;
+	if (!srv->heads_per_ip) return 1;
+	if (hw_cidr_any_contains(cfg->trusted_proxies, cfg->trusted_proxy_count, (const struct sockaddr *)&c->peer_addr)) {
+		return 1;
+	}
+	int r = hw_gauge_acquire(srv->heads_per_ip, c->ip);
+	if (r == 0) return 0;
+	c->head_slot = r == 1;
+	return 1;
+}
+
+// The head is in (or the connection is going): its slot goes back, under the key it was taken by,
+// before the trusted headers can change c->ip.
+static void conn_head_done(hw_conn *c) {
+	if (!c->head_slot) return;
+	hw_gauge_release(c->w->server->heads_per_ip, c->ip);
+	c->head_slot = 0;
+}
+
 void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	hw_conn *c = calloc(1, sizeof(*c));
 	if (!c) {
@@ -133,12 +162,24 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	hw_addr_str(peer, c->peer, sizeof(c->peer));
 	// Policy IP defaults to the socket peer; the upgrade may replace it from a trusted header.
 	hw_addr_ip_str(peer, c->ip, sizeof(c->ip));
+	if (!conn_head_admit(c)) {
+		static const char busy[] = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+		ssize_t r = send(fd, busy, sizeof(busy) - 1, HW_MSG_NOSIGNAL | MSG_DONTWAIT); // best effort
+		(void)r;
+		HW_DEBUG("conn", "%s: refused, too many connections still in their HTTP head", c->peer);
+		HW_STAT_INC(w->server, refused_connection_limit);
+		atomic_fetch_sub(&w->load, 1);
+		close(fd);
+		free(c);
+		return;
+	}
 	server_tune_socket(w->server, fd, 1);
 	if (w->server->client_rcvbuf > 0) {
 		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &w->server->client_rcvbuf, sizeof(w->server->client_rcvbuf));
 	}
 	if (hw_loop_add_fd(w->loop, fd, HW_EV_READ, conn_io_cb, c) != 0) {
 		HW_WARN("conn", "%s: cannot watch fd: %s", c->peer, strerror(errno));
+		conn_head_done(c);
 		atomic_fetch_sub(&w->load, 1);
 		close(fd);
 		free(c);
@@ -196,6 +237,7 @@ void conn_close(hw_conn *c) {
 		hw_gauge_release(c->w->server->conns_per_ip, c->ip);
 		c->ip_slot = 0;
 	}
+	conn_head_done(c);
 	if (c->budget_held) { // taken under this c->ip: it does not change after the upgrade
 		hw_budget_give(c->w->server->queue_budget, c->ip, c->budget_held);
 		c->budget_held = 0;
@@ -1291,9 +1333,16 @@ static int http_process(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
 	hw_server *srv = c->w->server;
 	hw_http_request req;
-	int r = hw_http_parse_request(hw_buf_head(&c->rbuf), hw_buf_avail(&c->rbuf), &req);
-	if (r == HW_ERR_AGAIN) return 0;
-	if (r < 0) {
+	// Each read looks only at what is new: a head that arrives a byte at a time is scanned once.
+	size_t avail = hw_buf_avail(&c->rbuf);
+	size_t end = hw_http_head_end(hw_buf_head(&c->rbuf), avail, c->head_scanned);
+	if (end == 0 && avail < HW_HTTP_MAX_REQUEST) {
+		c->head_scanned = avail;
+		return 0;
+	}
+	conn_head_done(c); // a whole head, or more than one may be: either way it is not pending now
+	int r = hw_http_parse_request(hw_buf_head(&c->rbuf), end ? end : avail, &req);
+	if (r < 0) { // HW_ERR_AGAIN cannot be: the head is whole, or too long to ever be
 		http_reply(c, 400, "Bad Request", "text/plain; charset=utf-8", "bad request\n");
 		return 0;
 	}
@@ -1828,7 +1877,8 @@ static void conn_process(hw_conn *c) {
 static void conn_read(hw_conn *c) {
 	size_t total = 0;
 	while (!c->closing && !conn_reads_stopped(c) && total < CONN_MAX_READ_PER_EVENT) {
-		if (hw_buf_reserve(&c->rbuf, c->read_chunk) != 0) {
+		int head = c->state == CONN_HTTP; // a head is small: no room for frames until it is in
+		if (hw_buf_reserve(&c->rbuf, head ? CONN_HEAD_CHUNK : c->read_chunk) != 0) {
 			conn_close(c);
 			return;
 		}
@@ -1851,6 +1901,7 @@ static void conn_read(hw_conn *c) {
 		c->heard = 1;
 		conn_process(c);
 		if (c->closing) return;
+		if (head && (size_t)n == room) continue; // more of the head, or frames behind it
 		if ((size_t)n == room) {
 			// The client is sending faster than one read takes: offer more room next time, so a
 			// burst of frames arrives in one recv and leaves in one write per stream.
@@ -1860,7 +1911,7 @@ static void conn_read(hw_conn *c) {
 			if (c->read_chunk < limit) c->read_chunk *= 2;
 			continue;
 		}
-		if ((size_t)n < c->read_chunk / 4 && c->read_chunk > HW_READ_CHUNK) {
+		if (!head && (size_t)n < c->read_chunk / 4 && c->read_chunk > HW_READ_CHUNK) {
 			c->read_chunk /= 2;
 			hw_buf_shrink(&c->rbuf, c->read_chunk); // no-op unless the buffer is empty
 		}

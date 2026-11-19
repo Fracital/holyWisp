@@ -29,6 +29,8 @@ export type FloodProtectionConfig = {
 	maxConcurrentConnections?: number;
 	/** Of `maxConcurrentConnections`, how many one client address may hold at a time. */
 	maxConcurrentConnectionsPerIP?: number;
+	/** Connections from one address still sending their HTTP head (default 128, 0 off). */
+	maxHandshakesPerIP?: number;
 	synFloodSignature?: {
 		enabled?: boolean;
 		windowMs?: number;
@@ -472,6 +474,7 @@ export function workerArgs(
 			"maxConcurrentConnectionsPerIP",
 			flood.maxConcurrentConnectionsPerIP,
 		);
+		int("max-handshakes-per-ip", "maxHandshakesPerIP", flood.maxHandshakesPerIP);
 		const sig = flood.synFloodSignature;
 		if (sig) {
 			bool("syn-signature", "synFloodSignature.enabled", sig.enabled);

@@ -180,12 +180,17 @@ void hw_ws_accept_key(const char *key, char out[HW_WS_ACCEPT_LEN + 1]) {
 
 // ---------------------------------------------------------------------------------- HTTP
 
-// Find "\r\n\r\n"; returns the length through it or 0.
-static size_t find_head_end(const uint8_t *data, size_t len) {
-	for (size_t i = 3; i < len; i++) {
+size_t hw_http_head_end(const uint8_t *data, size_t len, size_t from) {
+	// The terminator may straddle what was looked at before: its last byte is the first new one.
+	for (size_t i = from > 3 ? from : 3; i < len; i++) {
 		if (data[i - 3] == '\r' && data[i - 2] == '\n' && data[i - 1] == '\r' && data[i] == '\n') return i + 1;
 	}
 	return 0;
+}
+
+// Find "\r\n\r\n"; returns the length through it or 0.
+static size_t find_head_end(const uint8_t *data, size_t len) {
+	return hw_http_head_end(data, len, 0);
 }
 
 static void copy_trimmed(char *dst, size_t cap, const char *src, size_t n) {

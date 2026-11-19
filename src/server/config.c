@@ -101,6 +101,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("max-in-flight-syns-per-ip", flood.max_in_flight_syns_per_ip, 0, 1 << 24)
 	INT_KEY("max-concurrent-connections", flood.max_concurrent_connections, 0, 1 << 24)
 	INT_KEY("max-concurrent-connections-per-ip", flood.max_concurrent_connections_per_ip, 0, 1 << 24)
+	INT_KEY("max-handshakes-per-ip", flood.max_handshakes_per_ip, 0, 1 << 24)
 	BOOL_KEY("syn-signature", flood.syn_signature_enabled)
 	INT_KEY("syn-signature-window-ms", flood.syn_signature_window_ms, 1, 600000)
 	INT_KEY("syn-signature-min-samples", flood.syn_signature_min_samples, 1, HW_SIGDET_RING)
@@ -495,6 +496,8 @@ void hw_config_usage(const char *argv0) {
 	    "  max-in-flight-syns, max-concurrent-connections   server-wide caps (4096 / 50000)\n"
 	    "  max-in-flight-syns-per-ip,                the same per client IP, so one client cannot hold them\n"
 	    "  max-concurrent-connections-per-ip         all (512 / 5000)\n"
+	    "  max-handshakes-per-ip                     connections of one address still sending their HTTP head;\n"
+	    "                                            past it, closed at accept (128; trusted proxies exempt)\n"
 	    "  syn-signature, syn-signature-window-ms,   SYN-flood heuristic (on, 2000ms, 128, 0.75)\n"
 	    "  syn-signature-min-samples, syn-signature-failed-ratio\n"
 	    "  ws-close-after-violations                 drop a client after this many flood hits (64)\n"

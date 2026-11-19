@@ -361,7 +361,10 @@ in `hw_server_new` (`build_limiters`), lock internally, and are evicted and pers
 maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_reputation`,
 `test_filter`) and the whole path has `test_security`. Keep these invariants:
 
-- **Where each check runs.** Connection-level checks (the origin allowlist, real-IP resolution,
+- **Where each check runs.** Before anything is read, `conn_accept` counts the connection against
+  `max-handshakes-per-ip` by its socket peer (a trusted proxy's are not counted) until its HTTP
+  head is in (`conn_head_admit`, `conn_head_done`); over it, 429 and closed.
+  Connection-level checks (the origin allowlist, real-IP resolution,
   per-IP connect rate, reputation tier, the per-IP connection gauge, the concurrent-connection
   semaphore) are in `http_process` at upgrade time, in that order.
   Per-CONNECT checks (per-source connect rate, the Twisp gate) are in `handle_connect`.

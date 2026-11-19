@@ -141,7 +141,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `parseRealIP`, `trustedProxies`, `trustedHeaders` (default `X-Forwarded-For`) | `trusted-proxy`, `trusted-header`; `trusted-proxy-secret` is set by the wrapper |
 | `allowedOrigins` (each `scheme://host[:port]`; empty means any page may connect) | `allow-origin` |
 | `connectionsLimitPerIP`, `connectionWindowSeconds`, `bandwidthLimitKbps` | `connections-limit-per-ip`, `connection-window-s`, `bandwidth-limit-kbps` |
-| `floodProtection.*` | `flood-protection`, `max-connects-per-*`, `max-in-flight-syns`, `max-in-flight-syns-per-ip`, `max-streams-per-conn`, `max-concurrent-connections`, `max-concurrent-connections-per-ip`, `syn-signature*`, `ws-close-after-violations`, `log-blocked-dials` |
+| `floodProtection.*` | `flood-protection`, `max-connects-per-*`, `max-in-flight-syns`, `max-in-flight-syns-per-ip`, `max-streams-per-conn`, `max-concurrent-connections`, `max-concurrent-connections-per-ip`, `max-handshakes-per-ip`, `syn-signature*`, `ws-close-after-violations`, `log-blocked-dials` |
 | `reputation.*` | `reputation`, `reputation-store`, `reputation-save-interval-s`, `reputation-decay-per-hour`, `reputation-evict-after-days`, `reputation-{warn,throttle,strict}`, `reputation-weight`, `reputation-dest-weight` |
 | `proxy`, `proxyUDP` | `proxy`, `proxy-udp` |
 | `dnsServers`, `dnsResultOrder`, `dnsTtlSeconds`, `dnsNegativeTtlSeconds`, `dnsTimeoutMs` | `dns-server`, `dns-order`, `dns-ttl-s`, `dns-negative-ttl-s`, `dns-timeout-ms` |

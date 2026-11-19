@@ -1030,6 +1030,86 @@ static void test_queue_budget_per_ip(void) {
 	hw_server_free(s);
 }
 
+// What a connection that was sent `req` answers first, or "" when it says nothing for a second.
+static void raw_request(int fd, const char *req, int bytewise, char *out, size_t cap) {
+	size_t n = strlen(req);
+	for (size_t off = 0; off < n;) {
+		size_t chunk = bytewise ? 1 : n - off;
+		ssize_t r = send(fd, req + off, chunk, HW_MSG_NOSIGNAL);
+		if (r <= 0) break;
+		off += (size_t)r;
+		if (bytewise) sleep_ms(1);
+	}
+	size_t got = 0;
+	while (got + 1 < cap) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, 1000) <= 0) break;
+		ssize_t r = recv(fd, out + got, cap - 1 - got, 0);
+		if (r <= 0) break;
+		got += (size_t)r;
+		out[got] = '\0';
+		if (strstr(out, "\r\n\r\n")) break;
+	}
+	out[got] = '\0';
+}
+
+static int open_idle(hw_server *s) {
+	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
+	CHECK(fd >= 0, "connect");
+	set_blocking(fd);
+	return fd;
+}
+
+// A connection that never finishes its HTTP head was counted by nothing: it held a descriptor and
+// a 64 KiB read buffer until the handshake timeout, and one address could open them until accept
+// ran out of descriptors for everyone. Now one address holds max-handshakes-per-ip of them at a
+// time, counted from accept; the next is told 429 and closed, a slot comes back as soon as a head
+// is in, and a trusted proxy, whose address every client behind it shares, is not counted.
+static void test_handshakes_per_ip(void) {
+	enum {
+		CAP = 4
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.flood.enabled = 1;
+	cfg.flood.max_handshakes_per_ip = CAP;
+	hw_server *s = start(&cfg);
+	int idle[CAP];
+	for (int i = 0; i < CAP; i++) idle[i] = open_idle(s);
+	uint64_t deadline = hw_now_ms() + 5000;
+	while (active_connections(s) < CAP && hw_now_ms() < deadline) sleep_ms(10);
+	CHECK_EQ(active_connections(s), CAP);
+
+	char out[512];
+	int extra = open_idle(s);
+	raw_request(extra, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 0, out, sizeof(out));
+	CHECK(strncmp(out, "HTTP/1.1 429", 12) == 0, "over the cap: '%.20s'", out);
+	close(extra);
+
+	// A head that arrives a byte at a time is still found (the scan resumes), and frees its slot.
+	raw_request(idle[0], "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 1, out, sizeof(out));
+	CHECK(strncmp(out, "HTTP/1.1 200", 12) == 0, "bytewise head: '%.20s'", out);
+	extra = open_idle(s);
+	raw_request(extra, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 0, out, sizeof(out));
+	CHECK(strncmp(out, "HTTP/1.1 200", 12) == 0, "a slot came back: '%.20s'", out);
+	close(extra);
+	for (int i = 0; i < CAP; i++) close(idle[i]);
+	hw_server_free(s);
+
+	// From a trusted proxy nothing is counted.
+	CHECK_EQ(hw_cidr_parse("127.0.0.1", &cfg.trusted_proxies[0]), 0);
+	cfg.trusted_proxy_count = 1;
+	s = start(&cfg);
+	int many[2 * CAP];
+	for (int i = 0; i < 2 * CAP; i++) many[i] = open_idle(s);
+	extra = open_idle(s);
+	raw_request(extra, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 0, out, sizeof(out));
+	CHECK(strncmp(out, "HTTP/1.1 200", 12) == 0, "behind a trusted proxy: '%.20s'", out);
+	close(extra);
+	for (int i = 0; i < 2 * CAP; i++) close(many[i]);
+	hw_server_free(s);
+}
+
 // idle-timeout-s closes a client that has no streams and has said nothing for that long, and
 // leaves one with a stream alone however quiet it is.
 static void test_idle_timeout(void) {
@@ -1208,6 +1288,7 @@ int main(void) {
 	RUN(test_stream_cap_is_not_a_violation);
 	RUN(test_bandwidth_limits_downloads);
 	RUN(test_queue_budget_per_ip);
+	RUN(test_handshakes_per_ip);
 	RUN(test_idle_timeout);
 	RUN(test_host_bytes);
 	RUN(test_raw_connects);

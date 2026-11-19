@@ -129,7 +129,8 @@ static void test_stream_credit_key(void) {
 }
 
 // The queue budget: on by default, sizes past 4 GiB (a 64-bit field), 0 turns either half off.
-static void test_server_queue_keys(void) {
+// And the cap on connections of one address still in their HTTP head.
+static void test_queue_and_head_keys(void) {
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
 	char err[256];
@@ -140,6 +141,9 @@ static void test_server_queue_keys(void) {
 	CHECK_EQ(hw_config_set(&cfg, "server-queue-max-per-ip", "0", err, sizeof(err)), 0);
 	CHECK_EQ(cfg.server_queue_max_per_ip, 0);
 	CHECK(hw_config_set(&cfg, "server-queue-max", "-1", err, sizeof(err)) != 0, "rejects a negative size");
+	CHECK_EQ(cfg.flood.max_handshakes_per_ip, 128);
+	CHECK_EQ(hw_config_set(&cfg, "max-handshakes-per-ip", "8", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.flood.max_handshakes_per_ip, 8);
 }
 
 static void test_proxy_client_key_keys(void) {
@@ -289,7 +293,7 @@ int main(void) {
 	RUN(test_busy_poll_key);
 	RUN(test_stop_on_stdin_eof_key);
 	RUN(test_stream_credit_key);
-	RUN(test_server_queue_keys);
+	RUN(test_queue_and_head_keys);
 	RUN(test_proxy_client_key_keys);
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);

@@ -82,6 +82,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->flood.max_in_flight_syns_per_ip = 512;
 	cfg->flood.max_concurrent_connections = 50000;
 	cfg->flood.max_concurrent_connections_per_ip = 5000;
+	cfg->flood.max_handshakes_per_ip = 128;
 	cfg->flood.syn_signature_enabled = 1;
 	cfg->flood.syn_signature_window_ms = 2000;
 	cfg->flood.syn_signature_min_samples = 128;
@@ -770,6 +771,10 @@ static int build_limiters(hw_server *s) {
 			s->conns_per_ip = hw_gauge_new(f->max_concurrent_connections_per_ip);
 			if (!s->conns_per_ip) return -1;
 		}
+		if (f->max_handshakes_per_ip > 0) {
+			s->heads_per_ip = hw_gauge_new(f->max_handshakes_per_ip);
+			if (!s->heads_per_ip) return -1;
+		}
 	} else {
 		hw_semaphore_init(&s->in_flight_syns, 0);
 		hw_semaphore_init(&s->connections, 0);
@@ -912,6 +917,7 @@ fail: {
 	hw_bandwidth_free(s->bandwidth);
 	hw_gauge_free(s->syns_per_ip);
 	hw_gauge_free(s->conns_per_ip);
+	hw_gauge_free(s->heads_per_ip);
 	hw_budget_free(s->queue_budget);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
@@ -1012,6 +1018,7 @@ void hw_server_free(hw_server *s) {
 	hw_bandwidth_free(s->bandwidth);
 	hw_gauge_free(s->syns_per_ip);
 	hw_gauge_free(s->conns_per_ip);
+	hw_gauge_free(s->heads_per_ip);
 	hw_budget_free(s->queue_budget);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);

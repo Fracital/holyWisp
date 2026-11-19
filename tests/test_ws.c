@@ -128,6 +128,30 @@ static int parse(const char *head, hw_http_request *r) {
 
 // The header table is what was sent, or the head is refused. Each case here was a way to make
 // the server read a client address other than the one its proxy wrote.
+// The head's end is found the same whether it arrives at once or a byte at a time, with the scan
+// resumed where the last one stopped, a terminator split over two reads included.
+static void test_http_head_end(void) {
+	static const char head[] = "GET / HTTP/1.1\r\nHost: x\r\n\r\nafter";
+	const uint8_t *d = (const uint8_t *)head;
+	size_t want = strlen("GET / HTTP/1.1\r\nHost: x\r\n\r\n");
+	CHECK_EQ(hw_http_head_end(d, strlen(head), 0), want);
+	size_t from = 0, got = 0;
+	for (size_t len = 1; len <= strlen(head) && !got; len++) {
+		got = hw_http_head_end(d, len, from);
+		from = len;
+	}
+	CHECK_EQ(got, want);
+	for (size_t split = 0; split <= want; split++) {
+		size_t first = hw_http_head_end(d, split, 0);
+		size_t end = first ? first : hw_http_head_end(d, want, split);
+		CHECK(end == want, "split at %zu: %zu", split, end);
+	}
+	CHECK_EQ(hw_http_head_end(d, 3, 0), 0);
+	CHECK_EQ(hw_http_head_end(d, want - 1, 0), 0);
+	CHECK_EQ(hw_http_head_end((const uint8_t *)"\r\n\r\n", 4, 0), 4);
+	CHECK_EQ(hw_http_head_end((const uint8_t *)"\r\n\r\n", 4, 10), 0); // nothing new to look at
+}
+
 static void test_http_header_table(void) {
 	static hw_http_request r;
 	char head[HW_HTTP_MAX_REQUEST];
@@ -265,6 +289,7 @@ int main(void) {
 	RUN(test_header_rejections);
 	RUN(test_mask);
 	RUN(test_http_request);
+	RUN(test_http_head_end);
 	RUN(test_http_header_table);
 	RUN(test_http_upgrade_injection);
 	RUN(test_http_upgrade_roundtrip);

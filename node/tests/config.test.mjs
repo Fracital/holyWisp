@@ -128,6 +128,7 @@ test("a wispurr config maps onto the server's flags", () => {
 				maxConcurrentStreamsPerConnection: 64,
 				maxInFlightSynsPerIP: 128,
 				maxConcurrentConnectionsPerIP: 40,
+				maxHandshakesPerIP: 16,
 				synFloodSignature: { enabled: false, failedHandshakeRatio: 0.5 },
 			},
 			reputation: {
@@ -166,6 +167,7 @@ test("a wispurr config maps onto the server's flags", () => {
 		"--allow-origin=http://localhost:5173",
 		"--max-in-flight-syns-per-ip=128",
 		"--max-concurrent-connections-per-ip=40",
+		"--max-handshakes-per-ip=16",
 		'--motd=hello "world" # not a comment',
 		"--non-ws-response=line one\nline two",
 		"--log-level=info",
