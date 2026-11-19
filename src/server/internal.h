@@ -306,6 +306,7 @@ struct hw_server {
 	_Atomic uint64_t wt_retries;
 	_Atomic uint64_t wt_refused_handshakes;
 	_Atomic uint64_t wt_dropped;
+	_Atomic uint64_t relay_pipes; // open, whether a stream holds them or the queue still empties them
 };
 
 #define HW_STAT_INC(server, field) atomic_fetch_add(&(server)->field, 1)
@@ -339,6 +340,7 @@ typedef struct hw_conn {
 	uint64_t fr_end;
 	int pri_mid;
 	size_t pipe_bytes; // sum of the marks' n: what backpressure counts besides wbuf
+	int pipes_held;    // streams of this connection that hold a relay pipe (conn_sweep looks at those)
 	hw_buf frag;       // reassembly of a fragmented binary message
 	int frag_active;
 	hw_map streams;  // stream_id -> hw_stream
@@ -440,7 +442,8 @@ typedef struct hw_stream {
 	int bulk;           // the remote delivers full reads: relay through the pipe (conn_splice_data)
 	int bulk_miss;      // consecutive small splices; enough of them end bulk mode
 	int parked;         // reads stopped until the stream's own pipe has drained into the client
-	hw_spipe *pipe;     // opened when the stream first goes bulk
+	hw_spipe *pipe;     // opened when the stream goes bulk, given back when it leaves or idles
+	int pipe_used;      // the pipe was filled since the last sweep (conn_sweep_pipes)
 	int read_armed;
 	int detached;    // hung up while reads were paused: off the loop until they resume
 	int heard;       // the remote has sent something since the client last did
@@ -587,7 +590,8 @@ int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t l
 // still in its pipe: the caller waits for it (stream_park). A failure toward the client closes the
 // connection: check c->closing.
 ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max);
-// The stream is closing: free its pipe, or leave it to the queue when a payload is still in it.
+// The stream is closing, or done with its pipe for now: free the pipe, or leave it to the queue
+// when a payload is still in it.
 void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
 // A CLOSE for a CONNECT refused before it was a stream (counted so in the stats), or for stream 0.

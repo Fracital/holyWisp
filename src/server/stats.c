@@ -168,6 +168,7 @@ int stats_json(const hw_worker *w, hw_buf *out) {
 	// Which build answers, and whether UDP and TCP go through WARP right now: the state the
 	// workers were given at the last look (once a second), not the file's path or its marks.
 	jprintf(&j, ",\"version\":\"%s%s\"", HW_VERSION, HW_VERSION_SUFFIX);
+	jprintf(&j, ",\"relayPipes\":%llu", ull(st.relay_pipes));
 	int on = st.warp_state != HW_WARP_STATUS_OFF;
 	jprintf(&j, ",\"warpState\":{\"configured\":%s,\"canMark\":%s,\"usable\":%s,\"state\":\"%s\",\"ageSeconds\":",
 	        on ? "true" : "false", on && st.warp_state != HW_WARP_STATUS_NO_MARK ? "true" : "false",

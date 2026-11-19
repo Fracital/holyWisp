@@ -349,7 +349,7 @@ void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
 // ---------------------------------------------------------------------------------- workers
 
 #define ACCEPT_RETRY_MS 100  // how long a listener rests after accept ran out of descriptors
-#define SWEEP_MS        5000 // how often, at most, a worker looks for clients to time out (conn_sweep)
+#define SWEEP_MS        5000 // how often, at most, a worker looks for clients to time out and idle pipes (conn_sweep)
 
 static void accept_resume_cb(hw_loop *loop, void *ud) {
 	hw_worker *w = ud;
@@ -507,16 +507,15 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	if (w->listen_fd < 0) return -1;
 	if (hw_loop_add_fd(w->loop, w->listen_fd, HW_EV_READ, accept_cb, w) != 0) return -1;
 	// Half the shorter of the two timeouts, so that a timeout is never late by more than half of
-	// itself, and no more often than a few times a second.
+	// itself, and no more often than a few times a second. With neither, the sweep still gives
+	// idle streams' relay pipes back, every SWEEP_MS.
 	int shortest = s->cfg.client_write_timeout_s;
 	if (s->cfg.idle_timeout_s > 0 && (shortest <= 0 || s->cfg.idle_timeout_s < shortest)) {
 		shortest = s->cfg.idle_timeout_s;
 	}
-	if (shortest > 0) {
-		uint64_t every = (uint64_t)shortest * 500;
-		if (every > SWEEP_MS) every = SWEEP_MS;
-		if (!hw_loop_add_timer(w->loop, every, every, sweep_cb, w)) return -1;
-	}
+	uint64_t every = shortest > 0 ? (uint64_t)shortest * 500 : SWEEP_MS;
+	if (every > SWEEP_MS) every = SWEEP_MS;
+	if (!hw_loop_add_timer(w->loop, every, every, sweep_cb, w)) return -1;
 	return 0;
 }
 
@@ -1172,6 +1171,7 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	}
 	out->warp_tunnels_v4 = (uint64_t)atomic_load(&s->warp_stat_n4);
 	out->warp_tunnels_v6 = (uint64_t)atomic_load(&s->warp_stat_n6);
+	out->relay_pipes = atomic_load(&s->relay_pipes);
 	if (s->reputation) {
 		size_t src, dst;
 		hw_reputation_counts(s->reputation, &src, &dst);

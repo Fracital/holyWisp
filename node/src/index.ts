@@ -59,6 +59,8 @@ export type holyWispStats = {
 	authFailures: number;
 	dnsCacheEntries: number;
 	reputation: { sources: number; destinations: number };
+	/** Relay pipes open now (Linux): busy bulk streams hold one each. */
+	relayPipes: number;
 };
 
 const READY_TIMEOUT_MS = 10_000;

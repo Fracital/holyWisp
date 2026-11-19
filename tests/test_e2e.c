@@ -1068,6 +1068,104 @@ static void test_connections_spread(void) {
 	hw_server_free(s);
 }
 
+// Echo `total` bytes in packets of `chunk` through stream sid and check that they come back whole.
+static void echo_round(hw_client *c, uint32_t sid, size_t total, size_t chunk, uint32_t seed) {
+	uint8_t *data = malloc(total);
+	uint8_t *back = malloc(total);
+	fill_pattern(data, total, seed);
+	size_t sent = 0, got = 0;
+	while (got < total) {
+		if (sent < total) {
+			size_t n = HW_MIN(chunk, total - sent);
+			CHECK_EQ(hw_client_send(c, sid, data + sent, n), 0);
+			sent += n;
+		}
+		hw_client_event ev;
+		int r;
+		while ((r = hw_client_poll(c, sent < total ? 0 : 5000, &ev)) > 0) {
+			if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
+				CHECK(got + ev.len <= total, "overflow");
+				memcpy(back + got, ev.data, ev.len);
+				got += ev.len;
+			} else if (ev.type != HW_CEV_CONTINUE) {
+				CHECK(0, "unexpected event %d on stream %u (reason %u)", ev.type, ev.stream_id, ev.reason);
+			}
+			if (sent < total || got >= total) break;
+		}
+		CHECK(r >= 0, "poll: %d", r);
+		if (r == 0 && sent >= total) CHECK(0, "timed out with %zu/%zu bytes", got, total);
+	}
+	CHECK(memcmp(data, back, total) == 0, "%zu bytes in %zu-byte packets intact", total, chunk);
+	free(data);
+	free(back);
+}
+
+// The server's open relay pipes, once they are `want` or wait_ms has passed.
+static uint64_t relay_pipes(hw_server *s, uint64_t want, int wait_ms) {
+	hw_server_stats st;
+	for (int i = 0;; i++) {
+		hw_server_stats_get(s, &st);
+		if (st.relay_pipes == want || i * 10 >= wait_ms) return st.relay_pipes;
+		usleep(10000);
+	}
+}
+
+static hw_server *pipe_server(int write_timeout_s) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.allow_direct_ip = 1;
+	cfg.allow_loopback = 1;
+	cfg.client_write_timeout_s = write_timeout_s;
+	cfg.log_level = HW_LOG_WARN;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL && hw_server_start(s) == 0, "server: %s", strerror(errno));
+	return s;
+}
+
+// A relay pipe is two descriptors and 1 MiB of the kernel's per-user pipe budget, so a stream
+// holds one only while it is bulk and busy: it gives it back when its reads turn small, and when it
+// has not filled it for a sweep. A stream that has given its pipe back still relays every byte,
+// and takes a pipe again when it goes bulk again.
+static void test_relay_pipes_given_back(void) {
+	// Leaving bulk mode. No sweep comes within the case: with no timeouts it runs every 5 s, and
+	// it only takes a pipe that went unfilled for a whole interval.
+	hw_server *s = pipe_server(0);
+	hw_client *c = connect_to(s, 0, NULL, NULL, 0);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
+	echo_round(c, sid, 8u * 1024 * 1024, 512 * 1024, 300);
+	if (relay_pipes(s, 1, 0) == 0) {
+		// No pipe to be had (not Linux, or this user's pipe budget is spent by other processes).
+		printf("skip test_relay_pipes_given_back: the bulk stream got no relay pipe\n");
+		hw_client_free(c);
+		hw_server_free(s);
+		return;
+	}
+	for (int i = 0; i < 24; i++) echo_round(c, sid, 1024, 1024, 400 + (uint32_t)i); // one small read each
+	CHECK_EQ(relay_pipes(s, 0, 1000), 0);
+	echo_round(c, sid, 8u * 1024 * 1024, 512 * 1024, 301);
+	hw_client_free(c);
+	hw_server_free(s);
+
+	// Idle. A write timeout of 1 s sweeps every 500 ms.
+	s = pipe_server(1);
+	c = connect_to(s, 0, NULL, NULL, 0);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
+	echo_round(c, sid, 8u * 1024 * 1024, 512 * 1024, 302);
+	uint64_t held = relay_pipes(s, 1, 0);
+	CHECK_EQ(relay_pipes(s, 0, 3000), 0);
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.streams_active, 1); // the stream is still open, only its pipe is gone
+	echo_round(c, sid, 8u * 1024 * 1024, 512 * 1024, 303);
+	printf("  pipes: %llu held while busy, 0 after idling\n", (unsigned long long)held);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
 // credit_cases.h's way to connect over a WebSocket.
 static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manual, size_t max_queue) {
 	hw_client_opts o;
@@ -1130,6 +1228,7 @@ int main(void) {
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);
+	RUN(test_relay_pipes_given_back);
 
 	cfg.stream_credit = 0;
 	hw_server *off = hw_server_new(&cfg);

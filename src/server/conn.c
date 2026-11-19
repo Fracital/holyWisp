@@ -498,7 +498,10 @@ static int arm_write(hw_conn *c, int on) {
 // slower than copying, so anything under PIPE_MIN is refused and the stream copies instead (and
 // the worker waits a while before asking again: the pressure may come from other processes of
 // the same user, or from this server's own bulk streams). A pipe costs two descriptors and is
-// opened only when a stream first goes bulk.
+// opened only when a stream goes bulk. It is given back when the stream stops being bulk
+// (stream_read) or has not filled it for a whole sweep (conn_sweep_pipes): a pipe kept for the
+// stream's life was 1 MiB of that budget for every connection that once downloaded something,
+// and 64 of them on a stock limit made every later download on the box copy.
 #define PIPE_WANT     (1024 * 1024)
 #define PIPE_MIN      (256 * 1024)
 #define PIPE_RETRY_MS 2000
@@ -517,24 +520,44 @@ static hw_spipe *spipe_open(hw_worker *w, hw_stream *s) {
 		return NULL;
 	}
 	p->stream = s;
+	atomic_fetch_add(&w->server->relay_pipes, 1);
 	return p;
 }
 
-static void spipe_free(hw_spipe *p) {
+static void spipe_free(hw_server *srv, hw_spipe *p) {
 	close(p->fd[0]);
 	close(p->fd[1]);
 	free(p);
+	atomic_fetch_sub(&srv->relay_pipes, 1);
 }
 
 void conn_pipe_drop(hw_stream *s) {
 	hw_spipe *p = s->pipe;
 	if (!p) return;
 	s->pipe = NULL;
+	s->conn->pipes_held--;
 	if (p->pending > 0) {
 		p->stream = NULL; // its payload is already framed on the wire: the queue finishes and frees it
 	} else {
-		spipe_free(p);
+		spipe_free(s->conn->w->server, p);
 	}
+}
+
+static int pipe_idle_visit(uint32_t key, void *value, void *ud) {
+	(void)key;
+	(void)ud;
+	hw_stream *s = value;
+	if (!s->pipe) return 0;
+	// A pipe with a payload in it is busy whatever the stream did since; the stream is parked on it.
+	if (!s->pipe_used && s->pipe->pending == 0) conn_pipe_drop(s);
+	s->pipe_used = 0;
+	return 0;
+}
+
+// The streams that have not filled their pipe since the last sweep give it back. One that goes
+// bulk again opens another (a pipe2 and a fcntl, once per busy spell, not per read).
+static void conn_sweep_pipes(hw_conn *c) {
+	if (c->pipes_held > 0) hw_map_each(&c->streams, pipe_idle_visit, NULL);
 }
 
 static int mark_push(hw_conn *c, hw_spipe *p, size_t n) {
@@ -567,7 +590,7 @@ static void mark_pop(hw_conn *c) {
 	c->mark_count--;
 	p->pending = 0;
 	if (!p->stream) {
-		spipe_free(p);
+		spipe_free(c->w->server, p);
 	} else if (!c->closing) {
 		stream_unpark(p->stream);
 	}
@@ -681,6 +704,7 @@ void conn_sweep(hw_worker *w) {
 			continue;
 		}
 		c->wrote = 0;
+		conn_sweep_pipes(c);
 		if (idle_ms > 0 && c->state == CONN_WS && hw_map_count(&c->streams) == 0 && now - c->active_ms >= idle_ms) {
 			HW_DEBUG("conn", "%s: idle for %d s with no streams, closing", c->peer, cfg->idle_timeout_s);
 			ws_fail(c, 1001);
@@ -864,8 +888,10 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max) {
 	if (!p) {
 		p = s->pipe = spipe_open(c->w, s);
 		if (!p) return -2;
+		c->pipes_held++;
 	}
 	if (p->pending > 0) return -3;
+	s->pipe_used = 1;
 	size_t cap = frame_payload_max(c);
 	if (cap > p->size) cap = p->size;
 	if (cap > max) cap = max; // the stream's credit: never a byte more is taken from the remote

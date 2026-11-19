@@ -508,7 +508,7 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   `connect()`: resolving (`0x42`) and the upstream proxy's handshake (`0x43`) are covered by
   `open_timeout_cb` on the same `connect_timer`.
 - **Relay pipes.** A TCP stream whose remote delivers full reads (`s->bulk`) gets its own pipe
-  (`hw_spipe`, opened on first use) and relays remote to client through it without a copy
+  (`hw_spipe`, opened when it goes bulk) and relays remote to client through it without a copy
   (`conn_splice_data`): the frame header is appended to `wbuf`, the payload is spliced into the
   pipe, and a mark (`hw_pipe_mark`) records "after this many queue bytes, splice n from this
   pipe". `conn_flush` sends `wbuf` up to the head mark (with `MSG_MORE`), empties that pipe into
@@ -523,7 +523,14 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   pipe memory per user and, past `fs.pipe-user-pages-soft`, hands out 8 KiB pipes that make
   every splice tiny: a pipe under 256 KiB is refused and that stream copies, and the worker waits
   before asking again. A pipe costs two descriptors per bulk stream. A bulk stream stays bulk
-  through isolated small splices (`bulk_miss`); it takes a run of them to leave. Small reads, UDP
+  through isolated small splices (`bulk_miss`); it takes a run of them to leave, and it gives
+  its pipe back when it does (`conn_pipe_drop`; a payload still in it goes on through the queue,
+  which frees the pipe). So does a stream that has not filled its pipe for a whole sweep
+  (`conn_sweep_pipes`, from `conn_sweep`, which runs every `SWEEP_MS` even with no timeouts set):
+  kept for the stream's life, one pipe per connection that ever downloaded something spent the
+  per-user budget (64 pipes of 1 MiB on a stock limit) and every later download copied. A
+  stream that goes bulk again opens another. `relay_pipes` (`relayPipes` in `/stats`) counts the
+  pipes open; `test_relay_pipes_given_back` holds both releases. Small reads, UDP
   and PTY streams never use a pipe: three syscalls for a tiny frame cost more than one copy.
 - **The ingress batch.** DATA for an idle TCP stream is not written packet by packet.
   `stream_on_data` records a pointer into the connection's read buffer in the worker's batch

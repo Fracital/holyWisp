@@ -353,6 +353,9 @@ typedef struct hw_server_stats {
 	// The same per WARP tunnel, in udp-warp-marks order (warp_tunnel_count of them).
 	int warp_tunnel_count;
 	hw_stats_tunnel warp_tunnels[HW_WARP_MAX_TUNNELS];
+	// Relay pipes open now (Linux): each is two descriptors and pipe memory the kernel charges to
+	// the user, so a stream gives its pipe back when it stops being bulk or has been idle a sweep.
+	uint64_t relay_pipes;
 } hw_server_stats;
 
 typedef struct hw_server hw_server;

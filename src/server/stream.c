@@ -1134,6 +1134,7 @@ static void stream_read(hw_stream *s) {
 			} else if (++s->bulk_miss >= STREAM_BULK_MISSES) {
 				s->bulk = 0;
 				s->bulk_miss = 0;
+				conn_pipe_drop(s); // the payload just spliced stays queued; the queue frees the pipe
 			}
 			if (stream_credit_held(s)) {
 				stream_credit_spent(s);
