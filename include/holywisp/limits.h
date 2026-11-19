@@ -43,6 +43,20 @@ int hw_gauge_acquire(hw_gauge *g, const char *key);
 void hw_gauge_release(hw_gauge *g, const char *key);
 int hw_gauge_value(hw_gauge *g, const char *key); // holders of key now
 
+// Bytes held per key, against a share of each key's own (per_key) and a total that every key
+// shares (total); 0 for either is no limit. Holders take bytes and give the same bytes back. A
+// take that would pass either limit takes nothing. Like the gauge, a key costs memory only while
+// it holds something.
+typedef struct hw_budget hw_budget;
+hw_budget *hw_budget_new(uint64_t total, uint64_t per_key);
+void hw_budget_free(hw_budget *b);
+// 1: taken, give it back. 0: the key's share or the total would be passed; nothing was taken.
+// -1: let through uncounted (no memory for the key's count: fail open); nothing to give back.
+int hw_budget_take(hw_budget *b, const char *key, uint64_t n);
+void hw_budget_give(hw_budget *b, const char *key, uint64_t n);
+// What key holds now, or with key NULL what all keys hold together.
+uint64_t hw_budget_held(hw_budget *b, const char *key);
+
 // Per-key bandwidth: a virtual clock per key advances by bytes / rate; a one-second burst is
 // free. Returns the milliseconds the caller should wait before moving more bytes (0 = none).
 typedef struct hw_bandwidth hw_bandwidth;

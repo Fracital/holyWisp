@@ -148,6 +148,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `maxPendingLookupsPerIP` | `max-pending-lookups-per-ip` |
 | `bufferRemainingLength`, `maxMessageSize` | `buffer-remaining`, `max-message-size` |
 | `wsWriteHighWater`, `uploadWindow`, `streamQueueMax`, `connQueueMax` | `ws-write-high-water`, `upload-window`, `stream-queue-max`, `conn-queue-max` |
+| `serverQueueMax`, `serverQueueMaxPerIP` | `server-queue-max`, `server-queue-max-per-ip` |
 | `socketBufferSize`, `clientRecvBuffer`, `listenBacklog` | `socket-buffer-size`, `client-recv-buffer`, `listen-backlog` |
 | `connectTimeoutMs`, `familyFallbackMs`, `handshakeTimeoutSeconds`, `clientWriteTimeoutSeconds`, `idleTimeoutSeconds` | `connect-timeout-ms`, `family-fallback-ms`, `handshake-timeout-ms`, `client-write-timeout-s`, `idle-timeout-s` |
 | `resolverThreads`, `busyPollUs`, `tcpNoDelay`, `tcpQuickAck` | `resolver-threads`, `busy-poll-us`, `tcp-nodelay`, `tcp-quickack` |

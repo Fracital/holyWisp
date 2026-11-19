@@ -172,6 +172,87 @@ int hw_gauge_value(hw_gauge *g, const char *key) {
 	return v;
 }
 
+// ---------------------------------------------------------------------------------- budget
+
+struct hw_budget {
+	uint64_t total, per_key;
+	uint64_t held; // across every key
+	pthread_mutex_t lock;
+	hw_smap holders; // key -> uint64_t *, present only while it holds something
+};
+
+hw_budget *hw_budget_new(uint64_t total, uint64_t per_key) {
+	hw_budget *b = calloc(1, sizeof(*b));
+	if (!b) return NULL;
+	b->total = total;
+	b->per_key = per_key;
+	pthread_mutex_init(&b->lock, NULL);
+	hw_smap_init(&b->holders);
+	return b;
+}
+
+void hw_budget_free(hw_budget *b) {
+	if (!b) return;
+	hw_smap_each(&b->holders, free_entry_visit, NULL);
+	hw_smap_free(&b->holders);
+	pthread_mutex_destroy(&b->lock);
+	free(b);
+}
+
+int hw_budget_take(hw_budget *b, const char *key, uint64_t n) {
+	if (!b) return -1;
+	int r = 1;
+	pthread_mutex_lock(&b->lock);
+	uint64_t *h = hw_smap_get(&b->holders, key);
+	uint64_t mine = h ? *h : 0;
+	if ((b->total && n > b->total - (b->held < b->total ? b->held : b->total)) ||
+	    (b->per_key && n > b->per_key - (mine < b->per_key ? mine : b->per_key))) {
+		r = 0;
+	} else if (!h) {
+		h = malloc(sizeof(*h));
+		if (!h || hw_smap_put(&b->holders, key, h) != 0) {
+			free(h);
+			r = -1; // out of memory: fail open, uncounted
+		} else {
+			*h = 0;
+		}
+	}
+	if (r == 1) {
+		*h += n;
+		b->held += n;
+	}
+	pthread_mutex_unlock(&b->lock);
+	return r;
+}
+
+void hw_budget_give(hw_budget *b, const char *key, uint64_t n) {
+	if (!b) return;
+	pthread_mutex_lock(&b->lock);
+	uint64_t *h = hw_smap_get(&b->holders, key);
+	if (h) {
+		if (n > *h) n = *h;
+		*h -= n;
+		b->held -= n;
+		if (*h == 0) {
+			hw_smap_remove(&b->holders, key);
+			free(h);
+		}
+	}
+	pthread_mutex_unlock(&b->lock);
+}
+
+uint64_t hw_budget_held(hw_budget *b, const char *key) {
+	if (!b) return 0;
+	pthread_mutex_lock(&b->lock);
+	uint64_t v = b->held;
+	if (key) {
+		const uint64_t *h = hw_smap_get(&b->holders, key);
+		v = h ? *h : 0;
+	}
+	pthread_mutex_unlock(&b->lock);
+	return v;
+}
+
 // ---------------------------------------------------------------------------------- semaphore
 
 void hw_semaphore_init(hw_semaphore *s, int64_t max) {

@@ -880,6 +880,156 @@ static void test_bandwidth_limits_downloads(void) {
 	hw_server_free(s);
 }
 
+// What the queue-budget case's uploaders and sink readers share.
+#define BUDGET_CONNS  4
+#define BUDGET_PKT    (64 * 1024)
+#define BUDGET_PKTS   256 // 16 MiB per connection, 64 MiB in all
+#define BUDGET_SHARE  (8u * 1024 * 1024)
+#define BUDGET_LAYERS (BUDGET_CONNS * 1024u * 1024 + 4u * 1024 * 1024) // uncounted chunks, kernels
+static struct {
+	hw_client *c;
+	uint32_t sid;
+	int sink;
+	_Atomic int sent; // packets hw_client_send took
+	size_t drained;
+} g_up[BUDGET_CONNS];
+
+static void *budget_upload(void *arg) {
+	int i = (int)(intptr_t)arg;
+	static const uint8_t pkt[BUDGET_PKT];
+	for (int k = 0; k < BUDGET_PKTS; k++) {
+		if (hw_client_send(g_up[i].c, g_up[i].sid, pkt, sizeof(pkt)) != 0) return NULL;
+		atomic_fetch_add(&g_up[i].sent, 1);
+	}
+	return NULL;
+}
+
+static void *budget_drain(void *arg) {
+	int i = (int)(intptr_t)arg;
+	static uint8_t buf[BUDGET_CONNS][65536];
+	while (g_up[i].drained < (size_t)BUDGET_PKTS * BUDGET_PKT) {
+		ssize_t n = recv(g_up[i].sink, buf[i], sizeof(buf[i]), 0);
+		if (n <= 0) break;
+		g_up[i].drained += (size_t)n;
+	}
+	return NULL;
+}
+
+// Queues were bounded per stream and per connection only, and one address may hold thousands of
+// connections: each uploading inside its window into a remote that reads nothing, or downloading
+// to a client that reads nothing, made the server hold that many times a connection's queue.
+// server-queue-max-per-ip bounds what one address has queued across its connections, in both
+// directions, by pausing them, never by closing anything; and a connection of the same address
+// that queues little goes on meanwhile.
+static void test_queue_budget_per_ip(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.server_queue_max = 0;
+	cfg.server_queue_max_per_ip = BUDGET_SHARE;
+	cfg.max_message_size = BUDGET_PKT + HW_WISP_HEADER_LEN;
+	cfg.buffer_remaining = BUDGET_PKTS; // one window is the whole upload: nothing waits on a CONTINUE
+	cfg.stream_queue_max = 64u * 1024 * 1024;
+	cfg.conn_queue_max = 64u * 1024 * 1024;
+	cfg.upload_window = 64u * 1024 * 1024;
+	cfg.socket_buffer_size = 64 * 1024; // the kernels hold little, so what the server took it holds
+	hw_server *s = start(&cfg);
+
+	// Uploads into remotes that read nothing.
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 16, &port);
+	CHECK(lfd >= 0, "sink listen");
+	int small = 64 * 1024;
+	setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+	pthread_t up[BUDGET_CONNS];
+	for (int i = 0; i < BUDGET_CONNS; i++) {
+		g_up[i].c = connect_plain(s);
+		CHECK_EQ(hw_client_buffer_size(g_up[i].c), BUDGET_PKTS);
+		setsockopt(hw_client_fd(g_up[i].c), SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+		CHECK_EQ(hw_client_open(g_up[i].c, HW_STREAM_TCP, "127.0.0.1", port, &g_up[i].sid), 0);
+		struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+		CHECK_EQ(poll(&pfd, 1, 5000), 1);
+		g_up[i].sink = accept(lfd, NULL, NULL);
+		CHECK(g_up[i].sink >= 0, "accept");
+		set_blocking(g_up[i].sink);
+		atomic_store(&g_up[i].sent, 0);
+		g_up[i].drained = 0;
+		CHECK_EQ(pthread_create(&up[i], NULL, budget_upload, (void *)(intptr_t)i), 0);
+	}
+	// Wait for the uploads to stop moving.
+	hw_server_stats st;
+	uint64_t last = 0, still = hw_now_ms();
+	while (hw_now_ms() - still < 700) {
+		sleep_ms(50);
+		hw_server_stats_get(s, &st);
+		if (st.bytes_in != last) still = hw_now_ms();
+		last = st.bytes_in;
+	}
+	CHECK(st.bytes_in < BUDGET_SHARE + BUDGET_LAYERS, "the server took %llu bytes of uploads nobody reads",
+	      (unsigned long long)st.bytes_in);
+	CHECK(st.queue_budget_pauses >= 1, "a connection paused for the budget");
+	CHECK(st.queue_budget_held <= BUDGET_SHARE, "%llu bytes held", (unsigned long long)st.queue_budget_held);
+	CHECK_EQ(active_connections(s), BUDGET_CONNS);
+
+	// Another connection of the same address that queues little is not held up by it.
+	hw_client *e = connect_plain(s);
+	uint32_t esid;
+	CHECK_EQ(hw_client_open(e, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &esid), 0);
+	CHECK_EQ(hw_client_send(e, esid, "hello", 5), 0);
+	uint8_t buf[8];
+	CHECK_EQ(hw_client_read_exact(e, esid, buf, 5, 5000), 5);
+
+	// The remotes read: every byte arrives, and nothing was closed.
+	pthread_t dr[BUDGET_CONNS];
+	for (int i = 0; i < BUDGET_CONNS; i++) {
+		CHECK_EQ(pthread_create(&dr[i], NULL, budget_drain, (void *)(intptr_t)i), 0);
+	}
+	for (int i = 0; i < BUDGET_CONNS; i++) {
+		pthread_join(dr[i], NULL);
+		pthread_join(up[i], NULL);
+		CHECK_EQ(atomic_load(&g_up[i].sent), BUDGET_PKTS);
+		CHECK_EQ(g_up[i].drained, (size_t)BUDGET_PKTS * BUDGET_PKT);
+	}
+	CHECK_EQ(active_connections(s), BUDGET_CONNS + 1);
+	uint64_t deadline = hw_now_ms() + 5000;
+	do {
+		hw_server_stats_get(s, &st);
+	} while (st.queue_budget_held != 0 && hw_now_ms() < deadline && (sleep_ms(10), 1));
+	CHECK_EQ(st.queue_budget_held, 0);
+
+	// Downloads to clients that read nothing: each would queue up to twice ws-write-high-water.
+	uint64_t out_before = st.bytes_out;
+	hw_client *down[BUDGET_CONNS];
+	for (int i = 0; i < BUDGET_CONNS; i++) {
+		down[i] = connect_plain(s);
+		setsockopt(hw_client_fd(down[i]), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+		uint32_t sid;
+		CHECK_EQ(hw_client_open(down[i], HW_STREAM_TCP, "127.0.0.1", g_blast_port, &sid), 0);
+	}
+	last = 0;
+	still = hw_now_ms();
+	while (hw_now_ms() - still < 700) {
+		sleep_ms(50);
+		hw_server_stats_get(s, &st);
+		if (st.bytes_out != last) still = hw_now_ms();
+		last = st.bytes_out;
+	}
+	CHECK(st.bytes_out - out_before < BUDGET_SHARE + BUDGET_LAYERS,
+	      "the server queued %llu bytes for clients that read nothing",
+	      (unsigned long long)(st.bytes_out - out_before));
+	CHECK_EQ(hw_client_send(e, esid, "again", 5), 0);
+	CHECK_EQ(hw_client_read_exact(e, esid, buf, 5, 5000), 5);
+	CHECK_EQ(active_connections(s), 2 * BUDGET_CONNS + 1);
+
+	for (int i = 0; i < BUDGET_CONNS; i++) {
+		hw_client_free(down[i]);
+		hw_client_free(g_up[i].c);
+		close(g_up[i].sink);
+	}
+	hw_client_free(e);
+	close(lfd);
+	hw_server_free(s);
+}
+
 // idle-timeout-s closes a client that has no streams and has said nothing for that long, and
 // leaves one with a stream alone however quiet it is.
 static void test_idle_timeout(void) {
@@ -1057,6 +1207,7 @@ int main(void) {
 	RUN(test_lookups_per_ip);
 	RUN(test_stream_cap_is_not_a_violation);
 	RUN(test_bandwidth_limits_downloads);
+	RUN(test_queue_budget_per_ip);
 	RUN(test_idle_timeout);
 	RUN(test_host_bytes);
 	RUN(test_raw_connects);

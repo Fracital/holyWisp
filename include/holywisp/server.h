@@ -145,10 +145,15 @@ typedef struct hw_server_config {
 	size_t upload_window;       // bytes one client may have in flight toward its remotes; 0 = ws_write_high_water
 	size_t stream_queue_max;    // bytes queued toward a remote before the stream is throttled
 	size_t conn_queue_max;      // bytes queued toward remotes across one client before its reads pause
-	size_t socket_buffer_size;  // SO_RCVBUF/SO_SNDBUF; 0 = kernel default
-	size_t client_recv_buffer;  // SO_RCVBUF on client sockets when socket_buffer_size is 0; 0 = kernel
-	int max_streams_per_conn;   // 0 = unlimited
-	int connect_timeout_ms;     // remote TCP connect
+	// Bytes queued toward clients and toward remotes across every client, and the share of it one
+	// client IP may hold: past either, a connection that would queue more stops reading its client
+	// and its remotes until its own queues drain or the budget frees. 0 = no limit.
+	uint64_t server_queue_max;
+	uint64_t server_queue_max_per_ip;
+	size_t socket_buffer_size; // SO_RCVBUF/SO_SNDBUF; 0 = kernel default
+	size_t client_recv_buffer; // SO_RCVBUF on client sockets when socket_buffer_size is 0; 0 = kernel
+	int max_streams_per_conn;  // 0 = unlimited
+	int connect_timeout_ms;    // remote TCP connect
 	// An attempt with an address of the other family still to try gets at most this long, so a
 	// name whose IPv6 (or IPv4) is broken is not a connect-timeout-ms wait. 0: the full timeout.
 	int family_fallback_ms;
@@ -224,23 +229,25 @@ typedef struct hw_server_stats {
 	uint64_t refused_connection_rate;
 	uint64_t refused_connection_limit;
 	uint64_t refused_reputation;
-	uint64_t blocked_filter;    // host/port lists
-	uint64_t blocked_egress;    // address policy
-	uint64_t throttled_source;  // per-source connect rate
-	uint64_t throttled_dest;    // per-destination connect rate
-	uint64_t throttled_syns;    // in-flight SYN cap
-	uint64_t throttled_lookups; // a client IP's share of the resolver (max-pending-lookups-per-ip)
-	uint64_t udp_warp_marked;   // UDP streams dialled through a WARP tunnel
-	uint64_t udp_warp_direct;   // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
-	uint64_t udp_warp_refused;  // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
-	uint64_t tcp_warp_marked;   // TCP streams dialled here through a WARP tunnel (tcp-warp)
-	uint64_t tcp_warp_direct;   // ... dialled unmarked under tcp-warp-fallback direct
-	uint64_t tcp_warp_refused;  // ... refused under tcp-warp-fallback refuse
-	uint64_t udp_warp_bypassed; // UDP streams to a warp-bypass-host name, sent unmarked
-	uint64_t tcp_warp_bypassed; // TCP streams dialled here to a warp-bypass-host name, unmarked
-	uint64_t tcp_proxied;       // TCP streams that went through the proxy
-	uint64_t tcp_direct;        // TCP streams dialled here although a proxy is set (proxy-only-to)
-	uint64_t syn_signatures;    // SYN-flood matches
+	uint64_t blocked_filter;      // host/port lists
+	uint64_t blocked_egress;      // address policy
+	uint64_t throttled_source;    // per-source connect rate
+	uint64_t throttled_dest;      // per-destination connect rate
+	uint64_t throttled_syns;      // in-flight SYN cap
+	uint64_t throttled_lookups;   // a client IP's share of the resolver (max-pending-lookups-per-ip)
+	uint64_t queue_budget_held;   // bytes held of server-queue-max now (whole MiB per connection)
+	uint64_t queue_budget_pauses; // connections paused for server-queue-max or its per-IP share
+	uint64_t udp_warp_marked;     // UDP streams dialled through a WARP tunnel
+	uint64_t udp_warp_direct;     // UDP streams with udp-warp-marks dialled unmarked: no usable state, or fallback
+	uint64_t udp_warp_refused;    // UDP streams refused: no tunnel for the family and udp-warp-fallback refuse
+	uint64_t tcp_warp_marked;     // TCP streams dialled here through a WARP tunnel (tcp-warp)
+	uint64_t tcp_warp_direct;     // ... dialled unmarked under tcp-warp-fallback direct
+	uint64_t tcp_warp_refused;    // ... refused under tcp-warp-fallback refuse
+	uint64_t udp_warp_bypassed;   // UDP streams to a warp-bypass-host name, sent unmarked
+	uint64_t tcp_warp_bypassed;   // TCP streams dialled here to a warp-bypass-host name, unmarked
+	uint64_t tcp_proxied;         // TCP streams that went through the proxy
+	uint64_t tcp_direct;          // TCP streams dialled here although a proxy is set (proxy-only-to)
+	uint64_t syn_signatures;      // SYN-flood matches
 	uint64_t ws_closed_violations;
 	uint64_t auth_failures;
 	uint64_t dns_cache_entries;

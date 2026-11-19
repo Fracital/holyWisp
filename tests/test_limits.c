@@ -69,6 +69,55 @@ static void test_gauge(void) {
 	hw_gauge_release(NULL, "a");
 }
 
+static void test_budget(void) {
+	hw_budget *b = hw_budget_new(100, 60);
+	CHECK(b != NULL, "new");
+	CHECK_EQ(hw_budget_take(b, "a", 40), 1);
+	CHECK_EQ(hw_budget_take(b, "a", 20), 1);
+	// The key's share is spent, and a take that would pass it takes nothing at all.
+	CHECK_EQ(hw_budget_take(b, "a", 1), 0);
+	CHECK_EQ(hw_budget_held(b, "a"), 60);
+	// Another key has a share of its own, but the total is shared: 40 are left of it.
+	CHECK_EQ(hw_budget_take(b, "b", 50), 0);
+	CHECK_EQ(hw_budget_take(b, "b", 40), 1);
+	CHECK_EQ(hw_budget_held(b, NULL), 100);
+	CHECK_EQ(hw_budget_take(b, "c", 1), 0);
+	// Giving back frees the key's share and the total alike.
+	hw_budget_give(b, "a", 30);
+	CHECK_EQ(hw_budget_held(b, "a"), 30);
+	CHECK_EQ(hw_budget_take(b, "c", 30), 1);
+	CHECK_EQ(hw_budget_held(b, NULL), 100);
+	// More given back than held stops at zero and lends the next take nothing.
+	hw_budget_give(b, "c", 1000);
+	CHECK_EQ(hw_budget_held(b, "c"), 0);
+	CHECK_EQ(hw_budget_held(b, NULL), 70);
+	hw_budget_give(b, "nobody", 5);
+	CHECK_EQ(hw_budget_held(b, NULL), 70);
+	CHECK_EQ(hw_budget_take(b, "c", 31), 0);
+	CHECK_EQ(hw_budget_take(b, "c", 30), 1);
+	hw_budget_free(b);
+	// No limits: everything is taken, and still counted.
+	hw_budget *u = hw_budget_new(0, 0);
+	CHECK_EQ(hw_budget_take(u, "a", UINT64_MAX / 2), 1);
+	CHECK_EQ(hw_budget_take(u, "a", UINT64_MAX / 4), 1);
+	CHECK_EQ(hw_budget_held(u, "a"), UINT64_MAX / 2 + UINT64_MAX / 4);
+	hw_budget_free(u);
+	// A total alone, and a share alone.
+	hw_budget *t = hw_budget_new(10, 0);
+	CHECK_EQ(hw_budget_take(t, "a", 10), 1);
+	CHECK_EQ(hw_budget_take(t, "b", 1), 0);
+	hw_budget_free(t);
+	hw_budget *k = hw_budget_new(0, 10);
+	CHECK_EQ(hw_budget_take(k, "a", 10), 1);
+	CHECK_EQ(hw_budget_take(k, "a", 1), 0);
+	CHECK_EQ(hw_budget_take(k, "b", 10), 1);
+	hw_budget_free(k);
+	// No budget at all: let through, nothing to give back.
+	CHECK_EQ(hw_budget_take(NULL, "a", 1), -1);
+	hw_budget_give(NULL, "a", 1);
+	CHECK_EQ(hw_budget_held(NULL, "a"), 0);
+}
+
 static void test_bandwidth(void) {
 	// 1 MiB/s. The first second is a free burst, then charges accrue.
 	hw_bandwidth *b = hw_bandwidth_new(1024 * 1024);
@@ -134,6 +183,7 @@ int main(void) {
 	RUN(test_window);
 	RUN(test_semaphore);
 	RUN(test_gauge);
+	RUN(test_budget);
 	RUN(test_bandwidth);
 	RUN(test_bandwidth_evict);
 	RUN(test_sigdet);

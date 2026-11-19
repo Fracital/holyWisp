@@ -194,6 +194,10 @@ void conn_close(hw_conn *c) {
 		hw_gauge_release(c->w->server->conns_per_ip, c->ip);
 		c->ip_slot = 0;
 	}
+	if (c->budget_held) { // taken under this c->ip: it does not change after the upgrade
+		hw_budget_give(c->w->server->queue_budget, c->ip, c->budget_held);
+		c->budget_held = 0;
+	}
 	atomic_fetch_sub(&c->w->server->connections_active, 1);
 	HW_DEBUG("conn", "%s: closed", c->peer);
 	hw_loop_post(c->w->loop, conn_free_task, c);
@@ -222,12 +226,13 @@ int conn_violation(hw_conn *c, const char *reason) {
 	return 0;
 }
 
-// Reads from the client stop for four reasons: the bandwidth throttle, too much queued toward slow
+// Reads from the client stop for five reasons: the bandwidth throttle, too much queued toward slow
 // remotes (conn-queue-max), too much queued toward the client itself, which is a client that sends
-// but does not read (conn_backpressure), and a plain HTTP reply on its way out, after which nothing
-// the client sends is wanted (reading it would only grow rbuf).
+// but does not read (conn_backpressure), the server-wide queue budget or its per-IP share spent
+// (conn_budget_sync), and a plain HTTP reply on its way out, after which nothing the client sends
+// is wanted (reading it would only grow rbuf).
 static int conn_reads_stopped(const hw_conn *c) {
-	return c->throttled || c->read_paused || c->wr_stalled || c->state == CONN_HTTP_REPLY;
+	return c->throttled || c->read_paused || c->wr_stalled || c->budget_paused || c->state == CONN_HTTP_REPLY;
 }
 
 // The client socket's event mask follows that and one more bit: writes are wanted while wbuf (or
@@ -257,11 +262,11 @@ static int resume_visit(uint32_t key, void *value, void *ud) {
 	return 0;
 }
 
-// The streams read from their remotes unless the client's send queue is over its mark or the
-// connection is over its bandwidth. `paused` is what stream.c looks at; this keeps it and every
-// stream's read interest equal to the two reasons.
+// The streams read from their remotes unless the client's send queue is over its mark, the
+// connection is over its bandwidth or it may not queue more (the queue budget). `paused` is what
+// stream.c looks at; this keeps it and every stream's read interest equal to the three reasons.
 static void conn_sync_streams(hw_conn *c) {
-	int want = c->bp_paused || c->throttled;
+	int want = c->bp_paused || c->throttled || c->budget_paused;
 	if (want == c->paused) return;
 	c->paused = want;
 	hw_map_each(&c->streams, want ? pause_visit : resume_visit, NULL);
@@ -358,6 +363,61 @@ uint32_t conn_window(hw_conn *c, hw_stream *s) {
 	return (uint32_t)w;
 }
 
+// ---- the queue budget
+//
+// Every queue is bounded per stream or per connection, and the connections of one address only
+// by max-concurrent-connections-per-ip, which is thousands: on their own, one address could make
+// the server hold that many times conn-queue-max. server-queue-max bounds what every connection
+// together queues toward its client and its remotes, and server-queue-max-per-ip what those of
+// one client address do, so that no address can take the whole of it.
+//
+// The budget is shared by all workers and locked, so a connection takes and gives back whole
+// chunks of it, never bytes: it holds what it queues rounded down to a chunk, takes a chunk when
+// its queues pass the next one and gives back only once they are a chunk below what it holds,
+// or all of it once they are under one chunk.
+// Below one chunk it never touches the lock, and a queue swinging between the backpressure marks
+// costs a few locked operations per megabyte that moves. What a connection queues uncounted is
+// under one chunk.
+//
+// A refused take is a pause, never a drop: the connection stops reading its client and its
+// remotes (conn_reads_stopped, conn_sync_streams), and everything it has queued still drains.
+// It goes on as soon as it can take again or its own queues have drained to what it holds, so
+// it needs no timer: draining is what calls this. A connection whose peers never read is held
+// for as long as they do not, and closed by client-write-timeout-s for its client.
+#define BUDGET_CHUNK (1024 * 1024)
+
+static void conn_budget_sync(hw_conn *c) {
+	hw_budget *b = c->w->server->queue_budget;
+	// Only an upgraded connection: c->ip may still change before that, and an HTTP reply is small.
+	if (!b || c->closing || c->state != CONN_WS) return;
+	uint64_t queued = (uint64_t)c->queued_out + c->q_client;
+	uint64_t want = queued / BUDGET_CHUNK * BUDGET_CHUNK;
+	int pause = 0;
+	if (want > c->budget_held) {
+		int r = hw_budget_take(b, c->ip, want - c->budget_held);
+		if (r == 1) {
+			c->budget_held = want;
+		} else if (r == 0) {
+			pause = 1;
+		} // -1: no memory for the count, let through uncounted (fail open)
+	} else if (c->budget_held > want + BUDGET_CHUNK || (want == 0 && c->budget_held > 0)) {
+		// One chunk is kept against a queue that swings, but not by a queue that has drained:
+		// idle connections would hold a chunk each of their address's share.
+		uint64_t keep = want ? want + BUDGET_CHUNK : 0;
+		hw_budget_give(b, c->ip, c->budget_held - keep);
+		c->budget_held = keep;
+	}
+	if (pause == c->budget_paused) return;
+	c->budget_paused = pause;
+	if (pause) {
+		HW_DEBUG("conn", "%s (%s): %llu bytes queued, over the queue budget: pausing", c->peer, c->ip,
+		         (unsigned long long)queued);
+		HW_STAT_INC(c->w->server, queue_budget_pauses);
+	}
+	conn_apply_events(c);
+	conn_sync_streams(c);
+}
+
 void conn_queue_add(hw_conn *c, size_t n) {
 	c->queued_out += n;
 	if (!c->read_paused && c->queued_out > c->w->server->cfg.conn_queue_max) {
@@ -365,6 +425,7 @@ void conn_queue_add(hw_conn *c, size_t n) {
 		c->read_paused = 1;
 		conn_apply_events(c);
 	}
+	conn_budget_sync(c);
 }
 
 void conn_queue_sub(hw_conn *c, size_t n) {
@@ -373,6 +434,7 @@ void conn_queue_sub(hw_conn *c, size_t n) {
 		c->read_paused = 0;
 		conn_apply_events(c);
 	}
+	conn_budget_sync(c);
 }
 
 // ---------------------------------------------------------------------------------- writing
@@ -524,6 +586,9 @@ static size_t conn_wt_lane_marks(hw_conn *c, size_t high) {
 static void conn_backpressure(hw_conn *c) {
 	size_t queued = conn_queued(c);
 	size_t high = c->w->server->cfg.ws_write_high_water;
+	c->q_client = queued;
+	conn_budget_sync(c);
+	if (c->closing) return;
 	if (c->wt) high = conn_wt_lane_marks(c, high);
 	if (!c->bp_paused && queued > high) {
 		c->bp_paused = 1;
@@ -919,6 +984,7 @@ static void stats_json(hw_conn *c) {
 	         "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},"
 	         "\"blocked\":{\"filter\":%llu,\"egress\":%llu},"
 	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu,\"lookups\":%llu},"
+	         "\"queueBudget\":{\"held\":%llu,\"pauses\":%llu},"
 	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
 	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
@@ -934,7 +1000,8 @@ static void stats_json(hw_conn *c) {
 	         (unsigned long long)st.refused_reputation, (unsigned long long)st.blocked_filter,
 	         (unsigned long long)st.blocked_egress, (unsigned long long)st.throttled_source,
 	         (unsigned long long)st.throttled_dest, (unsigned long long)st.throttled_syns,
-	         (unsigned long long)st.throttled_lookups, (unsigned long long)st.udp_warp_marked,
+	         (unsigned long long)st.throttled_lookups, (unsigned long long)st.queue_budget_held,
+	         (unsigned long long)st.queue_budget_pauses, (unsigned long long)st.udp_warp_marked,
 	         (unsigned long long)st.udp_warp_direct, (unsigned long long)st.udp_warp_refused,
 	         (unsigned long long)st.udp_warp_bypassed, (unsigned long long)st.tcp_warp_marked,
 	         (unsigned long long)st.tcp_warp_direct, (unsigned long long)st.tcp_warp_refused,

@@ -135,6 +135,8 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("upload-window", upload_window, 0, 1LL << 31)
 	INT_KEY("stream-queue-max", stream_queue_max, 4096, 1LL << 31)
 	INT_KEY("conn-queue-max", conn_queue_max, 4096, 1LL << 31)
+	INT_KEY("server-queue-max", server_queue_max, 0, 1LL << 50)
+	INT_KEY("server-queue-max-per-ip", server_queue_max_per_ip, 0, 1LL << 50)
 	INT_KEY("socket-buffer-size", socket_buffer_size, 0, 1LL << 30)
 	INT_KEY("client-recv-buffer", client_recv_buffer, 0, 1LL << 30)
 	INT_KEY("max-streams-per-conn", max_streams_per_conn, 0, 1 << 20)
@@ -521,6 +523,8 @@ void hw_config_usage(const char *argv0) {
 	printf("  buffer-remaining                          CONTINUE window in packets (128)\n"
 	       "  stream-queue-max, conn-queue-max          bytes queued toward remotes: per stream (128 MiB, closes\n"
 	       "                                            0x49), per client (256 MiB, pauses its reads)\n"
+	       "  server-queue-max, server-queue-max-per-ip bytes queued toward clients and remotes: by every client\n"
+	       "                                            (4 GiB), by one client IP (1 GiB); past it, more pauses\n"
 	       "  max-message-size, ws-write-high-water, socket-buffer-size\n"
 	       "  upload-window                             bytes a client may have in flight toward its remotes,\n"
 	       "                                            shared by its streams (0 = ws-write-high-water)\n"

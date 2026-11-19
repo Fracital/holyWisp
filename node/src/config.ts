@@ -191,6 +191,10 @@ export type holyWispConfig = {
 	uploadWindow?: number;
 	streamQueueMax?: number;
 	connQueueMax?: number;
+	/** Bytes queued toward clients and remotes by every connection together (default 4 GiB, 0 off). */
+	serverQueueMax?: number;
+	/** Of `serverQueueMax`, what the connections of one client address may queue (default 1 GiB, 0 off). */
+	serverQueueMaxPerIP?: number;
 	socketBufferSize?: number;
 	clientRecvBuffer?: number;
 	connectTimeoutMs?: number;
@@ -540,6 +544,8 @@ export function workerArgs(
 	int("upload-window", "uploadWindow", config.uploadWindow);
 	int("stream-queue-max", "streamQueueMax", config.streamQueueMax);
 	int("conn-queue-max", "connQueueMax", config.connQueueMax);
+	int("server-queue-max", "serverQueueMax", config.serverQueueMax);
+	int("server-queue-max-per-ip", "serverQueueMaxPerIP", config.serverQueueMaxPerIP);
 	int("socket-buffer-size", "socketBufferSize", config.socketBufferSize);
 	int("client-recv-buffer", "clientRecvBuffer", config.clientRecvBuffer);
 	int("connect-timeout-ms", "connectTimeoutMs", config.connectTimeoutMs);

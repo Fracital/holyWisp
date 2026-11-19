@@ -52,6 +52,8 @@ export type holyWispStats = {
 	refused: { connectionRate: number; connectionLimit: number; reputation: number };
 	blocked: { filter: number; egress: number };
 	throttled: { source: number; dest: number; syns: number };
+	/** server-queue-max: bytes held of it now, and connections paused for it so far. */
+	queueBudget: { held: number; pauses: number };
 	synSignatures: number;
 	wsClosedViolations: number;
 	authFailures: number;

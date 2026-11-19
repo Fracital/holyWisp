@@ -176,8 +176,9 @@ struct hw_server {
 	hw_window *per_dest_min; // ... per minute
 	hw_semaphore in_flight_syns;
 	hw_semaphore connections;
-	hw_gauge *syns_per_ip;  // TCP connects in progress per client IP
-	hw_gauge *conns_per_ip; // WebSocket clients per client IP
+	hw_gauge *syns_per_ip;   // TCP connects in progress per client IP
+	hw_gauge *conns_per_ip;  // WebSocket clients per client IP
+	hw_budget *queue_budget; // server-queue-max and its per-IP share (conn_budget_sync)
 	hw_bandwidth *bandwidth;
 	hw_reputation *reputation;
 
@@ -238,6 +239,7 @@ struct hw_server {
 	_Atomic uint64_t throttled_dest;
 	_Atomic uint64_t throttled_syns;
 	_Atomic uint64_t throttled_lookups;
+	_Atomic uint64_t queue_budget_pauses;
 	_Atomic uint64_t udp_warp_marked;
 	_Atomic uint64_t udp_warp_direct;
 	_Atomic uint64_t udp_warp_refused;
@@ -315,7 +317,13 @@ typedef struct hw_conn {
 	uint32_t pt_stream;
 	uint8_t pt_mask[4];
 	size_t pt_off;
-	int read_paused;    // client reads suspended: queued_out past conn-queue-max
+	int read_paused; // client reads suspended: queued_out past conn-queue-max
+	// server-queue-max: what this connection holds of the budget (whole BUDGET_CHUNKs), what was
+	// queued toward the client at the last look (conn_backpressure), and whether a take was
+	// refused, which stops the client's reads and the remotes' until it can take again.
+	uint64_t budget_held;
+	size_t q_client;
+	int budget_paused;
 	int wr_stalled;     // client reads suspended: its own send queue is far past the high-water mark
 	int wrote;          // bytes left for the client since the worker's last sweep
 	uint64_t stall_ms;  // when a sweep first found the send queue not moving, 0 while it moves

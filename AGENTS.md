@@ -379,7 +379,8 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   not `flood-protection` is). The resolver's threads are shared the same way: the client
   addresses take turns for them, one the pool was doing nothing for first, and one address never holds
   all of them (`pool_take`), so names that never resolve delay another client's lookup by one
-  lookup at most (`test_lookups_per_ip`). A new server-wide cap needs one too. The SYN-signature
+  lookup at most (`test_lookups_per_ip`); `server-queue-max-per-ip` beside `server-queue-max`
+  (`hw_budget`). A new server-wide cap needs one too. The SYN-signature
   records a connection keeps are bounded (`SIGDET_MAX_PER_CONN`, oldest reused), and the
   resolver and the password pool have bounded queues that fail the newcomer (`EAI_AGAIN`,
   CLOSE `0x49`) instead of growing.
@@ -584,6 +585,12 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   Toward a slow remote, bytes queue in `s->out` up to `stream-queue-max` (and `conn-queue-max`
   across the connection, which pauses the client's reads instead), then the stream closes
   `0x49`. Both limits are configuration; neither may become unbounded.
+  Across connections, `server-queue-max` and its per-IP share bound the sum of both directions'
+  queues (`conn_budget_sync`, in whole MiB per connection so the shared lock is touched once per
+  megabyte that moves, never per packet): a connection that cannot take more stops reading its
+  client and its remotes (`budget_paused`) and goes on when its own queues drain or the budget
+  frees. It is a pause and never a close, and a connection queueing under 1 MiB never waits for
+  it. `test_queue_budget_per_ip` in `test_abuse` holds it.
 - The resolver owns `hw_resolve_req` from `hw_resolve()` until its delivery task runs or
   `hw_resolver_free` drops it. Cancellation is a flag read on the loop thread. Do not free a
   request from stream code. `auth.c` is the same pattern for `hw_auth_req` (`auth_check`,

@@ -51,6 +51,12 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->ws_write_high_water = 8u * 1024 * 1024;
 	cfg->stream_queue_max = 128u * 1024 * 1024;
 	cfg->conn_queue_max = 256u * 1024 * 1024;
+	// A client's queues are bounded per stream and per connection, and connections per IP only by
+	// max-concurrent-connections-per-ip: 5000 connections of one address could each queue their
+	// 256 MiB. No deployment queues gigabytes for one address, and these bound what one address
+	// and every address together can make the server hold.
+	cfg->server_queue_max = 4ull * 1024 * 1024 * 1024;
+	cfg->server_queue_max_per_ip = 1ull * 1024 * 1024 * 1024;
 	cfg->client_recv_buffer = 8u * 1024 * 1024;
 	cfg->max_streams_per_conn = 2048;
 	cfg->connect_timeout_ms = 15000;
@@ -736,6 +742,10 @@ static int build_limiters(hw_server *s) {
 		s->bandwidth = hw_bandwidth_new((uint64_t)cfg->bandwidth_limit_kbps * 1000 / 8);
 		if (!s->bandwidth) return -1;
 	}
+	if (cfg->server_queue_max > 0 || cfg->server_queue_max_per_ip > 0) {
+		s->queue_budget = hw_budget_new(cfg->server_queue_max, cfg->server_queue_max_per_ip);
+		if (!s->queue_budget) return -1;
+	}
 	if (cfg->flood.enabled) {
 		const hw_flood_config *f = &cfg->flood;
 		if (f->max_connects_per_source_per_second > 0) {
@@ -902,6 +912,7 @@ fail: {
 	hw_bandwidth_free(s->bandwidth);
 	hw_gauge_free(s->syns_per_ip);
 	hw_gauge_free(s->conns_per_ip);
+	hw_budget_free(s->queue_budget);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
@@ -1001,6 +1012,7 @@ void hw_server_free(hw_server *s) {
 	hw_bandwidth_free(s->bandwidth);
 	hw_gauge_free(s->syns_per_ip);
 	hw_gauge_free(s->conns_per_ip);
+	hw_budget_free(s->queue_budget);
 	hw_reputation_free(s->reputation);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
@@ -1040,6 +1052,8 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->throttled_dest = atomic_load(&s->throttled_dest);
 	out->throttled_syns = atomic_load(&s->throttled_syns);
 	out->throttled_lookups = atomic_load(&s->throttled_lookups);
+	out->queue_budget_held = hw_budget_held(s->queue_budget, NULL);
+	out->queue_budget_pauses = atomic_load(&s->queue_budget_pauses);
 	out->udp_warp_marked = atomic_load(&s->udp_warp_marked);
 	out->udp_warp_direct = atomic_load(&s->udp_warp_direct);
 	out->udp_warp_refused = atomic_load(&s->udp_warp_refused);

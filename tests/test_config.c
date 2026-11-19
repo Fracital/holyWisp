@@ -128,6 +128,20 @@ static void test_stream_credit_key(void) {
 	CHECK_EQ(cfg.stream_credit, 1);
 }
 
+// The queue budget: on by default, sizes past 4 GiB (a 64-bit field), 0 turns either half off.
+static void test_server_queue_keys(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(cfg.server_queue_max, 4ull << 30);
+	CHECK_EQ(cfg.server_queue_max_per_ip, 1ull << 30);
+	CHECK_EQ(hw_config_set(&cfg, "server-queue-max", "17179869184", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.server_queue_max, 16ull << 30);
+	CHECK_EQ(hw_config_set(&cfg, "server-queue-max-per-ip", "0", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.server_queue_max_per_ip, 0);
+	CHECK(hw_config_set(&cfg, "server-queue-max", "-1", err, sizeof(err)) != 0, "rejects a negative size");
+}
+
 static void test_proxy_client_key_keys(void) {
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
@@ -275,6 +289,7 @@ int main(void) {
 	RUN(test_busy_poll_key);
 	RUN(test_stop_on_stdin_eof_key);
 	RUN(test_stream_credit_key);
+	RUN(test_server_queue_keys);
 	RUN(test_proxy_client_key_keys);
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);
