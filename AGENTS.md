@@ -561,7 +561,13 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   (`conn_send_continue` flushes; the client is stalled until it arrives, and deferring it
   measurably slowed a connection with ten busy streams) and anything sent right before `conn_close` (flush first, as
   `handle_info` does, or the frame is lost with the socket). The list is emptied before any
-  `conn_free_task` can run, which is what makes it safe to hold `hw_conn` pointers in it. The
+  `conn_free_task` can run, which is what makes it safe to hold `hw_conn` pointers in it. Nor do
+  a refill CONTINUE or a pong wait behind a queued download: after the opening, on a WebSocket,
+  they go on `c->pri` (`conn_send_ahead`), which `conn_flush` sends at the next frame boundary of
+  `wbuf` (`fr_end`, walked one header per frame as bytes leave; a mark at `wsent` is mid-frame),
+  gathered with what follows in one `sendmsg`. Frames never interleave, every such frame goes
+  there so they keep their order among themselves, CLOSE and DATA stay in order in `wbuf`, and
+  the stream-0 CONTINUE of the opening never goes ahead (`test_continue_ahead_of_download`). The
   retries after a short write in `conn_flush` and `conn_splice_data` are deliberate: removing them
   saved 11% of the syscalls and lost 3 to 4% of throughput.
 - **The unmask.** `hw_ws_mask` is the server's only per-byte work in user space (every uploaded

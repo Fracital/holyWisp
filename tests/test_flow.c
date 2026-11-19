@@ -25,10 +25,12 @@
 #include <unistd.h>
 
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 
 static uint16_t g_echo_port;
 static uint16_t g_blast_port;
+static uint16_t g_big_port;
 
 #define BLAST_BYTES  (2u * 1024 * 1024)
 #define BLAST_SEED   77u
@@ -127,6 +129,32 @@ static void *blast_conn(void *arg) {
 
 static void *blast_main(void *arg) {
 	return accept_loop((int)(intptr_t)arg, blast_conn);
+}
+
+// Big service: a download larger than the kernels between it and a client can hold, in small
+// unbuffered writes; then it waits for the peer to go. With the relay's receive buffer small too,
+// no read of it fills HW_READ_CHUNK, so the relay copies it into the queue (a stream that splices
+// queues one frame at a time: it parks until its pipe has drained).
+#define BIG_BYTES  (6u * 1024 * 1024)
+#define BIG_SNDBUF (8 * 1024)
+static void *big_conn(void *arg) {
+	int fd = (int)(intptr_t)arg;
+	int sz = BIG_SNDBUF, on = 1;
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
+	static const uint8_t chunk[BIG_SNDBUF];
+	for (size_t sent = 0; sent < BIG_BYTES; sent += sizeof(chunk)) {
+		if (write_full(fd, chunk, sizeof(chunk)) != 0) break;
+	}
+	uint8_t buf[256];
+	while (read(fd, buf, sizeof(buf)) > 0) {
+	}
+	close(fd);
+	return NULL;
+}
+
+static void *big_main(void *arg) {
+	return accept_loop((int)(intptr_t)arg, big_conn);
 }
 
 static void start_service(void *(*fn)(void *), uint16_t *port) {
@@ -489,6 +517,80 @@ static void test_upload_window(void) {
 	CHECK_EQ(refill_after_window(256 * 1024, 0, 30, 1), 8);          // two uploading streams split it
 }
 
+// A refill CONTINUE is not queued behind a download already waiting for the client: it goes at the
+// next frame boundary. The client reads nothing until the server holds megabytes of a download on
+// one stream, then spends a window on another stream and counts the download's bytes that reach it
+// before that stream's CONTINUE: what the kernels held and the frame under way, not the queue. A
+// byte count, not a time, so it does not depend on the machine's speed.
+static size_t download_before_continue(int v2) {
+	enum {
+		PKT = 256 // a window of them fits the kernel toward the sink, so the CONTINUE is never held
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	// The kernels hold little, so the rest is the server's queue; and the remote's reads are small,
+	// so the stream copies (big_conn).
+	cfg.socket_buffer_size = 16 * 1024;
+	hw_server *s = start_server(&cfg);
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "sink listen");
+
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_port(s);
+	o.timeout_ms = 5000;
+	o.v2 = v2;
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "connect: %s", err);
+	int small = 64 * 1024;
+	setsockopt(hw_client_fd(c), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+	uint32_t window = hw_client_buffer_size(c);
+
+	uint32_t down;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_big_port, &down), 0);
+	// Until the download is all framed: the client reads nothing, so what is not in the kernels is
+	// queued.
+	hw_server_stats st;
+	uint64_t last = 0, still = hw_now_ms(), deadline = still + 10000;
+	while (last < BIG_BYTES && hw_now_ms() - still < 2000 && hw_now_ms() < deadline) {
+		usleep(20 * 1000);
+		hw_server_stats_get(s, &st);
+		if (st.bytes_out != last) still = hw_now_ms();
+		last = st.bytes_out;
+	}
+	CHECK_EQ(st.bytes_out, BIG_BYTES);
+
+	uint32_t up;
+	int sink = open_to_sink(c, lfd, port, &up);
+	uint8_t pkt[PKT];
+	memset(pkt, 'u', sizeof(pkt));
+	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, up, pkt, sizeof(pkt)), 0);
+	size_t before = 0;
+	for (;;) {
+		hw_client_event ev;
+		CHECK_EQ(hw_client_poll(c, 5000, &ev), 1);
+		if (ev.stream_id == down && ev.type == HW_CEV_DATA) before += ev.len;
+		if (ev.stream_id == up && ev.type == HW_CEV_CONTINUE) break;
+		CHECK(ev.type != HW_CEV_CLOSE || ev.stream_id != up, "upload stream closed (reason %u)", ev.reason);
+	}
+	close(sink);
+	close(lfd);
+	hw_client_free(c);
+	hw_server_free(s);
+	return before;
+}
+
+static void test_continue_ahead_of_download(void) {
+	for (int v2 = 0; v2 <= 1; v2++) {
+		size_t before = download_before_continue(v2);
+		CHECK(before < 1024 * 1024, "v%d: %zu bytes of a %u-byte download came before the CONTINUE", v2 + 1, before,
+		      BIG_BYTES);
+	}
+}
+
 // A sender thread for the connection-budget test: hw_client_send blocks once the server stops
 // reading, which is exactly what the test wants to observe, so it cannot run on the test thread.
 static struct {
@@ -634,6 +736,7 @@ int main(void) {
 	hw_log_set_level(HW_LOG_ERROR);
 	start_service(echo_main, &g_echo_port);
 	start_service(blast_main, &g_blast_port);
+	start_service(big_main, &g_big_port);
 	RUN(test_data_before_connect_completes);
 	RUN(test_egress_frames_within_max_message);
 	RUN(test_egress_frames_capped);
@@ -641,5 +744,6 @@ int main(void) {
 	RUN(test_ingress_window_stalled_upstream);
 	RUN(test_conn_queue_pauses_reads);
 	RUN(test_upload_window);
+	RUN(test_continue_ahead_of_download);
 	return 0;
 }

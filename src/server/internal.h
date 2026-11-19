@@ -285,6 +285,12 @@ typedef struct hw_conn {
 	hw_pipe_mark *marks;
 	size_t mark_head, mark_count, mark_cap;
 	uint64_t wsent;
+	// Frames the client is waiting on (a refill CONTINUE, a pong), sent at the next frame boundary
+	// of wbuf instead of behind it (conn_send_ahead): fr_end is where the frame being sent ends its
+	// part in wbuf, in wsent's count, and pri_mid says a frame of pri is half sent.
+	hw_buf pri;
+	uint64_t fr_end;
+	int pri_mid;
 	size_t pipe_bytes; // sum of the marks' n: what backpressure counts besides wbuf
 	hw_buf frag;       // reassembly of a fragmented binary message
 	int frag_active;

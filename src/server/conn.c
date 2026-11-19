@@ -83,6 +83,7 @@ static void conn_release(hw_conn *c) {
 	hw_buf_free(&c->wbuf);
 	free(c->marks);
 	hw_buf_free(&c->frag);
+	hw_buf_free(&c->pri);
 	hw_map_free(&c->streams);
 	hw_smap_each(&c->sigdets, free_sigdet_visit, NULL);
 	hw_smap_free(&c->sigdets);
@@ -125,6 +126,7 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 	hw_buf_init(&c->rbuf);
 	hw_buf_init(&c->wbuf);
 	hw_buf_init(&c->frag);
+	hw_buf_init(&c->pri);
 	hw_map_init(&c->streams);
 	hw_smap_init(&c->sigdets);
 	memcpy(&c->peer_addr, peer, peer->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
@@ -535,7 +537,7 @@ static void marks_free(hw_conn *c) {
 // Everything queued toward the client: the write buffer plus the payloads still in pipes.
 static size_t conn_queued(const hw_conn *c) {
 	if (c->wt) return wt_conn_queued(c->wt); // the session's queue stands in for wbuf
-	return hw_buf_avail(&c->wbuf) + c->pipe_bytes;
+	return hw_buf_avail(&c->wbuf) + c->pipe_bytes + hw_buf_avail(&c->pri);
 }
 
 typedef struct {
@@ -643,9 +645,39 @@ void conn_sweep(hw_worker *w) {
 	}
 }
 
+// The wire length of a frame the server wrote (hw_ws_write_header: unmasked, the shortest length
+// form), from its header, which wbuf always holds whole.
+static uint64_t frame_wire_len(const uint8_t *p) {
+	uint8_t code = p[1] & 0x7f;
+	if (code < 126) return 2 + (uint64_t)code;
+	if (code == 126) return 4 + ((uint64_t)p[2] << 8 | p[3]);
+	uint64_t n = 0;
+	for (int i = 0; i < 8; i++) n = n << 8 | p[2 + i];
+	return 10 + n;
+}
+
+// n bytes from the head of wbuf have just been sent (they are still in it): move fr_end over the
+// frames they began. Only the head mark can lie inside one of them, since a send stops at it, and
+// a frame with a mark inside ends its part in wbuf there: its payload follows from the pipe. One
+// header read per frame, and none for the bytes of a frame already begun.
+static void conn_frames_walk(hw_conn *c, size_t n) {
+	if (c->state != CONN_WS) return; // the HTTP head is not frames; http_process sets fr_end past it
+	uint64_t to = c->wsent + n;
+	const hw_pipe_mark *m = c->mark_count ? &c->marks[c->mark_head] : NULL;
+	while (c->fr_end < to) {
+		uint64_t end = c->fr_end + frame_wire_len(hw_buf_head(&c->wbuf) + (c->fr_end - c->wsent));
+		if (m && m->at > c->fr_end && m->at < end) end = m->at;
+		c->fr_end = end;
+	}
+}
+
 // The queue is wbuf with pipe payloads spliced in at the marks: bytes are sent from wbuf until
 // the head mark's position, then that pipe is emptied into the socket, and so on. A frame header
 // is always the last thing in wbuf before its mark, so frames never interleave.
+//
+// pri goes ahead of all that at the next frame boundary: where the frame under way has ended in
+// wbuf and no pipe payload is owed at that point (a mark at wsent is the middle of a frame). Once a
+// frame of pri has begun, pri is sent to its end before anything else.
 //
 // After a short write or a large splice the loops here and in conn_splice_data ask the kernel
 // again, and about one call in eight comes back EAGAIN. That looks like waste and is not: taking
@@ -662,8 +694,32 @@ void conn_flush(hw_conn *c) {
 	for (;;) {
 		size_t avail = hw_buf_avail(&c->wbuf);
 		hw_pipe_mark *m = c->mark_count ? &c->marks[c->mark_head] : NULL;
+		size_t ahead = hw_buf_avail(&c->pri);
 		ssize_t n;
-		if (m && m->at == c->wsent) {
+		if (ahead > 0 && (c->pri_mid || (!(m && m->at == c->wsent) && (c->fr_end <= c->wsent || avail == 0)))) {
+			// pri, and behind it in the same call what wbuf holds up to its head mark: what goes
+			// ahead costs no syscall of its own. (The casts: iovec is not const, sendmsg only reads.)
+			struct iovec iov[2] = {{.iov_base = (void *)(uintptr_t)hw_buf_head(&c->pri), .iov_len = ahead}};
+			size_t more = avail;
+			if (m && m->at - c->wsent < more) more = (size_t)(m->at - c->wsent);
+			iov[1].iov_base = (void *)(uintptr_t)hw_buf_head(&c->wbuf);
+			iov[1].iov_len = more;
+			struct msghdr mh = {.msg_iov = iov, .msg_iovlen = more > 0 ? 2 : 1};
+			n = sendmsg(c->fd, &mh, HW_MSG_NOSIGNAL | MSG_DONTWAIT);
+			if (n > 0) {
+				size_t took = (size_t)n < ahead ? (size_t)n : ahead;
+				hw_buf_consume(&c->pri, took);
+				c->pri_mid = took < ahead;
+				size_t rest = (size_t)n - took;
+				if (rest > 0) {
+					conn_frames_walk(c, rest);
+					hw_buf_consume(&c->wbuf, rest);
+					c->wsent += (uint64_t)rest;
+				}
+				c->wrote = 1;
+				continue;
+			}
+		} else if (m && m->at == c->wsent) {
 			n = hw_sys_splice(m->p->fd[0], c->fd, m->n);
 			if (n > 0) {
 				m->n -= (size_t)n;
@@ -687,8 +743,13 @@ void conn_flush(hw_conn *c) {
 				want = (size_t)(m->at - c->wsent);
 				flags |= HW_MSG_MORE; // a payload follows from its pipe
 			}
+			if (ahead > 0 && c->fr_end - c->wsent < want) {
+				want = (size_t)(c->fr_end - c->wsent); // to the end of this frame: pri goes next
+				flags &= ~HW_MSG_MORE;
+			}
 			n = send(c->fd, hw_buf_head(&c->wbuf), want, flags);
 			if (n > 0) {
+				conn_frames_walk(c, (size_t)n);
 				hw_buf_consume(&c->wbuf, (size_t)n);
 				c->wsent += (uint64_t)n;
 				c->wrote = 1;
@@ -709,6 +770,7 @@ void conn_flush(hw_conn *c) {
 	}
 	arm_write(c, 0);
 	hw_buf_shrink(&c->wbuf, CONN_WBUF_KEEP);
+	hw_buf_shrink(&c->pri, CONN_DEFER_MAX);
 	conn_backpressure(c);
 	if (c->state == CONN_HTTP_REPLY) conn_close(c);
 }
@@ -890,12 +952,40 @@ int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t l
 	return c->closing ? -1 : 0;
 }
 
+// Whether a frame the client is waiting on goes ahead of what is queued for it (pri): on a
+// WebSocket, once the opening is over. Every such frame goes there, an empty queue or not, so they
+// keep their order among themselves: two CONTINUEs of one stream never swap, nor two pongs.
+static int conn_ahead(const hw_conn *c) {
+	return !c->wt && c->state == CONN_WS && c->handshake_done;
+}
+
+// Queue a frame on pri. It never waits behind the download that fills wbuf, only for the end of
+// the frame being sent (at most CONN_FRAME_MAX of payload): a refill CONTINUE behind 2 MiB of
+// queue cost that upload 2 MiB of the client's downlink per round trip.
+static int conn_send_ahead(hw_conn *c, uint8_t opcode, const uint8_t *payload, size_t len) {
+	uint8_t hdr[HW_WS_MAX_HEADER];
+	size_t hlen = hw_ws_write_header(hdr, 1, opcode, len, NULL);
+	if (hw_buf_append(&c->pri, hdr, hlen) != 0 || hw_buf_append(&c->pri, payload, len) != 0) {
+		conn_close(c);
+		return -1;
+	}
+	conn_kick(c);
+	return c->closing ? -1 : 0;
+}
+
 // A CONTINUE is the one small frame that does not wait for the end of the batch: the client has
 // stopped sending on that stream until it arrives, so every microsecond it sits in the queue is a
 // microsecond of idle pipeline (deferring it measurably slowed a connection with ten busy streams).
+// For the same reason it goes ahead of a queued download (conn_ahead); the stream-0 CONTINUE of
+// the opening never does.
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining) {
 	uint8_t pkt[HW_WISP_HEADER_LEN + 4];
-	if (conn_send_packet(c, pkt, hw_wisp_build_continue(pkt, stream_id, remaining)) != 0) return -1;
+	size_t n = hw_wisp_build_continue(pkt, stream_id, remaining);
+	if (stream_id != 0 && conn_ahead(c)) {
+		if (conn_send_ahead(c, HW_WS_BINARY, pkt, n) != 0) return -1;
+	} else if (conn_send_packet(c, pkt, n) != 0) {
+		return -1;
+	}
 	if (!c->write_armed) conn_flush(c);
 	return c->closing ? -1 : 0;
 }
@@ -912,8 +1002,13 @@ int conn_send_close_lane(hw_conn *c, uint32_t stream_id, uint8_t reason, int lan
 	return conn_send_packet(c, pkt, n);
 }
 
-// A control frame (a pong) joins the queue behind whatever is already waiting.
+// A control frame (a pong) goes ahead of a queued download, as a refill CONTINUE does: a client
+// that pings to measure the path, or to keep it, would otherwise measure the queue.
 static void send_control(hw_conn *c, uint8_t opcode, const uint8_t *payload, size_t len) {
+	if (conn_ahead(c)) {
+		conn_send_ahead(c, opcode, payload, len);
+		return;
+	}
 	uint8_t hdr[HW_WS_MAX_HEADER];
 	size_t hlen = hw_ws_write_header(hdr, 1, opcode, len, NULL);
 	if (hw_buf_append(&c->wbuf, hdr, hlen) != 0 || hw_buf_append(&c->wbuf, payload, len) != 0) {
@@ -1282,6 +1377,7 @@ static int http_process(hw_conn *c) {
 		return 0;
 	}
 	c->state = CONN_WS;
+	c->fr_end = c->wsent + hw_buf_avail(&c->wbuf); // the head is no frame: the first one starts here
 	c->is_v2 = v2;
 	// c->ip is no address only for a peer that is none (a Unix socket): it then has no key.
 	if (cfg->proxy_client_key) {
@@ -1807,6 +1903,7 @@ hw_conn *conn_wt_new(hw_worker *w, wt_session *s, const struct sockaddr *peer) {
 	hw_buf_init(&c->rbuf);
 	hw_buf_init(&c->wbuf);
 	hw_buf_init(&c->frag);
+	hw_buf_init(&c->pri);
 	hw_map_init(&c->streams);
 	hw_smap_init(&c->sigdets);
 	memcpy(&c->peer_addr, peer, peer->sa_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
