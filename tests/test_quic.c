@@ -2115,6 +2115,44 @@ static void test_loss(void) {
 	      (unsigned long long)c.packets_sent, (unsigned long long)d.packets_sent);
 }
 
+static int cond_server_stream(sim *s, void *ud) {
+	const uint64_t *id = ud;
+	return s->sv.q && hw_qc_smap_get(&s->sv.q->streams, *id) != NULL;
+}
+
+// More gaps in a stream than its receiver holds: the packet with one more is left unacknowledged
+// and its frames come again, where it used to close the connection with INTERNAL_ERROR ("stream
+// reassembly") under heavy loss. Both receivers hold 4 ranges here instead of 1024.
+static void test_reassembly_refused(void) {
+	sim *s = sim_new(17);
+	s->loss_ppm = 50000;
+	s->reorder_ppm = 200000;
+	s->jitter_ms = 8;
+	s->delay_ms = 10;
+	s->bw = 2000;
+	sim_handshake(s);
+	uint64_t bytes = 2u << 20;
+	s->sv.reply = bytes;
+	int64_t id = hw_quic_stream_open(s->c.q, 1);
+	CHECK(id >= 0, "open");
+	uint64_t uid = (uint64_t)id;
+	hw_qc_smap_get(&s->c.q->streams, uid)->rb.have.max = 4;
+	app_send(&s->c, uid, bytes);
+	CHECK(sim_run(s, cond_server_stream, &uid, 10000), "server stream");
+	hw_qc_smap_get(&s->sv.q->streams, uid)->rb.have.max = 4;
+	xfer x = {uid, bytes, bytes};
+	CHECK(sim_run(s, cond_xfer, &x, 600000), "transfer: c2s %llu s2c %llu, closed %d/%d (%s)",
+	      (unsigned long long)s->sv.st[uid].received, (unsigned long long)s->c.st[uid].received, s->c.closed,
+	      s->sv.closed, s->sv.closed ? s->sv.reason : s->c.reason);
+	CHECK(!s->c.closed && !s->sv.closed, "still open");
+	CHECK(s->sv.q->rx_refused > 0 && s->c.q->rx_refused > 0, "refused %llu + %llu",
+	      (unsigned long long)s->sv.q->rx_refused, (unsigned long long)s->c.q->rx_refused);
+	printf("  4 ranges a stream at 5%% loss: 2 MiB each way in %llu ms, %llu + %llu packets refused\n",
+	       (unsigned long long)(s->now - 1000), (unsigned long long)s->c.q->rx_refused,
+	       (unsigned long long)s->sv.q->rx_refused);
+	sim_free(s);
+}
+
 // bbr2 through the stack: a writer waiting for the send buffer is not app-limited (as
 // test_bbr_buffer_limited), the lossy, reordering path of test_loss is as fast as with BBR, its
 // spurious losses undone, and the losses quic.c declares are bbr2's.
@@ -2688,6 +2726,7 @@ int main(int argc, char **argv) {
 	RUN(test_key_update);
 	RUN(test_migration);
 	RUN(test_loss);
+	RUN(test_reassembly_refused);
 	RUN(test_bbr2_stack);
 	RUN(test_pmtu);
 	RUN(test_bulk_64m);

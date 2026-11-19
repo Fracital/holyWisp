@@ -264,7 +264,12 @@ window, sets each write, a WebTransport echo moves 4 to 6% fewer bytes per serve
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per
 level is CRYPTO_BUFFER_EXCEEDED, out-of-order stream data beyond the credit granted is
-FLOW_CONTROL_ERROR, and more than 32 ACK ranges kept per space drops the oldest.
+FLOW_CONTROL_ERROR, and more than 32 ACK ranges kept per space drops the oldest. The gaps in a
+stream's out-of-order data are bounded too (1024 per stream), but by the path's loss, not by
+what the peer is allowed: a packet that would open one more is left unacknowledged, as if lost,
+and its frames come again (`rx_info.refused`). It used to close the connection with
+INTERNAL_ERROR, which heavy loss on a long path reached (a gigabit at 138 ms and 5% loss is
+about that many gaps).
 
 **Connection IDs and steering.** Every CID the server issues is 8 bytes: byte 0 is the owning
 worker's index and the rest is random. Each worker has its own `SO_REUSEPORT` UDP socket on the

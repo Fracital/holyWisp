@@ -32,7 +32,7 @@
 #define HW_QC_ACK_RANGES_MAX    32u     // received-packet ranges kept per space
 #define HW_QC_SEEN_RANGES_MAX   32u     // received-packet ranges kept per space to drop duplicates
 #define HW_QC_CRYPTO_MAX        65536u  // CRYPTO bytes buffered past the delivered offset, per level
-#define HW_QC_RECV_RANGES_MAX   1024u   // out-of-order fragments held per stream
+#define HW_QC_RECV_RANGES_MAX   1024u   // out-of-order fragments held per stream (then rx_refused)
 #define HW_QC_OUR_CIDS          4u      // connection IDs issued to the peer at most
 #define HW_QC_PEER_CID_LIMIT    4u      // our active_connection_id_limit
 #define HW_QC_PEER_CIDS         8u      // slots for the peer's connection IDs
@@ -687,6 +687,7 @@ struct hw_quic_conn {
 	unsigned pmtu_tries;    // probes of the current size lost
 	uint64_t peer_max_ack_delay;
 	uint64_t spurious_lost; // packets declared lost that were acknowledged later
+	uint64_t rx_refused;    // packets left unacknowledged: a fragment in them could not be held
 	uint64_t pkt_threshold; // adaptive packet threshold (RFC 9002 6.1.1), raised by spurious losses
 	unsigned time_shift;    // adaptive time threshold, see hw_qc_rtt_loss_delay
 

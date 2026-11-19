@@ -1083,7 +1083,19 @@ static int stream_rx_account(hw_quic_conn *q, hw_qc_stream *s, uint64_t end_off,
 	return 0;
 }
 
-static void handle_stream(hw_quic_conn *q, const hw_qc_frame *f) {
+typedef struct {
+	int ae;         // an ack-eliciting frame
+	int nonprobing; // a frame other than PATH_*, NEW_CONNECTION_ID, PADDING
+	int challenge;  // a PATH_CHALLENGE (its data in challenge_data)
+	uint8_t challenge_data[8];
+	const uint8_t *dcid;
+	size_t dcid_len;
+	// A STREAM or CRYPTO fragment in it could not be held (too many gaps, or no memory): the packet
+	// is not acknowledged, so the peer sends its frames again. Every frame is safe to receive twice.
+	int refused;
+} rx_info;
+
+static void handle_stream(hw_quic_conn *q, const hw_qc_frame *f, rx_info *ri) {
 	uint64_t err;
 	hw_qc_stream *s = stream_for_peer(q, f->stream_id, &err);
 	if (err) {
@@ -1119,7 +1131,9 @@ static void handle_stream(hw_quic_conn *q, const hw_qc_frame *f) {
 	const uint8_t *direct;
 	size_t dlen;
 	if (hw_qc_recvbuf_push(rb, f->offset, f->data, f->len, &direct, &dlen) < 0) {
-		conn_error(q, HW_QUIC_INTERNAL_ERROR, f->type, "stream reassembly");
+		// Nothing of it was delivered (only a fragment ahead of the delivered offset is held), and
+		// the one at that offset never needs a range, so the stream still advances.
+		ri->refused = 1;
 		return;
 	}
 	stream_deliver(q, s, direct, dlen);
@@ -1214,7 +1228,7 @@ static void handshake_resend(hw_quic_conn *q) {
 	if (any) q->hs_resends++;
 }
 
-static void handle_crypto(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
+static void handle_crypto(hw_quic_conn *q, int spi, const hw_qc_frame *f, rx_info *ri) {
 	hw_qc_space *sp = &q->sp[spi];
 	hw_qc_recvbuf *rb = &sp->crypto_rx;
 	if (q->is_server && spi == HW_QC_SP_INITIAL && f->len && f->offset + f->len <= rb->off && !q->handshake_complete) {
@@ -1228,7 +1242,7 @@ static void handle_crypto(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 	const uint8_t *p;
 	size_t n;
 	if (hw_qc_recvbuf_push(rb, f->offset, f->data, f->len, &p, &n) < 0) {
-		conn_error(q, HW_QUIC_INTERNAL_ERROR, f->type, "CRYPTO reassembly");
+		ri->refused = 1;
 		return;
 	}
 	while (n) {
@@ -1289,15 +1303,6 @@ static int frame_allowed(const hw_quic_conn *q, int spi, uint64_t type) {
 	return 1;
 }
 
-typedef struct {
-	int ae;         // an ack-eliciting frame
-	int nonprobing; // a frame other than PATH_*, NEW_CONNECTION_ID, PADDING
-	int challenge;  // a PATH_CHALLENGE (its data in challenge_data)
-	uint8_t challenge_data[8];
-	const uint8_t *dcid;
-	size_t dcid_len;
-} rx_info;
-
 static void handle_frame(hw_quic_conn *q, int spi, const hw_qc_frame *f, rx_info *ri) {
 	uint64_t err;
 	hw_qc_stream *s;
@@ -1319,10 +1324,10 @@ static void handle_frame(hw_quic_conn *q, int spi, const hw_qc_frame *f, rx_info
 		handle_stop_sending(q, f);
 		break;
 	case HW_QC_F_CRYPTO:
-		handle_crypto(q, spi, f);
+		handle_crypto(q, spi, f, ri);
 		break;
 	case HW_QC_F_STREAM:
-		handle_stream(q, f);
+		handle_stream(q, f, ri);
 		break;
 	case HW_QC_F_MAX_DATA:
 		if (f->value > q->tx_max_data) {
@@ -1585,6 +1590,11 @@ static int packet_input(hw_quic_conn *q, const hw_qw_hdr *h, uint8_t *pkt, size_
 	frames_process(q, spi, payload, payload_len, &ri);
 	if (q->state >= HW_QC_ST_CLOSING) return 1;
 	if (sp->discarded) return 1; // HANDSHAKE_DONE discarded this very space
+	if (ri.refused) {
+		// Not acknowledged, as if lost: the peer declares it so and sends its frames again.
+		q->rx_refused++;
+		return 1;
+	}
 	hw_qc_ranges_add(&sp->recv, pn, pn + 1);
 	hw_qc_ranges_add(&sp->seen, pn, pn + 1);
 	int64_t prev = sp->largest_rx;
