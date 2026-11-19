@@ -546,16 +546,18 @@ static void test_stalled_reader(void) {
 	CHECK(g_source_sent - src_a < 1024 * 1024, "the remote is still read: %llu",
 	      (unsigned long long)(g_source_sent - src_a));
 
-	// Reading again: the queue drains and the stream moves.
+	// Reading again: the queue drains and the stream moves. Past what the queues held (32 MiB at
+	// most), so this is new data; not a throughput figure (macOS's sanitized build on CI did 62 MiB
+	// in 5 s).
 	size_t got = 0;
-	uint64_t until = hw_now_ms() + 5000;
-	while (got < 64ull * 1024 * 1024 && hw_now_ms() < until) {
+	uint64_t until = hw_now_ms() + 10000;
+	while (got < 48ull * 1024 * 1024 && hw_now_ms() < until) {
 		int r = hw_client_poll(c, 1000, &ev);
 		CHECK(r > 0, "poll %d", r);
 		CHECK(ev.type != HW_CEV_CLOSE, "closed 0x%02x", ev.reason);
 		if (ev.type == HW_CEV_DATA) got += ev.len;
 	}
-	CHECK(got >= 64ull * 1024 * 1024, "resumed: %zu bytes in 5 s", got);
+	CHECK(got >= 48ull * 1024 * 1024, "resumed: %zu bytes in 10 s", got);
 	hw_client_free(c);
 	wait_sessions_gone(s, 5000);
 	hw_server_free(s);

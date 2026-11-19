@@ -68,14 +68,14 @@ static void test_hostlist_capacity(void) {
 	for (;; fitted++) {
 		memset(longest, 'a', HW_FILTER_HOST_LEN - 1);
 		longest[HW_FILTER_HOST_LEN - 1] = '\0';
-		snprintf(longest, 8, "%07d", fitted);
+		snprintf(longest, 8, "%07u", (unsigned)fitted % 10000000u); // GCC: provably 7 digits
 		longest[7] = 'a';
 		if (hw_hostlist_add(&big, longest) != 0) break;
 	}
 	CHECK_EQ(fitted, HW_FILTER_POOL / HW_FILTER_HOST_LEN);
 	CHECK_EQ(hw_hostlist_add(&big, "short.example"), -1); // the longest names fill the pool exactly
 	memset(longest, 'a', HW_FILTER_HOST_LEN - 1);
-	snprintf(longest, 8, "%07d", fitted - 1);
+	snprintf(longest, 8, "%07u", (unsigned)(fitted - 1) % 10000000u);
 	longest[7] = 'a';
 	CHECK_EQ(match(&big, longest), 1);
 	CHECK_EQ(match(&big, "short.example"), 0);
