@@ -20,6 +20,7 @@
 #include "internal.h"
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -150,6 +151,8 @@ hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, s
 	s->port = port;
 	s->lane = c->rx_lane;
 	s->remaining = c->w->server->window;
+	// Stream credit counts what a TCP or terminal stream sends the client; UDP is never counted.
+	s->credit_limit = c->credit_window && type != HW_STREAM_UDP ? c->credit_window : UINT64_MAX;
 	hw_buf_init(&s->out);
 	hw_buf_init(&s->pin);
 	if (host_len >= sizeof(s->host)) host_len = sizeof(s->host) - 1;
@@ -227,7 +230,8 @@ void stream_pause(hw_stream *s) {
 }
 
 void stream_resume(hw_stream *s) {
-	if (s->parked) return; // its pipe is still busy: stream_unpark resumes it
+	if (s->parked) return;             // its pipe is still busy: stream_unpark resumes it
+	if (stream_credit_held(s)) return; // its credit is spent: the CREDIT that raises it resumes it
 	if (s->state != STREAM_OPEN || s->read_armed) return;
 	s->read_armed = 1;
 	stream_update_events(s);
@@ -969,8 +973,25 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 #define STREAM_BULK_OFF    (16 * 1024)
 #define STREAM_BULK_MISSES 16
 
+// The stream has just queued its last byte of credit: it stops reading until a CREDIT. What the
+// remote sends meanwhile, its end included, waits in the kernel (stream_io_cb for a reset).
+static void stream_credit_spent(hw_stream *s) {
+	HW_DEBUG("stream", "%s: stream %u holds at %llu bytes of credit", s->conn->peer, s->id,
+	         (unsigned long long)s->credit_limit);
+	stream_pause(s);
+}
+
+// Every read from the remote asks for no more than the stream's credit leaves (stream_credit_cap),
+// so the client is never sent past its limit, and what is relayed is counted against it. Without
+// credit the cap is never the smaller number and nothing here changes.
 static void stream_read(hw_stream *s) {
 	hw_conn *c = s->conn;
+	// A held stream is not armed, so this is an event that was already on its way. A read of no
+	// bytes would come back as the end of the stream.
+	if (stream_credit_held(s)) {
+		stream_credit_spent(s);
+		return;
+	}
 	if (s->type == HW_STREAM_TCP && s->bulk) {
 		int copy = 0; // finish this event on the copying path
 		// One event relays up to STREAM_MAX_READS_PER_EVENT pipes' worth, in however many packets
@@ -978,7 +999,8 @@ static void stream_read(hw_stream *s) {
 		size_t done = 0;
 		size_t budget = STREAM_MAX_READS_PER_EVENT * (size_t)1024 * 1024;
 		while (done < budget && s->read_armed && !copy) {
-			ssize_t n = conn_splice_data(c, s);
+			size_t asked = stream_credit_cap(s, SIZE_MAX);
+			ssize_t n = conn_splice_data(c, s, asked);
 			if (s->pipe) budget = STREAM_MAX_READS_PER_EVENT * s->pipe->size;
 			if (n == -3) {
 				// The previous payload is still in the pipe, so the client is not keeping up.
@@ -1003,14 +1025,20 @@ static void stream_read(hw_stream *s) {
 			}
 			s->heard = 1;
 			done += (size_t)n;
+			s->credit_sent += (uint64_t)n;
 			// One small splice does not end bulk mode: right after a switch the remote's data is
 			// still arriving in pieces, and leaving on the first of them would flap between the
-			// two paths for the rest of the transfer. A run of them does.
-			if ((size_t)n >= STREAM_BULK_OFF) {
+			// two paths for the rest of the transfer. A run of them does. A splice that took all
+			// the credit left took all it asked for, however small: that is no miss.
+			if ((size_t)n >= STREAM_BULK_OFF || (size_t)n == asked) {
 				s->bulk_miss = 0;
 			} else if (++s->bulk_miss >= STREAM_BULK_MISSES) {
 				s->bulk = 0;
 				s->bulk_miss = 0;
+			}
+			if (stream_credit_held(s)) {
+				stream_credit_spent(s);
+				return;
 			}
 			if ((size_t)n < HW_READ_CHUNK) return; // drained
 		}
@@ -1018,7 +1046,8 @@ static void stream_read(hw_stream *s) {
 	}
 	uint8_t *scratch = c->w->scratch;
 	for (int i = 0; i < STREAM_MAX_READS_PER_EVENT && s->read_armed; i++) {
-		ssize_t n = stream_recv(s, scratch, HW_READ_CHUNK);
+		size_t asked = stream_credit_cap(s, HW_READ_CHUNK);
+		ssize_t n = stream_recv(s, scratch, asked);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
@@ -1039,11 +1068,16 @@ static void stream_read(hw_stream *s) {
 			return;
 		}
 		s->heard = 1;
+		s->credit_sent += (uint64_t)n;
 		conn_send_data(c, s->id, scratch, (size_t)n);
 		if (c->closing) return;
 		// A WebTransport session copies into QUIC packets: there is no pipe to relay through.
 		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP && !c->wt) s->bulk = 1;
-		if ((size_t)n < HW_READ_CHUNK && s->type != HW_STREAM_UDP) return; // drained
+		if (stream_credit_held(s)) {
+			stream_credit_spent(s);
+			return;
+		}
+		if ((size_t)n < asked && s->type != HW_STREAM_UDP) return; // drained
 	}
 }
 
@@ -1093,11 +1127,21 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		return;
 	}
 	if (s->state != STREAM_OPEN) return;
+	if (!s->read_armed && (events & HW_EV_ERROR) && stream_credit_held(s)) {
+		// The remote reset (or failed) while the client has not granted this stream more. That
+		// may never come, and the reset is what the client would see natively: the stream ends
+		// now, and what the kernel held for it is lost with the connection, as it is there. Only
+		// a backend that reports errors unasked (epoll) gets here; on the others the stream finds
+		// the reset when a grant lets it read.
+		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
+		return;
+	}
 	if (!s->read_armed && (events & (HW_EV_HUP | HW_EV_ERROR))) {
 		// The remote reset or hung up while this stream may not read (the client is not taking
-		// what is already queued for it). The condition is level-triggered and nothing here can
-		// clear it, so the loop would report it without end: stop watching the socket until
-		// reads resume (stream_update_events). What the remote sent before stays in the kernel.
+		// what is already queued for it, or its credit is spent and the kernel reports a hang-up
+		// alone). The condition is level-triggered and nothing here can clear it, so the loop
+		// would report it without end: stop watching the socket until reads resume
+		// (stream_update_events). What the remote sent before stays in the kernel.
 		hw_loop_del_fd(loop, fd);
 		s->detached = 1;
 		return;

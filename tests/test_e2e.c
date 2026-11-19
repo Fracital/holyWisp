@@ -10,6 +10,7 @@
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
+#include "credit_cases.h"
 #include "test.h"
 
 #include <errno.h>
@@ -854,6 +855,23 @@ static void test_connections_spread(void) {
 	hw_server_free(s);
 }
 
+// credit_cases.h's way to connect over a WebSocket.
+static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manual, size_t max_queue) {
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_port(s);
+	o.v2 = v2;
+	o.credit_window = window;
+	o.credit_manual = manual;
+	if (max_queue) o.max_queue_bytes = max_queue;
+	o.timeout_ms = 5000;
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "connect: %s", err);
+	return c;
+}
+
 int main(void) {
 	start_echo_services();
 	hw_server_config cfg;
@@ -896,6 +914,17 @@ int main(void) {
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);
+
+	cfg.stream_credit = 0;
+	hw_server *off = hw_server_new(&cfg);
+	CHECK(off != NULL && hw_server_start(off) == 0, "a server with stream-credit off");
+	credit_env credit = {.server = g_server,
+	                     .server_off = off,
+	                     .echo_port = g_tcp_echo_port,
+	                     .udp_echo_port = g_udp_echo_port,
+	                     .open_client = credit_connect};
+	credit_cases_run(&credit);
+	hw_server_free(off);
 
 	hw_server_stop(g_server);
 	hw_server_free(g_server);

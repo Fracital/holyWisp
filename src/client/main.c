@@ -46,6 +46,11 @@ static void usage(const char *argv0) {
 	        "                       CONTINUE at once (offers \"wisp-v2-server-stream\")\n"
 	        "      --lanes N        WebTransport v2: ride up to N QUIC streams (lanes) when the server\n"
 	        "                       offers them, the first included; at most 16 (1)\n"
+	        "      --credit BYTES   v2: ask for stream credit with an initial window of BYTES per\n"
+	        "                       stream (at least 16384): the server sends each stream only what\n"
+	        "                       this client has read, and a window more (off)\n"
+	        "      --read-rate BPS  read what arrives no faster than BPS bytes a second, a slow\n"
+	        "                       reader; with --credit the server is held to that rate (off)\n"
 	        "  -v, --verbose        print events on stderr\n"
 	        "  -h, --help\n",
 	        argv0);
@@ -130,6 +135,29 @@ static int parse_pin(const char *s, uint8_t out[32]) {
 
 static int g_verbose;
 
+// --read-rate: the reader takes no more than this many bytes a second, counted from its first.
+static uint64_t g_read_rate;
+static uint64_t g_read_start;
+static uint64_t g_read_bytes;
+
+// How long the reader must wait before it may take anything more: 0 when it may now.
+static int read_wait_ms(void) {
+	if (!g_read_rate) return 0;
+	uint64_t now = hw_now_ms();
+	if (!g_read_start) g_read_start = now;
+	uint64_t due = g_read_start + g_read_bytes * 1000 / g_read_rate;
+	return due > now ? (int)HW_MIN(due - now, (uint64_t)INT_MAX) : 0;
+}
+
+static void read_count(size_t n) {
+	g_read_bytes += n;
+}
+
+static void sleep_ms(int ms) {
+	struct pollfd none;
+	poll(&none, 0, ms);
+}
+
 static void log_event(const hw_client_event *ev) {
 	if (!g_verbose) return;
 	switch (ev->type) {
@@ -176,9 +204,11 @@ static const char *send_error(int r) {
 // the exit code in *rc.
 static int pipe_drain(hw_client *c, uint32_t sid, int *rc) {
 	hw_client_event ev;
-	int r;
-	while ((r = hw_client_poll(c, 0, &ev)) > 0) {
+	int r = 0;
+	// A reader ahead of --read-rate takes nothing, and the client grants nothing, until it is due.
+	while (read_wait_ms() == 0 && (r = hw_client_poll(c, 0, &ev)) > 0) {
 		log_event(&ev);
+		if (ev.type == HW_CEV_DATA) read_count(ev.len);
 		if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
 			if (write_all(STDOUT_FILENO, ev.data, ev.len) != 0) {
 				*rc = 1;
@@ -213,6 +243,12 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 		// Over WebTransport the client's timers run only when it is called.
 		int timers = hw_client_wait_ms(c);
 		if (timers >= 0 && (wait < 0 || timers < wait)) wait = timers;
+		// A reader that is ahead of --read-rate does not look at the server until it is due.
+		int paced = read_wait_ms();
+		if (paced > 0) {
+			pfds[0].fd = -1;
+			if (wait < 0 || paced < wait) wait = paced;
+		}
 		int r = poll(pfds, stdin_open ? 2 : 1, wait);
 		if (r < 0 && errno == EINTR) continue;
 		if (r < 0) return 1;
@@ -269,16 +305,33 @@ static uint64_t byte_sum(const uint8_t *p, size_t n) {
 	return sum;
 }
 
+// The index of stream id among the bench's streams, which were opened in a row: nsid when it is
+// none of them.
+static size_t bench_index(const uint32_t *sid, size_t nsid, uint32_t id) {
+	size_t k = id - sid[0];
+	if (k < nsid && sid[k] == id) return k;
+	for (k = 0; k < nsid; k++) {
+		if (sid[k] == id) break;
+	}
+	return k;
+}
+
 // The echo benchmark over nsid streams at once, total bytes split among them: each stream sends
-// a chunk in turn, and what has come back is taken between the sends.
+// a chunk in turn, and what has come back is taken between the sends. With stream credit a
+// stream has at most half a window in flight: the server sends a stream no more than a window
+// past what was taken, and an echo that cannot come back would hold the CONTINUE the next send
+// waits for while nothing is taken.
 static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t total) {
 	uint8_t *chunk = malloc(PIPE_CHUNK);
 	size_t *sent = calloc(nsid, sizeof(*sent));
-	if (!chunk || !sent) {
+	size_t *recv = calloc(nsid, sizeof(*recv));
+	if (!chunk || !sent || !recv) {
 		free(chunk);
 		free(sent);
+		free(recv);
 		return 1;
 	}
+	size_t ahead = hw_client_credit_window(c) / 2; // 0: no bound
 	for (size_t i = 0; i < PIPE_CHUNK; i++) chunk[i] = (uint8_t)(i * 31 + 7);
 	size_t per = total / nsid;
 	total = per * nsid;
@@ -287,9 +340,16 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 	uint64_t sum_sent = 0, sum_recv = 0;
 	int rc = 1;
 	while (received < total) {
+		int more = 0; // a stream may send more now
 		for (size_t k = 0; k < nsid; k++) {
 			if (sent[k] >= per) continue;
 			size_t n = HW_MIN(PIPE_CHUNK, per - sent[k]);
+			if (ahead) {
+				size_t out = sent[k] - recv[k];
+				if (out >= ahead) continue;
+				n = HW_MIN(n, ahead - out);
+			}
+			more = 1;
 			int s = hw_client_send(c, sid[k], chunk, n);
 			if (s != 0) {
 				fprintf(stderr, "send failed at %zu bytes: %s\n", sent_all, send_error(s));
@@ -300,18 +360,30 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 			sent_all += n;
 		}
 		hw_client_event ev;
-		int r;
-		while ((r = hw_client_poll(c, sent_all < total ? 0 : 10000, &ev)) > 0) {
+		int r = 1;
+		int wait = sent_all < total && more ? 0 : 10000;
+		for (;;) {
+			int paced = read_wait_ms();
+			if (paced > 0) { // ahead of --read-rate: take nothing until it is due
+				sleep_ms(HW_MIN(paced, 50));
+				break;
+			}
+			r = hw_client_poll(c, wait, &ev);
+			if (r <= 0) break;
+			wait = 0; // something came: go back and send what that let go before waiting again
 			if (ev.type == HW_CEV_DATA) {
 				sum_recv += byte_sum(ev.data, ev.len);
 				received += ev.len;
+				read_count(ev.len);
+				size_t k = bench_index(sid, nsid, ev.stream_id);
+				if (k < nsid) recv[k] += ev.len;
 			} else if (ev.type == HW_CEV_CLOSE) {
 				fprintf(stderr, "stream closed: %s\n", hw_close_reason_str(ev.reason));
 				goto done;
 			}
 			if (received >= total) break;
 		}
-		if (r < 0 || (r == 0 && sent_all >= total)) {
+		if (r < 0 || (r == 0 && wait > 0)) {
 			fprintf(stderr, "%s after %zu/%zu bytes\n", r < 0 ? "connection lost" : "timed out", received, total);
 			goto done;
 		}
@@ -325,6 +397,7 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 done:
 	free(chunk);
 	free(sent);
+	free(recv);
 	return rc;
 }
 
@@ -373,6 +446,20 @@ int main(int argc, char **argv) {
 		} else if (!strcmp(a, "--lanes") && i + 1 < argc) {
 			o.wt_lanes = (int)strtol(argv[++i], NULL, 10);
 			o.v2 = 1;
+		} else if (!strcmp(a, "--credit") && i + 1 < argc) {
+			unsigned long long w = strtoull(argv[++i], NULL, 10);
+			if (w == 0 || w > UINT32_MAX) {
+				fprintf(stderr, "--credit is 1 to %u bytes\n", UINT32_MAX);
+				return 2;
+			}
+			o.credit_window = (uint32_t)w;
+			o.v2 = 1;
+		} else if (!strcmp(a, "--read-rate") && i + 1 < argc) {
+			g_read_rate = strtoull(argv[++i], NULL, 10);
+			if (g_read_rate == 0) {
+				fprintf(stderr, "--read-rate is a number of bytes a second\n");
+				return 2;
+			}
 		} else if (!strcmp(a, "--pin") && i + 1 < argc) {
 			pin = argv[++i];
 		} else if (!strcmp(a, "--insecure")) {
@@ -447,6 +534,9 @@ int main(int argc, char **argv) {
 		fprintf(stderr, "%s\n", err);
 		return 1;
 	}
+	if (o.credit_window && !hw_client_credit_window(c)) {
+		fprintf(stderr, "warning: the server does not offer stream credit: --credit has no effect\n");
+	}
 	if (o.user && o.pass && !hw_client_authenticated(c)) {
 		fprintf(stderr, "warning: the server did not ask for a password, so none was sent: not authenticated\n");
 	}
@@ -455,9 +545,10 @@ int main(int argc, char **argv) {
 		const char *motd = hw_client_motd(c);
 		char shown[MOTD_SHOWN];
 		hw_client_printable(shown, sizeof(shown), motd, strlen(motd));
-		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s%s%s\n", hw_client_is_v2(c) ? 2 : 1,
-		        hw_client_buffer_size(c), hw_client_lanes(c), hw_client_lanes(c) == 1 ? "" : "s",
-		        hw_client_server_stream(c) ? ", server-opened" : "", shown[0] ? ", motd: " : "", shown);
+		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s, stream credit %u%s%s\n",
+		        hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c), hw_client_lanes(c),
+		        hw_client_lanes(c) == 1 ? "" : "s", hw_client_server_stream(c) ? ", server-opened" : "",
+		        hw_client_credit_window(c), shown[0] ? ", motd: " : "", shown);
 	}
 	if (!bench) streams = 1;
 	uint32_t *sid = calloc((size_t)streams, sizeof(*sid));

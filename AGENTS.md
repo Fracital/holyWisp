@@ -145,7 +145,8 @@ every test still passes, so each item has a test and a change to it needs a reas
   "WebTransport").
 - **Extensions advertised.** `0x01` UDP when `allow-udp`, `0x02` password (meta = required byte)
   when any `password-user` exists, `0x04` MOTD when set, `0xE1` lanes (meta = the count) on a
-  WebTransport session with `webtransport-lanes` of 2 or more. Stream-confirm (`0x05`) is honoured when
+  WebTransport session with `webtransport-lanes` of 2 or more, `0xE2` stream credit (meta empty)
+  with `stream-credit` (on by default). Stream-confirm (`0x05`) is honoured when
   the client asks for it: a connected TCP stream gets `CONTINUE(id, buffer_remaining)`. Unknown
   extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
@@ -167,6 +168,32 @@ every test still passes, so each item has a test and a change to it needs a reas
   in `conn.c`) whatever that size allows: a client holds a whole message before it can use any of
   it, and megabyte frames cost the client and the echo behind it 20 to 40% more per byte while
   saving the server nothing (`test_egress_frames_capped`).
+- **Stream credit** (`0xE2`, `stream-credit`): flow control toward the client, per stream, in
+  bytes, the receive window a native socket has. On when the server's v2 INFO offered `0xE2` and
+  the client's INFO names it with `initial_window(u32 LE)` (a meta under 4 bytes is no window, a
+  window under 16384 is 16384), over WebSocket and WebTransport alike; v1 never has it. Each TCP
+  and Twisp stream opened in the session counts the DATA payload bytes it puts in the queue toward
+  the client (`credit_sent`) against a limit that starts at the window (`credit_limit`; UDP is
+  never counted, `UINT64_MAX`). CREDIT is `type 0xE2, stream, limit(u64 LE)`, the total the stream
+  may have sent from its start, and only ever raises the limit (`handle_credit`): one that is
+  lower or repeated, before the handshake, on stream 0, for a stream not open or UDP, on a session
+  without credit or under 8 bytes is ignored, and one in a WebTransport datagram is dropped
+  (`conn_wt_packet`, `wt_dropped`). A stream reads its remote only while nothing holds it, its own
+  spent credit included (`conn_stream_paused`, and `stream_resume` refuses a held stream, so every
+  resume path keeps the hold), and every read asks for no more than the credit left
+  (`stream_credit_cap`: the copy path, the splice fill, a PTY, a proxy's leftover), so the server
+  never sends past a limit and a held stream costs its neighbours on the connection or the lane
+  nothing. A splice that took all the credit left is not a bulk miss. The server learns of a
+  remote's end only by reading, so a held stream's CLOSE `0x02` waits for the grant that lets it
+  read, even with the remote done and `sent == limit` exactly. A held stream whose socket reports
+  an error is closed `0x03` at once, since no grant may ever come (what the kernel held is lost,
+  as a reset loses it natively); a hang-up alone is detached as for a paused stream. Only epoll
+  reports an error to a socket that is not read (`loop_backend.h`): on kqueue and select the held
+  stream finds the reset with the grant that lets it read, and closes `0x03` then. A CLOSE is
+  never held and a held stream is never timed out. A CREDIT does not flush the ingress batch: it
+  opens and closes nothing and only arms a read. Without both INFOs naming it nothing changes.
+  `tests/credit_cases.h` (run by `test_e2e` and `test_e2e_wt`), `test_credit_not_by_datagram` and
+  `test_remote_resets_while_held` hold it.
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
   CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x48` blocked
   by egress policy, `0x49` throttled. A UDP stream whose remote port is closed gets `0x42` as soon

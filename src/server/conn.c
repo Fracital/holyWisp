@@ -636,7 +636,7 @@ static size_t frame_payload_max(const hw_conn *c) {
 	return max < 1 ? 1 : max;
 }
 
-ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
+ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max) {
 	if (c->throttled || c->wt) return -2; // a session's bytes are copied into QUIC packets, never spliced
 	hw_spipe *p = s->pipe;
 	if (!p) {
@@ -646,6 +646,7 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s) {
 	if (p->pending > 0) return -3;
 	size_t cap = frame_payload_max(c);
 	if (cap > p->size) cap = p->size;
+	if (cap > max) cap = max; // the stream's credit: never a byte more is taken from the remote
 	size_t got = 0;
 	for (int i = 0; i < PIPE_FILLS && got < cap; i++) {
 		ssize_t n = hw_sys_splice(s->fd, p->fd[1], cap - got);
@@ -955,7 +956,7 @@ static int apply_reputation(hw_conn *c) {
 
 static void send_server_info(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 6];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 6 + 5];
 	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 	if (cfg->allow_udp) n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 	if (cfg->password_user_count > 0) {
@@ -968,6 +969,10 @@ static void send_server_info(hw_conn *c) {
 	if (c->wt && wt_conn_lanes_offered(c->wt) >= 2) {
 		uint8_t lanes = (uint8_t)wt_conn_lanes_offered(c->wt);
 		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_LANES, &lanes, 1);
+	}
+	if (cfg->stream_credit) {
+		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, NULL, 0);
+		c->credit_offered = 1;
 	}
 	conn_send_packet(c, pkt, n);
 }
@@ -1264,6 +1269,10 @@ static void handle_info(hw_conn *c, const hw_wisp_packet *p) {
 		return;
 	}
 	c->stream_confirm = info.has_stream_confirm;
+	// Stream credit is on when both INFOs name it; a client's 0xE2 without a window is no 0xE2.
+	if (c->credit_offered && info.has_credit_window) {
+		c->credit_window = info.credit_window > HW_WISP_CREDIT_MIN ? info.credit_window : HW_WISP_CREDIT_MIN;
+	}
 	if (cfg->password_user_count > 0 && info.has_password && info.user) {
 		int r = password_check(c, info.user, info.user_len, info.pass, info.pass_len);
 		if (r == PASS_PENDING) return; // auth_done carries on
@@ -1375,6 +1384,19 @@ static void handle_resize(hw_conn *c, const hw_wisp_packet *p) {
 	if (s && s->type == HW_STREAM_TERM) twisp_resize(s, hw_le16(p->payload), hw_le16(p->payload + 2));
 }
 
+// CREDIT: the client lets a stream send it more. It is ignored where it cannot apply (a session
+// without stream credit, stream 0, a stream that is not open or is UDP, a short payload, a limit
+// that is not higher), so a duplicate or one overtaken by a later one changes nothing. A stream
+// held by nothing else reads again.
+static void handle_credit(hw_conn *c, const hw_wisp_packet *p) {
+	uint64_t limit;
+	if (!c->credit_window || p->stream_id == 0 || hw_wisp_parse_credit(p, &limit) != 0) return;
+	hw_stream *s = hw_map_get(&c->streams, p->stream_id);
+	if (!s || s->type == HW_STREAM_UDP || limit <= s->credit_limit) return;
+	s->credit_limit = limit;
+	if (!conn_stream_paused(c, s)) stream_resume(s); // a parked one goes on when its pipe drains
+}
+
 static void handle_message(hw_conn *c, const uint8_t *data, size_t len) {
 	hw_wisp_packet p;
 	if (hw_wisp_parse(data, len, &p) != 0) return; // runt packet: ignored, like other servers do
@@ -1388,6 +1410,13 @@ static void handle_message(hw_conn *c, const uint8_t *data, size_t len) {
 		return;
 	}
 
+	if (p.type == HW_WISP_CREDIT) {
+		// Not behind the batch flush below: a CREDIT opens and closes nothing, writes nothing and
+		// only arms a stream's read interest, while the batch is bytes toward a remote. Flushing for
+		// it would cut an upload's batch at every grant for a download on the same connection.
+		handle_credit(c, &p);
+		return;
+	}
 	if (p.type != HW_WISP_DATA) {
 		// Anything else may open, close or resize a stream: batched DATA goes out first, in order.
 		stream_batch_flush(c->w);

@@ -1,14 +1,16 @@
 /*
  * End to end for what a hostile or broken client can do to the server and to its other clients:
- * a client that sends and never reads, a remote that goes away while its stream is paused, one
- * address taking every connection or every connect in progress, pages of other origins, bytes in
- * a hostname that are not a hostname's, a download past the bandwidth limit, a duplicate CONNECT.
+ * a client that sends and never reads, a remote that goes away while its stream is paused or held
+ * by its credit, one address taking every connection or every connect in progress, pages of other
+ * origins, bytes in a hostname that are not a hostname's, a download past the bandwidth limit, a
+ * duplicate CONNECT.
  * A real server on loopback, driven by the client library and, where the library is too well
  * behaved, by a raw socket.
  */
 #include "holywisp/client.h"
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
+#include "holywisp/loop.h"
 #include "holywisp/net.h"
 #include "holywisp/reputation.h"
 #include "holywisp/server.h"
@@ -359,6 +361,99 @@ static void test_remote_resets_while_paused(void) {
 	// And the connection is as good as before.
 	uint32_t sid2;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid2), 0);
+	CHECK_EQ(hw_client_send(c, sid2, "hello", 5), 0);
+	uint8_t buf[8];
+	CHECK_EQ(hw_client_read_exact(c, sid2, buf, 5, 5000), 5);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
+static void unwatched_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
+	*(int *)ud = 1;
+}
+
+// Whether this platform's loop reports a reset to an fd that is watched for nothing. epoll does
+// (loop_backend.h); select and kqueue tell only a reader, so there a stream that may not read
+// finds its remote's reset when it next reads.
+static int loop_reports_unwatched_reset(void) {
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "listen");
+	int peer = hw_connect_tcp("127.0.0.1", port, 2000);
+	CHECK(peer >= 0, "connect");
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 2000), 1);
+	int fd = accept(lfd, NULL, NULL);
+	CHECK(fd >= 0, "accept");
+	close(lfd);
+	hw_loop *loop = hw_loop_new();
+	int reported = 0;
+	CHECK_EQ(hw_loop_add_fd(loop, fd, HW_EV_READ, unwatched_cb, &reported), 0);
+	CHECK_EQ(hw_loop_mod_fd(loop, fd, 0), 0);
+	CHECK_EQ(send(peer, "x", 1, HW_MSG_NOSIGNAL), 1);
+	struct linger lg = {.l_onoff = 1, .l_linger = 0};
+	setsockopt(peer, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
+	close(peer);
+	uint64_t deadline = hw_now_ms() + 300;
+	while (!reported && hw_now_ms() < deadline) hw_loop_run_once(loop, 50);
+	hw_loop_del_fd(loop, fd);
+	close(fd);
+	hw_loop_free(loop);
+	return reported;
+}
+
+// The same remote, but the stream is held by its own credit: the client has not granted it more
+// than its window and may never do so. Where the loop reports the reset to a socket nobody reads,
+// it must not spin the worker, and since no grant may ever come to let the stream find it, the
+// stream ends at once, 0x03, with what the kernel still held for it lost (as a reset socket's is
+// natively). Where it does not, the stream finds the reset with the next grant, and says 0x03.
+static void test_remote_resets_while_held(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	hw_server *s = start(&cfg);
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_port(s);
+	o.timeout_ms = 5000;
+	o.v2 = 1;
+	o.credit_window = HW_WISP_CREDIT_MIN;
+	o.credit_manual = 1; // nothing is ever granted
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "connect: %s", err);
+	CHECK_EQ(hw_client_credit_window(c), HW_WISP_CREDIT_MIN);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_reset_port, &sid), 0);
+
+	// The window arrives at once; 300 ms in the remote resets.
+	int measure = cpu_clock_works();
+	sleep_ms(500);
+	long before = cpu_ms();
+	sleep_ms(600);
+	long spent = cpu_ms() - before;
+	if (measure) CHECK(spent < 300, "the server used %ld ms of CPU in 600 ms of waiting", spent);
+
+	uint8_t reason = 0;
+	size_t got = 0;
+	if (loop_reports_unwatched_reset()) {
+		CHECK(wait_close(c, sid, &reason, &got), "the stream was closed without a grant");
+		CHECK_EQ(got, HW_WISP_CREDIT_MIN);
+	} else {
+		hw_client_event ev;
+		while (hw_client_poll(c, 300, &ev) == 1) {
+			CHECK(ev.stream_id != sid || ev.type == HW_CEV_DATA, "a held stream's close with no reset reported");
+			if (ev.stream_id == sid) got += ev.len;
+		}
+		CHECK_EQ(got, HW_WISP_CREDIT_MIN);
+		CHECK_EQ(hw_client_credit(c, sid, HW_WISP_CREDIT_MIN + 1), 0);
+		CHECK(wait_close(c, sid, &reason, &got), "the stream was closed once granted");
+		CHECK(got <= HW_WISP_CREDIT_MIN + 1, "%zu bytes", got);
+	}
+	CHECK_EQ(reason, HW_CLOSE_NETWORK_ERROR);
+	uint32_t sid2;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid2), 0);
+	CHECK_EQ(hw_client_credit(c, sid2, 1u << 20), 0);
 	CHECK_EQ(hw_client_send(c, sid2, "hello", 5), 0);
 	uint8_t buf[8];
 	CHECK_EQ(hw_client_read_exact(c, sid2, buf, 5, 5000), 5);
@@ -813,6 +908,7 @@ int main(void) {
 
 	RUN(test_client_that_never_reads);
 	RUN(test_remote_resets_while_paused);
+	RUN(test_remote_resets_while_held);
 	RUN(test_origin_allowlist);
 	RUN(test_forwarded_address);
 	RUN(test_connections_per_ip);

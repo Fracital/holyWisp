@@ -38,6 +38,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->allow_tcp = 1;
 	cfg->allow_udp = 1;
 	cfg->enable_v2 = 1;
+	cfg->stream_credit = 1;
 	cfg->parse_real_ip = 1;
 	// One header by default, and the one every proxy rewrites. A header a proxy passes through
 	// untouched (CF-Connecting-IP behind anything but Cloudflare) would let the client name itself.

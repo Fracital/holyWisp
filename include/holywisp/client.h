@@ -72,6 +72,18 @@ typedef struct hw_client_opts {
 	// server's INFO offers lanes; at most 16. Each CONNECT goes on the lane with the fewest open
 	// streams, the lowest first. 0 or 1 (the default): lane 0 alone.
 	int wt_lanes;
+	// Stream credit, v2 on either transport: name INFO extension 0xE2 with this initial window in
+	// bytes when the server's INFO offers it (hw_client_credit_window then says so; a window under
+	// 16384 is 16384, as the server takes it). The server then sends each TCP or terminal stream no
+	// more than the client has granted: the window, and more as the caller takes the stream's data.
+	// Taken means handed to the caller (hw_client_poll returning its DATA, hw_client_read_exact
+	// copying it out); what waits in the client's queue is not taken. Once a stream's caller has
+	// taken half a window since its last grant, the library sends CREDIT(taken + window) on the
+	// stream's lane. A caller that takes nothing from a stream holds that stream alone. 0 (the
+	// default): not named, and nothing changes.
+	uint32_t credit_window;
+	// With credit_window: the library grants nothing by itself, the caller does (hw_client_credit).
+	int credit_manual;
 } hw_client_opts;
 
 enum hw_client_event_type {
@@ -113,7 +125,10 @@ int hw_client_lanes(const hw_client *c);
 int hw_client_stream_lane(const hw_client *c, uint32_t stream_id);
 int hw_client_server_stream(const hw_client *c);
 uint32_t hw_client_buffer_size(const hw_client *c); // the server's initial CONTINUE
-int hw_client_fd(const hw_client *c);               // for poll(2) alongside other fds
+// Stream credit as the session has it: the initial window per stream in bytes, 0 when it is off
+// (not asked for, v1, or a server whose INFO does not offer it).
+uint32_t hw_client_credit_window(const hw_client *c);
+int hw_client_fd(const hw_client *c); // for poll(2) alongside other fds
 // The longest a caller that polls hw_client_fd may wait before it calls hw_client_poll, in
 // milliseconds: QUIC's timers (retransmission, acknowledgements, keepalive) run only inside the
 // client's calls. -1 on a WebSocket, which has none.
@@ -141,6 +156,14 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 // would be.
 int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t len);
 int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason);
+// Send CREDIT for stream_id: the server may have sent it `limit` DATA payload bytes in all,
+// counted from its start. On the stream's lane (lane 0 for an id the client does not have open).
+// The server only ever raises a limit, so a lower or repeated one changes nothing; it ignores one
+// for stream 0, a stream it does not have open or a UDP stream. This is the only way to give a
+// stream more than the window at once (a large download the caller is waiting on), and with
+// opts.credit_manual the only grant there is. It does not change when the library grants next.
+// 0, HW_ERR_INVALID when stream credit is off, HW_ERR_CLOSED.
+int hw_client_credit(hw_client *c, uint32_t stream_id, uint64_t limit);
 
 // Next event: 1 and ev filled, 0 on timeout, HW_ERR_CLOSED when the WebSocket is gone,
 // HW_ERR_PROTOCOL on a framing error. timeout_ms -1 = forever. The timeout covers the whole call:

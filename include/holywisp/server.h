@@ -63,7 +63,8 @@ typedef struct hw_server_config {
 
 	// Protocol.
 	int enable_v2;
-	int enable_twisp; // PTY streams; needs v2 + password auth
+	int enable_twisp;  // PTY streams; needs v2 + password auth
+	int stream_credit; // offer stream credit (INFO 0xE2): per-stream byte windows the client grants
 	char motd[512];
 	hw_password_user password_users[HW_MAX_PASSWORD_USERS];
 	int password_user_count;

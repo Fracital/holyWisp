@@ -164,6 +164,7 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `allow-host` / `block-host`, `allow-port` / `block-port` | none | Destination allow/block lists |
 | `enable-v2`, `motd` | on, `""` | Wisp v2 handshake, message of the day |
 | `enable-twisp` | off | PTY terminal streams; needs v2 and an authenticated client |
+| `stream-credit` | on | Offer stream credit in the v2 INFO (extension `0xE2`). A client that names it with a window grants each TCP or terminal stream its bytes as it reads them (CREDIT, packet `0xE2`), and the server reads that stream's remote no further than the grant, so a body nobody reads holds up only its own stream. Off leaves `0xE2` out of the INFO; a client that does not name it sees no difference |
 | `password-user USER:PASS`, `password-required` | none, off | v2 password auth (hash or plaintext); refuse unauthenticated clients |
 | `trusted-proxy`, `trusted-header`, `trusted-proxy-secret` | none, `X-Forwarded-For`, none | Whose proxy headers name the client, which header, and a secret the proxy must also send |
 | `parse-real-ip`, `trusted-headers-reset` | on, off | Read the client's address from a trusted proxy's header at all; empty the header list (`X-Forwarded-For`) before the `trusted-header` lines add theirs |
@@ -254,6 +255,13 @@ build/release/holywisp-client --bench 268435456 echo.example 7
 # the same over WebTransport, pinned to the certificate hash /webtransport.json lists
 build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-256> example.org 80
 ```
+
+`--credit BYTES` asks a v2 server for stream credit with an initial window of `BYTES` per stream:
+the server then sends each TCP stream only what this client has read and one window more, and the
+client grants more as it reads (a CREDIT once it has read half a window). `--read-rate BPS` makes
+the client read what arrives no faster than `BPS` bytes a second, a slow reader; with `--credit`
+that holds the server, and the remote behind it, to that rate. Over `--bench` with `--credit`, each
+stream keeps at most half a window in flight, so the window bounds the rate as it does natively.
 
 An `https://` server URL is WebTransport (UDP, port 443 unless the URL says otherwise). There is no
 certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what authenticates the

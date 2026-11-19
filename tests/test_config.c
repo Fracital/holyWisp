@@ -115,6 +115,19 @@ static void test_stop_on_stdin_eof_key(void) {
 	CHECK(hw_config_set(&cfg, "stop-on-stdin-eof", "maybe", err, sizeof(err)) != 0, "rejects a non-boolean");
 }
 
+static void test_stream_credit_key(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(cfg.stream_credit, 1);
+	CHECK_EQ(hw_config_set(&cfg, "stream-credit", "off", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.stream_credit, 0);
+	CHECK_EQ(hw_config_set(&cfg, "stream-credit", "true", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.stream_credit, 1);
+	CHECK(hw_config_set(&cfg, "stream-credit", "sometimes", err, sizeof(err)) != 0, "rejects a non-boolean");
+	CHECK_EQ(cfg.stream_credit, 1);
+}
+
 static void test_proxy_client_key_keys(void) {
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
@@ -258,6 +271,7 @@ int main(void) {
 	RUN(test_webclient_url_validation);
 	RUN(test_busy_poll_key);
 	RUN(test_stop_on_stdin_eof_key);
+	RUN(test_stream_credit_key);
 	RUN(test_proxy_client_key_keys);
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);

@@ -37,6 +37,11 @@ typedef struct cstream {
 	uint8_t type;
 	uint32_t remaining;
 	int lane; // WebTransport: the lane its CONNECT went on, which all its packets take
+	// Stream credit: DATA bytes handed to the caller, what that was at the last grant (the server
+	// may send up to it plus the window), and whether that grant could not go out yet (owed).
+	uint64_t taken;
+	uint64_t granted_at;
+	int owed;
 } cstream;
 
 typedef struct qevent {
@@ -66,6 +71,9 @@ struct hw_client {
 	int authenticated; // the password extension went out and the server completed the handshake
 	int timeout_ms;    // opts.timeout_ms: the longest a send waits for a CONTINUE
 	uint32_t buffer_size;
+	uint32_t credit;   // stream credit's window, 0 when off
+	int credit_manual; // opts.credit_manual: no grants but the caller's
+	int credit_owed;   // a stream has a grant that could not be sent at once (credit_flush)
 	char motd[512];
 	size_t max_message;
 
@@ -470,6 +478,51 @@ static int pump_one(hw_client *c, ctimer *t) {
 	return 1;
 }
 
+// ---------------------------------------------------------------------------------- stream credit
+
+// Send the CREDIT a stream is due: a window past what its caller has taken. With can_wait 0 it
+// goes only if it can go at once: the event the caller was just handed may point into the
+// session's receive queue, and a WebTransport send that has to wait for room receives, which can
+// move that queue. Then it is owed, and the next call into the client sends it (credit_flush).
+static void credit_grant(hw_client *c, cstream *s, int can_wait) {
+	uint8_t pkt[HW_WISP_HEADER_LEN + 8];
+	size_t n = hw_wisp_build_credit(pkt, s->id, s->taken + c->credit);
+	int r;
+	if (c->wt && !can_wait) {
+		r = c->closed ? HW_ERR_CLOSED : hw_wtc_send(c->wt, s->lane, pkt, n, 0, 0); // a deadline already past
+		if (r == HW_ERR_CLOSED) c->closed = 1;
+	} else {
+		r = send_packet_lane(c, s->lane, pkt, n);
+	}
+	if (r == HW_ERR_TIMEOUT) {
+		s->owed = 1;
+		c->credit_owed = 1;
+		return;
+	}
+	s->owed = 0;
+	if (r == 0) s->granted_at = s->taken;
+}
+
+// The caller has taken n bytes of a stream's DATA.
+static void credit_take(hw_client *c, uint32_t id, size_t n, int can_wait) {
+	if (!c->credit || n == 0) return;
+	cstream *s = stream_find(c, id);
+	if (!s || s->type == HW_STREAM_UDP) return;
+	s->taken += n;
+	if (c->credit_manual || s->taken - s->granted_at < c->credit / 2) return;
+	credit_grant(c, s, can_wait);
+}
+
+// The grants that could not go when they were due. Called where no event the client handed out
+// is still valid, so the send may wait for room.
+static void credit_flush(hw_client *c) {
+	if (!c->credit_owed) return;
+	c->credit_owed = 0;
+	for (size_t i = 0; i < c->nstreams && !c->closed; i++) {
+		if (c->streams[i].owed) credit_grant(c, &c->streams[i], 1);
+	}
+}
+
 // ---------------------------------------------------------------------------------- handshake
 
 static int do_upgrade(hw_client *c, const hw_client_opts *o, ctimer *t, char *err, size_t err_cap) {
@@ -578,11 +631,20 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				c->motd[ml] = '\0';
 			}
 			uint8_t meta[1 + CLIENT_USER_MAX + CLIENT_PASS_MAX];
-			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 3 * 5 + sizeof(meta)];
+			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 4 * 5 + 4 + sizeof(meta)];
 			size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 			n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 			if (o->stream_confirm) {
 				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_CONFIRM, NULL, 0);
+			}
+			// Stream credit only toward a server that offered it: one that did not would take no
+			// CREDIT, and the window would hold nothing.
+			if (o->credit_window && info.has_credit) {
+				uint8_t window[4];
+				hw_put_le32(window, o->credit_window);
+				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, window, sizeof(window));
+				c->credit = o->credit_window > HW_WISP_CREDIT_MIN ? o->credit_window : HW_WISP_CREDIT_MIN;
+				c->credit_manual = o->credit_manual;
 			}
 			// Credentials go only to a server that asked for them. One that did not advertise the
 			// extension has no use for a password, and would get it in clear all the same.
@@ -747,11 +809,16 @@ uint32_t hw_client_buffer_size(const hw_client *c) {
 	return c->buffer_size;
 }
 
+uint32_t hw_client_credit_window(const hw_client *c) {
+	return c->credit;
+}
+
 int hw_client_fd(const hw_client *c) {
 	return c->wt ? hw_wtc_fd(c->wt) : c->fd;
 }
 
 int hw_client_wait_ms(const hw_client *c) {
+	if (c->credit_owed) return 0; // a grant is waiting for the next call, and the server for it
 	return c->wt ? hw_wtc_wait_ms(c->wt) : -1;
 }
 
@@ -779,6 +846,9 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	s->type = stream_type;
 	s->remaining = c->buffer_size;
 	s->lane = lane;
+	s->taken = 0;
+	s->granted_at = 0;
+	s->owed = 0;
 	int r = send_packet_lane(c, lane, pkt, n);
 	if (r != 0) {
 		c->nstreams--;
@@ -790,6 +860,7 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 
 int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t len) {
 	if (c->closed) return HW_ERR_CLOSED;
+	credit_flush(c);
 	cstream *s = stream_find(c, stream_id);
 	if (!s) return HW_ERR_CLOSED;
 	if (s->type == HW_STREAM_TCP) {
@@ -829,18 +900,31 @@ int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason) {
 	return send_packet_lane(c, lane < 0 ? 0 : lane, pkt, hw_wisp_build_close(pkt, stream_id, reason));
 }
 
+int hw_client_credit(hw_client *c, uint32_t stream_id, uint64_t limit) {
+	if (c->closed) return HW_ERR_CLOSED;
+	if (!c->credit) return HW_ERR_INVALID;
+	int lane = hw_client_stream_lane(c, stream_id);
+	uint8_t pkt[HW_WISP_HEADER_LEN + 8];
+	return send_packet_lane(c, lane < 0 ? 0 : lane, pkt, hw_wisp_build_credit(pkt, stream_id, limit));
+}
+
 int hw_client_poll(hw_client *c, int timeout_ms, hw_client_event *ev) {
 	qevent_free(c, c->last);
 	c->last = NULL;
+	credit_flush(c);
 	qevent *q = queue_pop(c);
 	if (q) {
 		*ev = q->ev;
 		c->last = q;
+		if (ev->type == HW_CEV_DATA) credit_take(c, ev->stream_id, ev->len, 1); // ev is the client's own copy
 		return 1;
 	}
 	if (c->closed) return HW_ERR_CLOSED;
 	ctimer t = timer_start(timeout_ms);
-	return next_event(c, &t, ev);
+	int r = next_event(c, &t, ev);
+	// The event points into the read buffer. A WebSocket's send never touches it; a session's may.
+	if (r == 1 && ev->type == HW_CEV_DATA) credit_take(c, ev->stream_id, ev->len, !c->wt);
+	return r;
 }
 
 long long hw_client_read_exact(hw_client *c, uint32_t stream_id, uint8_t *out, size_t want, int timeout_ms) {
@@ -851,6 +935,7 @@ long long hw_client_read_exact(hw_client *c, uint32_t stream_id, uint8_t *out, s
 	ctimer t = timer_start(timeout_ms);
 	qevent_free(c, c->last);
 	c->last = NULL;
+	credit_flush(c);
 	while (got < want) {
 		// Queued events first, then the socket. q is the event's copy when it has one: a queued
 		// event is moved, never copied again, and one from the socket is copied only if it has to
@@ -871,6 +956,7 @@ long long hw_client_read_exact(hw_client *c, uint32_t stream_id, uint8_t *out, s
 			got += take;
 			if (take == ev.len) {
 				qevent_free(c, q);
+				credit_take(c, stream_id, take, 1); // ev's bytes are not looked at again
 				continue;
 			}
 			// Keep the rest for the caller's next read.
@@ -885,6 +971,7 @@ long long hw_client_read_exact(hw_client *c, uint32_t stream_id, uint8_t *out, s
 				if (result != 0) break;
 			}
 			queue_push_front(c, q);
+			credit_take(c, stream_id, take, 1);
 			continue;
 		}
 		if (!q) {

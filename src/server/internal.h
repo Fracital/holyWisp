@@ -325,8 +325,13 @@ typedef struct hw_conn {
 	uint32_t lane_paused;
 	int wt_info_first; // the server opened lane 0: the client's next packet must be its INFO
 	int continue_sent; // ... and the stream-0 CONTINUE went out with the server's INFO
-	int heard;         // a read from the client since the worker's last sweep
-	int stream_cap;    // effective max streams (reputation THROTTLE tier lowers it)
+	// Stream credit: whether the server's INFO offered it, and the initial window the client named
+	// (at least HW_WISP_CREDIT_MIN), 0 while it is off. Every TCP and Twisp stream opened while it
+	// is set starts with that window (stream_new).
+	int credit_offered;
+	uint32_t credit_window;
+	int heard;      // a read from the client since the worker's last sweep
+	int stream_cap; // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
 	char peer[HW_ADDR_STR_LEN];                  // socket peer, with port, for logs
 	char ip[HW_IP_STR_LEN];                      // client IP after trusted-proxy headers, for policy
@@ -386,12 +391,29 @@ typedef struct hw_stream {
 	// Twisp.
 	pid_t pid;
 	int lane; // WebTransport: the lane its CONNECT came on, which every packet of it goes on
+	// Stream credit: DATA payload bytes queued toward the client so far, and the most the client
+	// lets it have (raised by CREDIT, never lowered). UINT64_MAX for a stream that is not counted
+	// (UDP, or credit off), which therefore never reaches it.
+	uint64_t credit_sent;
+	uint64_t credit_limit;
 } hw_stream;
 
+// Stream credit spent: the stream may not read its remote until a CREDIT raises the limit.
+static inline int stream_credit_held(const hw_stream *s) {
+	return s->credit_sent >= s->credit_limit;
+}
+
+// The most one read from the remote may take for the client: cap, or what is left of the credit.
+static inline size_t stream_credit_cap(const hw_stream *s, size_t cap) {
+	uint64_t left = s->credit_limit - s->credit_sent;
+	return left < cap ? (size_t)left : cap;
+}
+
 // Whether a stream reads from its remote: not while the connection's send queue or bandwidth
-// holds every stream (c->paused), nor while its own lane's queue holds its lane (WebTransport).
+// holds every stream (c->paused), nor while its own lane's queue holds its lane (WebTransport),
+// nor while its own credit is spent.
 static inline int conn_stream_paused(const hw_conn *c, const hw_stream *s) {
-	return c->paused || (c->lane_paused >> s->lane & 1u);
+	return c->paused || (c->lane_paused >> s->lane & 1u) || stream_credit_held(s);
 }
 
 // conn.c
@@ -456,12 +478,13 @@ void server_warp_refresh(hw_server *s, int running);
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len);
 // Queue a DATA packet for stream_id with `len` payload bytes copied from `data`.
 int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len);
-// Relay what the stream's remote has to read as one DATA packet without copying it through user
-// space. Returns the bytes relayed (> 0), 0 on remote EOF, -1 with errno from the remote read
-// (EAGAIN: nothing to read), -2 when the copying path (recv into scratch + conn_send_data) must be
-// used instead, or -3 when the stream's previous payload is still in its pipe: the caller waits
-// for it (stream_park). A failure toward the client closes the connection: check c->closing.
-ssize_t conn_splice_data(hw_conn *c, hw_stream *s);
+// Relay what the stream's remote has to read, at most max bytes (its credit; > 0), as one DATA
+// packet without copying it through user space. Returns the bytes relayed (> 0), 0 on remote EOF,
+// -1 with errno from the remote read (EAGAIN: nothing to read), -2 when the copying path (recv
+// into scratch + conn_send_data) must be used instead, or -3 when the stream's previous payload is
+// still in its pipe: the caller waits for it (stream_park). A failure toward the client closes the
+// connection: check c->closing.
+ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max);
 // The stream is closing: free its pipe, or leave it to the queue when a payload is still in it.
 void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
@@ -526,7 +549,8 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 void stream_batch_flush(hw_worker *w);
 // Close the remote side, tell the client when send_close, remove from the connection, free.
 void stream_close(hw_stream *s, uint8_t reason, int send_close);
-// Stop/resume reading from the remote (connection-level backpressure).
+// Stop/resume reading from the remote (connection-level backpressure). A resume does nothing for a
+// stream that is parked or whose credit is spent: those resume when their own hold ends.
 void stream_pause(hw_stream *s);
 void stream_resume(hw_stream *s);
 // A bulk stream's pipe still holds its previous payload: stop reading the remote until the queue

@@ -178,6 +178,63 @@ static void test_lanes(void) {
 	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), HW_ERR_INVALID);
 }
 
+// Stream credit: INFO extension 0xE2 (empty from the server, a u32 window from the client, a
+// shorter meta as no window, reserved bytes after it skipped) and the CREDIT packet.
+static void test_credit(void) {
+	uint8_t pkt[64];
+	hw_wisp_packet p;
+	hw_wisp_info info;
+	size_t n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, NULL, 0);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
+	CHECK_EQ(pkt[7], 0xE2);
+	CHECK_EQ(hw_le32(pkt + 8), 0);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_credit, "server's 0xE2");
+	CHECK(!info.has_credit_window, "no window in the server's");
+	CHECK(info.has_udp, "the extension after it");
+
+	uint8_t meta[6] = {0x00, 0x00, 0x10, 0x00, 0xaa, 0xbb}; // 1 MiB, then two reserved bytes
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, meta, 6);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_credit && info.has_credit_window, "client's 0xE2");
+	CHECK_EQ(info.credit_window, 1024 * 1024);
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, meta, 3); // too short for a window
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_credit && !info.has_credit_window, "3 bytes are no window");
+	CHECK_EQ(info.credit_window, 0);
+	n = hw_wisp_build_info(pkt, 2, 1);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(!info.has_credit && !info.has_credit_window, "absent");
+
+	CHECK_EQ(hw_wisp_build_credit(pkt, 7, 0x0102030405060708ull), HW_WISP_HEADER_LEN + 8);
+	static const uint8_t want[] = {0xE2, 7, 0, 0, 0, 8, 7, 6, 5, 4, 3, 2, 1};
+	CHECK(memcmp(pkt, want, sizeof(want)) == 0, "CREDIT bytes");
+	CHECK_EQ(hw_wisp_parse(pkt, 13, &p), 0);
+	CHECK_EQ(p.stream_id, 7);
+	uint64_t limit = 0;
+	CHECK_EQ(hw_wisp_parse_credit(&p, &limit), 0);
+	CHECK(limit == 0x0102030405060708ull, "limit %llx", (unsigned long long)limit);
+	CHECK_STR(hw_wisp_type_str(HW_WISP_CREDIT), "CREDIT");
+	pkt[13] = 0x77; // a reserved byte after the limit
+	CHECK_EQ(hw_wisp_parse(pkt, 14, &p), 0);
+	CHECK_EQ(hw_wisp_parse_credit(&p, &limit), 0);
+	CHECK(limit == 0x0102030405060708ull, "limit with a reserved byte");
+	CHECK_EQ(hw_wisp_parse(pkt, 12, &p), 0); // 7 bytes of limit
+	CHECK_EQ(hw_wisp_parse_credit(&p, &limit), HW_ERR_INVALID);
+	hw_wisp_write_header(pkt, HW_WISP_DATA, 7); // another type
+	CHECK_EQ(hw_wisp_parse(pkt, 13, &p), 0);
+	CHECK_EQ(hw_wisp_parse_credit(&p, &limit), HW_ERR_INVALID);
+	hw_put_le64(pkt, UINT64_MAX);
+	CHECK(hw_le64(pkt) == UINT64_MAX, "le64 round trip");
+}
+
 int main(void) {
 	RUN(test_le16);
 	RUN(test_header_roundtrip);
@@ -186,5 +243,6 @@ int main(void) {
 	RUN(test_info_server);
 	RUN(test_info_client_password);
 	RUN(test_lanes);
+	RUN(test_credit);
 	return 0;
 }

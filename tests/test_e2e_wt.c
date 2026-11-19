@@ -18,6 +18,7 @@
 #include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 
+#include "credit_cases.h"
 #include "test.h"
 
 #include <errno.h>
@@ -1636,6 +1637,68 @@ static void test_stats_json(void) {
 	CHECK_EQ(st.wt_sessions_active, 0);
 }
 
+// A CREDIT is taken from the session's streams only: one in a datagram, which could be lost or
+// overtake the stream, is dropped and counted, and the stream stays held until one comes on its
+// lane. Stream credit as an INFO with 0xE2 names it, and as the small source's end shows it.
+static void test_credit_not_by_datagram(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open(&r, s, 1);
+	uint8_t pkt[64];
+	uint8_t window[4];
+	hw_put_le32(window, HW_WISP_CREDIT_MIN);
+	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, 0);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, window, sizeof(window));
+	raw_send(&r, pkt, n);
+	raw_wait_packets(&r, 2, 3000);
+	CHECK(r.types[1] == HW_WISP_CONTINUE, "the handshake");
+	raw_connect(&r, 0, 1, g_credit_small_port);
+	uint64_t until = hw_now_ms() + 3000;
+	while (r.lane_bytes[0] < HW_WISP_CREDIT_MIN && hw_now_ms() < until) raw_pump(&r, 20, NULL);
+	raw_pump(&r, 300, NULL);
+	CHECK_EQ(r.lane_bytes[0], HW_WISP_CREDIT_MIN);
+
+	uint64_t dropped = stats(s).wt_dropped;
+	n = hw_wisp_build_credit(pkt, 1, CREDIT_SMALL + 1);
+	CHECK_EQ(hw_wt_send(r.wt, pkt, n, 1), 0); // a datagram
+	raw_output(&r);
+	raw_pump(&r, 300, NULL);
+	CHECK_EQ(r.lane_bytes[0], HW_WISP_CREDIT_MIN);
+	CHECK_EQ(stats(s).wt_dropped, dropped + 1);
+	CHECK(r.last_type == HW_WISP_DATA, "no CLOSE: %u", r.last_type);
+
+	raw_send(&r, pkt, n); // the same on the Wisp stream
+	until = hw_now_ms() + 3000;
+	while (r.last_type != HW_WISP_CLOSE && hw_now_ms() < until) raw_pump(&r, 20, NULL);
+	CHECK_EQ(r.lane_bytes[0], CREDIT_SMALL);
+	CHECK(r.last_type == HW_WISP_CLOSE && r.last_stream == 1 && r.last_reason == HW_CLOSE_VOLUNTARY, "the end");
+	raw_free(&r);
+	hw_server_free(s);
+}
+
+// credit_cases.h's way to connect: WebTransport, and a v2 session with two lanes, so that a held
+// stream and a busy one can share one while another lane is open beside them.
+static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manual, size_t max_queue) {
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_wt_port(s);
+	o.webtransport = 1;
+	o.v2 = v2;
+	o.wt_lanes = v2 ? 2 : 0;
+	o.credit_window = window;
+	o.credit_manual = manual;
+	if (max_queue) o.max_queue_bytes = max_queue;
+	o.timeout_ms = 5000;
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "connect: %s", err);
+	return c;
+}
+
 int main(void) {
 	start_services();
 	hw_server_config cfg;
@@ -1668,6 +1731,19 @@ int main(void) {
 	RUN(test_lane_backpressure);
 	RUN(test_old_clients);
 	RUN(test_stats_json);
+
+	base_config(&cfg);
+	cfg.stream_credit = 0;
+	hw_server *off = server_with(&cfg);
+	credit_env credit = {.server = g_server,
+	                     .server_off = off,
+	                     .echo_port = g_tcp_echo_port,
+	                     .udp_echo_port = g_udp_echo_port,
+	                     .open_client = credit_connect,
+	                     .lanes = 1};
+	credit_cases_run(&credit);
+	RUN(test_credit_not_by_datagram); // after credit_cases_run, which starts its source
+	hw_server_free(off);
 
 	hw_server_stop(g_server);
 	hw_server_free(g_server);
