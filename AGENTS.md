@@ -890,6 +890,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 | `src/server/server.c` | Config defaults, listeners, worker threads, lifecycle, stats. |
 | `src/server/conn.c` | One client: HTTP upgrade, WebSocket frames, Wisp dispatch, write queue, backpressure. |
 | `src/server/stream.c` | One relayed TCP/UDP stream: resolve, connect with fallback, both data directions. |
+| `src/server/stats.c` | `GET /stats`: `hw_server_stats` as JSON, fields only ever added. |
 | `src/server/egress.c` | The allow/deny decision for a remote address (address class only). |
 | `src/server/proxy.c` | Upstream SOCKS5 / HTTP CONNECT handshake, driven on the stream socket. |
 | `src/server/auth.c` | Hashed-password checks on two threads of their own, answered on the loop that asked. |

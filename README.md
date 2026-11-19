@@ -223,7 +223,11 @@ would not: a gate to run before a restart. The most important keys:
 | `stop-on-stdin-eof` | off | Shut down when standard input reaches end of file. For a program that runs `holywisp` as a child with a pipe on its stdin (the Node wrapper does): the server then never outlives its parent. Leave it off under systemd, where stdin is `/dev/null` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,
-streams, bytes, and every refusal/throttle/block tally), both on the same port. With
+streams, bytes, and every refusal/throttle/block tally), both on the same port. `/stats` also
+names the running build (`version`) and, as `warpState`, what the WARP state file means at the
+last look: `configured`, `canMark` (the process may mark sockets), `usable`, `state` (`ok`,
+`missing`, `unreadable`, `malformed`, `stale`, `noCapability` or `off`), `ageSeconds` since the
+router last rewrote it and the usable `tunnels` per family. Fields are only ever added. With
 `webtransport`, `GET /webtransport.json` on that port is `{"url": ..., "hashes": [...]}`: the URL
 to open (`webtransport-url`, or `""`) and the certificate hashes a page passes to
 `new WebTransport(url, {serverCertificateHashes})`.

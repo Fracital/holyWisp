@@ -158,6 +158,20 @@ static void check_workers(hw_server *s, int present, int n4, int n6) {
 	}
 }
 
+// What /stats says of the state: its status, its age, the tunnels per family.
+static void check_stat(hw_server *s, int status, int n4, int n6) {
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.warp_state, status);
+	CHECK_EQ(st.warp_tunnels_v4, (uint64_t)n4);
+	CHECK_EQ(st.warp_tunnels_v6, (uint64_t)n6);
+	if (status == HW_WARP_STATUS_MISSING) {
+		CHECK_EQ(st.warp_state_age_s, -1);
+	} else {
+		CHECK(st.warp_state_age_s >= 0 && st.warp_state_age_s < 3600, "age %lld", (long long)st.warp_state_age_s);
+	}
+}
+
 static const char *const STATE_TWO =
     "{\"v4\": [{\"name\": \"warp0\", \"mark\": 30465}, {\"name\": \"warp1\", \"mark\": 30466},"
     " {\"name\": \"rogue\", \"mark\": 1}], \"v6\": [{\"name\": \"warp0\", \"mark\": 30465}]}";
@@ -169,6 +183,25 @@ static void test_unprivileged_start(void) {
 	hw_server *s = hw_server_new(&cfg);
 	CHECK(s != NULL, "a server with udp-warp-marks and no capability starts");
 	CHECK_EQ(s->warp_on, g_can_mark);
+	if (!g_can_mark) {
+		hw_server_stats st;
+		hw_server_stats_get(s, &st);
+		CHECK_EQ(st.warp_state, HW_WARP_STATUS_NO_MARK);
+	}
+	hw_server_free(s);
+	// Without udp-warp-marks, there is nothing to say but that.
+	hw_server_config off;
+	hw_server_config_defaults(&off);
+	snprintf(off.host, sizeof(off.host), "127.0.0.1");
+	off.port = 0;
+	off.workers = 1;
+	off.log_level = HW_LOG_NONE;
+	s = hw_server_new(&off);
+	CHECK(s != NULL, "server");
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK_EQ(st.warp_state, HW_WARP_STATUS_OFF);
+	CHECK_EQ(st.warp_state_age_s, -1);
 	hw_server_free(s);
 
 	// Half the pair is a config error, wherever it runs.
@@ -185,10 +218,12 @@ static void test_state_tracking(void) {
 	unlink(g_state);
 	hw_server *s = warp_server(0);
 	check_workers(s, 0, 0, 0); // missing: unmarked
+	check_stat(s, HW_WARP_STATUS_MISSING, 0, 0);
 
 	write_state(STATE_TWO);
 	server_warp_refresh(s, 0);
 	check_workers(s, 1, 2, 1); // the rogue mark is not one of udp-warp-marks
+	check_stat(s, HW_WARP_STATUS_OK, 2, 1);
 
 	// A rewrite within the same second is still seen: it is another file.
 	write_state("{\"v4\": [{\"name\": \"warp3\", \"mark\": 30468}]}");
@@ -200,6 +235,10 @@ static void test_state_tracking(void) {
 	age_state(61);
 	server_warp_refresh(s, 0);
 	check_workers(s, 0, 0, 0);
+	check_stat(s, HW_WARP_STATUS_STALE, 0, 0);
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK(st.warp_state_age_s >= 61, "age %lld", (long long)st.warp_state_age_s);
 	s->cfg.udp_warp_state_max_age_s = 0; // never too old
 	server_warp_refresh(s, 0);
 	check_workers(s, 1, 1, 0);
@@ -209,6 +248,7 @@ static void test_state_tracking(void) {
 	write_state("{\"v4\": [{\"name\": \"warp0\", \"mark\": 30465}");
 	server_warp_refresh(s, 0);
 	check_workers(s, 0, 0, 0);
+	check_stat(s, HW_WARP_STATUS_MALFORMED, 0, 0);
 
 	write_state(STATE_TWO);
 	server_warp_refresh(s, 0);
@@ -216,6 +256,7 @@ static void test_state_tracking(void) {
 	unlink(g_state);
 	server_warp_refresh(s, 0);
 	check_workers(s, 0, 0, 0);
+	check_stat(s, HW_WARP_STATUS_MISSING, 0, 0);
 	hw_server_free(s);
 }
 

@@ -188,6 +188,7 @@ add_library(holywisp-server STATIC
   src/server/egress.c
   src/server/proxy.c
   src/server/server.c
+  src/server/stats.c
   src/server/stream.c
   src/server/twisp.c
   src/server/wt_listener.c

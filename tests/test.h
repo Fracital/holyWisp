@@ -33,6 +33,71 @@ static int g_checks;
 #define CHECK_EQ(a, b)  CHECK((a) == (b), "%lld != %lld", (long long)(a), (long long)(b))
 #define CHECK_STR(a, b) CHECK(strcmp((a), (b)) == 0, "\"%s\" != \"%s\"", (a), (b))
 
+// Whether s, from *pos, is one JSON value (RFC 8259, without string escapes other than \" and
+// \\, which is all the server writes), with nothing after it but whitespace when top is set. For
+// the bodies the server makes by hand: GET /stats, /webtransport.json.
+static inline int hw_test_json_value(const char *s, size_t *pos, int top) {
+	size_t i = *pos;
+	while (s[i] == ' ' || s[i] == '\n') i++;
+	if (s[i] == '{' || s[i] == '[') {
+		char close = s[i] == '{' ? '}' : ']';
+		int obj = s[i] == '{';
+		i++;
+		while (s[i] == ' ' || s[i] == '\n') i++;
+		if (s[i] == close) {
+			i++;
+		} else {
+			for (;;) {
+				if (obj) {
+					if (s[i] != '"') return 0;
+					if (!hw_test_json_value(s, &i, 0)) return 0;
+					while (s[i] == ' ') i++;
+					if (s[i++] != ':') return 0;
+				}
+				if (!hw_test_json_value(s, &i, 0)) return 0;
+				while (s[i] == ' ' || s[i] == '\n') i++;
+				if (s[i] == ',') {
+					i++;
+					while (s[i] == ' ' || s[i] == '\n') i++;
+					continue;
+				}
+				if (s[i++] != close) return 0;
+				break;
+			}
+		}
+	} else if (s[i] == '"') {
+		for (i++; s[i] != '"'; i++) {
+			if (!s[i] || (unsigned char)s[i] < 0x20) return 0;
+			if (s[i] == '\\' && (s[i + 1] == '"' || s[i + 1] == '\\')) i++;
+		}
+		i++;
+	} else if (s[i] == '-' || (s[i] >= '0' && s[i] <= '9')) {
+		if (s[i] == '-') i++;
+		if (s[i] < '0' || s[i] > '9') return 0;
+		while ((s[i] >= '0' && s[i] <= '9') || s[i] == '.' || s[i] == 'e' || s[i] == 'E' || s[i] == '+' ||
+		       s[i] == '-') {
+			i++;
+		}
+	} else if (!strncmp(s + i, "true", 4) || !strncmp(s + i, "null", 4)) {
+		i += 4;
+	} else if (!strncmp(s + i, "false", 5)) {
+		i += 5;
+	} else {
+		return 0;
+	}
+	if (top) {
+		while (s[i] == ' ' || s[i] == '\n' || s[i] == '\r') i++;
+		if (s[i]) return 0;
+	}
+	*pos = i;
+	return 1;
+}
+
+static inline int hw_test_json_valid(const char *s) {
+	size_t pos = 0;
+	return hw_test_json_value(s, &pos, 1);
+}
+
 #define RUN(fn)                                                \
 	do {                                                       \
 		int before = g_checks;                                 \

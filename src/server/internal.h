@@ -200,10 +200,16 @@ struct hw_server {
 	uint64_t warp_ino, warp_size;    // inode each time, so a change within one second still shows
 	struct hw_warp_state *warp_read; // its content, restricted to udp-warp-marks; NULL: unusable
 	char warp_why[96];               // why it is unusable, for the log
+	int warp_why_code;               // ... and as an enum hw_warp_status, for the stats
 	uint8_t client_key_secret[128];  // proxy-client-key's secret (the configured one, or random)
 	size_t client_key_secret_len;
 	struct hw_warp_state *warp_given; // what the workers were last given (NULL: unmarked)
 	int warp_published;               // whether every worker has warp_given
+	// The same for /stats, written at every look and read from any thread (hw_server_stats_get):
+	// an enum hw_warp_status, the file's mtime in wall-clock seconds (0: none), the tunnels given.
+	_Atomic int warp_stat_status;
+	_Atomic int64_t warp_stat_mtime;
+	_Atomic int warp_stat_n4, warp_stat_n6;
 	// WebTransport. The keys are drawn once and never change: Retry tokens are sealed with the
 	// first and stateless reset tokens derived from the second, and any worker must be able to
 	// answer for any other's connection IDs. The certificate is the maintenance thread's
@@ -503,6 +509,10 @@ void wt_conn_flush(wt_session *s);
 void wt_conn_detach(wt_session *s, uint32_t code);
 // A per-worker buffer of one frame's payload plus a Wisp header, to lay out a packet in.
 uint8_t *wt_conn_scratch(wt_session *s);
+
+// stats.c: the body of GET /stats, appended to out, for a connection on worker w (whose own copy
+// of the WARP state names the tunnels). 0, or -1 when out could not grow.
+int stats_json(const hw_worker *w, hw_buf *out);
 
 // Look at udp-warp-state again and give the workers what it now means (server.c). The maintenance
 // thread does this every second; running 0 means the workers have not started, so their copies

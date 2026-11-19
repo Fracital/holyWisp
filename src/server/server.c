@@ -598,6 +598,7 @@ static void warp_read_file(hw_server *s) {
 	char *buf = malloc(WARP_STATE_MAX + 1);
 	hw_warp_state *st = malloc(sizeof(*st));
 	int fd = open(s->cfg.udp_warp_state, O_RDONLY);
+	s->warp_why_code = fd < 0 && errno == ENOENT ? HW_WARP_STATUS_MISSING : HW_WARP_STATUS_UNREADABLE;
 	if (!buf || !st || fd < 0) {
 		snprintf(s->warp_why, sizeof(s->warp_why), "%s", strerror(!buf || !st ? ENOMEM : errno));
 		goto done;
@@ -619,6 +620,7 @@ static void warp_read_file(hw_server *s) {
 	}
 	char err[64];
 	if (hw_warp_state_parse(buf, len, st, err, sizeof(err)) != 0) {
+		s->warp_why_code = HW_WARP_STATUS_MALFORMED;
 		snprintf(s->warp_why, sizeof(s->warp_why), "not a tunnel list (%s)", err);
 		goto done;
 	}
@@ -628,6 +630,7 @@ static void warp_read_file(hw_server *s) {
 		        s->cfg.udp_warp_state, dropped, dropped == 1 ? "" : "s");
 	}
 	s->warp_read = st;
+	s->warp_why_code = HW_WARP_STATUS_OK;
 	st = NULL;
 done:
 	if (fd >= 0) close(fd);
@@ -640,12 +643,16 @@ void server_warp_refresh(hw_server *s, int running) {
 	const hw_warp_state *want = NULL;
 	char why[160];
 	struct stat sb;
+	int status;
+	int64_t mtime = 0;
 	if (stat(cfg->udp_warp_state, &sb) != 0) {
+		status = errno == ENOENT ? HW_WARP_STATUS_MISSING : HW_WARP_STATUS_UNREADABLE;
 		snprintf(why, sizeof(why), "%s", strerror(errno));
 		s->warp_seen = 0;
 		free(s->warp_read);
 		s->warp_read = NULL;
 	} else {
+		mtime = (int64_t)sb.st_mtime;
 		if (!s->warp_seen || (int64_t)sb.st_mtime != s->warp_mtime || (uint64_t)sb.st_ino != s->warp_ino ||
 		    (uint64_t)sb.st_size != s->warp_size) {
 			s->warp_seen = 1;
@@ -656,13 +663,20 @@ void server_warp_refresh(hw_server *s, int running) {
 		}
 		long long age = (long long)time(NULL) - (long long)sb.st_mtime;
 		if (!s->warp_read) {
+			status = s->warp_why_code;
 			snprintf(why, sizeof(why), "%s", s->warp_why);
 		} else if (cfg->udp_warp_state_max_age_s > 0 && age > cfg->udp_warp_state_max_age_s) {
+			status = HW_WARP_STATUS_STALE;
 			snprintf(why, sizeof(why), "not rewritten for %lld s", age);
 		} else {
+			status = HW_WARP_STATUS_OK;
 			want = s->warp_read;
 		}
 	}
+	atomic_store(&s->warp_stat_status, status);
+	atomic_store(&s->warp_stat_mtime, mtime);
+	atomic_store(&s->warp_stat_n4, want ? want->n4 : 0);
+	atomic_store(&s->warp_stat_n6, want ? want->n6 : 0);
 	int same = want ? s->warp_given && memcmp(want, s->warp_given, sizeof(*want)) == 0 : !s->warp_given;
 	if (same && s->warp_published) return;
 	if (!same) {
@@ -687,6 +701,7 @@ void server_warp_refresh(hw_server *s, int running) {
 // UDP's exit address. The log says so once, loudly.
 static void warp_init(hw_server *s) {
 	if (s->cfg.udp_warp_mark_count == 0) return;
+	atomic_store(&s->warp_stat_status, HW_WARP_STATUS_NO_MARK); // until the capability is shown
 	int fd = socket(AF_INET, SOCK_DGRAM, 0);
 	int ok = fd >= 0 && hw_sys_set_mark(fd, s->cfg.udp_warp_marks[0]) == 0;
 	int e = errno;
@@ -1099,6 +1114,15 @@ void hw_server_stats_get(const hw_server *s, hw_server_stats *out) {
 	out->wt_retries = atomic_load(&s->wt_retries);
 	out->wt_refused_handshakes = atomic_load(&s->wt_refused_handshakes);
 	out->wt_dropped = atomic_load(&s->wt_dropped);
+	out->warp_state = atomic_load(&s->warp_stat_status);
+	int64_t mtime = atomic_load(&s->warp_stat_mtime);
+	out->warp_state_age_s = -1;
+	if (mtime > 0) {
+		int64_t age = (int64_t)time(NULL) - mtime;
+		out->warp_state_age_s = age > 0 ? age : 0; // a file from the future is a new one
+	}
+	out->warp_tunnels_v4 = (uint64_t)atomic_load(&s->warp_stat_n4);
+	out->warp_tunnels_v6 = (uint64_t)atomic_load(&s->warp_stat_n6);
 	if (s->reputation) {
 		size_t src, dst;
 		hw_reputation_counts(s->reputation, &src, &dst);

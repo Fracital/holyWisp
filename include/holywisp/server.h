@@ -220,6 +220,17 @@ typedef struct hw_server_config {
 	int stop_on_stdin_eof;
 } hw_server_config;
 
+// What udp-warp-state means at the maintenance thread's last look (hw_server_stats.warp_state).
+enum hw_warp_status {
+	HW_WARP_STATUS_OFF = 0,    // no udp-warp-marks
+	HW_WARP_STATUS_NO_MARK,    // this process cannot mark sockets (CAP_NET_ADMIN): never looked at
+	HW_WARP_STATUS_OK,         // usable: streams are marked by it
+	HW_WARP_STATUS_MISSING,    // no such file
+	HW_WARP_STATUS_UNREADABLE, // there, but it could not be read (permissions, I/O, too large)
+	HW_WARP_STATUS_MALFORMED,  // read, but not a tunnel list
+	HW_WARP_STATUS_STALE       // not rewritten for longer than udp-warp-state-max-age-s
+};
+
 typedef struct hw_server_stats {
 	uint64_t uptime_s;
 	uint64_t connections_total;
@@ -270,6 +281,13 @@ typedef struct hw_server_stats {
 	uint64_t wt_retries;
 	uint64_t wt_refused_handshakes;
 	uint64_t wt_dropped;
+	// UDP and TCP on WARP: the state file as the workers were last given it. The age is of the
+	// file's last rewrite, -1 when there is none to be had; the tunnels are those usable now,
+	// per family (0 unless warp_state is HW_WARP_STATUS_OK).
+	int warp_state; // enum hw_warp_status
+	int64_t warp_state_age_s;
+	uint64_t warp_tunnels_v4;
+	uint64_t warp_tunnels_v6;
 } hw_server_stats;
 
 typedef struct hw_server hw_server;

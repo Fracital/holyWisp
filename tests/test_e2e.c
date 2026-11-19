@@ -780,6 +780,48 @@ static void test_plain_http(void) {
 	close(fd);
 }
 
+// GET path on s: the whole response, and its body (after the head) in *body.
+static size_t http_get_path(hw_server *s, const char *path, char *buf, size_t cap, const char **body) {
+	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
+	CHECK(fd >= 0, "connect");
+	char req[256];
+	int len = snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
+	CHECK_EQ(write(fd, req, (size_t)len), len);
+	size_t n = 0;
+	for (;;) {
+		ssize_t r = read(fd, buf + n, cap - 1 - n);
+		if (r <= 0) break;
+		n += (size_t)r;
+	}
+	buf[n] = '\0';
+	close(fd);
+	const char *end = strstr(buf, "\r\n\r\n");
+	CHECK(end != NULL, "no head: %s", buf);
+	*body = end + 4;
+	return n;
+}
+
+// GET /stats is JSON however much it says, and its length is what it says it is. The fields that
+// were there before stay where they were.
+static void test_stats_json(void) {
+	static char buf[65536];
+	const char *body;
+	http_get_path(g_server, "/stats", buf, sizeof(buf), &body);
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	const char *cl = strstr(buf, "Content-Length: ");
+	CHECK(cl != NULL && cl < body, "no Content-Length");
+	CHECK_EQ(strtoul(cl + 16, NULL, 10), strlen(body));
+	CHECK(hw_test_json_valid(body), "not JSON: %s", body);
+	CHECK(strstr(body, "{\"uptimeSeconds\":") == body, "first field: %.40s", body);
+	CHECK(strstr(body, "\"connections\":{\"total\":") != NULL, "connections: %s", body);
+	CHECK(strstr(body, "\"webTransport\":{\"sessions\":{\"total\":") != NULL, "webTransport: %s", body);
+	// The running build, and WARP: off here, so nothing to report but that.
+	CHECK(strstr(body, "\"version\":\"" HW_VERSION HW_VERSION_SUFFIX "\"") != NULL, "version: %s", body);
+	CHECK(strstr(body, "\"warpState\":{\"configured\":false,\"canMark\":false,\"usable\":false,\"state\":\"off\","
+	                   "\"ageSeconds\":null,\"tunnels\":{\"v4\":0,\"v6\":0}}") != NULL,
+	      "warpState: %s", body);
+}
+
 static size_t http_get_root(hw_server *s, char *buf, size_t cap) {
 	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
 	CHECK(fd >= 0, "connect");
@@ -949,6 +991,7 @@ int main(void) {
 	RUN(test_v2_continue_waits_for_password);
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
+	RUN(test_stats_json);
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);

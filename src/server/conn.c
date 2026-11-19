@@ -1109,48 +1109,15 @@ static void http_reply(hw_conn *c, int status, const char *reason, const char *c
 	http_reply_n(c, status, reason, ctype, body, strlen(body));
 }
 
-static void stats_json(hw_conn *c) {
-	hw_server_stats st;
-	hw_server_stats_get(c->w->server, &st);
-	char body[2048]; // every counter at 20 digits still fits
-	snprintf(body, sizeof(body),
-	         "{\"uptimeSeconds\":%llu,"
-	         "\"connections\":{\"total\":%llu,\"active\":%llu,\"perWorkerMin\":%llu,\"perWorkerMax\":%llu},"
-	         "\"streams\":{\"total\":%llu,\"active\":%llu},"
-	         "\"bytes\":{\"in\":%llu,\"out\":%llu},"
-	         "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},"
-	         "\"blocked\":{\"filter\":%llu,\"egress\":%llu},"
-	         "\"throttled\":{\"source\":%llu,\"dest\":%llu,\"syns\":%llu,\"lookups\":%llu},"
-	         "\"queueBudget\":{\"held\":%llu,\"pauses\":%llu},"
-	         "\"udpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
-	         "\"tcpWarp\":{\"marked\":%llu,\"direct\":%llu,\"refused\":%llu,\"bypassed\":%llu},"
-	         "\"tcpRoute\":{\"proxied\":%llu,\"direct\":%llu},"
-	         "\"synSignatures\":%llu,\"wsClosedViolations\":%llu,\"authFailures\":%llu,"
-	         "\"dnsCacheEntries\":%llu,\"reputation\":{\"sources\":%llu,\"destinations\":%llu},"
-	         "\"webTransport\":{\"sessions\":{\"total\":%llu,\"active\":%llu},\"handshakes\":%llu,"
-	         "\"retries\":%llu,\"refusedHandshakes\":%llu,\"dropped\":%llu}}\n",
-	         (unsigned long long)st.uptime_s, (unsigned long long)st.connections_total,
-	         (unsigned long long)st.connections_active, (unsigned long long)st.worker_connections_min,
-	         (unsigned long long)st.worker_connections_max, (unsigned long long)st.streams_total,
-	         (unsigned long long)st.streams_active, (unsigned long long)st.bytes_in, (unsigned long long)st.bytes_out,
-	         (unsigned long long)st.refused_connection_rate, (unsigned long long)st.refused_connection_limit,
-	         (unsigned long long)st.refused_reputation, (unsigned long long)st.blocked_filter,
-	         (unsigned long long)st.blocked_egress, (unsigned long long)st.throttled_source,
-	         (unsigned long long)st.throttled_dest, (unsigned long long)st.throttled_syns,
-	         (unsigned long long)st.throttled_lookups, (unsigned long long)st.queue_budget_held,
-	         (unsigned long long)st.queue_budget_pauses, (unsigned long long)st.udp_warp_marked,
-	         (unsigned long long)st.udp_warp_direct, (unsigned long long)st.udp_warp_refused,
-	         (unsigned long long)st.udp_warp_bypassed, (unsigned long long)st.tcp_warp_marked,
-	         (unsigned long long)st.tcp_warp_direct, (unsigned long long)st.tcp_warp_refused,
-	         (unsigned long long)st.tcp_warp_bypassed, (unsigned long long)st.tcp_proxied,
-	         (unsigned long long)st.tcp_direct, (unsigned long long)st.syn_signatures,
-	         (unsigned long long)st.ws_closed_violations, (unsigned long long)st.auth_failures,
-	         (unsigned long long)st.dns_cache_entries, (unsigned long long)st.reputation_sources,
-	         (unsigned long long)st.reputation_dests, (unsigned long long)st.wt_sessions_total,
-	         (unsigned long long)st.wt_sessions_active, (unsigned long long)st.wt_handshakes,
-	         (unsigned long long)st.wt_retries, (unsigned long long)st.wt_refused_handshakes,
-	         (unsigned long long)st.wt_dropped);
-	http_reply(c, 200, "OK", "application/json", body);
+static void stats_reply(hw_conn *c) {
+	hw_buf body;
+	hw_buf_init(&body);
+	if (stats_json(c->w, &body) != 0) {
+		http_reply(c, 503, "Service Unavailable", "text/plain; charset=utf-8", "no memory for the stats\n");
+	} else {
+		http_reply_n(c, 200, "OK", "application/json", hw_buf_head(&body), hw_buf_avail(&body));
+	}
+	hw_buf_free(&body);
 }
 
 static int ct_equal(const char *a, const char *b, size_t n);
@@ -1352,7 +1319,7 @@ static int http_process(hw_conn *c) {
 		if (strcmp(req.path, "/health") == 0) {
 			http_reply(c, 200, "OK", "application/json", "{\"status\":\"ok\"}\n");
 		} else if (strcmp(req.path, "/stats") == 0) {
-			stats_json(c);
+			stats_reply(c);
 		} else if (c->w->wt && strcmp(req.path, "/webtransport.json") == 0) {
 			wt_json_reply(c);
 		} else if (cfg->serve_webclient && strcmp(req.path, "/") == 0) {
