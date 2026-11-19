@@ -364,6 +364,12 @@ typedef struct {
 		int full_bw_now;      // the plateau test passed (startup, or the current UP)
 		int bw_probe_samples; // ACKs of what a probe sent are arriving
 		uint64_t probe_wait, rounds_since_probe;
+		uint64_t probe_rounds_max;       // the next probe after this many rounds at most
+		uint64_t last_probe_hi;          // inflight_hi where the last probe left it
+		uint64_t probe_end_delivered;    // delivered when this flow last stopped probing
+		uint64_t round_lost_since_probe; // lost this round, sent since then
+		uint64_t round_max_rtt;          // the round's largest RTT sample
+		unsigned overflow_rounds;        // rounds in a row of another flow's overflow
 		unsigned probe_up_rounds;
 		uint64_t probe_up_acks, probe_up_cnt;
 		int cwnd_limited, cwnd_limited_round; // the window was full in the last round, in this one

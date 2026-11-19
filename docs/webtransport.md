@@ -173,9 +173,51 @@ Mbit/s, 40 ms and 1% random loss: the draft's judgment kept 79% of the path, one
 gap was 37 to 67 ms against 66 to 106; two downloads on one session the same; two sessions lost
 7 to 12% against 0.5 to 0.6%. At 1 Gbit/s, 138 ms and 0.3% random loss both made 640 to 670
 Mbit/s (both made 910 without the loss, so that limit is not the congestion control), and on
-loopback both are the same within the noise. Fairness between two `bbr2` sessions converges
-slowly, as the draft's does: the second session held 0.14 of the path for its first 10 s, 0.26
-over 30 s (`bbr`: 0.13). `bbr` stays the default until `bbr2` has run on the edges.
+loopback both are the same within the noise.
+
+Two `bbr2` sessions on one path converged slowly as the draft has it. A newcomer's startup ends on
+the queue the first session keeps full, at a sixth of the path, and that bound holds until its
+next probe 2 to 3 s later. The first session cruises at about the BDP and gives up room only
+when it probes: each probe moves about 15% of the difference, PROBE_RTT restarted the wait, and
+the draft's short-term bounds (floored at what the round delivered) moved it by 3%. The second
+session held 0.13 to 0.26 of the path for 10 to 30 s. Three changes, each of which
+`test_bbr2_fairness` needs:
+- a probe that raised `inflight_hi` by more than 5%, and startup's bound, are followed by
+  another probe 4 to 7 rounds later;
+- PROBE_RTT no longer restarts the wait for the next probe;
+- another flow's overflow cuts this one's flight. That is two rounds in a row of too much loss
+  (2%) among packets sent since this flow's own last probe, with a queue standing (the round's
+  largest RTT more than 5% over the minimum). The cut sets `inflight_lo` to 0.8 of the flight
+  until the next probe, so the larger flow gives up more. Without the queue test the
+  simulator's 1% random-loss path kept 84% instead of 95%.
+
+In the simulator, the newcomer started at 24 different times. Its share in the fifth second
+after it started was within 0.4 to 0.6 of the path in 15 and 14 of them on 440 Mbit/s and
+30 ms, and on 100 Mbit/s and 40 ms (each behind a 5 ms queue). Before the changes it was in
+none of them. In the tenth second it was within the range in 21 and 12 (before: 5 and 1).
+
+On netns (2026-11-19) the second session started 3 s after the first, three runs of each:
+
+| Path, ACK jitter | Newcomer's share in seconds 1 to 12, before | After | Loss before / after |
+| --- | --- | --- | --- |
+| 440 Mbit/s, 30 ms, 5 ms queue, 500 µs | 0.12 to 0.21 in the first second, 0.30 to 0.36 in the tenth | 0.24 to 0.26, then 0.28 to 0.59 from the second on | 0.44 to 0.54% / 0.46 to 0.61% |
+| Same path, 100 µs | 0.28 to 0.43 in the tenth | 0.43 to 0.55 in the tenth | 0.48 to 0.55% / 0.55 to 0.67% |
+| 100 Mbit/s, 40 ms, 500 µs | 0.29 to 0.33 in the tenth | 0.38 to 0.51 in the tenth | 0.63 to 0.78% / 0.77 to 1.09% |
+
+The newcomer first reached 0.4 of the path 2 to 5 s after it started at 500 µs, and 4 to 7 s at 100 µs.
+
+All of this depends on drops being shared between the flows in proportion to their sending.
+With a tail-drop queue and ACKs that come back exactly on time (netem with no jitter), the
+flow clocked by its ACKs takes each slot the moment it frees, so the paced newcomer takes the
+drops. There, on both paths, the newcomer still had only 0.13 to 0.42 in the fifth second and 0.38 to 0.57 in
+the twelfth (before: 0.13 to 0.26 and 0.26 to 0.39). The simulator showed the same with no ACK jitter,
+which is why its paths carry 100 µs.
+
+Across the change:
+- the 1 Gbit/s, 138 ms, 0.3% random-loss path made 646 to 684 Mbit/s against 666 to 685 before;
+- loopback stayed the same within the noise.
+
+`bbr` stays the default until `bbr2` has run on the edges.
 
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per

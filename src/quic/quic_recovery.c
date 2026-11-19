@@ -324,6 +324,30 @@ static void bbr_check_full_bw(hw_qc_cc *c) {
 // well under the threshold crossed it every few rounds on a small window. On 40 Mbit/s, 40 ms
 // and 1% random loss the draft's test kept 79% of the path, one round of too much loss 81%, and
 // two rounds 95%.
+// Sharing a path, the draft is slow to make room for a newcomer. Its startup meets the queue
+// another flow keeps full and ends at a sixth of the path (440 Mbit/s, 30 ms, a 5 ms queue),
+// bounded there until it probes 2 to 3 s later. The flow already there cruises at its bound less
+// the headroom, about the BDP, and gives up room only when it probes itself: its new bound is the
+// path less what the newcomer cruises at, about 15% of the difference each time, and PROBE_RTT
+// restarted its wait. The draft's short-term bounds, floored at what the round delivered, moved
+// it by 3%. A newcomer had 0.13 to 0.26 of the path for 10 to 30 s. So here:
+// - a probe that raised inflight_hi by more than BBR2_GAIN_PCT, and startup's bound, are
+//   followed by another after BBR2_SOON_ROUNDS to twice as many rounds: a flow that found room
+//   looks again while it is finding it;
+// - PROBE_RTT does not restart the wait for the next probe;
+// - another flow's overflow is answered as Reno answers loss: BBR2_LOSS_ROUNDS rounds in a row of
+//   too much loss of packets this flow sent since it last probed, with a queue standing (the
+//   round's largest RTT more than BBR2_QUEUE_PCT over the minimum), cut inflight_lo to
+//   BBR2_YIELD_PCT of the flight, so that the larger flow gives up more. The cut lasts until this
+//   flow's next probe. Random loss at 0.3% is not too much, and without the queue test the
+//   simulator's 1% path (test_bbr2_random_loss) kept 84% where it keeps 95%.
+// In the simulator (test_bbr2_fairness, --cc-fair-sweep), over 24 start times of the newcomer,
+// its share in the fifth second was within 0.4 to 0.6 of the path in 15 and 14 of them on the
+// two 5 ms paths (none before), in the tenth second in 21 and 12 (5 and 1). Each of the three
+// changes is needed for that. All of it rests on drops shared between the flows as their
+// sending is: behind a queue that drops at the instant a slot frees and ACKs that come back
+// exactly on time (netem without jitter), the flow clocked by its ACKs takes every slot and the
+// paced newcomer every drop, and nothing here helps it.
 
 #define BBR2_STARTUP_GAIN      709u // 4 ln 2
 #define BBR2_DRAIN_GAIN        90u  // 0.35: startup's queue drains in about a round
@@ -340,6 +364,10 @@ static void bbr_check_full_bw(hw_qc_cc *c) {
 #define BBR2_PROBE_WAIT_US     (2ull * 1000000) // and up to a second more, at random
 #define BBR2_RENO_ROUNDS_MAX   63u
 #define BBR2_PROBE_RTT_US      (5ull * 1000000)
+#define BBR2_GAIN_PCT          5u  // a probe that raised inflight_hi by more than this found room
+#define BBR2_SOON_ROUNDS       4u  // and the next probe follows after this many rounds, up to twice as many
+#define BBR2_QUEUE_PCT         5u  // a round's largest RTT this far over the minimum: a queue stands
+#define BBR2_YIELD_PCT         80u // another flow's overflow leaves this much of the flight
 
 enum {
 	ACKS_INIT = 0,
@@ -406,15 +434,23 @@ static void bbr2_raise_slope(hw_qc_cc *c) {
 	c->b.probe_up_cnt = HW_MAX(c->cwnd / growth, c->mds);
 }
 
+// DOWN after startup, a probe or PROBE_RTT. After PROBE_RTT the wait for the next probe goes on.
 static void bbr2_start_down(hw_qc_cc *c, uint64_t now) {
+	if (c->b.mode != HW_QC_BBR_PROBE_RTT) {
+		uint64_t hi = c->b.inflight_hi, last = c->b.last_probe_hi;
+		int found = hi != UINT64_MAX && (last == UINT64_MAX || hi * 100 > last * (100 + BBR2_GAIN_PCT));
+		c->b.probe_rounds_max = found ? BBR2_SOON_ROUNDS + bbr2_rand(c) % BBR2_SOON_ROUNDS : UINT64_MAX;
+		c->b.last_probe_hi = hi;
+		c->b.probe_end_delivered = c->delivered;
+		// Flows that started together should not probe together.
+		c->b.rounds_since_probe = bbr2_rand(c) & 1;
+		c->b.probe_wait = BBR2_PROBE_WAIT_US + bbr2_rand(c) % 1000000;
+		c->b.cycle_stamp = now;
+	}
 	c->b.loss_in_round = 0;
 	c->b.round_lost = 0;
 	c->b.bw_latest = c->b.inflight_latest = 0;
 	c->b.probe_up_cnt = UINT64_MAX;
-	// Flows that started together should not probe together.
-	c->b.rounds_since_probe = bbr2_rand(c) & 1;
-	c->b.probe_wait = BBR2_PROBE_WAIT_US + bbr2_rand(c) % 1000000;
-	c->b.cycle_stamp = now;
 	c->b.ack_phase = ACKS_PROBE_STOPPING;
 	bbr2_start_round(c);
 	c->b.mode = HW_QC_BBR_PROBE_BW;
@@ -468,6 +504,7 @@ void hw_qc_cc_on_lost(hw_qc_cc *c, const hw_qc_sent *s, uint64_t pn) {
 	if (pn != c->b.last_lost_pn + 1 || !c->b.loss_events) c->b.loss_events++;
 	c->b.last_lost_pn = pn;
 	c->b.round_lost += s->size;
+	if (s->delivered >= c->b.probe_end_delivered) c->b.round_lost_since_probe += s->size;
 	if (c->b.loss_in_round || !bbr2_too_much_loss(c, c->b.round_lost, c->b.round_in_flight)) return;
 	// Where the loss began: what was in flight when this packet went, less what the round lost,
 	// which that flight still counted (lost, not yet known to be). The draft's estimate from the
@@ -541,6 +578,7 @@ static void bbr2_adapt_upper_bounds(hw_qc_cc *c) {
 
 static int bbr2_time_to_probe(hw_qc_cc *c, uint64_t now) {
 	uint64_t reno = HW_MIN(bbr2_target_inflight(c) / c->mds, (uint64_t)BBR2_RENO_ROUNDS_MAX);
+	reno = HW_MIN(reno, c->b.probe_rounds_max);
 	if (now - c->b.cycle_stamp <= c->b.probe_wait && c->b.rounds_since_probe < reno) return 0;
 	bbr2_start_refill(c);
 	return 1;
@@ -608,6 +646,17 @@ static void bbr2_update_signals(hw_qc_cc *c, uint64_t rate, uint64_t delivered) 
 		c->b.bw_lo = HW_MAX(c->b.bw_latest, c->b.bw_lo * BBR2_BETA_PCT / 100);
 		c->b.inflight_lo = HW_MAX(c->b.inflight_latest, c->b.inflight_lo * BBR2_BETA_PCT / 100);
 	}
+	// Another flow's overflow: the loss is of what this one sent since its own probe, and a queue
+	// stands behind it.
+	int queue = c->b.min_rtt_raw != UINT64_MAX && c->b.round_max_rtt * 100 > c->b.min_rtt_raw * (100 + BBR2_QUEUE_PCT);
+	int overflow = !bbr2_probing(c) && queue &&
+	               bbr2_too_much_loss(c, c->b.round_lost_since_probe, c->b.round_in_flight);
+	c->b.overflow_rounds = overflow ? c->b.overflow_rounds + 1 : 0;
+	if (c->b.overflow_rounds == BBR2_LOSS_ROUNDS) {
+		c->b.inflight_lo = HW_MIN(c->b.inflight_lo, c->in_flight) * BBR2_YIELD_PCT / 100;
+	}
+	c->b.round_lost_since_probe = 0;
+	c->b.round_max_rtt = 0;
 	c->b.loss_in_round = 0;
 	c->b.loss_events = 0;
 	c->b.round_lost = 0;
@@ -620,7 +669,8 @@ void hw_qc_cc_use_bbr2(hw_qc_cc *c, uint64_t now) {
 	c->b.v2 = 1;
 	c->b.pacing_gain = BBR2_STARTUP_GAIN;
 	c->b.cwnd_gain = BBR2_CWND_GAIN;
-	c->b.inflight_hi = c->b.undo_inflight_hi = UINT64_MAX;
+	c->b.inflight_hi = c->b.undo_inflight_hi = c->b.last_probe_hi = UINT64_MAX;
+	c->b.probe_rounds_max = c->b.probe_end_delivered = UINT64_MAX;
 	bbr2_reset_lower_bounds(c);
 	c->b.probe_up_cnt = UINT64_MAX;
 	c->b.rng = (now ^ 0x9e3779b97f4a7c15ull) | 1;
@@ -755,6 +805,7 @@ static void bbr_update_gains(hw_qc_cc *c) {
 // bbr2's model from an ACK's sample (version 3's BBRUpdateModelAndState). delivered: the bytes
 // the sample spans.
 static void bbr2_update(hw_qc_cc *c, uint64_t rate, uint64_t delivered, uint64_t rtt_us, uint64_t now) {
+	c->b.round_max_rtt = HW_MAX(c->b.round_max_rtt, rtt_us);
 	if (c->b.round_start) {
 		c->b.rounds_since_probe++;
 		c->b.cwnd_limited = c->b.cwnd_limited_round;

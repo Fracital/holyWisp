@@ -788,6 +788,296 @@ static void test_bbr2_app_limited(void) {
 	      (unsigned long long)b.delivered_after);
 }
 
+// Flows that share a bottleneck: each its own controller, RTT and packets, one FIFO link of
+// rate_bpms bytes per millisecond with a queue of queue_us, rtt_us of propagation for all, the
+// same loss detection as ccsim_run and random loss of one packet in loss_in across them. Flow i
+// starts at start[i] and always has data. Each flow's bytes acknowledged are counted in bins of
+// CCFAIR_BIN_US, so a share can be read at any second. An ACK comes up to ack_jitter_us late, at
+// random (never before the one ahead of it): with a perfect ACK clock the flow that already fills
+// the queue sends each packet into the slot the last one left, and every drop is the paced
+// newcomer's (netem without jitter does that too; a path with any jitter in its ACKs does not).
+#define CCFAIR_FLOWS  2
+#define CCFAIR_RING   (1u << 17)
+#define CCFAIR_BIN_US 100000u
+#define CCFAIR_BINS   400u // 40 s
+
+typedef struct {
+	uint64_t rate_bpms, rtt_us, queue_us, loss_in, ack_jitter_us;
+} ccfair_path;
+
+typedef struct {
+	uint64_t bins[CCFAIR_FLOWS][CCFAIR_BINS];        // bytes acknowledged, by when
+	uint64_t sent[CCFAIR_FLOWS], lost[CCFAIR_FLOWS]; // packets sent, and dropped by the queue
+	uint64_t sent_after, lost_after;                 // the same, all flows, after t_measure
+} ccfair_result;
+
+static int g_ccfair_trace; // --cc-fair N trace: each flow's state every CCFAIR_BIN_US
+
+static void ccfair_trace_flow(uint64_t now, int i, const hw_qc_cc *c, uint64_t bin_bytes, uint64_t bin_lost) {
+	printf("TR %6llu f%d m%d p%d bw %6.2f max %6.2f hi0 %6.2f hi1 %6.2f lo %6.2f ihi %8lld ilo %8lld cwnd %8llu "
+	       "inf %8llu got %6.2f lost %4llu\n",
+	       (unsigned long long)(now / 1000), i, c->b.mode, c->b.phase, (double)c->b.bw / 1e6, (double)c->b.max_bw / 1e6,
+	       (double)c->b.bw_hi[0] / 1e6, (double)c->b.bw_hi[1] / 1e6,
+	       c->b.bw_lo == UINT64_MAX ? -1.0 : (double)c->b.bw_lo / 1e6,
+	       c->b.inflight_hi == UINT64_MAX ? -1LL : (long long)c->b.inflight_hi,
+	       c->b.inflight_lo == UINT64_MAX ? -1LL : (long long)c->b.inflight_lo, (unsigned long long)c->cwnd,
+	       (unsigned long long)c->in_flight, (double)bin_bytes * 1e6 / CCFAIR_BIN_US / 1e6,
+	       (unsigned long long)bin_lost);
+}
+
+static void ccsim_fair(int bbr, const ccfair_path *path, const uint64_t start[CCFAIR_FLOWS], uint64_t end,
+                       uint64_t t_measure, ccfair_result *out) {
+	static ccsim_pkt pk[CCFAIR_FLOWS][CCFAIR_RING];
+#define CCFAIR_PK(f, i) (&pk[f][(i) & (CCFAIR_RING - 1)])
+	struct {
+		hw_qc_cc c;
+		hw_qc_rtt r;
+		uint64_t n, next_ack, scan, wake, lost_bin, last_ack;
+		int on;
+	} fl[CCFAIR_FLOWS];
+	memset(out, 0, sizeof(*out));
+	memset(fl, 0, sizeof(fl));
+	uint64_t seed = 0x9e3779b97f4a7c15ull, now = 0, link_free_ns = 0, next_trace = 0;
+	const uint64_t pkt_ns = CCSIM_MDS * 1000000 / path->rate_bpms;
+	while (now < end) {
+		for (int i = 0; i < CCFAIR_FLOWS; i++) {
+			if (fl[i].on || now < start[i]) continue;
+			fl[i].on = 1;
+			hw_qc_cc_init(&fl[i].c, CCSIM_MDS, now);
+			if (bbr == 1) hw_qc_cc_use_bbr(&fl[i].c, now);
+			if (bbr == 2) hw_qc_cc_use_bbr2(&fl[i].c, now);
+			hw_qc_rtt_init(&fl[i].r);
+		}
+		if (g_ccfair_trace && now >= next_trace) {
+			for (int i = 0; i < CCFAIR_FLOWS; i++) {
+				uint64_t b = next_trace / CCFAIR_BIN_US;
+				if (fl[i].on) {
+					ccfair_trace_flow(now, i, &fl[i].c, b ? out->bins[i][b - 1] : 0, fl[i].lost_bin);
+				}
+				fl[i].lost_bin = 0;
+			}
+			next_trace += CCFAIR_BIN_US;
+		}
+		uint64_t next = UINT64_MAX;
+		// Alternate which flow goes first, so that neither always meets the queue first.
+		for (int k = 0; k < CCFAIR_FLOWS; k++) {
+			int i = (int)((k + (now & 1)) % CCFAIR_FLOWS);
+			if (!fl[i].on) {
+				if (start[i] < next) next = start[i];
+				continue;
+			}
+			hw_qc_cc *c = &fl[i].c;
+			while (fl[i].next_ack < fl[i].n &&
+			       (!CCFAIR_PK(i, fl[i].next_ack)->ack_at || CCFAIR_PK(i, fl[i].next_ack)->ack_at <= now)) {
+				uint64_t me = fl[i].next_ack++;
+				ccsim_pkt *p = CCFAIR_PK(i, me);
+				if (p->done || !p->ack_at) continue;
+				p->done = 1;
+				uint64_t at = p->ack_at;
+				hw_qc_rs_on_acked(c, &p->rec, at);
+				hw_qc_cc_on_acked(c, p->rec.size, p->rec.time, 0);
+				uint64_t rtt = at - p->rec.time;
+				if (!rtt) rtt = 1;
+				hw_qc_rtt_sample(&fl[i].r, rtt, 0, at);
+				if (at / CCFAIR_BIN_US < CCFAIR_BINS) out->bins[i][at / CCFAIR_BIN_US] += p->rec.size;
+				for (; fl[i].scan + 3 <= me; fl[i].scan++) {
+					ccsim_pkt *l = CCFAIR_PK(i, fl[i].scan);
+					if (l->done) continue;
+					if (!l->ack_at) {
+						l->done = 1;
+						hw_qc_cc_on_lost(c, &l->rec, fl[i].scan);
+						hw_qc_cc_remove(c, l->rec.size);
+						hw_qc_cc_congestion_event(c, l->rec.time, 1, at);
+					}
+				}
+				hw_qc_cc_on_ack_done(c, rtt, at);
+			}
+			// The time threshold (RFC 9002 6.1.2), for a loss with nothing acknowledged after it: a
+			// whole flight dropped would otherwise never be declared.
+			const uint64_t lost_after = (path->rtt_us + path->queue_us) * 9 / 8 + 1000;
+			for (; fl[i].scan < fl[i].n; fl[i].scan++) {
+				ccsim_pkt *l = CCFAIR_PK(i, fl[i].scan);
+				if (l->done) continue;
+				if (l->ack_at || now < l->rec.time + lost_after) break;
+				l->done = 1;
+				hw_qc_cc_on_lost(c, &l->rec, fl[i].scan);
+				hw_qc_cc_remove(c, l->rec.size);
+				hw_qc_cc_congestion_event(c, l->rec.time, 1, now);
+			}
+			fl[i].wake = UINT64_MAX;
+			while (hw_qc_cc_can_send(c) && fl[i].n - fl[i].scan < CCFAIR_RING) {
+				uint64_t t = hw_qc_pacer_next(c, &fl[i].r, now);
+				if (t > now) {
+					fl[i].wake = t;
+					break;
+				}
+				ccsim_pkt *p = CCFAIR_PK(i, fl[i].n++);
+				memset(p, 0, sizeof(*p));
+				p->rec.time = now;
+				p->rec.size = CCSIM_MDS;
+				hw_qc_rs_on_sent(c, &p->rec, now);
+				hw_qc_cc_on_sent(c, CCSIM_MDS);
+				hw_qc_pacer_on_sent(c, CCSIM_MDS);
+				uint64_t at = HW_MAX(now * 1000, link_free_ns);
+				int full = at - now * 1000 > path->queue_us * 1000;
+				int dropped = full || (path->loss_in && ccsim_rand(&seed) % path->loss_in == 0);
+				if (!full) link_free_ns = at + pkt_ns;
+				p->ack_at = dropped ? 0 : link_free_ns / 1000 + path->rtt_us;
+				if (p->ack_at && path->ack_jitter_us) {
+					p->ack_at += ccsim_rand(&seed) % path->ack_jitter_us;
+					if (p->ack_at < fl[i].last_ack) p->ack_at = fl[i].last_ack;
+					fl[i].last_ack = p->ack_at;
+				}
+				out->sent[i]++;
+				out->lost[i] += (uint64_t)full;
+				fl[i].lost_bin += (uint64_t)full;
+				if (now >= t_measure) {
+					out->sent_after++;
+					out->lost_after += (uint64_t)full;
+				}
+			}
+			if (fl[i].wake < next) next = fl[i].wake;
+			if (fl[i].scan < fl[i].n && !CCFAIR_PK(i, fl[i].scan)->ack_at &&
+			    CCFAIR_PK(i, fl[i].scan)->rec.time + lost_after < next) {
+				next = CCFAIR_PK(i, fl[i].scan)->rec.time + lost_after;
+			}
+			if (fl[i].next_ack < fl[i].n && CCFAIR_PK(i, fl[i].next_ack)->ack_at < next) {
+				next = CCFAIR_PK(i, fl[i].next_ack)->ack_at;
+			}
+		}
+		if (next == UINT64_MAX) next = now + 1000;
+		now = next > now ? next : now + 1;
+	}
+#undef CCFAIR_PK
+}
+
+// Flow f's share of what all flows had acknowledged between from and to (us, multiples of the bin).
+static double ccfair_share(const ccfair_result *r, int f, uint64_t from, uint64_t to) {
+	uint64_t mine = 0, all = 0;
+	for (uint64_t b = from / CCFAIR_BIN_US; b < to / CCFAIR_BIN_US && b < CCFAIR_BINS; b++) {
+		mine += r->bins[f][b];
+		for (int i = 0; i < CCFAIR_FLOWS; i++) all += r->bins[i][b];
+	}
+	return all ? (double)mine / (double)all : 0.0;
+}
+
+static const struct {
+	const char *name;
+	ccfair_path path;
+} CCFAIR_ROWS[] = {
+    {"440 Mbit/s, 30 ms, 5 ms queue", {55000, 30000, 5000, 0, 100}},
+    {"100 Mbit/s, 40 ms, 5 ms queue", {12500, 40000, 5000, 0, 100}},
+    {"440 Mbit/s, 30 ms, 10 ms queue", {55000, 30000, 10000, 0, 100}},
+    {"100 Mbit/s, 40 ms, 10 ms queue", {12500, 40000, 10000, 0, 100}},
+};
+
+// --cc-fair [row] [trace]: two flows, the second 3 s after the first, on each path: the
+// newcomer's share each second, and the loss.
+static void cc_fair(int only_row, int only_v) {
+	static const char *const names[] = {"newreno", "bbr", "bbr2"};
+	const uint64_t start[CCFAIR_FLOWS] = {0, 3000000};
+	for (size_t i = 0; i < sizeof(CCFAIR_ROWS) / sizeof(CCFAIR_ROWS[0]); i++) {
+		if (only_row >= 0 && (size_t)only_row != i) continue;
+		printf("%s\n", CCFAIR_ROWS[i].name);
+		for (int v = 1; v <= 2; v++) {
+			if (only_v >= 0 && only_v != v) continue;
+			static ccfair_result r;
+			ccsim_fair(v, &CCFAIR_ROWS[i].path, start, 33000000, 5000000, &r);
+			printf("  %-7s share:", names[v]);
+			for (uint64_t s = 1; s <= 30; s++) {
+				printf(" %.2f", ccfair_share(&r, 1, start[1] + (s - 1) * 1000000, start[1] + s * 1000000));
+			}
+			printf("\n          dropped %.2f%% after 5 s, %llu + %llu in all\n",
+			       r.sent_after ? 100.0 * (double)r.lost_after / (double)r.sent_after : 0.0,
+			       (unsigned long long)r.lost[0], (unsigned long long)r.lost[1]);
+		}
+	}
+}
+
+static int ccfair_cmp(const void *a, const void *b) {
+	double x = *(const double *)a, y = *(const double *)b;
+	return x < y ? -1 : x > y;
+}
+
+// The newcomer's share in the second that ends +2, +5 and +10 s after it started, over n start
+// times from 3 s on, step us apart, across the incumbent's probe cycle: the worst, the 10th
+// percentile, the median, and how many of the n were within 0.4 to 0.6 of the path.
+#define CCFAIR_OFFSETS_MAX 24u
+
+typedef struct {
+	double worst[3], p10[3], median[3];
+	unsigned fair[3];
+	double loss; // packets the queue dropped from +2 s on, all start times, both flows
+} ccfair_sweep;
+
+static void ccsim_fair_sweep(int bbr, const ccfair_path *path, unsigned n, uint64_t step, ccfair_sweep *out) {
+	static const uint64_t at[3] = {2000000, 5000000, 10000000};
+	static ccfair_result r;
+	double sh[3][CCFAIR_OFFSETS_MAX];
+	uint64_t sent = 0, lost = 0;
+	memset(out, 0, sizeof(*out));
+	for (unsigned k = 0; k < n; k++) {
+		uint64_t t0 = 3000000 + k * step;
+		const uint64_t start[CCFAIR_FLOWS] = {0, t0};
+		ccsim_fair(bbr, path, start, t0 + 10000000, t0 + 2000000, &r);
+		for (int j = 0; j < 3; j++) {
+			sh[j][k] = ccfair_share(&r, 1, t0 + at[j] - 1000000, t0 + at[j]);
+			out->fair[j] += sh[j][k] >= 0.4 && sh[j][k] <= 0.6;
+		}
+		sent += r.sent_after;
+		lost += r.lost_after;
+	}
+	for (int j = 0; j < 3; j++) {
+		qsort(sh[j], n, sizeof(double), ccfair_cmp);
+		out->worst[j] = sh[j][0];
+		out->p10[j] = sh[j][n / 10];
+		out->median[j] = (sh[j][(n - 1) / 2] + sh[j][n / 2]) / 2;
+	}
+	out->loss = sent ? 100.0 * (double)lost / (double)sent : 0.0;
+}
+
+// --cc-fair-sweep: the newcomer's share over CCFAIR_OFFSETS_MAX start times on each path.
+static void cc_fair_sweep(void) {
+	static const char *const names[] = {"newreno", "bbr", "bbr2"};
+	for (size_t i = 0; i < sizeof(CCFAIR_ROWS) / sizeof(CCFAIR_ROWS[0]); i++) {
+		printf("%s\n", CCFAIR_ROWS[i].name);
+		for (int v = 1; v <= 2; v++) {
+			ccfair_sweep w;
+			ccsim_fair_sweep(v, &CCFAIR_ROWS[i].path, CCFAIR_OFFSETS_MAX, 115000, &w);
+			printf("  %-7s newcomer's share, worst/p10/median (of %u in 0.4 to 0.6):", names[v], CCFAIR_OFFSETS_MAX);
+			for (int j = 0; j < 3; j++) {
+				printf(" +%d s %.2f/%.2f/%.2f (%u)",
+				       j == 0   ? 2
+				       : j == 1 ? 5
+				                : 10,
+				       w.worst[j], w.p10[j], w.median[j], w.fair[j]);
+			}
+			printf("; dropped %.2f%%\n", w.loss);
+		}
+	}
+}
+
+// Two bbr2 flows on one path, the second started 3 s after the first and at eleven more times up
+// to 2.5 s later, across the first's probe cycle; 440 Mbit/s and 30 ms, and 100 Mbit/s and 40 ms,
+// each with a 5 ms queue. The newcomer's share of the path in the fifth second and in the tenth.
+// The draft's way to converge (see quic_recovery.c) left the median newcomer 0.27 and 0.22 of
+// the path at +5 s, none of the twelve within 0.4 to 0.6, and 0.38 and 0.36 at +10 s.
+static void test_bbr2_fairness(void) {
+	for (int i = 0; i < 2; i++) {
+		ccfair_sweep w;
+		ccsim_fair_sweep(2, &CCFAIR_ROWS[i].path, 12, 230000, &w);
+		printf("  %s: +5 s %.2f/%.2f/%.2f (%u of 12 within 0.4 to 0.6), +10 s %.2f/%.2f/%.2f (%u), dropped %.2f%%\n",
+		       CCFAIR_ROWS[i].name, w.worst[1], w.p10[1], w.median[1], w.fair[1], w.worst[2], w.p10[2], w.median[2],
+		       w.fair[2], w.loss);
+		CHECK(w.median[1] >= 0.38 && w.median[1] <= 0.62 && w.fair[1] >= 5,
+		      "%s: at +5 s the median newcomer had %.2f, %u of 12 fair", CCFAIR_ROWS[i].name, w.median[1], w.fair[1]);
+		CHECK(w.median[2] >= 0.45 && w.median[2] <= 0.55 && w.fair[2] >= 6 && w.worst[2] >= 0.3,
+		      "%s: at +10 s the median newcomer had %.2f, the worst %.2f, %u of 12 fair", CCFAIR_ROWS[i].name,
+		      w.median[2], w.worst[2], w.fair[2]);
+		CHECK(w.loss < 1.0, "%s: dropped %.2f%%", CCFAIR_ROWS[i].name, w.loss);
+	}
+}
+
 // --cc-table: BBR and bbr2 (and NewReno) side by side on the simulated paths the tests use, for
 // comparing them by hand: goodput after the warm-up as a share of the path, the queue's drops
 // after it and over the whole run, and how startup ended.
@@ -2248,6 +2538,15 @@ int main(int argc, char **argv) {
 		bench(argc > 2 ? strtoull(argv[2], NULL, 10) : 256);
 		return 0;
 	}
+	if (argc > 1 && !strcmp(argv[1], "--cc-fair-sweep")) {
+		cc_fair_sweep();
+		return 0;
+	}
+	if (argc > 1 && !strcmp(argv[1], "--cc-fair")) {
+		g_ccfair_trace = argc > 3 && !strcmp(argv[3], "trace");
+		cc_fair(argc > 2 ? (int)strtol(argv[2], NULL, 10) : -1, g_ccfair_trace ? 2 : -1);
+		return 0;
+	}
 	if (argc > 1 && !strcmp(argv[1], "--cc-table")) {
 		cc_table(argc > 2 ? (int)strtol(argv[2], NULL, 10) : -1, argc > 3 ? (int)strtol(argv[3], NULL, 10) : -1);
 		return 0;
@@ -2277,6 +2576,7 @@ int main(int argc, char **argv) {
 	RUN(test_bbr2_startup_loss);
 	RUN(test_bbr2_capacity_drop);
 	RUN(test_bbr2_app_limited);
+	RUN(test_bbr2_fairness);
 	RUN(test_smap);
 	RUN(test_handshake);
 	RUN(test_handshake_hrr);

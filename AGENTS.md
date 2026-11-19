@@ -674,9 +674,17 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   nothing (the edge's 0.3%), which is why loss is judged once per round by its sum, never at each
   loss as the draft does, and why the short-term bounds (`bw_lo`, `inflight_lo`) answer only two
   rounds of too much loss in a row: either way the draft's form kept 79 to 81% of a path at 1%
-  random loss, this keeps 95%. Every mechanism has a `test_bbr2_*` that fails without it
-  (`shallow_buffer`, `random_loss`, `startup_loss`, `capacity_drop`, `app_limited`, `stack`); the
-  v1 rules above (app-limited samples, `blk_head`, the clock, the floor) hold for it too.
+  random loss, this keeps 95%. A newcomer on a path that another session already fills gets
+  room through three changes from the draft (docs/webtransport.md):
+  - a probe that found room is followed by another a few rounds later;
+  - PROBE_RTT does not restart the wait for the next probe;
+  - another flow's overflow cuts this one's flight. That overflow is two rounds of too much loss
+    among packets sent since its own probe, with a queue standing.
+  Without them the newcomer held 0.13 to 0.26 of the path for 10 s or more. The queue test
+  keeps random loss from triggering the cut. Every mechanism has a `test_bbr2_*` that fails
+  without it (`shallow_buffer`, `random_loss`, `startup_loss`, `capacity_drop`, `app_limited`,
+  `fairness`, `stack`). The v1 rules above (app-limited samples, `blk_head`, the clock, the
+  floor) hold for it too.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
   lost, never sent in fragments that every later packet is then sent in too.
 - **Lanes and the server-opened stream** (docs/webtransport.md has the rules). A session may
