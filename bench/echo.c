@@ -12,7 +12,11 @@
  * per connection, the churn scenario measured this process queueing on its own address space
  * lock (the servers under test sat half idle), not the server.
  *
- *   echo PORT [COUNT]
+ *   echo [--sink | --source] PORT [COUNT]
+ *
+ * --sink reads and counts what arrives and sends nothing back, and --source sends without being
+ * asked (a fixed pattern, as fast as the connection takes it) and counts what it sent: the two ends
+ * of pump's one-direction modes, up and down, so uploads and downloads can be measured apart.
  *
  * With COUNT it listens on PORT .. PORT+COUNT-1 and counts them together. The churn scenario needs
  * that: a server that dials one address and port tens of thousands of times a second runs the
@@ -45,6 +49,9 @@
 static _Atomic uint64_t g_bytes;
 static _Atomic uint64_t g_conns;
 
+enum { MODE_ECHO, MODE_SINK, MODE_SOURCE };
+static int g_mode = MODE_ECHO;
+
 static void *serve(void *arg) {
 	int fd = (int)(intptr_t)arg;
 	uint8_t *buf = malloc(BUF);
@@ -56,6 +63,7 @@ static void *serve(void *arg) {
 		ssize_t n = read(fd, buf, BUF);
 		if (n <= 0) break;
 		atomic_fetch_add_explicit(&g_bytes, (uint64_t)n, memory_order_relaxed);
+		if (g_mode == MODE_SINK) continue;
 		size_t off = 0;
 		while (off < (size_t)n) {
 			ssize_t w = write(fd, buf + off, (size_t)n - off);
@@ -87,13 +95,34 @@ static void *reporter(void *arg) {
 	return NULL;
 }
 
+// --source: send the pattern until the peer goes away. What the peer sends is never read; the
+// pump sends nothing.
+static void *serve_source(void *arg) {
+	int fd = (int)(intptr_t)arg;
+	uint8_t *buf = malloc(BUF);
+	if (!buf) {
+		close(fd);
+		return NULL;
+	}
+	for (size_t i = 0; i < BUF; i++) buf[i] = (uint8_t)(i * 31 + 7);
+	for (;;) {
+		ssize_t w = write(fd, buf, BUF);
+		if (w < 0 && errno == EINTR) continue;
+		if (w <= 0) break;
+		atomic_fetch_add_explicit(&g_bytes, (uint64_t)w, memory_order_relaxed);
+	}
+	close(fd);
+	free(buf);
+	return NULL;
+}
+
 static void spawn_serve(int fd) {
 	pthread_t t;
 	pthread_attr_t at;
 	pthread_attr_init(&at);
 	pthread_attr_setdetachstate(&at, PTHREAD_CREATE_DETACHED);
 	pthread_attr_setstacksize(&at, 256 * 1024);
-	if (pthread_create(&t, &at, serve, (void *)(intptr_t)fd) != 0) close(fd);
+	if (pthread_create(&t, &at, g_mode == MODE_SOURCE ? serve_source : serve, (void *)(intptr_t)fd) != 0) close(fd);
 	pthread_attr_destroy(&at);
 }
 
@@ -102,6 +131,7 @@ static ssize_t echo_small(int fd, uint8_t *buf) {
 	ssize_t n = recv(fd, buf, SMALL, 0);
 	if (n < 0 && (errno == EAGAIN || errno == EINTR)) return 0;
 	if (n <= 0) return -1;
+	if (g_mode == MODE_SINK) return n;
 	size_t off = 0;
 	while (off < (size_t)n) {
 		ssize_t w = send(fd, buf + off, (size_t)n - off, MSG_NOSIGNAL);
@@ -160,6 +190,11 @@ static void *acceptor(void *arg) {
 				}
 				setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
 				atomic_fetch_add_explicit(&g_conns, 1, memory_order_relaxed);
+				if (g_mode == MODE_SOURCE) { // busy from its first byte: a thread at once
+					fcntl(c, F_SETFL, 0);
+					spawn_serve(c);
+					continue;
+				}
 				if (c >= seen_cap) {
 					int cap = seen_cap ? seen_cap : 1024;
 					while (cap <= c) cap *= 2;
@@ -181,8 +216,13 @@ static void *acceptor(void *arg) {
 }
 
 int main(int argc, char **argv) {
+	if (argc > 1 && (!strcmp(argv[1], "--sink") || !strcmp(argv[1], "--source"))) {
+		g_mode = !strcmp(argv[1], "--sink") ? MODE_SINK : MODE_SOURCE;
+		argv++;
+		argc--;
+	}
 	if (argc < 2) {
-		fprintf(stderr, "usage: echo PORT [COUNT]\n");
+		fprintf(stderr, "usage: echo [--sink | --source] PORT [COUNT]\n");
 		return 2;
 	}
 	int port = atoi(argv[1]);

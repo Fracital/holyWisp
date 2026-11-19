@@ -282,8 +282,10 @@ login; the systemd sandbox still contains whatever it spawns. Leave it off unles
 # UDP, wisp-v2 with a password (the first line of the file; or $HOLYWISP_PASSWORD)
 build/release/holywisp-client -s ws://wisp.example:6001/ --udp --user me --pass-file ~/.wisp-pass 1.1.1.1 53
 
-# throughput against a TCP echo service
+# throughput against a TCP echo service, and one way: to a discard service, from a chargen
 build/release/holywisp-client --bench 268435456 echo.example 7
+build/release/holywisp-client --bench 268435456 --upload discard.example 9
+build/release/holywisp-client --bench 268435456 --download chargen.example 19
 
 # the same over WebTransport, pinned to the certificate hash /webtransport.json lists
 build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-256> example.org 80

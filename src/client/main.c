@@ -3,6 +3,7 @@
  *
  *   holywisp-client [-s ws://host:port/path] [--udp] [--v2] HOST PORT      stdin/stdout <-> HOST:PORT
  *   holywisp-client [-s ...] --bench BYTES HOST PORT                        echo throughput test
+ *   holywisp-client [-s ...] --bench BYTES --upload|--download HOST PORT    one direction: a sink, a source
  *   holywisp-client -s https://host:port/ --pin SHA256 ...                  the same over WebTransport
  *   holywisp-client -s https://host/ --pin-key SHA256 ...                   pinned to the server's key
  */
@@ -55,6 +56,9 @@ static void usage(const char *argv0) {
 	        "      --idle-ms N      after stdin EOF, exit when nothing arrives for N ms (2000)\n"
 	        "      --bench BYTES    send BYTES to an echo service at HOST:PORT and report throughput\n"
 	        "      --streams N      with --bench: over N streams at once, BYTES split among them (1)\n"
+	        "      --upload         with --bench: send BYTES to a sink (discard service) at HOST:PORT\n"
+	        "      --download       with --bench: read BYTES from a source (chargen, bench/echo\n"
+	        "                       --source) at HOST:PORT\n"
 	        "      --server-stream  WebTransport v2: have the server open the Wisp stream and send its\n"
 	        "                       CONTINUE at once (offers \"wisp-v2-server-stream\")\n"
 	        "      --lanes N        WebTransport v2: ride up to N QUIC streams (lanes) when the server\n"
@@ -363,12 +367,23 @@ static size_t bench_index(const uint32_t *sid, size_t nsid, uint32_t id) {
 	return k;
 }
 
-// The echo benchmark over nsid streams at once, total bytes split among them: each stream sends
-// a chunk in turn, and what has come back is taken between the sends. With stream credit a
-// stream has at most half a window in flight: the server sends a stream no more than a window
-// past what was taken, and an echo that cannot come back would hold the CONTINUE the next send
-// waits for while nothing is taken.
-static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t total) {
+enum {
+	BENCH_ECHO,
+	BENCH_UP,
+	BENCH_DOWN
+};
+
+static uint64_t g_connect_us; // hw_client_connect, for the bench's report
+
+// The benchmark over nsid streams at once, total bytes split among them. BENCH_ECHO: each stream
+// sends a chunk in turn to an echo service, and what has come back is taken between the sends.
+// With stream credit a stream has at most half a window in flight: the server sends a stream no
+// more than a window past what was taken, and an echo that cannot come back would hold the
+// CONTINUE the next send waits for while nothing is taken. BENCH_UP sends to a sink (a discard
+// service), done when the last chunk is sent: the window holds a sender to what the remote takes,
+// to within one window. BENCH_DOWN sends nothing and takes total bytes from a source (a chargen,
+// echo --source).
+static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t total, int dir) {
 	uint8_t *chunk = malloc(PIPE_CHUNK);
 	size_t *sent = calloc(nsid, sizeof(*sent));
 	size_t *recv = calloc(nsid, sizeof(*recv));
@@ -378,17 +393,18 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 		free(recv);
 		return 1;
 	}
-	size_t ahead = hw_client_credit_window(c) / 2; // 0: no bound
+	size_t ahead = dir == BENCH_ECHO ? hw_client_credit_window(c) / 2 : 0; // 0: no bound
 	for (size_t i = 0; i < PIPE_CHUNK; i++) chunk[i] = (uint8_t)(i * 31 + 7);
 	size_t per = total / nsid;
 	total = per * nsid;
-	uint64_t start = hw_now_ms();
+	uint64_t start = hw_now_us();
+	uint64_t first_byte = 0; // from the start to the first DATA, in microseconds
 	size_t sent_all = 0, received = 0;
 	uint64_t sum_sent = 0, sum_recv = 0;
 	int rc = 1;
-	while (received < total) {
+	while (dir == BENCH_UP ? sent_all < total : received < total) {
 		int more = 0; // a stream may send more now
-		for (size_t k = 0; k < nsid; k++) {
+		for (size_t k = 0; k < nsid && dir != BENCH_DOWN; k++) {
 			if (sent[k] >= per) continue;
 			size_t n = HW_MIN(PIPE_CHUNK, per - sent[k]);
 			if (ahead) {
@@ -402,7 +418,7 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 				fprintf(stderr, "send failed at %zu bytes: %s\n", sent_all, send_error(s));
 				goto done;
 			}
-			sum_sent += byte_sum(chunk, n);
+			if (dir == BENCH_ECHO) sum_sent += byte_sum(chunk, n);
 			sent[k] += n;
 			sent_all += n;
 		}
@@ -419,7 +435,8 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 			if (r <= 0) break;
 			wait = 0; // something came: go back and send what that let go before waiting again
 			if (ev.type == HW_CEV_DATA) {
-				sum_recv += byte_sum(ev.data, ev.len);
+				if (!first_byte) first_byte = HW_MAX(hw_now_us() - start, (uint64_t)1);
+				if (dir == BENCH_ECHO) sum_recv += byte_sum(ev.data, ev.len);
 				received += ev.len;
 				read_count(ev.len);
 				size_t k = bench_index(sid, nsid, ev.stream_id);
@@ -428,19 +445,32 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 				fprintf(stderr, "stream closed: %s\n", hw_close_reason_str(ev.reason));
 				goto done;
 			}
-			if (received >= total) break;
+			if (dir != BENCH_UP && received >= total) break;
 		}
 		if (r < 0 || (r == 0 && wait > 0)) {
-			fprintf(stderr, "%s after %zu/%zu bytes\n", r < 0 ? "connection lost" : "timed out", received, total);
+			fprintf(stderr, "%s after %zu/%zu bytes\n", r < 0 ? "connection lost" : "timed out",
+			        dir == BENCH_UP ? sent_all : received, total);
 			goto done;
 		}
 	}
-	uint64_t ms = hw_now_ms() - start;
+	uint64_t ms = (hw_now_us() - start) / 1000;
 	if (ms == 0) ms = 1;
-	double mb = (double)total / (1024.0 * 1024.0);
-	printf("%zu bytes echoed in %llu ms: %.1f MiB/s each way, checksum %s\n", total, (unsigned long long)ms,
-	       mb / ((double)ms / 1000.0), sum_sent == sum_recv ? "ok" : "MISMATCH");
-	rc = sum_sent == sum_recv ? 0 : 1;
+	double rate = (double)total / (1024.0 * 1024.0) / ((double)ms / 1000.0);
+	if (dir == BENCH_ECHO) {
+		printf("%zu bytes echoed in %llu ms: %.1f MiB/s each way, checksum %s\n", total, (unsigned long long)ms, rate,
+		       sum_sent == sum_recv ? "ok" : "MISMATCH");
+		rc = sum_sent == sum_recv ? 0 : 1;
+	} else {
+		printf("%zu bytes %s in %llu ms: %.1f MiB/s %s\n", total, dir == BENCH_UP ? "sent" : "received",
+		       (unsigned long long)ms, rate, dir == BENCH_UP ? "up" : "down");
+		rc = 0;
+	}
+	if (first_byte) {
+		printf("connect %.1f ms, first byte %.1f ms after the start\n", (double)g_connect_us / 1000.0,
+		       (double)first_byte / 1000.0);
+	} else {
+		printf("connect %.1f ms\n", (double)g_connect_us / 1000.0);
+	}
 done:
 	free(chunk);
 	free(sent);
@@ -454,6 +484,7 @@ int main(int argc, char **argv) {
 	int idle_ms = 2000;
 	size_t bench = 0;
 	long streams = 1;
+	int bench_dir = BENCH_ECHO;
 	int insecure = 0;
 	const char *pin = NULL;
 	const char *connect_to = NULL;
@@ -493,6 +524,10 @@ int main(int argc, char **argv) {
 			bench = (size_t)strtoull(argv[++i], NULL, 10);
 		} else if (!strcmp(a, "--streams") && i + 1 < argc) {
 			streams = strtol(argv[++i], NULL, 10);
+		} else if (!strcmp(a, "--upload")) {
+			bench_dir = BENCH_UP;
+		} else if (!strcmp(a, "--download")) {
+			bench_dir = BENCH_DOWN;
 		} else if (!strcmp(a, "--server-stream")) {
 			o.wt_server_stream = 1;
 			o.v2 = 1;
@@ -566,6 +601,10 @@ int main(int argc, char **argv) {
 	if (o.user && !o.pass) {
 		fprintf(stderr, "warning: --user without a password (--pass-file, $" PASS_ENV " or --pass): none is sent\n");
 	}
+	if (bench_dir != BENCH_ECHO && !bench) {
+		fprintf(stderr, "--upload and --download are for --bench\n");
+		return 2;
+	}
 	if (streams < 1 || streams > 1024 || o.wt_lanes < 0 || o.wt_lanes > 16) {
 		fprintf(stderr, "--streams is 1 to 1024, --lanes 0 to 16\n");
 		return 2;
@@ -619,11 +658,13 @@ int main(int argc, char **argv) {
 	if (bench && streams > 1) o.max_queue_bytes *= (size_t)HW_MIN(streams, 16);
 
 	char err[512];
+	uint64_t connect_start = hw_now_us();
 	hw_client *c = hw_client_connect(&o, err, sizeof(err));
 	if (!c) {
 		fprintf(stderr, "%s\n", err);
 		return 1;
 	}
+	g_connect_us = hw_now_us() - connect_start;
 	if (o.credit_window && !hw_client_credit_window(c)) {
 		fprintf(stderr, "warning: the server does not offer stream credit: --credit has no effect\n");
 	}
@@ -663,7 +704,7 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 	}
-	int rc = bench ? run_bench(c, sid, (size_t)streams, bench) : run_pipe(c, sid[0], idle_ms);
+	int rc = bench ? run_bench(c, sid, (size_t)streams, bench, bench_dir) : run_pipe(c, sid[0], idle_ms);
 	free(sid);
 	hw_client_free(c);
 	return rc;

@@ -27,8 +27,8 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
 
 | File | Purpose |
 | --- | --- |
-| `echo.c` | The counting echo service. One thread per connection; prints `ns bytes conns` every 100 ms. It listens on eight consecutive ports, which only the churn scenario uses (see below). |
-| `pump.c` | The native load generator, built on `libholywisp-client`. `tp` keeps N streams full while respecting CONTINUE, `rtt` measures latency with one message in flight, `churn` opens a stream, echoes one byte and closes it, over and over. Prints one JSON line when it finishes. |
+| `echo.c` | The counting echo service. One thread per connection; prints `ns bytes conns` every 100 ms. It listens on eight consecutive ports, which only the churn scenario uses (see below). `--sink` reads and counts without answering, `--source` sends a pattern without being asked: the far ends of the one-direction modes. |
+| `pump.c` | The native load generator, built on `libholywisp-client`. `tp` keeps N streams full while respecting CONTINUE, `up` does the same toward a sink and `down` reads N streams from a source (uploads and downloads apart), `rtt` measures latency with one message in flight, `churn` opens a stream, echoes one byte and closes it, over and over. Every mode takes `-s https://...` with `--pin`, `--pin-key` or `--insecure` for WebTransport, and reports `connect_us` (connect and Wisp handshake); `tp`, `up` and `down` add `first_byte_us` and `churn` `open_p50_us` / `open_p99_us`, CONNECT to echoed byte. Prints one JSON line when it finishes. |
 | `run.py` | Starts servers and clients, takes the measurements, and writes `results.json`, `runs.jsonl`, `results.csv` and `results.md`. |
 | `test_run.py` | Unit tests for scenario sizing, rotation, timing checks and cgroup memory reporting (`python3 -I -m unittest discover -s bench -p test_run.py`). |
 | `charts.py` | Reads a results directory and produces `charts/*.svg` (add `--png` for PNGs too) and `report.html`. |
@@ -71,6 +71,20 @@ make bench                                  # release build plus build/bench/{ec
 python3 -I bench/run.py --duration 10 --repeats 12 --out bench/results/full
 python3 -I bench/charts.py bench/results/full --png
 ```
+
+The harness's scenarios use `tp`, `rtt` and `churn` over WebSockets. The other modes are for a
+question at hand, run by hand on loopback against services this machine owns:
+
+```sh
+build/bench/echo --sink 16403 & build/bench/echo --source 16404 &
+build/bench/pump -s ws://127.0.0.1:16401/ --mode up --streams 1 --duration 10 127.0.0.1 16403
+build/bench/pump -s ws://127.0.0.1:16401/ --mode down --streams 1 --duration 10 127.0.0.1 16404
+build/bench/pump -s https://127.0.0.1:16401/ --insecure --mode rtt --duration 10 127.0.0.1 16402
+```
+
+(the last one needs the server's `webtransport` on). `holywisp-client --bench BYTES` has the same
+directions as `--upload` and `--download`, and prints the connect and first-byte times under its
+throughput line.
 
 The scenarios are sized for a host with 8 CPUs, which the servers, the clients and the echo
 service share, and `run.py` refuses to start on any other (`--any-cpus` overrides it, for numbers
