@@ -21,6 +21,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 
 // ---------------------------------------------------------------------------------- echo services
 
@@ -476,6 +477,75 @@ static void test_connection_refused(void) {
 	CHECK_EQ(wait_event(c, sid, HW_CEV_CLOSE, &ev, 5000), 1);
 	CHECK_EQ(ev.reason, HW_CLOSE_REFUSED);
 	hw_client_free(c);
+}
+
+// The server's own end of the TCP connection that `remote` accepted: the in-process socket whose
+// local port is the accepted socket's peer port and whose peer is remote's port. -1 when none.
+static int server_side_of(int remote) {
+	struct sockaddr_in mine, theirs;
+	socklen_t sl = sizeof(mine);
+	if (getsockname(remote, (struct sockaddr *)&mine, &sl) != 0) return -1;
+	sl = sizeof(theirs);
+	if (getpeername(remote, (struct sockaddr *)&theirs, &sl) != 0) return -1;
+	for (int fd = 3; fd < 4096; fd++) {
+		if (fd == remote) continue;
+		struct sockaddr_in a, b;
+		socklen_t al = sizeof(a), bl = sizeof(b);
+		if (getsockname(fd, (struct sockaddr *)&a, &al) != 0 || a.sin_family != AF_INET) continue;
+		if (getpeername(fd, (struct sockaddr *)&b, &bl) != 0 || b.sin_family != AF_INET) continue;
+		if (a.sin_port == theirs.sin_port && b.sin_port == mine.sin_port) return fd;
+	}
+	return -1;
+}
+
+// A remote that stops answering after its stream opened closes the stream 0x47 (the spec's "TCP
+// data transfer timed out"), not 0x43, which says the dial got no answer. The remote here takes
+// nothing (a zero window), and the server's socket is given a TCP_USER_TIMEOUT from this side, so
+// the kernel gives up on it in half a second with ETIMEDOUT, as it does after unanswered
+// retransmissions or keepalive probes. The same socket shows the keepalive the server set, so that
+// a remote that vanished without a word frees its stream in minutes, not the kernel's two hours.
+static void test_remote_timeout_after_open(void) {
+#if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
+	uint16_t port;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	CHECK(lfd >= 0, "listen");
+	int small = 4096;
+	setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)); // inherited by what it accepts
+	hw_client *c = connect_to(g_server, 1, NULL, NULL, 1);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sid), 0);
+	hw_client_event ev;
+	CHECK_EQ(wait_event(c, sid, 0, &ev, 5000), 1);
+	CHECK_EQ(ev.type, HW_CEV_CONTINUE); // connected
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 5000), 1);
+	int remote = accept(lfd, NULL, NULL);
+	CHECK(remote >= 0, "accept");
+	int fd = server_side_of(remote);
+	CHECK(fd >= 0, "the server's socket for the stream");
+	int on = 0, idle = 0;
+	socklen_t ol = sizeof(on);
+	CHECK_EQ(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, &ol), 0);
+	CHECK(on, "keepalive on the remote socket");
+	ol = sizeof(idle);
+	CHECK_EQ(getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol), 0);
+	CHECK_EQ(idle, 60);
+	unsigned timeout_ms = 300;
+	CHECK_EQ(setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout_ms, sizeof(timeout_ms)), 0);
+	uint8_t chunk[16384];
+	fill_pattern(chunk, sizeof(chunk), 5);
+	// Well inside the window (16 packets here), and more than the remote's receive buffer and the
+	// server's send buffer can hold together at the start, so some of it waits on a zero window.
+	for (int i = 0; i < 12; i++) CHECK_EQ(hw_client_send(c, sid, chunk, sizeof(chunk)), 0);
+	CHECK_EQ(wait_event(c, sid, HW_CEV_CLOSE, &ev, 10000), 1);
+	CHECK_EQ(ev.reason, HW_CLOSE_TRANSFER_TIMEOUT);
+	close(remote);
+	close(lfd);
+	hw_client_free(c);
+	wait_streams_idle(g_server);
+#else
+	printf("skip: no TCP_USER_TIMEOUT here\n");
+#endif
 }
 
 // A UDP port nothing listens on: bind, note the port, close.
@@ -1240,6 +1310,7 @@ int main(void) {
 	RUN(test_remote_eof_closes_stream);
 	RUN(test_close_toward_remote);
 	RUN(test_connection_refused);
+	RUN(test_remote_timeout_after_open);
 	if (hw_sys_has_udp_unreachable()) {
 		RUN(test_udp_port_unreachable);
 	} else {

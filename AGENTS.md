@@ -204,8 +204,10 @@ every test still passes, so each item has a test and a change to it needs a reas
   `tests/credit_cases.h` (run by `test_e2e` and `test_e2e_wt`), `test_credit_not_by_datagram` and
   `test_remote_resets_while_held` hold it.
 - **Close reasons** are the spec's: `0x02` remote EOF, `0x03` network error, `0x41` invalid
-  CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x48` blocked
-  by egress policy, `0x49` throttled. A UDP stream whose remote port is closed gets `0x42` as soon
+  CONNECT, `0x42` unresolvable/unreachable, `0x43` connect timeout, `0x44` refused, `0x47` an open
+  stream's remote timed out (`open_errno`: ETIMEDOUT after the stream opened, from unanswered
+  retransmissions or keepalive probes; `test_remote_timeout_after_open`), `0x48` blocked by egress
+  policy, `0x49` throttled. A UDP stream whose remote port is closed gets `0x42` as soon
   as the socket reports the port unreachable, whichever of a send or a read collects it: a client
   sends a QUIC Initial two datagrams at a time, and the second send takes the error the first one
   drew (`test_udp_port_unreachable`). A client's CLOSE for a stream gets no CLOSE back. A CONNECT
@@ -526,7 +528,10 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   could cause. A new "ignore this event for now" has to say which of the four it is.
 - **Every wait has an end.** A stream has a timer from CONNECT to connected, not only around
   `connect()`: resolving (`0x42`) and the upstream proxy's handshake (`0x43`) are covered by
-  `open_timeout_cb` on the same `connect_timer`.
+  `open_timeout_cb` on the same `connect_timer`. An open TCP stream's remote socket has
+  keepalive at 60 s idle, 15 s apart, 4 probes (`STREAM_KEEPALIVE_*`), so a remote that vanished
+  without a FIN or a reset frees its stream (`0x47`) two minutes after it went quiet, not after
+  the kernel's two hours.
 - **Relay pipes.** A TCP stream whose remote delivers full reads (`s->bulk`) gets its own pipe
   (`hw_spipe`, opened when it goes bulk) and relays remote to client through it without a copy
   (`conn_splice_data`): the frame header is appended to `wbuf`, the payload is spliced into the

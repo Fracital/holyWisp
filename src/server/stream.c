@@ -33,6 +33,11 @@
 #define STREAM_MAX_READS_PER_EVENT 4
 #define STREAM_OUT_KEEP            (256 * 1024)
 #endif
+// TCP keepalive toward a remote: the first probe after this long idle, then one per interval, and
+// the remote is given up on (ETIMEDOUT, CLOSE 0x47) after `count` go unanswered.
+#define STREAM_KEEPALIVE_IDLE_S     60
+#define STREAM_KEEPALIVE_INTERVAL_S 15
+#define STREAM_KEEPALIVE_COUNT      4
 
 static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud);
 static void stream_connect_next(hw_stream *s, int last_errno);
@@ -53,6 +58,13 @@ static uint8_t map_errno(int err) {
 	default:
 		return HW_CLOSE_NETWORK_ERROR;
 	}
+}
+
+// The same for a stream that is open: a remote that stops answering now (retransmissions or
+// keepalive probes unanswered) timed out a transfer, the spec's 0x47. 0x43 is a stream that never
+// opened, and a client that shows reasons would blame the dial.
+static uint8_t open_errno(int err) {
+	return err == ETIMEDOUT ? HW_CLOSE_TRANSFER_TIMEOUT : map_errno(err);
 }
 
 static int stream_uses_proxy(const hw_stream *s) {
@@ -405,7 +417,14 @@ int stream_connected(hw_stream *s) {
 	}
 	s->state = STREAM_OPEN;
 	stream_time_open(s);
-	if (s->type == HW_STREAM_TCP) server_tune_socket(c->w->server, s->fd, 1);
+	if (s->type == HW_STREAM_TCP) {
+		server_tune_socket(c->w->server, s->fd, 1);
+		// The kernel's own keepalive waits two hours before its first probe, and a remote that
+		// vanished without a word (a NAT that forgot the flow, a host gone) held an idle stream's
+		// slot that long. Probes cost an idle stream one packet a minute; a dead one is closed
+		// 0x47 two minutes after it went quiet. The client library's sockets use the same.
+		hw_sys_keepalive(s->fd, STREAM_KEEPALIVE_IDLE_S, STREAM_KEEPALIVE_INTERVAL_S, STREAM_KEEPALIVE_COUNT);
+	}
 	s->read_armed = !conn_stream_paused(c, s);
 	// With client data already queued, stream_flush below sets the event mask once it knows what
 	// is left; setting it here as well would be a second epoll_ctl for every such stream.
@@ -896,7 +915,8 @@ static int stream_flush(hw_stream *s) {
 			return 0;
 		}
 		// A datagram's ECONNREFUSED is a port unreachable for an earlier one, as on the read side.
-		stream_close(s, s->type == HW_STREAM_UDP && errno == ECONNREFUSED ? HW_CLOSE_UNREACHABLE : map_errno(errno), 1);
+		stream_close(s, s->type == HW_STREAM_UDP && errno == ECONNREFUSED ? HW_CLOSE_UNREACHABLE : open_errno(errno),
+		             1);
 		return -1;
 	}
 	stream_update_events(s);
@@ -931,7 +951,7 @@ void stream_batch_flush(hw_worker *w) {
 	}
 	if (n < 0) {
 		if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
-			stream_close(s, map_errno(errno), 1);
+			stream_close(s, open_errno(errno), 1);
 			return;
 		}
 		n = 0;
@@ -1018,7 +1038,7 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 				stream_close(s, HW_CLOSE_UNREACHABLE, 1);
 				return;
 			} else {
-				stream_close(s, map_errno(errno), 1);
+				stream_close(s, open_errno(errno), 1);
 				return;
 			}
 		}
@@ -1120,7 +1140,7 @@ static void stream_read(hw_stream *s) {
 			if (n < 0) {
 				if (errno == EINTR) continue;
 				if (errno == EAGAIN || errno == EWOULDBLOCK) return;
-				stream_close(s, map_errno(errno), 1);
+				stream_close(s, open_errno(errno), 1);
 				return;
 			}
 			s->heard = 1;
@@ -1162,7 +1182,7 @@ static void stream_read(hw_stream *s) {
 				stream_close(s, HW_CLOSE_VOLUNTARY, 1);
 				return;
 			}
-			stream_close(s, map_errno(errno), 1);
+			stream_close(s, open_errno(errno), 1);
 			return;
 		}
 		if (n == 0 && s->type != HW_STREAM_UDP) {
