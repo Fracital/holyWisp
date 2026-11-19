@@ -635,6 +635,16 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   the RTT as measured (`min_rtt_raw`), never the floored one, or a path shorter than a tick keeps
   only the samples that spanned a stall (`test_bbr_sub_tick_rtt`). `test_bbr_*` in `test_quic` run
   it on a simulated lossy path, beside NewReno.
+  `bbr2` (selectable, not the default) is that model with version 3's answer to loss, for a
+  shallow buffer, where version 1 lost 3.5% of its packets and `bbr2` 0.5% at the same rate: a
+  round whose loss passes 2% of its flight (and 3 packets) ends startup and a probe and caps the
+  window at `inflight_hi`; PROBE_BW is DOWN, CRUISE, REFILL, UP. Loss under 2% must change
+  nothing (the edge's 0.3%), which is why loss is judged once per round by its sum, never at each
+  loss as the draft does, and why the short-term bounds (`bw_lo`, `inflight_lo`) answer only two
+  rounds of too much loss in a row: either way the draft's form kept 79 to 81% of a path at 1%
+  random loss, this keeps 95%. Every mechanism has a `test_bbr2_*` that fails without it
+  (`shallow_buffer`, `random_loss`, `startup_loss`, `capacity_drop`, `app_limited`, `stack`); the
+  v1 rules above (app-limited samples, `blk_head`, the clock, the floor) hold for it too.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
   lost, never sent in fragments that every later packet is then sent in too.
 - **Lanes and the server-opened stream** (docs/webtransport.md has the rules). A session may

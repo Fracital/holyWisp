@@ -82,8 +82,11 @@ export type WebTransportConfig = {
 	idleTimeoutSeconds?: number;
 	maxHandshakes?: number;
 	retryThreshold?: number;
-	/** QUIC congestion control toward the client: `"bbr"` (the server's default) or `"newreno"`. */
-	congestionControl?: "bbr" | "newreno";
+	/**
+	 * QUIC congestion control toward the client: `"bbr"` (the server's default), `"bbr2"` (BBR
+	 * that also bounds its flight where loss passes 2%) or `"newreno"`.
+	 */
+	congestionControl?: "bbr" | "bbr2" | "newreno";
 };
 
 export type holyWispConfig = {
@@ -550,8 +553,9 @@ export function workerArgs(
 			int("webtransport-idle-timeout-s", "webTransport.idleTimeoutSeconds", wt.idleTimeoutSeconds);
 			int("webtransport-max-handshakes", "webTransport.maxHandshakes", wt.maxHandshakes);
 			int("webtransport-retry-threshold", "webTransport.retryThreshold", wt.retryThreshold);
-			if (wt.congestionControl !== undefined && wt.congestionControl !== "bbr" && wt.congestionControl !== "newreno") {
-				fail("webTransport.congestionControl must be bbr or newreno");
+			const cc = wt.congestionControl;
+			if (cc !== undefined && cc !== "bbr" && cc !== "bbr2" && cc !== "newreno") {
+				fail("webTransport.congestionControl must be bbr, bbr2 or newreno");
 			}
 			str("webtransport-congestion-control", "webTransport.congestionControl", wt.congestionControl);
 		}

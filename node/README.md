@@ -154,7 +154,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `webTransport.host`, `webTransport.port`, `webTransport.url` | `webtransport-host`, `webtransport-port`, `webtransport-url` |
 | `webTransport.certFile`, `webTransport.keyFile` | `webtransport-cert`, `webtransport-key` |
 | `webTransport.idleTimeoutSeconds`, `webTransport.maxHandshakes`, `webTransport.retryThreshold` | `webtransport-idle-timeout-s`, `webtransport-max-handshakes`, `webtransport-retry-threshold` |
-| `webTransport.congestionControl` (`"bbr"` or `"newreno"`) | `webtransport-congestion-control` |
+| `webTransport.congestionControl` (`"bbr"`, `"bbr2"` or `"newreno"`) | `webtransport-congestion-control` |
 | `logLevel` (default `warn`) | `log-level` |
 
 WebTransport is UDP, so `route()` has no part in it: the browser opens

@@ -56,7 +56,11 @@ test("webTransport maps onto the webtransport keys, and false or absent passes n
 			"--webtransport-congestion-control=newreno",
 		],
 	);
-	assert.throws(() => workerArgs({ webTransport: { congestionControl: "cubic" } }, run), /congestionControl must be bbr or newreno/);
+	assert.deepEqual(
+		wtArgs({ webTransport: { congestionControl: "bbr2" } }),
+		["--webtransport=true", "--webtransport-congestion-control=bbr2"],
+	);
+	assert.throws(() => workerArgs({ webTransport: { congestionControl: "cubic" } }, run), /congestionControl must be bbr, bbr2 or newreno/);
 	assert.throws(() => workerArgs({ webTransport: "yes" }, run), /webTransport must be a boolean or an object/);
 	assert.throws(() => workerArgs({ webTransport: { port: 1.5 } }, run), /webTransport.port must be an integer/);
 });

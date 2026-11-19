@@ -408,21 +408,27 @@ static void test_rtt_cc(void) {
 	CHECK_EQ(hw_qc_pacer_next(&c, &r, t), t);
 }
 
-// A path for the congestion controller alone: a bottleneck of CCSIM_RATE bytes per microsecond with
-// a queue of g_ccsim.queue_us, g_ccsim.rtt_us of propagation, an ACK for every packet, a loss
-// detected when the packet three after it is acknowledged, and random loss of one packet in
-// loss_in (0: none). Time is in microseconds and the run is deterministic. The sender's clock
-// ticks every g_ccsim.tick_us: what the controller is told is the time of the last tick, and it is
-// woken at a tick, as a caller of the hw_quic_* calls with a millisecond clock is.
+// A path for the congestion controller alone: a bottleneck of g_cclink.rate bytes per microsecond
+// (CCSIM_RATE when 0; from rate2_at on, rate2) with a queue of g_ccsim.queue_us, g_ccsim.rtt_us of
+// propagation, an ACK for every packet, a loss detected when the packet three after it is
+// acknowledged, and random loss of one packet in loss_in (0: none). Time is in microseconds and the
+// run is deterministic. The sender's clock ticks every g_ccsim.tick_us: what the controller is told
+// is the time of the last tick, and it is woken at a tick, as a caller of the hw_quic_* calls with a
+// millisecond clock is. bbr: 0 NewReno, 1 BBR, 2 bbr2.
 #define CCSIM_RATE 5u // 5 MB/s
 #define CCSIM_MDS  1200u
-#define CCSIM_MAX  200000u
+#define CCSIM_RING (1u << 18) // packets the run may have in flight or unresolved at once
 
 typedef struct {
 	uint64_t rtt_us, queue_us, tick_us;
 } ccsim_path;
 static const ccsim_path CCSIM_DEFAULT = {40000, 40000, 1};
 static ccsim_path g_ccsim = {40000, 40000, 1};
+typedef struct {
+	uint64_t rate, rate2, rate2_at;
+} ccsim_link;
+static const ccsim_link CCLINK_DEFAULT = {0, 0, 0};
+static ccsim_link g_cclink = {0, 0, 0};
 #define CCSIM_RTT_US (g_ccsim.rtt_us)
 
 typedef struct {
@@ -438,6 +444,11 @@ typedef struct {
 	uint64_t bw_after_app_limited;   // BBR's estimate when the app-limited stretch ended
 	uint64_t bw_max_after;           // BBR's highest estimate after t_measure
 	uint64_t sent_after, lost_after; // packets sent after t_measure, and how many of them the queue dropped
+	uint64_t sent, lost;             // the same over the whole run
+	uint64_t startup_end;            // when BBR first left STARTUP (0: never)
+	uint64_t lost_at_startup_end;    // packets the queue had dropped by then
+	uint64_t inflight_hi_at_startup_end, inflight_hi_end; // bbr2's bound then, and at the end
+	int saw_up;                                           // bbr2 probed (PROBE_BW UP) after t_measure
 } ccsim_result;
 
 static uint64_t ccsim_rand(uint64_t *x) {
@@ -451,7 +462,8 @@ static uint64_t ccsim_rand(uint64_t *x) {
 // to send (it is app-limited); otherwise it always has data.
 static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measure, uint64_t app_from, uint64_t app_to,
                       ccsim_result *out) {
-	static ccsim_pkt pk[CCSIM_MAX];
+	static ccsim_pkt pk[CCSIM_RING];
+#define CCSIM_PK(i) (&pk[(i) & (CCSIM_RING - 1)])
 	const uint64_t tick = g_ccsim.tick_us;
 #define CCSIM_CLOCK(t) ((t) / tick * tick)
 	memset(out, 0, sizeof(*out));
@@ -459,16 +471,20 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 	hw_qc_cc c;
 	hw_qc_rtt r;
 	hw_qc_cc_init(&c, CCSIM_MDS, 0);
-	if (bbr) hw_qc_cc_use_bbr(&c, 0);
+	if (bbr == 1) hw_qc_cc_use_bbr(&c, 0);
+	if (bbr == 2) hw_qc_cc_use_bbr2(&c, 0);
 	hw_qc_rtt_init(&r);
-	uint64_t seed = 0x9e3779b97f4a7c15ull, now = 0, link_free = 0, app_credit = 0, app_last = 0;
-	size_t n = 0, next_ack = 0, scan = 0;
-	while (now < end && n < CCSIM_MAX) {
+	uint64_t seed = 0x9e3779b97f4a7c15ull, now = 0, link_free_ns = 0, app_credit = 0, app_last = 0;
+	uint64_t n = 0, next_ack = 0, scan = 0;
+	while (now < end && n - scan < CCSIM_RING) {
+		uint64_t rate = g_cclink.rate ? g_cclink.rate : CCSIM_RATE;
+		if (g_cclink.rate2 && now >= g_cclink.rate2_at) rate = g_cclink.rate2;
 		// Acknowledgments due by now, in order (the link is FIFO and the RTT constant).
 		// A lost packet is passed over (loss detection declares it below); ACK times grow with the
 		// send order, so the first one still due later ends the pass.
-		while (next_ack < n && (!pk[next_ack].ack_at || pk[next_ack].ack_at <= now)) {
-			ccsim_pkt *p = &pk[next_ack++];
+		while (next_ack < n && (!CCSIM_PK(next_ack)->ack_at || CCSIM_PK(next_ack)->ack_at <= now)) {
+			uint64_t me = next_ack++;
+			ccsim_pkt *p = CCSIM_PK(me);
 			if (p->done || !p->ack_at) continue;
 			p->done = 1;
 			uint64_t at = CCSIM_CLOCK(p->ack_at);
@@ -479,31 +495,40 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 			hw_qc_rtt_sample(&r, rtt, 0, at);
 			if (p->ack_at >= t_measure) out->delivered_after += p->rec.size;
 			// Packet threshold 3: what was sent three or more before this one and not acked is lost.
-			size_t me = (size_t)(p - pk);
 			for (; scan + 3 <= me; scan++) {
-				if (pk[scan].done) continue;
-				if (!pk[scan].ack_at) {
-					pk[scan].done = 1;
-					hw_qc_cc_remove(&c, pk[scan].rec.size);
-					hw_qc_cc_congestion_event(&c, pk[scan].rec.time, 1, at);
+				ccsim_pkt *l = CCSIM_PK(scan);
+				if (l->done) continue;
+				if (!l->ack_at) {
+					l->done = 1;
+					hw_qc_cc_on_lost(&c, &l->rec, scan);
+					hw_qc_cc_remove(&c, l->rec.size);
+					hw_qc_cc_congestion_event(&c, l->rec.time, 1, at);
 				}
 			}
 			hw_qc_cc_on_ack_done(&c, rtt, at);
 		}
 		if (bbr && now >= t_measure && c.b.bw > out->bw_max_after) out->bw_max_after = c.b.bw;
 		if (bbr && c.b.mode == HW_QC_BBR_PROBE_RTT) out->saw_probe_rtt = 1;
+		if (bbr && !out->startup_end && c.b.mode != HW_QC_BBR_STARTUP) {
+			out->startup_end = now;
+			out->lost_at_startup_end = out->lost;
+			out->inflight_hi_at_startup_end = c.b.inflight_hi;
+		}
+		if (bbr == 2 && now >= t_measure && c.b.mode == HW_QC_BBR_PROBE_BW && c.b.phase == HW_QC_BBR2_UP) {
+			out->saw_up = 1;
+		}
 		if (c.cwnd > out->max_cwnd) out->max_cwnd = c.cwnd;
 		if (now > end / 2 && c.cwnd < out->min_cwnd_late) out->min_cwnd_late = c.cwnd;
 		if (bbr && app_to && now >= app_to && !out->bw_after_app_limited) out->bw_after_app_limited = c.b.bw;
 		// Send what the window, the pacer and the application allow.
 		int app_limited = now >= app_from && now < app_to;
 		if (app_limited) {
-			app_credit += (now - app_last) * CCSIM_RATE / 10;
+			app_credit += (now - app_last) * rate / 10;
 			if (app_credit > 4 * CCSIM_MDS) app_credit = 4 * CCSIM_MDS;
 		}
 		app_last = now;
 		uint64_t wake = UINT64_MAX;
-		while (hw_qc_cc_can_send(&c) && n < CCSIM_MAX) {
+		while (hw_qc_cc_can_send(&c) && n - scan < CCSIM_RING) {
 			uint64_t t = hw_qc_pacer_next(&c, &r, CCSIM_CLOCK(now));
 			if (t > CCSIM_CLOCK(now)) {
 				wake = (t + tick - 1) / tick * tick;
@@ -511,22 +536,24 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 			}
 			if (app_limited && app_credit < CCSIM_MDS) {
 				hw_qc_cc_app_limited(&c);
-				wake = now + CCSIM_MDS * 10 / CCSIM_RATE;
+				wake = now + CCSIM_MDS * 10 / rate;
 				break;
 			}
 			if (app_limited) app_credit -= CCSIM_MDS;
-			ccsim_pkt *p = &pk[n++];
+			ccsim_pkt *p = CCSIM_PK(n++);
 			memset(p, 0, sizeof(*p));
 			p->rec.time = CCSIM_CLOCK(now);
 			p->rec.size = CCSIM_MDS;
 			hw_qc_rs_on_sent(&c, &p->rec, p->rec.time);
 			hw_qc_cc_on_sent(&c, CCSIM_MDS);
 			hw_qc_pacer_on_sent(&c, CCSIM_MDS);
-			uint64_t start = HW_MAX(now, link_free);
-			int full = start - now > g_ccsim.queue_us;
+			uint64_t start = HW_MAX(now * 1000, link_free_ns);
+			int full = start - now * 1000 > g_ccsim.queue_us * 1000;
 			int dropped = full || (loss_in && ccsim_rand(&seed) % loss_in == 0);
-			if (!full) link_free = start + CCSIM_MDS / CCSIM_RATE;
-			p->ack_at = dropped ? 0 : link_free + CCSIM_RTT_US;
+			if (!full) link_free_ns = start + CCSIM_MDS * 1000 / rate;
+			p->ack_at = dropped ? 0 : link_free_ns / 1000 + CCSIM_RTT_US;
+			out->sent++;
+			out->lost += (uint64_t)full;
 			if (now >= t_measure) {
 				out->sent_after++;
 				out->lost_after += (uint64_t)full;
@@ -534,11 +561,13 @@ static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measur
 		}
 		// On to the next thing that happens.
 		uint64_t t = wake;
-		if (next_ack < n && pk[next_ack].ack_at < t) t = pk[next_ack].ack_at;
+		if (next_ack < n && CCSIM_PK(next_ack)->ack_at < t) t = CCSIM_PK(next_ack)->ack_at;
 		if (t == UINT64_MAX) t = now + 1000; // stalled: what is in flight is all lost
 		now = t > now ? t : now + 1;
 	}
+	out->inflight_hi_end = c.b.inflight_hi;
 #undef CCSIM_CLOCK
+#undef CCSIM_PK
 }
 
 // BBR on a path that drops one packet in a hundred at random: it fills the bottleneck, where
@@ -643,6 +672,163 @@ static void test_bbr_app_limited(void) {
 	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
 	CHECK(b.bw_after_app_limited > rate * 85 / 100 && b.bw_after_app_limited < rate * 115 / 100, "bw %llu of %llu",
 	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+}
+
+// bbr2 behind a shallow buffer at the path's rate (440 Mbit/s, 30 ms, 5 ms of queue): BBR's 1.25
+// probes every eight rounds overfill a queue that small, and it never answers the loss, so it
+// loses a packet in a hundred for as long as it sends. bbr2 bounds its flight where the loss
+// began (inflight_hi) and probes above it only every 2 to 3 s, slowly: a fifth of that loss
+// or less, at nearly the same goodput.
+static void test_bbr2_shallow_buffer(void) {
+	ccsim_result v1, v2;
+	g_ccsim = (ccsim_path){30000, 5000, 1};
+	g_cclink = (ccsim_link){55, 0, 0};
+	ccsim_run(1, 0, 10000000, 2000000, 0, 0, &v1);
+	ccsim_run(2, 0, 10000000, 2000000, 0, 0, &v2);
+	g_ccsim = CCSIM_DEFAULT;
+	g_cclink = CCLINK_DEFAULT;
+	uint64_t path = 55ull * 8000000;
+	CHECK(v2.lost_after * 5 < v1.lost_after, "dropped after startup: bbr2 %llu, bbr %llu of %llu sent",
+	      (unsigned long long)v2.lost_after, (unsigned long long)v1.lost_after, (unsigned long long)v1.sent_after);
+	CHECK(v2.lost_after * 1000 < v2.sent_after * 3, "bbr2 dropped %llu of %llu", (unsigned long long)v2.lost_after,
+	      (unsigned long long)v2.sent_after);
+	CHECK(v2.lost * 4 < v1.lost, "dropped in all: bbr2 %llu, bbr %llu", (unsigned long long)v2.lost,
+	      (unsigned long long)v1.lost);
+	CHECK(v2.delivered_after > path * 96 / 100 && v2.delivered_after + path * 2 / 100 > v1.delivered_after,
+	      "delivered: bbr2 %llu, bbr %llu of %llu", (unsigned long long)v2.delivered_after,
+	      (unsigned long long)v1.delivered_after, (unsigned long long)path);
+	CHECK(v2.saw_up, "bbr2 probed");
+}
+
+// Random loss under the threshold is not congestion. On a long fat path that loses 0.3% at
+// random (400 Mbit/s, 138 ms: the edge's long path, scaled) bbr2 keeps the path as BBR does.
+// On a short one that loses 1% (40 Mbit/s, 40 ms; test_bbr_random_loss's path) a round of a
+// hundred and seventy packets is over 2% by chance now and then; the short-term bounds wait for
+// a second such round in a row, or each of those cut the window to a BDP and the goodput to 81%.
+static void test_bbr2_random_loss(void) {
+	ccsim_result v1, v2;
+	g_ccsim = (ccsim_path){138000, 20000, 1};
+	g_cclink = (ccsim_link){50, 0, 0};
+	ccsim_run(1, 333, 20000000, 5000000, 0, 0, &v1);
+	ccsim_run(2, 333, 20000000, 5000000, 0, 0, &v2);
+	g_ccsim = CCSIM_DEFAULT;
+	g_cclink = CCLINK_DEFAULT;
+	uint64_t path = 50ull * 15000000;
+	CHECK(v1.delivered_after > path * 85 / 100, "bbr delivered %llu of %llu", (unsigned long long)v1.delivered_after,
+	      (unsigned long long)path);
+	CHECK(v2.delivered_after > path * 90 / 100, "bbr2 delivered %llu of %llu", (unsigned long long)v2.delivered_after,
+	      (unsigned long long)path);
+	CHECK(v2.inflight_hi_end > 50ull * 138000, "inflight_hi %llu under the BDP",
+	      (unsigned long long)v2.inflight_hi_end);
+	ccsim_run(2, 100, 20000000, 5000000, 0, 0, &v2);
+	path = (uint64_t)CCSIM_RATE * 15000000;
+	CHECK(v2.delivered_after > path * 90 / 100, "1%%: bbr2 delivered %llu of %llu",
+	      (unsigned long long)v2.delivered_after, (unsigned long long)path);
+}
+
+// Startup ends on loss: past the path's BDP and queue, a round with more than 2% lost in six
+// places or more is the end of it, and inflight_hi is what was in flight where the loss began,
+// the BDP and the queue. BBR waits for three rounds without growth, sending at 2.89 times the
+// path into the queue's drops all that while.
+static void test_bbr2_startup_loss(void) {
+	ccsim_result v1, v2;
+	g_ccsim = (ccsim_path){30000, 5000, 1};
+	g_cclink = (ccsim_link){55, 0, 0};
+	ccsim_run(1, 0, 2000000, 1000000, 0, 0, &v1);
+	ccsim_run(2, 0, 2000000, 1000000, 0, 0, &v2);
+	g_ccsim = CCSIM_DEFAULT;
+	g_cclink = CCLINK_DEFAULT;
+	uint64_t holds = 55ull * (30000 + 5000);
+	CHECK(v2.startup_end && v2.startup_end < v1.startup_end, "startup over at %llu us, bbr's at %llu",
+	      (unsigned long long)v2.startup_end, (unsigned long long)v1.startup_end);
+	CHECK(v2.inflight_hi_at_startup_end > holds * 9 / 10 && v2.inflight_hi_at_startup_end < holds * 11 / 10,
+	      "inflight_hi %llu when startup ended, the path holds %llu", (unsigned long long)v2.inflight_hi_at_startup_end,
+	      (unsigned long long)holds);
+	CHECK(v2.lost * 4 < v1.lost, "dropped in the first 2 s: bbr2 %llu, bbr %llu", (unsigned long long)v2.lost,
+	      (unsigned long long)v1.lost);
+}
+
+// The path's capacity halves (440 to 220 Mbit/s at 5 s). The max filter remembers the old rate
+// for two probe cycles; a round of too much loss outside a probe lowers bw_lo and inflight_lo,
+// and a probe starts from bw_lo, so the loss ends within a second and does not come back.
+static void test_bbr2_capacity_drop(void) {
+	ccsim_result v2;
+	g_ccsim = (ccsim_path){30000, 5000, 1};
+	g_cclink = (ccsim_link){55, 27, 5000000};
+	ccsim_run(2, 0, 14000000, 6000000, 0, 0, &v2);
+	g_ccsim = CCSIM_DEFAULT;
+	g_cclink = CCLINK_DEFAULT;
+	uint64_t path = 27ull * 8000000;
+	CHECK(v2.lost_after * 1000 < v2.sent_after * 3, "dropped %llu of %llu after the drop",
+	      (unsigned long long)v2.lost_after, (unsigned long long)v2.sent_after);
+	CHECK(v2.delivered_after > path * 93 / 100, "delivered %llu of %llu", (unsigned long long)v2.delivered_after,
+	      (unsigned long long)path);
+	CHECK(v2.bw_max_after < 27000000ull * 105 / 100, "bw %llu after the drop", (unsigned long long)v2.bw_max_after);
+}
+
+// What BBR's app-limited tests hold, for bbr2: an app-limited stretch does not lower the
+// estimate, and PROBE_RTT's samples cannot replace one it left stale.
+static void test_bbr2_app_limited(void) {
+	ccsim_result b;
+	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
+	ccsim_run(2, 0, 6000000, 0, 2000000, 5000000, &b);
+	CHECK(b.bw_after_app_limited > rate * 85 / 100 && b.bw_after_app_limited < rate * 115 / 100, "bw %llu of %llu",
+	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+	ccsim_run(2, 0, 12000000, 0, 1000000, 11000000, &b);
+	CHECK(b.saw_probe_rtt, "no PROBE_RTT");
+	CHECK(b.bw_after_app_limited > rate * 85 / 100, "bw %llu of %llu after the probe",
+	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+	// PROBE_RTT every 5 s with half the BDP in flight, not four packets.
+	ccsim_run(2, 0, 12000000, 1000000, 0, 0, &b);
+	uint64_t bdp = (uint64_t)CCSIM_RATE * CCSIM_RTT_US;
+	CHECK(b.saw_probe_rtt, "probe_rtt");
+	CHECK(b.min_cwnd_late >= bdp / 2 * 9 / 10, "probe_rtt window %llu, bdp %llu", (unsigned long long)b.min_cwnd_late,
+	      (unsigned long long)bdp);
+	CHECK(b.delivered_after > (uint64_t)CCSIM_RATE * 11000000 * 90 / 100, "delivered %llu",
+	      (unsigned long long)b.delivered_after);
+}
+
+// --cc-table: BBR and bbr2 (and NewReno) side by side on the simulated paths the tests use, for
+// comparing them by hand: goodput after the warm-up as a share of the path, the queue's drops
+// after it and over the whole run, and how startup ended.
+static void cc_table(int only_row, int only_v) {
+	static const struct {
+		const char *name;
+		ccsim_path path;
+		ccsim_link link;
+		uint64_t loss_in, end, t_measure;
+	} rows[] = {
+	    {"440 Mbit/s, 30 ms, 5 ms queue", {30000, 5000, 1}, {55, 0, 0}, 0, 10000000, 2000000},
+	    {"440 Mbit/s, 30 ms, 10 ms queue", {30000, 10000, 1}, {55, 0, 0}, 0, 10000000, 2000000},
+	    {"40 Mbit/s, 30 ms, 5 ms queue", {30000, 5000, 1}, {5, 0, 0}, 0, 10000000, 2000000},
+	    {"400 Mbit/s, 138 ms, 20 ms queue, 0.3% loss", {138000, 20000, 1}, {50, 0, 0}, 333, 20000000, 5000000},
+	    {"40 Mbit/s, 138 ms, 20 ms queue, 0.3% loss", {138000, 20000, 1}, {5, 0, 0}, 333, 20000000, 5000000},
+	    {"440 -> 220 Mbit/s at 5 s, 30 ms, 5 ms queue", {30000, 5000, 1}, {55, 27, 5000000}, 0, 12000000, 6000000},
+	    {"40 Mbit/s, 40 ms, 40 ms queue, 1% loss", {40000, 40000, 1}, {5, 0, 0}, 100, 20000000, 5000000},
+	};
+	static const char *const names[] = {"newreno", "bbr", "bbr2"};
+	for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+		if (only_row >= 0 && (size_t)only_row != i) continue;
+		printf("%s\n", rows[i].name);
+		g_ccsim = rows[i].path;
+		g_cclink = rows[i].link;
+		for (int v = 1; v <= 2; v++) {
+			if (only_v >= 0 && only_v != v) continue;
+			ccsim_result r;
+			ccsim_run(v, rows[i].loss_in, rows[i].end, rows[i].t_measure, 0, 0, &r);
+			uint64_t rate = g_cclink.rate2 ? g_cclink.rate2 : g_cclink.rate;
+			double path = (double)rate * (double)(rows[i].end - rows[i].t_measure);
+			printf("  %-7s goodput %5.1f%%  dropped %5.2f%% after, %5.2f%% in all (%llu)  startup over at %llu ms with "
+			       "%llu dropped, inflight_hi %lld\n",
+			       names[v], 100.0 * (double)r.delivered_after / path,
+			       r.sent_after ? 100.0 * (double)r.lost_after / (double)r.sent_after : 0.0,
+			       r.sent ? 100.0 * (double)r.lost / (double)r.sent : 0.0, (unsigned long long)r.lost,
+			       (unsigned long long)(r.startup_end / 1000), (unsigned long long)r.lost_at_startup_end,
+			       r.inflight_hi_at_startup_end == UINT64_MAX ? -1LL : (long long)r.inflight_hi_at_startup_end);
+		}
+	}
+	g_ccsim = CCSIM_DEFAULT;
+	g_cclink = CCLINK_DEFAULT;
 }
 
 static void test_smap(void) {
@@ -1549,6 +1735,30 @@ static void test_loss(void) {
 	      (unsigned long long)c.packets_sent, (unsigned long long)d.packets_sent);
 }
 
+// bbr2 through the stack: a writer waiting for the send buffer is not app-limited (as
+// test_bbr_buffer_limited), the lossy, reordering path of test_loss is as fast as with BBR, its
+// spurious losses undone, and the losses quic.c declares are bbr2's.
+static void test_bbr2_stack(void) {
+	g_sim_cc = HW_QUIC_CC_BBR2;
+	test_bbr_buffer_limited();
+	hw_quic_stats a, b;
+	uint64_t spurious;
+	uint64_t took = lossy(9, 0, 4u << 20, &a, &b, &spurious);
+	CHECK(took < 2700, "reordering alone: %llu ms", (unsigned long long)took);
+	took = lossy(10, 10000, 4u << 20, &a, &b, NULL);
+	CHECK(took < 3200, "1%% loss: %llu ms", (unsigned long long)took);
+	// Loss that quic.c detects reaches bbr2: 5% is too much, and bounds the flight.
+	sim *s = sim_new(12);
+	s->loss_ppm = 50000;
+	s->delay_ms = 10;
+	s->bw = 2000;
+	sim_handshake(s);
+	bulk(s, 0, 2u << 20, 1200000);
+	CHECK(s->sv.q->cc.b.v2 && s->sv.q->cc.b.inflight_hi != UINT64_MAX, "no inflight_hi after 5%% loss");
+	sim_free(s);
+	g_sim_cc = HW_QUIC_CC_BBR;
+}
+
 // Goodput under loss and reordering on the lossy() path: each direction's payload over the
 // time it took, as a fraction of the link's bandwidth, averaged over seeds.
 static void loss_table(void) {
@@ -2038,6 +2248,10 @@ int main(int argc, char **argv) {
 		bench(argc > 2 ? strtoull(argv[2], NULL, 10) : 256);
 		return 0;
 	}
+	if (argc > 1 && !strcmp(argv[1], "--cc-table")) {
+		cc_table(argc > 2 ? (int)strtol(argv[2], NULL, 10) : -1, argc > 3 ? (int)strtol(argv[3], NULL, 10) : -1);
+		return 0;
+	}
 	if (argc > 1 && !strcmp(argv[1], "--loss-table")) {
 		g_bench = 1;
 		loss_table();
@@ -2058,6 +2272,11 @@ int main(int argc, char **argv) {
 	RUN(test_bbr_clock_tick);
 	RUN(test_bbr_sub_tick_rtt);
 	RUN(test_bbr_app_limited);
+	RUN(test_bbr2_shallow_buffer);
+	RUN(test_bbr2_random_loss);
+	RUN(test_bbr2_startup_loss);
+	RUN(test_bbr2_capacity_drop);
+	RUN(test_bbr2_app_limited);
 	RUN(test_smap);
 	RUN(test_handshake);
 	RUN(test_handshake_hrr);
@@ -2078,6 +2297,7 @@ int main(int argc, char **argv) {
 	RUN(test_key_update);
 	RUN(test_migration);
 	RUN(test_loss);
+	RUN(test_bbr2_stack);
 	RUN(test_pmtu);
 	RUN(test_bulk_64m);
 	hw_der_free(&g_cert);

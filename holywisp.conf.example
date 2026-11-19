@@ -177,5 +177,5 @@ webtransport-cert-dir =             # <host>.pem files (chain + P-256 key) picke
 webtransport-idle-timeout-s = 30
 webtransport-max-handshakes = 1024  # QUIC handshakes in progress per worker
 webtransport-retry-threshold = 64   # past this many per worker, every new Initial gets a Retry
-webtransport-congestion-control = bbr  # or newreno, which halves its window at every loss
+webtransport-congestion-control = bbr  # bbr2: also bounds its flight where loss passes 2%; newreno halves at every loss
 webtransport-lanes = 8              # Wisp lanes a v2 session may ride (0 or 1: none, at most 16)

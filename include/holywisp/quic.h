@@ -57,9 +57,11 @@
 #define HW_QUIC_CRYPTO_ERROR(alert)       (0x100 + (alert))
 
 // Congestion control: BBR, which a random loss does not slow, or RFC 9002's NewReno, which halves
-// its window at each.
+// its window at each, or BBR with version 3's loss response (bbr2), which bounds what it keeps in
+// flight where the loss rate passes 2% and does not slow for less.
 #define HW_QUIC_CC_BBR     0
 #define HW_QUIC_CC_NEWRENO 1
+#define HW_QUIC_CC_BBR2    2
 
 typedef struct {
 	int is_server;
@@ -76,7 +78,7 @@ typedef struct {
 	size_t conn_send_max;      // the same, across all streams of the connection
 	size_t datagram_queue_max; // datagrams queued for sending before the newest is dropped
 	uint64_t keepalive_ms;     // 0 = none: send a PING after this long without sending anything
-	int congestion;            // HW_QUIC_CC_BBR (the default) or HW_QUIC_CC_NEWRENO
+	int congestion;            // HW_QUIC_CC_BBR (the default), HW_QUIC_CC_NEWRENO or HW_QUIC_CC_BBR2
 	// Server: the first byte of every connection ID issued (the owning worker's index), the
 	// listener's stateless reset key (reset tokens are HMAC-SHA-256(key, cid) truncated), and
 	// the original DCID and Retry SCID when the client went through a Retry.

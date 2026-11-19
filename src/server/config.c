@@ -222,6 +222,8 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 			cfg->webtransport_congestion = HW_QUIC_CC_BBR;
 		} else if (!strcmp(value, "newreno")) {
 			cfg->webtransport_congestion = HW_QUIC_CC_NEWRENO;
+		} else if (!strcmp(value, "bbr2")) {
+			cfg->webtransport_congestion = HW_QUIC_CC_BBR2;
 		} else {
 			goto bad_value;
 		}
@@ -544,7 +546,8 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-max-handshakes               QUIC handshakes in progress per worker (1024)\n"
 	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"
 	       "                                            Retry (64)\n"
-	       "  webtransport-congestion-control           bbr or newreno: how fast QUIC sends to a client (bbr)\n"
+	       "  webtransport-congestion-control           bbr, bbr2 or newreno: how fast QUIC sends to a client;\n"
+	       "                                            bbr2 also bounds its flight where loss passes 2%% (bbr)\n"
 	       "  webtransport-lanes N                      QUIC streams one v2 session's Wisp may ride, the\n"
 	       "                                            first included; 0 or 1 for one, at most 16 (8)\n"
 	       "\n"

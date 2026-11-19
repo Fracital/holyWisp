@@ -3,7 +3,8 @@
  * control with its recovery period and persistent congestion, the undoing of a recovery period
  * whose every loss proved spurious, the pacer (section 7.7), and the ring of sent packets loss
  * detection walks. BBR replaces NewReno's window where the connection asks for it: delivery
- * rate samples, the bandwidth and min-RTT model, and the pacing rate and window it sets. The decisions that need the
+ * rate samples, the bandwidth and min-RTT model, and the pacing rate and window it sets, in
+ * version 1 or (bbr2) with version 3's response to loss. The decisions that need the
  * connection (which packets are lost, what to send again, the adaptive loss thresholds) are quic.c's.
  */
 #include "quic_internal.h"
@@ -67,6 +68,7 @@ void hw_qc_cc_init(hw_qc_cc *c, uint64_t mds, uint64_t now) {
 
 void hw_qc_cc_on_sent(hw_qc_cc *c, uint64_t bytes) {
 	c->in_flight += bytes;
+	if (c->in_flight >= c->cwnd) c->b.cwnd_limited_round = 1;
 }
 
 void hw_qc_cc_remove(hw_qc_cc *c, uint64_t bytes) {
@@ -94,10 +96,13 @@ void hw_qc_cc_on_acked(hw_qc_cc *c, uint64_t bytes, uint64_t time_sent, int limi
 	}
 }
 
+static void bbr2_on_loss_batch(hw_qc_cc *c, uint64_t now);
+
 void hw_qc_cc_congestion_event(hw_qc_cc *c, uint64_t time_sent, uint64_t nlost, uint64_t now) {
 	c->rs.lost += nlost;
 	if (c->in_recovery_valid && time_sent <= c->recovery_start) {
 		c->undo_lost += nlost;
+		if (c->b.v2) bbr2_on_loss_batch(c, now);
 		return;
 	}
 	c->epoch++;
@@ -109,7 +114,12 @@ void hw_qc_cc_congestion_event(hw_qc_cc *c, uint64_t time_sent, uint64_t nlost, 
 	c->recovery_start = now;
 	// BBR does not take a loss for congestion: its model is the delivery rate, which random
 	// loss does not move (the reason it is here: NewReno halved its window on every one of a
-	// path's 0.3% and ran at a tenth of the same path's TCP).
+	// path's 0.3% and ran at a tenth of the same path's TCP). bbr2 takes a loss rate over 2%
+	// for one, and bounds what it keeps in flight to where that began.
+	if (c->b.v2) {
+		c->b.undo_inflight_hi = c->b.inflight_hi;
+		bbr2_on_loss_batch(c, now);
+	}
 	if (c->bbr) return;
 	c->ssthresh = HW_MAX(c->cwnd / 2, cc_min_window(c));
 	c->cwnd = c->ssthresh;
@@ -133,6 +143,11 @@ int hw_qc_cc_spurious(hw_qc_cc *c, uint16_t epoch) {
 	c->ssthresh = c->undo_ssthresh;
 	c->in_recovery_valid = 0;
 	c->ca_acked = 0;
+	if (c->b.v2) {
+		// Reordering, not loss: the bounds it set go.
+		c->b.inflight_hi = HW_MAX(c->b.inflight_hi, c->b.undo_inflight_hi);
+		c->b.bw_lo = c->b.inflight_lo = UINT64_MAX;
+	}
 	return 1;
 }
 
@@ -144,6 +159,7 @@ void hw_qc_rs_on_sent(hw_qc_cc *c, hw_qc_sent *s, uint64_t now) {
 	s->delivered_time = c->delivered_time;
 	s->first_sent_time = c->first_sent_time;
 	s->rs_app_limited = c->app_limited != 0;
+	s->tx_in_flight = c->in_flight + s->size;
 }
 
 void hw_qc_rs_on_acked(hw_qc_cc *c, const hw_qc_sent *s, uint64_t now) {
@@ -157,6 +173,7 @@ void hw_qc_rs_on_acked(hw_qc_cc *c, const hw_qc_sent *s, uint64_t now) {
 		c->rs.is_app_limited = s->rs_app_limited;
 		c->rs.send_elapsed = s->time > s->first_sent_time ? s->time - s->first_sent_time : 0;
 		c->rs.ack_elapsed = now > s->delivered_time ? now - s->delivered_time : 0;
+		c->rs.tx_in_flight = s->tx_in_flight;
 		c->first_sent_time = s->time;
 	}
 }
@@ -292,10 +309,329 @@ static void bbr_check_full_bw(hw_qc_cc *c) {
 	if (++c->b.full_bw_cnt >= BBR_FULL_BW_CNT) c->b.full_bw_reached = 1;
 }
 
+// ---- bbr2 ----------------------------------------------------------------------------------
+// Version 1's model and machinery with version 3's answer to loss (draft-cardwell-ccwg-bbr). A
+// round's loss is counted against what was in flight when the round began; more than
+// BBR2_LOSS_THRESH_PCT of it, and BBR2_LOSS_MIN_PACKETS at least, is too much. Too much ends
+// startup and a probe and bounds the flight (inflight_hi) to where the loss began. PROBE_BW is
+// DOWN, CRUISE under that bound less a headroom, then every 2 to 3 s REFILL and UP, which raises
+// the bound slowly until the loss comes back. BBR2_LOSS_ROUNDS rounds in a row of too much loss
+// outside a probe cut the short-term bounds (bw_lo, inflight_lo) by beta, and the next probe
+// starts from bw_lo. A loss rate under the threshold changes nothing.
+// Where this is not the draft: its short-term bounds answer any loss at all, and the random 0.3%
+// of the edge's long path would cut them every round. Its test is made at every loss, over the
+// loss since that packet was sent, and a test made at a loss always counts one, so random loss
+// well under the threshold crossed it every few rounds on a small window. On 40 Mbit/s, 40 ms
+// and 1% random loss the draft's test kept 79% of the path, one round of too much loss 81%, and
+// two rounds 95%.
+
+#define BBR2_STARTUP_GAIN      709u // 4 ln 2
+#define BBR2_DRAIN_GAIN        90u  // 0.35: startup's queue drains in about a round
+#define BBR2_CWND_GAIN         512u
+#define BBR2_UP_CWND_GAIN      576u // 2.25
+#define BBR2_UP_GAIN           320u // 1.25
+#define BBR2_DOWN_GAIN         230u // 0.9
+#define BBR2_LOSS_THRESH_PCT   2u
+#define BBR2_LOSS_MIN_PACKETS  3u // and never fewer lost than this, so that one loss in a small window is not 2%
+#define BBR2_BETA_PCT          70u
+#define BBR2_HEADROOM_PCT      15u
+#define BBR2_STARTUP_LOSS_EVTS 6u               // discontiguous losses in a round, with too much loss, end startup
+#define BBR2_LOSS_ROUNDS       2u               // rounds in a row of too much loss that lower the short-term bounds
+#define BBR2_PROBE_WAIT_US     (2ull * 1000000) // and up to a second more, at random
+#define BBR2_RENO_ROUNDS_MAX   63u
+#define BBR2_PROBE_RTT_US      (5ull * 1000000)
+
+enum {
+	ACKS_INIT = 0,
+	ACKS_REFILLING,
+	ACKS_PROBE_STARTING,
+	ACKS_PROBE_FEEDBACK,
+	ACKS_PROBE_STOPPING
+};
+
+static uint64_t bbr2_rand(hw_qc_cc *c) {
+	c->b.rng ^= c->b.rng << 13;
+	c->b.rng ^= c->b.rng >> 7;
+	c->b.rng ^= c->b.rng << 17;
+	return c->b.rng;
+}
+
+static void bbr2_start_round(hw_qc_cc *c) {
+	c->b.next_round_delivered = c->delivered;
+}
+
+// bw * min_rtt * gain plus the pacer's bursts, in bytes; the initial window while either is unknown.
+static uint64_t bbr2_inflight(const hw_qc_cc *c, uint64_t bw, unsigned gain) {
+	if (!bw || c->b.min_rtt == UINT64_MAX) return c->b.init_cwnd;
+	return bw * c->b.min_rtt / 1000000 * gain / BBR_UNIT + 3 * c->mds;
+}
+
+static uint64_t bbr2_target_inflight(const hw_qc_cc *c) {
+	return HW_MIN(bbr_bdp(c, BBR_UNIT), c->cwnd);
+}
+
+// Room under inflight_hi that a probe of the other flows on the path may fill.
+static uint64_t bbr2_inflight_with_headroom(const hw_qc_cc *c) {
+	if (c->b.inflight_hi == UINT64_MAX) return UINT64_MAX;
+	uint64_t room = HW_MAX(c->mds, c->b.inflight_hi * BBR2_HEADROOM_PCT / 100);
+	return c->b.inflight_hi > room + bbr_min_cwnd(c) ? c->b.inflight_hi - room : bbr_min_cwnd(c);
+}
+
+static uint64_t bbr2_probe_rtt_cwnd(const hw_qc_cc *c) {
+	return HW_MAX(bbr_bdp(c, BBR_UNIT / 2), bbr_min_cwnd(c));
+}
+
+// Too much loss: more than the threshold of what was in flight, and a few packets at least.
+static int bbr2_too_much_loss(const hw_qc_cc *c, uint64_t lost, uint64_t in_flight) {
+	return lost >= BBR2_LOSS_MIN_PACKETS * c->mds && lost * 100 > in_flight * BBR2_LOSS_THRESH_PCT;
+}
+
+static int bbr2_cwnd_limited(const hw_qc_cc *c) {
+	return c->b.cwnd_limited || c->b.cwnd_limited_round;
+}
+
+static void bbr2_reset_lower_bounds(hw_qc_cc *c) {
+	c->b.bw_lo = c->b.inflight_lo = UINT64_MAX;
+}
+
+static void bbr2_reset_full_bw(hw_qc_cc *c, uint64_t rate) {
+	c->b.full_bw = rate;
+	c->b.full_bw_cnt = 0;
+	c->b.full_bw_now = 0;
+}
+
+static void bbr2_raise_slope(hw_qc_cc *c) {
+	uint64_t growth = 1ull << c->b.probe_up_rounds; // packets this round
+	if (c->b.probe_up_rounds < 30) c->b.probe_up_rounds++;
+	c->b.probe_up_cnt = HW_MAX(c->cwnd / growth, c->mds);
+}
+
+static void bbr2_start_down(hw_qc_cc *c, uint64_t now) {
+	c->b.loss_in_round = 0;
+	c->b.round_lost = 0;
+	c->b.bw_latest = c->b.inflight_latest = 0;
+	c->b.probe_up_cnt = UINT64_MAX;
+	// Flows that started together should not probe together.
+	c->b.rounds_since_probe = bbr2_rand(c) & 1;
+	c->b.probe_wait = BBR2_PROBE_WAIT_US + bbr2_rand(c) % 1000000;
+	c->b.cycle_stamp = now;
+	c->b.ack_phase = ACKS_PROBE_STOPPING;
+	bbr2_start_round(c);
+	c->b.mode = HW_QC_BBR_PROBE_BW;
+	c->b.phase = HW_QC_BBR2_DOWN;
+}
+
+// The short-term bounds end where a probe begins. One still in force says the path carries less
+// than the max filter remembers, so the filter takes it: the probe starts from what the path
+// delivers now. (The draft lets the filter keep the old rate for two cycles, and after a drop
+// in capacity every probe and every PROBE_RTT until then refilled at it: a thousand packets
+// lost each time, at 440 Mbit/s halved.)
+static void bbr2_end_lower_bounds(hw_qc_cc *c) {
+	if (c->b.bw_lo < c->b.max_bw) {
+		c->b.bw_hi[0] = 0;
+		c->b.bw_hi[1] = c->b.max_bw = c->b.bw_lo;
+	}
+	bbr2_reset_lower_bounds(c);
+}
+
+static void bbr2_start_refill(hw_qc_cc *c) {
+	bbr2_end_lower_bounds(c);
+	c->b.probe_up_rounds = 0;
+	c->b.probe_up_acks = 0;
+	c->b.ack_phase = ACKS_REFILLING;
+	bbr2_start_round(c);
+	c->b.phase = HW_QC_BBR2_REFILL;
+}
+
+static void bbr2_start_up(hw_qc_cc *c, uint64_t rate) {
+	c->b.ack_phase = ACKS_PROBE_STARTING;
+	bbr2_start_round(c);
+	bbr2_reset_full_bw(c, rate);
+	c->b.phase = HW_QC_BBR2_UP;
+	bbr2_raise_slope(c);
+}
+
+static void bbr2_set_inflight_hi(hw_qc_cc *c, uint64_t v) {
+	c->b.inflight_hi = v;
+	c->b.hi_cut_delivered = c->delivered;
+}
+
+// A probe met too much loss: the flight is bounded where the loss began.
+static void bbr2_inflight_too_high(hw_qc_cc *c, uint64_t in_flight, int app_limited, uint64_t now) {
+	c->b.bw_probe_samples = 0;
+	if (!app_limited) bbr2_set_inflight_hi(c, HW_MAX(in_flight, bbr2_target_inflight(c) * BBR2_BETA_PCT / 100));
+	if (c->b.mode == HW_QC_BBR_PROBE_BW && c->b.phase == HW_QC_BBR2_UP) bbr2_start_down(c, now);
+}
+
+void hw_qc_cc_on_lost(hw_qc_cc *c, const hw_qc_sent *s, uint64_t pn) {
+	if (!c->b.v2) return;
+	if (pn != c->b.last_lost_pn + 1 || !c->b.loss_events) c->b.loss_events++;
+	c->b.last_lost_pn = pn;
+	c->b.round_lost += s->size;
+	if (c->b.loss_in_round || !bbr2_too_much_loss(c, c->b.round_lost, c->b.round_in_flight)) return;
+	// Where the loss began: what was in flight when this packet went, less what the round lost,
+	// which that flight still counted (lost, not yet known to be). The draft's estimate from the
+	// loss since each packet was sent does not apply to a round's sum, and the round's first
+	// loss is as often a random one, sent with less in flight: on the long lossy path every probe
+	// then lowered the bound.
+	c->b.loss_in_round = 1;
+	c->b.pend = 1;
+	c->b.pend_hi = s->tx_in_flight > c->b.round_lost ? s->tx_in_flight - c->b.round_lost : 0;
+	c->b.pend_app_limited = s->rs_app_limited;
+}
+
+// After a batch of losses: startup ends on too much of it, in enough places, and a probe stops at
+// it. Startup's bound is where the loss began, or the path's BDP if that is more.
+static void bbr2_on_loss_batch(hw_qc_cc *c, uint64_t now) {
+	if (c->b.mode == HW_QC_BBR_STARTUP) {
+		if (c->b.full_bw_reached || !c->b.pend || c->b.loss_events < BBR2_STARTUP_LOSS_EVTS) return;
+		c->b.pend = 0;
+		c->b.full_bw_reached = 1;
+		bbr2_set_inflight_hi(c, HW_MAX(bbr_bdp(c, BBR_UNIT), c->b.pend_hi));
+		c->b.mode = HW_QC_BBR_DRAIN;
+		return;
+	}
+	if (!c->b.pend) return;
+	c->b.pend = 0;
+	if (c->b.bw_probe_samples) bbr2_inflight_too_high(c, c->b.pend_hi, c->b.pend_app_limited, now);
+}
+
+static void bbr2_check_full_bw(hw_qc_cc *c, uint64_t rate) {
+	if (c->b.full_bw_now || !c->rs.has || c->rs.is_app_limited) return;
+	if (rate && rate >= c->b.full_bw * BBR_FULL_BW_THRESH / BBR_UNIT) {
+		bbr2_reset_full_bw(c, rate);
+		return;
+	}
+	if (!c->b.round_start) return;
+	if (++c->b.full_bw_cnt >= BBR_FULL_BW_CNT) c->b.full_bw_now = c->b.full_bw_reached = 1;
+}
+
+static void bbr2_probe_inflight_hi_upward(hw_qc_cc *c) {
+	if (!bbr2_cwnd_limited(c) || c->cwnd < c->b.inflight_hi) return;
+	c->b.probe_up_acks += c->rs.acked;
+	if (c->b.probe_up_acks >= c->b.probe_up_cnt) {
+		uint64_t delta = c->b.probe_up_acks / c->b.probe_up_cnt;
+		c->b.probe_up_acks -= delta * c->b.probe_up_cnt;
+		c->b.inflight_hi += delta * c->mds;
+	}
+	if (c->b.round_start) bbr2_raise_slope(c);
+}
+
+static void bbr2_adapt_upper_bounds(hw_qc_cc *c) {
+	if (!c->rs.has) return;
+	if (c->b.ack_phase == ACKS_PROBE_STARTING && c->b.round_start) c->b.ack_phase = ACKS_PROBE_FEEDBACK;
+	if (c->b.ack_phase == ACKS_PROBE_STOPPING && c->b.round_start) {
+		// What the probe sent has been acknowledged: its samples move into the older half of
+		// the filter.
+		c->b.bw_probe_samples = 0;
+		c->b.ack_phase = ACKS_INIT;
+		if (c->b.mode == HW_QC_BBR_PROBE_BW && !c->rs.is_app_limited && c->b.bw_hi[1]) {
+			c->b.bw_hi[0] = c->b.bw_hi[1];
+			c->b.bw_hi[1] = 0;
+		}
+	}
+	// In a round of too much loss the bound does not rise, nor for what was sent before the loss
+	// lowered it.
+	if (c->b.loss_in_round || c->b.inflight_hi == UINT64_MAX) return;
+	if (c->rs.tx_in_flight > c->b.inflight_hi && c->rs.prior_delivered >= c->b.hi_cut_delivered) {
+		c->b.inflight_hi = c->rs.tx_in_flight;
+	}
+	if (c->b.mode == HW_QC_BBR_PROBE_BW && c->b.phase == HW_QC_BBR2_UP) bbr2_probe_inflight_hi_upward(c);
+}
+
+static int bbr2_time_to_probe(hw_qc_cc *c, uint64_t now) {
+	uint64_t reno = HW_MIN(bbr2_target_inflight(c) / c->mds, (uint64_t)BBR2_RENO_ROUNDS_MAX);
+	if (now - c->b.cycle_stamp <= c->b.probe_wait && c->b.rounds_since_probe < reno) return 0;
+	bbr2_start_refill(c);
+	return 1;
+}
+
+static void bbr2_update_cycle(hw_qc_cc *c, uint64_t rate, uint64_t now) {
+	if (!c->b.full_bw_reached) return;
+	bbr2_adapt_upper_bounds(c);
+	if (c->b.mode != HW_QC_BBR_PROBE_BW) return;
+	switch (c->b.phase) {
+	case HW_QC_BBR2_DOWN:
+		if (bbr2_time_to_probe(c, now)) break;
+		// The queue the probe built has drained, and what is in flight leaves the headroom.
+		if (c->in_flight <= bbr2_inflight_with_headroom(c) && c->in_flight <= bbr2_inflight(c, c->b.max_bw, BBR_UNIT)) {
+			c->b.phase = HW_QC_BBR2_CRUISE;
+		}
+		break;
+	case HW_QC_BBR2_CRUISE:
+		bbr2_time_to_probe(c, now);
+		break;
+	case HW_QC_BBR2_REFILL:
+		// A round at the bound, so that the probe's samples measure the path, not the refilling.
+		if (c->b.round_start) {
+			c->b.bw_probe_samples = 1;
+			bbr2_start_up(c, rate);
+		}
+		break;
+	default:
+		// UP until loss (bbr2_inflight_too_high) or a plateau not of inflight_hi's making.
+		if (bbr2_cwnd_limited(c) && c->cwnd >= c->b.inflight_hi) {
+			bbr2_reset_full_bw(c, rate);
+		} else if (c->b.full_bw_now) {
+			bbr2_start_down(c, now);
+		}
+		break;
+	}
+}
+
+static int bbr2_probing(const hw_qc_cc *c) {
+	return c->b.mode == HW_QC_BBR_STARTUP ||
+	       (c->b.mode == HW_QC_BBR_PROBE_BW && (c->b.phase == HW_QC_BBR2_REFILL || c->b.phase == HW_QC_BBR2_UP));
+}
+
+// The round's signals: the best rate and delivery it saw, the max filter, and at the end of a
+// round of too much loss outside a probe, the short-term bounds.
+static void bbr2_update_signals(hw_qc_cc *c, uint64_t rate, uint64_t delivered) {
+	c->b.loss_round_start = 0;
+	if (c->rs.has) {
+		c->b.bw_latest = HW_MAX(c->b.bw_latest, rate);
+		c->b.inflight_latest = HW_MAX(c->b.inflight_latest, delivered);
+		if (c->rs.prior_delivered >= c->b.loss_round_delivered) {
+			c->b.loss_round_delivered = c->delivered;
+			c->b.loss_round_start = 1;
+		}
+	}
+	if (rate && (!c->rs.is_app_limited || rate >= c->b.max_bw)) {
+		if (rate > c->b.bw_hi[1]) c->b.bw_hi[1] = rate;
+		c->b.max_bw = HW_MAX(c->b.bw_hi[0], c->b.bw_hi[1]);
+	}
+	if (!c->b.loss_round_start) return;
+	c->b.loss_rounds = c->b.loss_in_round ? c->b.loss_rounds + 1 : 0;
+	if (c->b.loss_rounds >= BBR2_LOSS_ROUNDS && !bbr2_probing(c)) {
+		if (c->b.bw_lo == UINT64_MAX) c->b.bw_lo = c->b.max_bw;
+		if (c->b.inflight_lo == UINT64_MAX) c->b.inflight_lo = c->cwnd;
+		c->b.bw_lo = HW_MAX(c->b.bw_latest, c->b.bw_lo * BBR2_BETA_PCT / 100);
+		c->b.inflight_lo = HW_MAX(c->b.inflight_latest, c->b.inflight_lo * BBR2_BETA_PCT / 100);
+	}
+	c->b.loss_in_round = 0;
+	c->b.loss_events = 0;
+	c->b.round_lost = 0;
+	c->b.round_in_flight = c->in_flight;
+	c->b.pend = 0;
+}
+
+void hw_qc_cc_use_bbr2(hw_qc_cc *c, uint64_t now) {
+	hw_qc_cc_use_bbr(c, now);
+	c->b.v2 = 1;
+	c->b.pacing_gain = BBR2_STARTUP_GAIN;
+	c->b.cwnd_gain = BBR2_CWND_GAIN;
+	c->b.inflight_hi = c->b.undo_inflight_hi = UINT64_MAX;
+	bbr2_reset_lower_bounds(c);
+	c->b.probe_up_cnt = UINT64_MAX;
+	c->b.rng = (now ^ 0x9e3779b97f4a7c15ull) | 1;
+}
+
 // rtt_raw is the sample as measured; the model's min RTT is never under a tick of the timers,
 // which pace and probe no finer than that (at 0 a loopback window was 4 packets).
+// bbr2 probes every 5 s, with half the BDP in flight rather than four packets (version 3).
 static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_raw, uint64_t now) {
-	int expired = now > c->b.min_rtt_stamp + BBR_MIN_RTT_US;
+	int expired = now > c->b.min_rtt_stamp + (c->b.v2 ? BBR2_PROBE_RTT_US : BBR_MIN_RTT_US);
+	uint64_t probe_cwnd = c->b.v2 ? bbr2_probe_rtt_cwnd(c) : bbr_min_cwnd(c);
 	uint64_t rtt_us = rtt_raw ? HW_MAX(rtt_raw, (uint64_t)HW_QC_GRANULARITY_US) : 0;
 	if (rtt_raw && (rtt_raw < c->b.min_rtt_raw || expired)) c->b.min_rtt_raw = rtt_raw;
 	if (rtt_us && (rtt_us < c->b.min_rtt || expired)) {
@@ -306,6 +642,10 @@ static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_raw, uint64_t now) {
 		c->b.mode = HW_QC_BBR_PROBE_RTT;
 		c->b.prior_cwnd = HW_MAX(c->b.prior_cwnd, c->cwnd);
 		c->b.probe_rtt_done = 0;
+		if (c->b.v2) {
+			c->b.ack_phase = ACKS_PROBE_STOPPING;
+			bbr2_start_round(c);
+		}
 	}
 	if (c->b.mode == HW_QC_BBR_PROBE_RTT) {
 		// Its samples measure four packets, not the path, and so do those that span its end: the
@@ -315,7 +655,7 @@ static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_raw, uint64_t now) {
 		// BDP of four packets.
 		uint64_t mark = c->delivered + c->in_flight;
 		c->app_limited = mark ? mark : 1;
-		if (!c->b.probe_rtt_done && c->in_flight <= bbr_min_cwnd(c)) {
+		if (!c->b.probe_rtt_done && c->in_flight <= probe_cwnd) {
 			c->b.probe_rtt_done = now + BBR_PROBE_RTT_US;
 			c->b.probe_rtt_round_done = 0;
 			c->b.next_round_delivered = c->delivered;
@@ -325,7 +665,11 @@ static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_raw, uint64_t now) {
 				c->b.min_rtt_stamp = now;
 				c->cwnd = HW_MAX(c->cwnd, c->b.prior_cwnd);
 				c->b.prior_cwnd = 0;
-				if (c->b.full_bw_reached) {
+				if (c->b.v2) bbr2_end_lower_bounds(c);
+				if (c->b.full_bw_reached && c->b.v2) {
+					bbr2_start_down(c, now);
+					c->b.phase = HW_QC_BBR2_CRUISE;
+				} else if (c->b.full_bw_reached) {
 					bbr_enter_probe_bw(c, now);
 				} else {
 					c->b.mode = HW_QC_BBR_STARTUP;
@@ -360,7 +704,36 @@ static uint64_t bbr_ack_aggregation_cwnd(const hw_qc_cc *c) {
 	return HW_MIN(a, c->b.bw * BBR_EXTRA_ACKED_MAX_US / 1000000);
 }
 
+static void bbr2_update_gains(hw_qc_cc *c) {
+	unsigned pacing = BBR_UNIT, cwnd = BBR2_CWND_GAIN;
+	switch (c->b.mode) {
+	case HW_QC_BBR_STARTUP:
+		pacing = BBR2_STARTUP_GAIN;
+		break;
+	case HW_QC_BBR_DRAIN:
+		pacing = BBR2_DRAIN_GAIN;
+		break;
+	case HW_QC_BBR_PROBE_BW:
+		if (c->b.phase == HW_QC_BBR2_UP) {
+			pacing = BBR2_UP_GAIN;
+			cwnd = BBR2_UP_CWND_GAIN;
+		} else if (c->b.phase == HW_QC_BBR2_DOWN) {
+			pacing = BBR2_DOWN_GAIN;
+		}
+		break;
+	default:
+		cwnd = BBR_UNIT;
+		break;
+	}
+	c->b.pacing_gain = pacing;
+	c->b.cwnd_gain = cwnd;
+}
+
 static void bbr_update_gains(hw_qc_cc *c) {
+	if (c->b.v2) {
+		bbr2_update_gains(c);
+		return;
+	}
 	switch (c->b.mode) {
 	case HW_QC_BBR_STARTUP:
 		c->b.pacing_gain = c->b.cwnd_gain = BBR_HIGH_GAIN;
@@ -379,6 +752,42 @@ static void bbr_update_gains(hw_qc_cc *c) {
 	}
 }
 
+// bbr2's model from an ACK's sample (version 3's BBRUpdateModelAndState). delivered: the bytes
+// the sample spans.
+static void bbr2_update(hw_qc_cc *c, uint64_t rate, uint64_t delivered, uint64_t rtt_us, uint64_t now) {
+	if (c->b.round_start) {
+		c->b.rounds_since_probe++;
+		c->b.cwnd_limited = c->b.cwnd_limited_round;
+		c->b.cwnd_limited_round = 0;
+	}
+	bbr2_update_signals(c, rate, delivered);
+	bbr_update_ack_aggregation(c, c->rs.acked, now);
+	bbr2_check_full_bw(c, rate);
+	if (c->b.mode == HW_QC_BBR_STARTUP && c->b.full_bw_reached) c->b.mode = HW_QC_BBR_DRAIN;
+	if (c->b.mode == HW_QC_BBR_DRAIN && c->in_flight <= bbr_bdp(c, BBR_UNIT)) bbr2_start_down(c, now);
+	bbr2_update_cycle(c, rate, now);
+	bbr_update_min_rtt(c, rtt_us, now);
+	if (c->b.loss_round_start) {
+		c->b.bw_latest = rate;
+		c->b.inflight_latest = delivered;
+	}
+	c->b.bw = HW_MIN(c->b.max_bw, c->b.bw_lo);
+}
+
+// The window within the model: inflight_hi while probing or about to, less the headroom in
+// CRUISE and PROBE_RTT, inflight_lo always, never under four packets; PROBE_RTT's own limit.
+static void bbr2_bound_cwnd(hw_qc_cc *c) {
+	uint64_t cap = UINT64_MAX;
+	if (c->b.mode == HW_QC_BBR_PROBE_BW && c->b.phase != HW_QC_BBR2_CRUISE) {
+		cap = c->b.inflight_hi;
+	} else if (c->b.mode == HW_QC_BBR_PROBE_RTT || c->b.mode == HW_QC_BBR_PROBE_BW) {
+		cap = bbr2_inflight_with_headroom(c);
+	}
+	cap = HW_MAX(HW_MIN(cap, c->b.inflight_lo), bbr_min_cwnd(c));
+	if (c->b.mode == HW_QC_BBR_PROBE_RTT) cap = HW_MIN(cap, bbr2_probe_rtt_cwnd(c));
+	if (c->cwnd > cap) c->cwnd = cap;
+}
+
 void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 	if (c->app_limited && c->delivered > c->app_limited) c->app_limited = 0;
 	if (!c->bbr) {
@@ -389,9 +798,9 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 	// than the min RTT is a burst of ACKs, not the path: the RTT as measured, not the model's,
 	// which is floored to a tick. Against the tick, a path shorter than one kept only the samples
 	// that spanned a stall, and a loopback session ran at a fifth of its speed.
-	uint64_t rate = 0;
+	uint64_t rate = 0, delivered = 0;
 	if (c->rs.has) {
-		uint64_t delivered = c->delivered - c->rs.prior_delivered;
+		delivered = c->delivered - c->rs.prior_delivered;
 		uint64_t interval = HW_MAX(c->rs.send_elapsed, c->rs.ack_elapsed);
 		uint64_t floor = c->b.min_rtt_raw != UINT64_MAX ? c->b.min_rtt_raw : rtt_us;
 		if (delivered && interval && interval >= floor) rate = delivered * 1000000 / interval;
@@ -405,16 +814,20 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 	} else {
 		c->b.round_start = 0;
 	}
-	if (rate && (!c->rs.is_app_limited || rate >= c->b.bw)) {
-		bbr_bw_update(c, c->b.round_count, rate);
-		c->b.bw = c->b.bw_s[0];
+	if (c->b.v2) {
+		bbr2_update(c, rate, delivered, rtt_us, now);
+	} else {
+		if (rate && (!c->rs.is_app_limited || rate >= c->b.bw)) {
+			bbr_bw_update(c, c->b.round_count, rate);
+			c->b.bw = c->b.bw_s[0];
+		}
+		bbr_update_ack_aggregation(c, c->rs.acked, now);
+		bbr_update_cycle(c, now);
+		bbr_check_full_bw(c);
+		if (c->b.mode == HW_QC_BBR_STARTUP && c->b.full_bw_reached) c->b.mode = HW_QC_BBR_DRAIN;
+		if (c->b.mode == HW_QC_BBR_DRAIN && c->in_flight <= bbr_bdp(c, BBR_UNIT)) bbr_enter_probe_bw(c, now);
+		bbr_update_min_rtt(c, rtt_us, now);
 	}
-	bbr_update_ack_aggregation(c, c->rs.acked, now);
-	bbr_update_cycle(c, now);
-	bbr_check_full_bw(c);
-	if (c->b.mode == HW_QC_BBR_STARTUP && c->b.full_bw_reached) c->b.mode = HW_QC_BBR_DRAIN;
-	if (c->b.mode == HW_QC_BBR_DRAIN && c->in_flight <= bbr_bdp(c, BBR_UNIT)) bbr_enter_probe_bw(c, now);
-	bbr_update_min_rtt(c, rtt_us, now);
 	bbr_update_gains(c);
 	// Pacing: the gain over the estimate, never lowered before startup has found the path.
 	if (c->b.bw) {
@@ -426,7 +839,8 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 	// bursts the pacer allows and for ACKs that arrive in clumps; it grows by what was
 	// acknowledged until it reaches that.
 	uint64_t target = bbr_bdp(c, c->b.cwnd_gain) + 3 * c->mds + bbr_ack_aggregation_cwnd(c);
-	if (c->b.mode == HW_QC_BBR_PROBE_BW && c->b.cycle_idx == 0) target += 2 * c->mds;
+	int up = c->b.v2 ? c->b.phase == HW_QC_BBR2_UP : c->b.cycle_idx == 0;
+	if (c->b.mode == HW_QC_BBR_PROBE_BW && up) target += 2 * c->mds;
 	uint64_t acked = c->rs.acked;
 	if (c->b.full_bw_reached) {
 		c->cwnd = HW_MIN(c->cwnd + acked, target);
@@ -435,7 +849,11 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 	}
 	if (c->cwnd > CC_CWND_MAX) c->cwnd = CC_CWND_MAX;
 	if (c->cwnd < bbr_min_cwnd(c)) c->cwnd = bbr_min_cwnd(c);
-	if (c->b.mode == HW_QC_BBR_PROBE_RTT && c->cwnd > bbr_min_cwnd(c)) c->cwnd = bbr_min_cwnd(c);
+	if (c->b.v2) {
+		bbr2_bound_cwnd(c);
+	} else if (c->b.mode == HW_QC_BBR_PROBE_RTT && c->cwnd > bbr_min_cwnd(c)) {
+		c->cwnd = bbr_min_cwnd(c);
+	}
 	memset(&c->rs, 0, sizeof(c->rs));
 }
 
@@ -449,7 +867,7 @@ static uint64_t pacer_rate(const hw_qc_cc *c, const hw_qc_rtt *r) {
 	if (c->bbr) {
 		if (c->b.pacing_rate) return c->b.pacing_rate;
 		// No bandwidth sample yet: the startup gain over the window and the RTT there is.
-		return c->cwnd * BBR_HIGH_GAIN / BBR_UNIT * 1000000 / srtt;
+		return c->cwnd * (c->b.v2 ? BBR2_STARTUP_GAIN : BBR_HIGH_GAIN) / BBR_UNIT * 1000000 / srtt;
 	}
 	// bytes per second
 	return (c->cwnd * 5 / 4) * 1000000 / srtt;

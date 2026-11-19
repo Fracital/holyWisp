@@ -191,7 +191,7 @@ typedef struct hw_server_config {
 	int webtransport_idle_timeout_s;  // QUIC idle timeout
 	int webtransport_max_handshakes;  // handshakes in progress per worker
 	int webtransport_retry_threshold; // handshakes in progress per worker past which an Initial gets a Retry
-	int webtransport_congestion;      // HW_QUIC_CC_BBR (0, the default) or HW_QUIC_CC_NEWRENO
+	int webtransport_congestion;      // HW_QUIC_CC_BBR (0, the default), HW_QUIC_CC_NEWRENO or HW_QUIC_CC_BBR2
 	// Lanes a v2 session may have, lane 0 included (docs/webtransport.md, "Lanes"): the most
 	// client streams one Wisp connection rides. 0 or 1 offers none; at most HW_WT_LANES_MAX (16).
 	int webtransport_lanes;

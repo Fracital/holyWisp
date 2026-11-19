@@ -765,7 +765,11 @@ static void frame_lost(hw_quic_conn *q, hw_qc_space *sp, const hw_qc_frec *r) {
 
 static void cc_init(hw_quic_conn *q) {
 	hw_qc_cc_init(&q->cc, q->mds, q->now);
-	if (q->cfg.congestion != HW_QUIC_CC_NEWRENO) hw_qc_cc_use_bbr(&q->cc, q->now);
+	if (q->cfg.congestion == HW_QUIC_CC_BBR2) {
+		hw_qc_cc_use_bbr2(&q->cc, q->now);
+	} else if (q->cfg.congestion != HW_QUIC_CC_NEWRENO) {
+		hw_qc_cc_use_bbr(&q->cc, q->now);
+	}
 }
 
 static void pmtu_result(hw_quic_conn *q, int passed);
@@ -834,6 +838,7 @@ static void detect_lost(hw_quic_conn *q, int spi) {
 				if (!nlost++) first_lost = pn;
 				last_lost = pn;
 				if (s->time > latest_lost) latest_lost = s->time;
+				hw_qc_cc_on_lost(&q->cc, s, pn);
 			}
 			if (s->flags & HW_QC_SENT_ACK_ELICITING) {
 				if (!run) {

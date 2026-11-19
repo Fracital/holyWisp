@@ -312,7 +312,8 @@ typedef struct {
 		int has;
 		int is_app_limited;
 		uint64_t prior_delivered, prior_time, send_elapsed, ack_elapsed;
-		uint64_t acked, lost; // bytes acknowledged and declared lost while this ACK is processed
+		uint64_t tx_in_flight; // that packet's in flight when it was sent
+		uint64_t acked, lost;  // bytes acknowledged and packets declared lost while this ACK is processed
 	} rs;
 	// BBR (draft-cardwell-iccrg-bbr-congestion-control-00, as Linux's tcp_bbr does it); bbr = 0
 	// is NewReno and leaves all of this alone.
@@ -343,6 +344,34 @@ typedef struct {
 		uint64_t ack_epoch_start, ack_epoch_acked;
 		uint64_t extra_acked[2];
 		unsigned extra_acked_idx, extra_acked_rounds;
+		// bbr2 (draft-cardwell-ccwg-bbr, version 3, with its loss response; hw_qc_cc_use_bbr2):
+		// what follows is zero and unused in version 1. Bytes, bytes per second and microseconds;
+		// UINT64_MAX is "no bound".
+		int v2;
+		int phase, ack_phase;                // HW_QC_BBR2_* while in PROBE_BW; which of its ACKs are arriving
+		uint64_t max_bw, bw_hi[2];           // the max filter: this ProbeBW cycle and the one before
+		uint64_t inflight_hi;                // the most in flight that lost under the threshold
+		uint64_t bw_lo, inflight_lo;         // short-term bounds after a round of too much loss
+		uint64_t undo_inflight_hi;           // inflight_hi when the current recovery period began
+		uint64_t bw_latest, inflight_latest; // the round's best rate sample and delivered bytes
+		uint64_t loss_round_delivered;
+		int loss_round_start, loss_in_round;  // loss_in_round: too much loss seen in this round
+		unsigned loss_rounds;                 // rounds in a row with too much loss
+		uint64_t round_lost, round_in_flight; // lost this round; in flight when it began
+		uint64_t hi_cut_delivered;            // delivered when inflight_hi was last lowered
+		unsigned loss_events;                 // discontiguous losses this round (startup's exit)
+		uint64_t last_lost_pn;
+		int full_bw_now;      // the plateau test passed (startup, or the current UP)
+		int bw_probe_samples; // ACKs of what a probe sent are arriving
+		uint64_t probe_wait, rounds_since_probe;
+		unsigned probe_up_rounds;
+		uint64_t probe_up_acks, probe_up_cnt;
+		int cwnd_limited, cwnd_limited_round; // the window was full in the last round, in this one
+		uint64_t rng;
+		// A round's loss became too much: what inflight_hi becomes, applied by
+		// hw_qc_cc_congestion_event after the recovery period's undo state is saved.
+		int pend, pend_app_limited;
+		uint64_t pend_hi;
 	} b;
 } hw_qc_cc;
 
@@ -353,9 +382,19 @@ enum {
 	HW_QC_BBR_PROBE_RTT,
 };
 
+// bbr2's phases of PROBE_BW.
+enum {
+	HW_QC_BBR2_DOWN = 0,
+	HW_QC_BBR2_CRUISE,
+	HW_QC_BBR2_REFILL,
+	HW_QC_BBR2_UP,
+};
+
 void hw_qc_cc_init(hw_qc_cc *c, uint64_t mds, uint64_t now);
 // After hw_qc_cc_init: the window is BBR's from then on, not NewReno's.
 void hw_qc_cc_use_bbr(hw_qc_cc *c, uint64_t now);
+// The same, with version 3's loss response (bbr2): an in-flight bound where loss passes 2%.
+void hw_qc_cc_use_bbr2(hw_qc_cc *c, uint64_t now);
 void hw_qc_cc_on_sent(hw_qc_cc *c, uint64_t bytes);
 // An in-flight packet sent at time_sent was acknowledged. limited = the sender was not using
 // the window (no growth then).
@@ -402,8 +441,10 @@ typedef struct {
 	uint8_t rs_app_limited; // in flight: sent while the sender was app-limited (hw_qc_cc.app_limited)
 	uint16_t loss_epoch;    // HW_QC_SENT_LOST: the recovery period that declared it (hw_qc_cc.epoch)
 	// In flight: the connection's delivery state when it was sent (hw_qc_cc.delivered and the
-	// rest), from which its acknowledgment makes a delivery rate sample.
+	// rest), from which its acknowledgment makes a delivery rate sample, and what was in flight
+	// then, itself included (bbr2 bounds the flight with it).
 	uint64_t delivered, delivered_time, first_sent_time;
+	uint64_t tx_in_flight;
 } hw_qc_sent;
 
 // Delivery rate estimation. An in-flight packet is being sent (before hw_qc_cc_on_sent counts
@@ -411,6 +452,9 @@ typedef struct {
 void hw_qc_rs_on_sent(hw_qc_cc *c, hw_qc_sent *s, uint64_t now);
 // An in-flight packet was acknowledged (before hw_qc_cc_on_acked).
 void hw_qc_rs_on_acked(hw_qc_cc *c, const hw_qc_sent *s, uint64_t now);
+// An in-flight packet, number pn, was declared lost: before hw_qc_cc_remove takes it out of the
+// flight and before the hw_qc_cc_congestion_event of its batch.
+void hw_qc_cc_on_lost(hw_qc_cc *c, const hw_qc_sent *s, uint64_t pn);
 // The sender has room in the window and pacer but nothing to send: what goes out until what is
 // in flight now is delivered says nothing about the path's bandwidth.
 void hw_qc_cc_app_limited(hw_qc_cc *c);

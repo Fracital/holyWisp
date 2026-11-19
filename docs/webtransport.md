@@ -152,6 +152,31 @@ stall and ran at a fifth of its speed. NewReno (RFC 9002 7, appendix B) remains 
 an 8 s download and ran at 4 Mbit/s where the same path's TCP (BBR) did 30. On a 40 Mbit/s netem
 link with that loss and RTT, NewReno moved 0.8 MiB/s and BBR 4.5.
 
+`bbr2` is the same model with version 3's answer to loss (draft-cardwell-ccwg-bbr), for paths
+where version 1's indifference to loss is the problem: behind a shallow buffer it keeps pacing at
+the path's rate, so its 1.25 probes and startup's overshoot are lost. A round whose losses pass
+2% of what was in flight when it began (and are 3 packets at least) is too much: it ends startup
+and a probe and sets `inflight_hi`, the flight at which the loss began, which caps the window.
+PROBE_BW is the draft's DOWN, CRUISE (under `inflight_hi` less 15%), REFILL and UP, a probe every
+2 to 3 s at random (or sooner, on a short path, as Reno would have); UP raises `inflight_hi`
+slowly until the loss comes back, and a probe that ends on loss cuts it by 0.7. Two rounds in a
+row of too much loss outside a probe cut the short-term bounds (`bw_lo`, `inflight_lo`) by 0.7,
+and the next probe starts from `bw_lo`, not from the rate before the drop. PROBE_RTT comes every
+5 s and keeps half the BDP. Where this is not the draft: loss is judged once per round, by the
+round's sum, where the draft judges at each loss the loss since that packet was sent (a judgment
+made at a loss always counts one, so random loss well under 2% crossed it every few rounds on a
+small window); and the short-term bounds answer two rounds of too much loss, where the draft's
+answer any loss and the edge's random 0.3% would cut them every round. In the simulator, 40
+Mbit/s, 40 ms and 1% random loss: the draft's judgment kept 79% of the path, one round 81%, two
+95%. On netns (2026-11-19), 440 Mbit/s, 30 ms, a 5 ms queue: one download lost 3.4 to 3.7% under
+`bbr` and 0.46 to 0.50% under `bbr2`, at 401 to 406 Mbit/s against 405 to 407, and its longest
+gap was 37 to 67 ms against 66 to 106; two downloads on one session the same; two sessions lost
+7 to 12% against 0.5 to 0.6%. At 1 Gbit/s, 138 ms and 0.3% random loss both made 640 to 670
+Mbit/s (both made 910 without the loss, so that limit is not the congestion control), and on
+loopback both are the same within the noise. Fairness between two `bbr2` sessions converges
+slowly, as the draft's does: the second session held 0.14 of the path for its first 10 s, 0.26
+over 30 s (`bbr`: 0.13). `bbr` stays the default until `bbr2` has run on the edges.
+
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per
 level is CRYPTO_BUFFER_EXCEEDED, out-of-order stream data beyond the credit granted is
@@ -324,7 +349,7 @@ places in the code. On top of it:
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout. |
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |
-| `webtransport-congestion-control` | `bbr` | `bbr` or `newreno` (see "Congestion control"). |
+| `webtransport-congestion-control` | `bbr` | `bbr`, `bbr2` or `newreno` (see "Congestion control"). |
 | `webtransport-lanes` | 8 | Lanes a v2 session may have, lane 0 included (INFO extension `0xE1`); 0 or 1: none; at most 16. |
 
 Like every key: `config.c` (parser, `--help`), `README.md`, `holywisp.conf.example`,
