@@ -27,6 +27,12 @@ int hw_log_get_level(void) {
 	return atomic_load_explicit(&g_log_level, memory_order_relaxed);
 }
 
+const char *hw_log_level_name(int level) {
+	if (level < HW_LOG_DEBUG) level = HW_LOG_DEBUG;
+	if (level > HW_LOG_NONE) level = HW_LOG_NONE;
+	return LEVEL_NAMES[level];
+}
+
 int hw_log_level_parse(const char *name) {
 	for (size_t i = 0; i < HW_ARRAY_LEN(LEVEL_NAMES); i++) {
 		if (strcasecmp(name, LEVEL_NAMES[i]) == 0) return (int)i;

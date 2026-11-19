@@ -862,7 +862,10 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 - Release builds carry `HW_HARDEN` (stack protector everywhere but Windows; FORTIFY, PIE and
   full RELRO on Linux). It is off under the sanitizers and must not cost the data path: if a
   bench row moves, find the flag, do not drop the option. The unit has no `ExecReload` on
-  purpose: the server has no SIGHUP handler, so a reload would stop it.
+  purpose: the server has no SIGHUP handler, so a reload would stop it. SIGUSR1 and SIGUSR2 move
+  the log level one step (`on_user_signal` in `main.c`); they are taken by `sigwait` on a thread
+  of their own (`hw_sys_user_signals`), blocked before `hw_server_new` makes any other thread, so
+  no thread is ever interrupted for them and a Twisp command gets them unblocked again.
 - If you touched packaging or the unit: `bash deploy/package.sh all` builds all four packages, and
   `systemd-analyze security --offline=true deploy/systemd/holywisp.service` must still rate "OK"
   (~1.3). Never lower the sandbox to work around a bug; fix the bug. `holywisp-client` is the
@@ -881,7 +884,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
 | `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
 | `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
-| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys, a poll in microseconds. |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys, a poll in microseconds, the operator's two signals. |
 | `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |
@@ -904,7 +907,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 | `src/server/twisp.c` | PTY terminal streams: shell-split the command, `hw_sys_pty_spawn`, relay the master. |
 | `src/server/wt_listener.c` | The WebTransport listener: steered UDP sockets, Retry and the handshake caps, sessions on the worker loops and their `hw_conn`, the rotating certificate and `/webtransport.json`. |
 | `src/server/config.c`, `config.h` | `key = value` file and `--flag` parsing, `--help`, validation. |
-| `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM, or (`stop-on-stdin-eof`) when stdin closes. |
+| `src/server/main.c` | The `holywisp` binary: parse, run, stop on SIGINT/SIGTERM, or (`stop-on-stdin-eof`) when stdin closes; SIGUSR1/SIGUSR2 move the log level. |
 | `include/holywisp/limits.h`, `src/common/limits.c` | Fixed-window rate counter, semaphore, per-key gauge, token-bucket bandwidth, SYN-signature ring. |
 | `include/holywisp/reputation.h`, `src/common/reputation.c` | Per-IP / per-dest scoring, tiers, decay, JSON persistence. |
 | `include/holywisp/filter.h`, `src/common/filter.c` | Host/port allow-block lists, CIDR match, real-client-IP from proxy headers. |

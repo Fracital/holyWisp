@@ -21,7 +21,8 @@ Group=wisp
 ExecStart=/usr/bin/holywisp --config /etc/holywisp/holywisp.conf
 # No ExecReload: the server reads its config once and has no SIGHUP handler, so a HUP would end it
 # (cleanly, which Restart=on-failure does not bring back). `systemctl reload` is refused instead;
-# a config change takes `systemctl restart holywisp`.
+# a config change takes `systemctl restart holywisp`. The log level alone changes live:
+# `systemctl kill -s USR1 holywisp` for one level more, `-s USR2` for one less.
 
 # A relay legitimately opens many sockets; raise the fd ceiling but keep it finite.
 LimitNOFILE=262144

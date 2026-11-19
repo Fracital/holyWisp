@@ -219,7 +219,7 @@ would not: a gate to run before a restart. The most important keys:
 | `webtransport-max-handshakes`, `webtransport-retry-threshold` | 1024, 64 | QUIC handshakes in progress per worker; past the threshold every new Initial gets a Retry, so the client must prove its address first |
 | `webtransport-congestion-control` | `bbr` | `bbr`, `bbr2` or `newreno`: QUIC's congestion control toward the client. BBR paces at the bandwidth it measures and does not slow down for a random loss; `bbr2` is BBR with version 3's answer to loss: a round that loses more than 2% ends startup or a probe and bounds what it keeps in flight to where the loss began, and it probes above that only every 2 to 3 s, so behind a shallow buffer it loses a fraction of what BBR does (a random loss under 2% still changes nothing); NewReno (RFC 9002) halves its window at every one, and on a path that loses 0.3% runs at a tenth of the same path's TCP |
 | `webtransport-lanes` | 8 | How many bidirectional QUIC streams (lanes) one v2 session may spread its Wisp streams over, so that a loss or a slow reader on one holds up only the streams on that lane; the server advertises it in INFO (extension `0xE1`). 0 or 1 turns lanes off; at most 16. A client that offers the protocol `wisp-v2-server-stream` also gets its Wisp stream opened by the server, with the stream-0 CONTINUE sent at once (docs/webtransport.md) |
-| `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none` |
+| `log-level` | `info` | `debug`, `info`, `warn`, `error`, `none`. While the server runs, SIGUSR1 makes it one level more verbose and SIGUSR2 one level less (never quieter than `error`); each change is logged. Not on Windows, which has no such signals |
 | `stop-on-stdin-eof` | off | Shut down when standard input reaches end of file. For a program that runs `holywisp` as a child with a pipe on its stdin (the Node wrapper does): the server then never outlives its parent. Leave it off under systemd, where stdin is `/dev/null` |
 
 `GET /health` returns `{"status":"ok"}` and `GET /stats` returns the counters (connections,
@@ -260,6 +260,10 @@ sudo systemctl daemon-reload && sudo systemctl enable --now holywisp
 
 The config may hold password hashes, so it is `root:wisp` mode `0640`, never world-readable. State
 (the reputation store) lives in `/var/lib/holywisp`, owned by `wisp`.
+
+The config is read once, and there is no reload (`systemctl reload` is refused): a change takes a
+restart. The log level is the exception: `sudo systemctl kill -s USR1 holywisp` makes the log one
+level more verbose, `-s USR2` one level less, without dropping a client.
 
 ## Terminal streams (Twisp)
 

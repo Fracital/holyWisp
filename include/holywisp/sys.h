@@ -175,14 +175,22 @@ int hw_sys_crypt(const char *key, const char *setting, char *out, size_t out_cap
 int hw_sys_has_pty(void);
 // Run argv[0] (looked up on PATH) with the arguments argv on a new pseudo-terminal with default
 // settings and TERM=xterm-256color, with SIGPIPE at its default whatever the caller has made of
-// it, and with none of the caller's descriptors. The child's pid, with the terminal's master side
-// in *master: non-blocking, close-on-exec, read and written like a socket, EIO once the child has
-// gone.
-// -1 with errno (ENOTSUP without hw_sys_has_pty).
+// it, no signal blocked (hw_sys_user_signals blocks two), and with none of the caller's descriptors. The child's pid,
+// with the terminal's master side in *master: non-blocking, close-on-exec, read and written like a socket, EIO once the
+// child has gone. -1 with errno (ENOTSUP without hw_sys_has_pty).
 pid_t hw_sys_pty_spawn(char *const argv[], int *master);
 // Tell the terminal behind `master` the size of its window.
 void hw_sys_pty_resize(int master, uint16_t rows, uint16_t cols);
 // End a child of hw_sys_pty_spawn and reap it: hang up, and kill it if that did not end it at once.
 void hw_sys_pty_end(pid_t pid);
+
+// The operator's two signals, SIGUSR1 and SIGUSR2 where there are such: fn(1) is called for each
+// SIGUSR1 sent to the process and fn(2) for each SIGUSR2, on a thread of its own that does
+// nothing else, so fn may log or lock as any thread may and nothing is ever interrupted to run
+// it. Two of one kind sent before the first is taken may come as one call. Call it once, before
+// any other thread exists: the calling thread, and every thread it makes afterwards, has both
+// signals blocked, and a thread made before would still die of one. 0, or -1 with errno
+// (ENOTSUP where there are no such signals: Windows), and then nothing has changed.
+int hw_sys_user_signals(void (*fn)(int which));
 
 #endif

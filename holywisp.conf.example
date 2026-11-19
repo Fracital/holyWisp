@@ -8,6 +8,7 @@ host =
 port = 6001
 workers = 0                      # 0 = one per CPU
 log-level = info                 # debug | info | warn | error | none
+                                 # (SIGUSR1: one level more, SIGUSR2: one less, while it runs)
 
 # ---------------------------------------------------------------- what clients may reach
 allow-tcp = on

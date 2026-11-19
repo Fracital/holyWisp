@@ -1068,7 +1068,64 @@ static void test_pty(void) {
 	close(master);
 }
 
+static _Atomic int g_user_signals[3];
+
+static void on_user_signal(int which) {
+	if (which == 1 || which == 2) atomic_fetch_add(&g_user_signals[which], 1);
+}
+
+static int user_signal_wait(int which, int want) {
+	for (int i = 0; i < 500 && atomic_load(&g_user_signals[which]) < want; i++) usleep(10000);
+	return atomic_load(&g_user_signals[which]);
+}
+
+// What an operator does with kill(1): each signal reaches the callback, on its own thread, and the
+// process lives through it. The signals are sent by a command on a terminal, a process of its own,
+// to the process: a signal raised by a thread of this one is that thread's and never reaches the
+// thread that waits. That command, itself a hw_sys_pty_spawn child, has neither signal blocked.
+// Run first: a thread made before the call could be handed a signal and die of it.
+static void test_user_signals(void) {
+	if (hw_sys_user_signals(on_user_signal) != 0) {
+		CHECK_EQ(errno, ENOTSUP);
+		CHECK(!hw_sys_has_pty(), "user signals refused (%s) where there are terminals", strerror(errno));
+		printf("  no user signals on this platform\n");
+		return;
+	}
+	CHECK(hw_sys_has_pty(), "user signals but no terminal to send them from");
+	char sh[] = "sh", dash_c[] = "-c";
+	char usr1[] = "kill -s USR1 $PPID; echo sent", usr2[] = "kill -s USR2 $PPID; echo sent";
+	char *send1[] = {sh, dash_c, usr1, NULL};
+	char *send2[] = {sh, dash_c, usr2, NULL};
+	char *const *order[] = {send1, send2, send1};
+	int want[3] = {0, 0, 0};
+	char buf[256];
+	for (int i = 0; i < 3; i++) {
+		int which = order[i] == send1 ? 1 : 2;
+		want[which]++;
+		int master = -1;
+		pid_t pid = hw_sys_pty_spawn(order[i], &master);
+		CHECK(pid > 0, "pty_spawn: errno %d", errno);
+		CHECK(pty_expect(master, buf, sizeof(buf), "sent"), "read \"%s\"", buf);
+		CHECK_EQ(user_signal_wait(which, want[which]), want[which]);
+		hw_sys_pty_end(pid);
+		close(master);
+	}
+	CHECK_EQ(atomic_load(&g_user_signals[1]), 2);
+	CHECK_EQ(atomic_load(&g_user_signals[2]), 1);
+	// A command does not inherit the block: SIGUSR1 at its default ends it before it says more.
+	char self[] = "echo started; kill -s USR1 $$; echo survived";
+	char *self_argv[] = {sh, dash_c, self, NULL};
+	int master = -1;
+	pid_t pid = hw_sys_pty_spawn(self_argv, &master);
+	CHECK(pid > 0, "pty_spawn: errno %d", errno);
+	CHECK(!pty_expect(master, buf, sizeof(buf), "survived"), "read \"%s\"", buf);
+	CHECK(strstr(buf, "started") != NULL, "read \"%s\"", buf);
+	hw_sys_pty_end(pid);
+	close(master);
+}
+
 int main(void) {
+	RUN(test_user_signals);
 	RUN(test_set_cloexec);
 	RUN(test_socket_flags);
 	RUN(test_accept_flags_and_no_sigpipe);

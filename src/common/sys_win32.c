@@ -248,3 +248,10 @@ int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us) {
 unsigned hw_sys_poll_resolution_us(void) {
 	return 1000;
 }
+
+// Windows has no user signals; a console sends only the two that stop the server.
+int hw_sys_user_signals(void (*fn)(int which)) {
+	(void)fn;
+	errno = ENOTSUP;
+	return -1;
+}

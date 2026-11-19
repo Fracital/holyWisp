@@ -8,6 +8,7 @@
 #include <crypt.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <pty.h>
 #include <signal.h>
 #include <stdatomic.h>
@@ -337,8 +338,12 @@ pid_t hw_sys_pty_spawn(char *const argv[], int *master) {
 	if (pid < 0) return -1;
 	if (pid == 0) {
 		// The server ignores SIGPIPE and an ignored signal stays ignored across exec, where a
-		// shell cannot even set it back: `yes | head` would never end.
+		// shell cannot even set it back: `yes | head` would never end. A blocked one stays
+		// blocked, and the server blocks the two it takes on a thread (hw_sys_user_signals).
 		signal(SIGPIPE, SIG_DFL);
+		sigset_t none;
+		sigemptyset(&none);
+		sigprocmask(SIG_SETMASK, &none, NULL);
 		setenv("TERM", "xterm-256color", 1);
 		execvp(argv[0], argv);
 		_exit(127); // exec failed; the master sees the end at once
@@ -395,4 +400,42 @@ int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us) {
 
 unsigned hw_sys_poll_resolution_us(void) {
 	return 1;
+}
+
+typedef struct {
+	void (*fn)(int which);
+	sigset_t set;
+} user_signals;
+
+static void *user_signals_main(void *arg) {
+	user_signals *u = arg;
+	for (;;) {
+		int sig = 0;
+		if (sigwait(&u->set, &sig) != 0) continue;
+		u->fn(sig == SIGUSR1 ? 1 : 2);
+	}
+	return NULL;
+}
+
+int hw_sys_user_signals(void (*fn)(int which)) {
+	user_signals *u = malloc(sizeof(*u));
+	if (!u) return -1;
+	u->fn = fn;
+	sigemptyset(&u->set);
+	sigaddset(&u->set, SIGUSR1);
+	sigaddset(&u->set, SIGUSR2);
+	sigset_t old;
+	int e = pthread_sigmask(SIG_BLOCK, &u->set, &old);
+	pthread_t th;
+	if (e == 0) {
+		e = pthread_create(&th, NULL, user_signals_main, u);
+		if (e == 0) {
+			pthread_detach(th);
+			return 0; // u is the thread's for as long as the process lives
+		}
+		pthread_sigmask(SIG_SETMASK, &old, NULL);
+	}
+	free(u);
+	errno = e;
+	return -1;
 }

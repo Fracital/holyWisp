@@ -1,9 +1,11 @@
 /*
- * holywisp: the server binary. Config file + flags in, SIGINT/SIGTERM out.
+ * holywisp: the server binary. Config file + flags in, SIGINT/SIGTERM out, SIGUSR1/SIGUSR2 for
+ * the log level of a running server.
  */
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
 #include "holywisp/server.h"
+#include "holywisp/sys.h"
 
 #include "config.h"
 
@@ -23,6 +25,21 @@ static pthread_mutex_t g_server_lock = PTHREAD_MUTEX_INITIALIZER;
 static void on_signal(int signo) {
 	// hw_server_stop only flips atomics and writes to eventfds: async-signal-safe enough.
 	if (g_server) hw_server_stop(g_server);
+}
+
+// SIGUSR1 makes the log one level more verbose, SIGUSR2 one level less, so a running relay can be
+// looked at in detail without a restart that would drop every client. Never quieter than error
+// by signal: `none` is only ever the config's choice. Each change is logged at the new level, the
+// one level sure to be written.
+static void on_user_signal(int which) {
+	int cur = hw_log_get_level();
+	int next = cur;
+	if (which == 1 && cur > HW_LOG_DEBUG) next = cur - 1;
+	if (which == 2 && cur < HW_LOG_ERROR) next = cur + 1;
+	hw_log_set_level(next);
+	if (next < HW_LOG_NONE) {
+		hw_log(next, "server", "log level %s (SIGUSR1: more, SIGUSR2: less)", hw_log_level_name(next));
+	}
 }
 
 // stop-on-stdin-eof: a parent that holds the other end of our stdin cannot die without the kernel
@@ -86,6 +103,12 @@ int main(int argc, char **argv) {
 		}
 		printf("holywisp %s%s: configuration ok\n", HW_VERSION, HW_VERSION_SUFFIX);
 		return 0;
+	}
+	// Before hw_server_new, which starts the resolver's threads: every thread from here on has the
+	// two signals blocked, and only the one this makes takes them.
+	if (hw_sys_user_signals(on_user_signal) != 0 && errno != ENOTSUP) {
+		HW_WARN("server", "cannot take SIGUSR1/SIGUSR2 for the log level (%s); they would end the server",
+		        strerror(errno));
 	}
 
 	g_server = hw_server_new(&cfg);

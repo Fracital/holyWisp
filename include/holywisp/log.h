@@ -23,6 +23,8 @@ void hw_log_set_level(int level);
 int hw_log_get_level(void);
 // "debug" | "info" | "warn" | "error" | "none"; -1 when unknown.
 int hw_log_level_parse(const char *name);
+// The name hw_log_level_parse takes for a level, a level out of range as the nearest one.
+const char *hw_log_level_name(int level);
 void hw_log(int level, const char *tag, const char *fmt, ...) HW_PRINTF(3, 4);
 
 #define HW_LOG_AT(level, tag, ...)                                              \

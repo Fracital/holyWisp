@@ -103,6 +103,11 @@ static void test_levels(void) {
 	CHECK_EQ(hw_log_level_parse("debug"), HW_LOG_DEBUG);
 	CHECK_EQ(hw_log_level_parse("WARNING"), HW_LOG_WARN);
 	CHECK_EQ(hw_log_level_parse("loud"), -1);
+	// Every level's name is the one the parser takes back, and a level out of range is the nearest.
+	for (int l = HW_LOG_DEBUG; l <= HW_LOG_NONE; l++) CHECK_EQ(hw_log_level_parse(hw_log_level_name(l)), l);
+	CHECK_STR(hw_log_level_name(-3), "debug");
+	CHECK_STR(hw_log_level_name(HW_LOG_WARN), "warn");
+	CHECK_STR(hw_log_level_name(99), "none");
 	int before = hw_log_get_level();
 	hw_log_set_level(99);
 	CHECK_EQ(hw_log_get_level(), HW_LOG_NONE);
