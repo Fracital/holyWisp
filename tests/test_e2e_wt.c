@@ -634,6 +634,8 @@ static void test_operator_certificate(void) {
 	cfg.log_level = HW_LOG_NONE;
 	snprintf(cfg.webtransport_cert, sizeof(cfg.webtransport_cert), "%s", cert_path);
 	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", key_path);
+	char err[512];
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) == 0, "the pair passes the check: %s", err);
 	hw_server *s = server_with(&cfg);
 	char json[2048];
 	uint8_t hashes[2][32];
@@ -653,6 +655,9 @@ static void test_operator_certificate(void) {
 	unlink(key_path);
 	write_pem(key_path, sizeof(key_path), "EC PRIVATE KEY", key, key_len);
 	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", key_path);
+	// --check-config says so before a start would, and binds nothing to say it.
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "a key that is not the certificate's is checked");
+	CHECK(strstr(err, "not the key of the first certificate") != NULL, "the reason: %s", err);
 	CHECK(hw_server_new(&cfg) == NULL, "a key that is not the certificate's is refused");
 	unlink(cert_path);
 	unlink(key_path);

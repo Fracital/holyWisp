@@ -279,6 +279,13 @@ void hw_server_config_defaults(hw_server_config *cfg);
 int hw_server_config_add_user(hw_server_config *cfg, const char *user, const char *pass);
 // Cross-field checks. 0 ok, -1 with a message in err.
 int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err_cap);
+// Everything hw_server_new would refuse the configuration for that needs no socket of its own:
+// hw_server_config_validate, the proxy's host resolving, and with webtransport the operator's
+// certificate and key loading as a matching P-256 pair and webtransport-cert-dir opening. Binds,
+// marks and starts nothing, so a configuration can be checked beside a running server and without
+// its privileges (holywisp --check-config). 0 ok, -1 with a message in err that, like every config
+// error, never holds a secret value.
+int hw_server_config_check(const hw_server_config *cfg, char *err, size_t err_cap);
 
 // Binds the listeners. NULL with errno on failure.
 hw_server *hw_server_new(const hw_server_config *cfg);

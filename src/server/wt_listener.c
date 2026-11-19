@@ -1888,6 +1888,23 @@ void wt_worker_stop(hw_worker *w) {
 	}
 }
 
+int wt_config_check(const hw_server_config *cfg, char *why, size_t why_cap) {
+	if (!cfg->webtransport) return 0;
+	if (cfg->webtransport_cert_dir[0]) {
+		DIR *d = opendir(cfg->webtransport_cert_dir);
+		if (!d) {
+			snprintf(why, why_cap, "webtransport-cert-dir %s: %s", cfg->webtransport_cert_dir, strerror(errno));
+			return -1;
+		}
+		closedir(d);
+	}
+	if (!cfg->webtransport_cert[0]) return 0;
+	wt_cert *c = NULL;
+	if (wt_cert_load(cfg, &c, why, why_cap) != 0) return -1;
+	wt_cert_free(c);
+	return 0;
+}
+
 void wt_worker_free(hw_worker *w) {
 	wt_worker *ww = w->wt;
 	if (!ww) return;

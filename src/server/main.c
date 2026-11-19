@@ -47,18 +47,46 @@ static void *stdin_watch(void *arg) {
 	return NULL;
 }
 
+// --check-config is what the binary does, not a configuration, so it is taken out of argv before
+// the rest is parsed, wherever it stands. 1 when it was there.
+static int take_check_flag(int *argc, char **argv) {
+	int found = 0, out = 1;
+	for (int i = 1; i < *argc; i++) {
+		if (argv[i] && !strcmp(argv[i], "--check-config")) {
+			found = 1;
+			continue;
+		}
+		argv[out++] = argv[i];
+	}
+	argv[out] = NULL;
+	*argc = out;
+	return found;
+}
+
 int main(int argc, char **argv) {
 	hw_server_config cfg;
 	hw_server_config_defaults(&cfg);
 	char err[512];
+	int check = take_check_flag(&argc, argv);
 	int r = hw_config_parse_args(&cfg, argc, argv, err, sizeof(err));
 	if (r > 0) return 0;
 	if (r < 0) {
 		fprintf(stderr, "holywisp: %s\n", err);
+		if (check) return 1;
 		fprintf(stderr, "try '%s --help'\n", argv[0]);
 		return 2;
 	}
 	hw_log_set_level(cfg.log_level);
+	if (check) {
+		// Whether the server would start with this, decided as hw_server_new decides it, with
+		// nothing bound: a pre-deploy gate that runs beside the server it is about to replace.
+		if (hw_server_config_check(&cfg, err, sizeof(err)) != 0) {
+			fprintf(stderr, "holywisp: configuration refused: %s\n", err);
+			return 1;
+		}
+		printf("holywisp %s%s: configuration ok\n", HW_VERSION, HW_VERSION_SUFFIX);
+		return 0;
+	}
 
 	g_server = hw_server_new(&cfg);
 	if (!g_server) {

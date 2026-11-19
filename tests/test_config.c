@@ -280,6 +280,54 @@ static void test_webtransport_keys(void) {
 	CHECK(hw_config_set(&cfg, "webtransport-path", "/x", err, sizeof(err)) != 0, "past HW_MAX_WT_PATHS");
 }
 
+// hw_server_config_check (holywisp --check-config): what a start would refuse, found without a
+// start, and nothing secret in what it says.
+static void test_config_check(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[512];
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) == 0, "defaults: %s", err);
+	// A rule across keys that every key alone passes: the parse accepts it, the check does not.
+	CHECK_EQ(hw_config_set(&cfg, "tcp-warp", "on", err, sizeof(err)), 0);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "tcp-warp without its tunnels");
+	CHECK(strstr(err, "tcp-warp") != NULL, "the error names it: %s", err);
+	cfg.tcp_warp = 0;
+	// A proxy at a literal address needs no lookup; its user and password are never repeated.
+	CHECK_EQ(hw_config_set(&cfg, "proxy", "socks5://user:hunter2secret@127.0.0.1:1080", err, sizeof(err)), 0);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) == 0, "literal proxy: %s", err);
+	CHECK_EQ(hw_config_set(&cfg, "proxy-client-key-secret", "hunter2", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "proxy-client-key", "on", err, sizeof(err)), 0);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "a short secret");
+	CHECK(strstr(err, "hunter2") == NULL, "the secret is in the message: %s", err);
+	hw_server_config_defaults(&cfg);
+	// WebTransport files: only what a start would read. Off, nothing is read.
+	char missing[512];
+	hw_test_tmp(missing, sizeof(missing), "hw-cfg-missing");
+	snprintf(cfg.webtransport_cert, sizeof(cfg.webtransport_cert), "%s", missing);
+	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", missing);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) == 0, "webtransport off: %s", err);
+	cfg.webtransport = 1;
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "a certificate that is not there");
+	CHECK(strstr(err, "webtransport-cert") != NULL, "the error names it: %s", err);
+	// Not a PEM certificate at all.
+	char junk[512];
+	hw_test_tmp(junk, sizeof(junk), "hw-cfg-pem");
+	int fd = mkstemp(junk);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	write_file(junk, "not a certificate\n");
+	snprintf(cfg.webtransport_cert, sizeof(cfg.webtransport_cert), "%s", junk);
+	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", junk);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "junk for a certificate");
+	unlink(junk);
+	cfg.webtransport_cert[0] = cfg.webtransport_key[0] = '\0';
+	// The self-signed certificate is made at start, from nothing: no file to check.
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) == 0, "self-signed: %s", err);
+	snprintf(cfg.webtransport_cert_dir, sizeof(cfg.webtransport_cert_dir), "%s", missing);
+	CHECK(hw_server_config_check(&cfg, err, sizeof(err)) != 0, "a certificate directory that is not there");
+	CHECK(strstr(err, "webtransport-cert-dir") != NULL, "the error names it: %s", err);
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -297,6 +345,7 @@ int main(void) {
 	RUN(test_proxy_client_key_keys);
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);
+	RUN(test_config_check);
 	RUN(test_shipped_configs);
 	return 0;
 }

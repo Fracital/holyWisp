@@ -474,6 +474,9 @@ int wt_listener_init(hw_server *s);
 void wt_worker_stop(hw_worker *w);
 // Every session of the worker, freed in place (shutdown, loops stopped), and the worker's state.
 void wt_worker_free(hw_worker *w);
+// What wt_listener_init would refuse before it binds: the operator's certificate and key not
+// loading as a pair, webtransport-cert-dir not opening. 0, or -1 with the reason in why.
+int wt_config_check(const hw_server_config *cfg, char *why, size_t why_cap);
 // The maintenance thread's look at the certificate, once a second. Self-signed: a new one every 6
 // days, or at once after hw_server_wt_renew. The operator's: read again once either file has
 // changed and then stayed as it is for one look, and published only when it loads as at start.

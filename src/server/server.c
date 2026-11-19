@@ -254,6 +254,24 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 	return 0;
 }
 
+int hw_server_config_check(const hw_server_config *cfg, char *err, size_t err_cap) {
+	if (hw_server_config_validate(cfg, err, err_cap) != 0) return -1;
+	hw_proxy_config pc;
+	char perr[256];
+	int rc = 0;
+	if (proxy_config_parse(cfg->proxy, &pc, perr, sizeof(perr)) != 0) {
+		snprintf(err, err_cap, "%s", perr);
+		rc = -1;
+	} else if (proxy_config_resolve(&pc) != 0) {
+		// Not the host: the proxy's value is never repeated (it may hold a user and password).
+		snprintf(err, err_cap, "proxy: its host does not resolve");
+		rc = -1;
+	}
+	memset(&pc, 0, sizeof(pc)); // it held the proxy's password
+	if (rc == 0 && wt_config_check(cfg, err, err_cap) != 0) rc = -1;
+	return rc;
+}
+
 // The window is counted in packets but the per-stream queue toward a slow remote is counted in
 // bytes. A client that spends a whole window of maximum-size packets into a remote that is not
 // draining must land inside stream-queue-max, or it is closed 0x49 before flow control ever slowed

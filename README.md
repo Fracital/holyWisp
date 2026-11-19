@@ -154,7 +154,11 @@ TLS is not built in: terminate `wss://` at a reverse proxy (nginx, Caddy, Cloudf
 
 Every option is a `--flag value` (or `--flag=value`) and a `flag = value` line in the config file;
 flags override the file. Boolean flags may stand alone (`--allow-loopback`). `holywisp --help`
-lists them all; `holywisp.conf.example` is the fully annotated reference. The most important keys:
+lists them all; `holywisp.conf.example` is the fully annotated reference.
+`holywisp --config FILE --check-config` parses and checks a configuration the way a start would
+(every cross-key rule, the proxy's host resolving, a WebTransport certificate and key loading as a
+pair), binds nothing, prints no secret and exits 0 when the server would start with it, 1 when it
+would not: a gate to run before a restart. The most important keys:
 
 | Key | Default | What it does |
 | --- | --- | --- |

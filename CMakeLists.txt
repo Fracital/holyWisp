@@ -262,6 +262,14 @@ if(HW_BUILD_TESTS)
   hw_test(test_config)
   # Loads the shipped configs, which live at the repo root.
   set_tests_properties(test_config PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+  # holywisp --check-config, the binary itself: the shipped configs would start, and a rule across
+  # keys that the parse alone lets through is refused.
+  add_test(NAME check_config_shipped
+           COMMAND holywisp-bin --config ${CMAKE_CURRENT_SOURCE_DIR}/deploy/holywisp.conf --check-config)
+  add_test(NAME check_config_example
+           COMMAND holywisp-bin --check-config --config ${CMAKE_CURRENT_SOURCE_DIR}/holywisp.conf.example)
+  add_test(NAME check_config_refused COMMAND holywisp-bin --check-config --tcp-warp on)
+  set_tests_properties(check_config_refused PROPERTIES PASS_REGULAR_EXPRESSION "configuration refused: tcp-warp needs")
   hw_test(test_limits)
   hw_test(test_filter)
   hw_test(test_dns)

@@ -570,6 +570,8 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-lanes N                      QUIC streams one v2 session's Wisp may ride, the\n"
 	       "                                            first included; 0 or 1 for one, at most 16 (8)\n"
 	       "\n"
+	       "  --check-config                            parse and check the configuration as a start would,\n"
+	       "                                            bind nothing, and exit 0 (it would start) or 1\n"
 	       "  --version, --help\n");
 }
 
