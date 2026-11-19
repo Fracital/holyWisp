@@ -480,6 +480,7 @@ static void test_connection_refused(void) {
 	hw_client_free(c);
 }
 
+#if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
 // The server's own end of the TCP connection that `remote` accepted: the in-process socket whose
 // local port is the accepted socket's peer port and whose peer is remote's port. -1 when none.
 static int server_side_of(int remote) {
@@ -498,6 +499,7 @@ static int server_side_of(int remote) {
 	}
 	return -1;
 }
+#endif
 
 // A remote that stops answering after its stream opened closes the stream 0x47 (the spec's "TCP
 // data transfer timed out"), not 0x43, which says the dial got no answer. The remote here takes
