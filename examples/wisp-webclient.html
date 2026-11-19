@@ -441,6 +441,14 @@
 				}
 			}
 
+			// The token that asks the server to open the Wisp stream itself (docs/webtransport.md,
+			// "Lanes and the server-opened stream"). Offered only where the browser says which token
+			// the server answered, which is how the page knows whose stream to use.
+			const WT_SERVER_STREAM = 'wisp-v2-server-stream';
+			const WT_SERVER_STREAM_OK =
+				typeof WebTransport !== 'undefined' &&
+				'protocol' in WebTransport.prototype;
+
 			// One bidirectional stream of packets, each behind a u32 LE length.
 			class WtTransport {
 				constructor(cfg, v2) {
@@ -458,7 +466,14 @@
 							value: Uint8Array.from(atob(h.value), (c) => c.charCodeAt(0)),
 						}));
 					}
-					if (this.v2) opts.protocols = ['wisp-v2'];
+					// With v2, a browser that reports the answer (wt.protocol) also offers the
+					// server-opened stream: a server that knows it opens the Wisp stream itself and
+					// sends INFO and its CONTINUE at once, one round trip sooner. An older server
+					// echoes the first token, wisp-v2, and the page opens the stream as before.
+					if (this.v2)
+						opts.protocols = WT_SERVER_STREAM_OK
+							? ['wisp-v2', WT_SERVER_STREAM]
+							: ['wisp-v2'];
 					const end = (why) => {
 						if (this.closed) return;
 						this.closed = true;
@@ -480,27 +495,56 @@
 					);
 					(async () => {
 						await this.wt.ready;
-						onLog('info', 'webtransport session ready');
-						const bidi = await this.wt.createBidirectionalStream();
+						const serverOpened = this.wt.protocol === WT_SERVER_STREAM;
+						onLog(
+							'info',
+							`webtransport session ready${serverOpened ? ' (the server opens the Wisp stream)' : ''}`,
+						);
+						let bidi;
+						if (serverOpened) {
+							const incoming = this.wt.incomingBidirectionalStreams.getReader();
+							const { value, done } = await incoming.read();
+							incoming.releaseLock();
+							if (done) throw new Error('the server opened no Wisp stream');
+							bidi = value;
+						} else {
+							bidi = await this.wt.createBidirectionalStream();
+						}
 						this.writer = bidi.writable.getWriter();
 						const reader = bidi.readable.getReader();
-						let buf = new Uint8Array(0);
+						// Packets behind a u32 LE length, in a buffer that grows by doubling and is
+						// compacted only when the tail runs out of room: each byte is copied a bounded
+						// number of times, however many reads a large packet arrives in.
+						let buf = new Uint8Array(64 * 1024);
+						let head = 0;
+						let tail = 0;
 						for (;;) {
 							const { value, done } = await reader.read();
 							if (done) break;
-							const m = new Uint8Array(buf.length + value.length);
-							m.set(buf);
-							m.set(value, buf.length);
-							buf = m;
-							while (buf.length >= 4) {
-								const n = new DataView(buf.buffer, buf.byteOffset).getUint32(
-									0,
-									true,
-								);
-								if (buf.length < 4 + n) break;
-								onPacket(buf.slice(4, 4 + n), 'stream');
-								buf = buf.subarray(4 + n);
+							if (tail + value.length > buf.length) {
+								const live = tail - head;
+								if (live + value.length > buf.length) {
+									let cap = buf.length * 2;
+									while (cap < live + value.length) cap *= 2;
+									const m = new Uint8Array(cap);
+									m.set(buf.subarray(head, tail));
+									buf = m;
+								} else {
+									buf.copyWithin(0, head, tail);
+								}
+								head = 0;
+								tail = live;
 							}
+							buf.set(value, tail);
+							tail += value.length;
+							const dv = new DataView(buf.buffer);
+							while (tail - head >= 4) {
+								const n = dv.getUint32(head, true);
+								if (tail - head < 4 + n) break;
+								onPacket(buf.slice(head + 4, head + 4 + n), 'stream');
+								head += 4 + n;
+							}
+							if (head === tail) head = tail = 0;
 						}
 						end('webtransport: the Wisp stream ended');
 					})().catch((e) => end(`webtransport failed: ${e.message || e}`));
@@ -753,14 +797,14 @@
 			}
 
 			// Resolves to the first WispClient whose handshake finishes (stream-0 CONTINUE); every
-			// other attempt is closed. WebTransport goes first, the WebSocket after a head start or
-			// as soon as WebTransport fails. Rejects when every attempt failed.
-			async function connectBest(wsUrl, mode, opts, log) {
+			// other attempt is closed. WebTransport is preferred: /webtransport.json is fetched at
+			// once, its session starts as soon as that answers, and the WebSocket starts after a head
+			// start counted from the beginning (so the fetch never delays it), or as soon as
+			// WebTransport turns out not to be there or fails. Rejects when every attempt failed.
+			function connectBest(wsUrl, mode, opts, log) {
 				const relay = wsUrl;
-				const attempts = [];
-				let winner = null;
 				const memo = memoGet(relay);
-				let wtCfg = null;
+				let tryWt = false;
 				if (mode !== 'websocket') {
 					if (typeof WebTransport === 'undefined') {
 						log('info', 'this browser has no WebTransport');
@@ -774,23 +818,24 @@
 							`WebTransport skipped: a WebSocket won here at ${new Date(memo.at).toLocaleTimeString('en-GB', { hour12: false })}`,
 						);
 					} else {
-						try {
-							wtCfg = await fetchWtConfig(wsUrl, 2500);
-						} catch (e) {
-							log('info', `no WebTransport for this relay (${e.message || e})`);
-						}
+						tryWt = true;
 					}
 				}
 				return new Promise((resolve, reject) => {
+					const attempts = [];
+					let winner = null;
+					let wtCfg = null;
+					let wtPending = tryWt; // the description is still on its way
 					let wsTimer = null;
+					let wsStarted = false;
 					const settle = () => {
-						if (!winner && attempts.length && attempts.every((a) => a.dead)) {
-							if (wtCfg && !attempts.some((a) => a.kind === 'websocket')) {
-								startWs();
-								return;
-							}
-							reject(new Error('no transport reached the server'));
+						if (winner || wtPending) return;
+						if (!attempts.length || !attempts.every((a) => a.dead)) return;
+						if (!wsStarted) {
+							startWs();
+							return;
 						}
+						reject(new Error('no transport reached the server'));
 					};
 					const start = (transport) => {
 						const a = { kind: transport.name, dead: false };
@@ -805,8 +850,7 @@
 								if (winner) return;
 								if (s === 'closed') {
 									a.dead = true;
-									if (transport.name === 'webtransport' && !wsStarted)
-										startWs();
+									if (transport.name === 'webtransport') startWs();
 									settle();
 									return;
 								}
@@ -825,20 +869,32 @@
 						attempts.push(a);
 						c.connect();
 					};
-					let wsStarted = false;
 					const startWs = () => {
 						if (wsStarted || winner) return;
 						wsStarted = true;
+						clearTimeout(wsTimer);
 						start(new WsTransport(wsUrl, opts.v2));
 					};
-					if (wtCfg) {
-						start(new WtTransport(wtCfg, opts.v2));
-						const head =
-							memo && memo.transport === 'webtransport' ? 3000 : 1000;
-						wsTimer = setTimeout(startWs, head);
-					} else {
+					if (!tryWt) {
 						startWs();
+						return;
 					}
+					const head = memo && memo.transport === 'webtransport' ? 3000 : 1000;
+					wsTimer = setTimeout(startWs, head);
+					fetchWtConfig(wsUrl, 2500).then(
+						(cfg) => {
+							wtPending = false;
+							if (winner) return;
+							wtCfg = cfg;
+							start(new WtTransport(cfg, opts.v2));
+						},
+						(e) => {
+							wtPending = false;
+							log('info', `no WebTransport for this relay (${e.message || e})`);
+							startWs();
+							settle();
+						},
+					);
 				});
 			}
 

@@ -346,11 +346,15 @@ Two toggles, both on by default:
 - **UDP** carries Wisp over WebTransport (HTTP/3 on QUIC, so UDP) instead of a WebSocket. The page
   reads the relay's `/webtransport.json`: pinned hashes, or none for a Web PKI certificate, and the
   URL to dial, where `""` means the relay's own host and port. It races WebTransport against a
-  WebSocket. WebTransport gets a 1 s head start, and the WebSocket starts at once if WebTransport
+  WebSocket. WebTransport gets a 1 s head start, counted from the click, so fetching the JSON never
+  delays the WebSocket, and the WebSocket starts at once if the JSON is missing or WebTransport
   fails. The first to finish the Wisp handshake wins, and the winner is remembered per relay: a
   WebSocket win keeps WebTransport off for that relay for an hour. A browser without WebTransport,
   or a relay without the JSON, uses the WebSocket. With UDP off, the WebSocket is used alone.
-- **Wisp v2** shows the server's extensions and MOTD, and asks for stream confirmation.
+- **Wisp v2** shows the server's extensions and MOTD, and asks for stream confirmation. Over
+  WebTransport, in a browser that reports the server's answer (`WebTransport.protocol`), it also
+  offers `wisp-v2-server-stream`, so the server opens the Wisp stream and sends its INFO and
+  CONTINUE at once; an older server answers `wisp-v2` and the page opens the stream itself.
 
 The request to the target is a TCP stream from the relay either way; the toggle chooses only how
 the page reaches the relay. The default target is `http://api.ipify.org/`.
