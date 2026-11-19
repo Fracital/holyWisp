@@ -607,6 +607,41 @@ static void test_request_validation(void) {
 	CHECK_EQ(hw_h3_response_parse(h, 2, &st, &proto), -1);
 }
 
+static void test_route_match(void) {
+	// Under the path, never beside it; the query aside.
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/k"), 1);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/k/"), 1);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/k/x/y"), 1);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/k?x=1"), 1);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/kx"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/pipe/"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/PIPE/k"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, "/pipe/k", "a.example", "/"), 0);
+	// "/" and any rule ending in "/" name that path alone.
+	CHECK_EQ(hw_wt_route_match("", "/", "a.example", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("", "/", "a.example", "/?v=2"), 1);
+	CHECK_EQ(hw_wt_route_match("", "/", "a.example", "/pipe/k"), 0);
+	CHECK_EQ(hw_wt_route_match("*", "/w/", "a.example", "/w/"), 1);
+	CHECK_EQ(hw_wt_route_match("*", "/w/", "a.example", "/w/x"), 0);
+	// The host whole, without case, port, brackets or the root's dot.
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "relay.example", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "RELAY.Example:443", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "relay.example.", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("Relay.Example", "/", "relay.example", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "x.relay.example", "/"), 0);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "relay.example.evil", "/"), 0);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "relay.exampl", "/"), 0);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", NULL, "/"), 0);
+	CHECK_EQ(hw_wt_route_match("relay.example", "/", "", "/"), 0);
+	CHECK_EQ(hw_wt_route_match("::1", "/", "[::1]:4433", "/"), 1);
+	CHECK_EQ(hw_wt_route_match("::1", "/", "[::1", "/"), 0);
+	// Paths that are not paths.
+	CHECK_EQ(hw_wt_route_match(NULL, "/", "a", "*"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, "x", "a", "x"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, NULL, "a", "/"), 0);
+	CHECK_EQ(hw_wt_route_match(NULL, "/", "a", NULL), 0);
+}
+
 static void test_protocol_first(void) {
 	char out[32];
 	CHECK_EQ(hw_wt_protocol_first("\"wisp-v2\", \"wisp-v1\"", out, sizeof(out)), 0);
@@ -1417,13 +1452,16 @@ static void test_chrome_other_requests(void) {
 	hw_quic_conn qc, qs;
 	static endpoint sv;
 	static decoded d;
-	// GET / gets a 404 with FIN, then the session still opens.
+	// GET / (a page, from a browser that holds an h3 alternative service for this host from
+	// elsewhere) gets 421 and alt-svc: clear with FIN, then the session still opens.
 	raw_setup(&qc, &qs, &sv, 1);
 	raw_headers(&qc, 0, "0000 d1 d7 c1 50 01 61", 0);
 	pump();
-	CHECK_EQ(raw_response(&qc, 0, &d), 1);
-	CHECK_STR(d.f[0].value, "404");
-	CHECK(mock_st(&qc, 0)->rx_fin && mock_st(&qc, 0)->stop_got == HW_H3_NO_ERROR, "404 and FIN");
+	CHECK_EQ(raw_response(&qc, 0, &d), 2);
+	CHECK_STR(d.f[0].value, "421");
+	CHECK_STR(d.f[1].name, "alt-svc");
+	CHECK_STR(d.f[1].value, "clear");
+	CHECK(mock_st(&qc, 0)->rx_fin && mock_st(&qc, 0)->stop_got == HW_H3_NO_ERROR, "421 and FIN");
 	CHECK_EQ(sv.requests, 0);
 	// A CONNECT for another protocol, a plain CONNECT.
 	raw_headers(&qc, 4, "0000 d7 cf 50 01 61 c1 2f00 b95d8749c87a3f 02 7773", 0);
@@ -1948,6 +1986,7 @@ int main(void) {
 	RUN(test_capsule);
 	RUN(test_request_validation);
 	RUN(test_protocol_first);
+	RUN(test_route_match);
 	RUN(test_lp_splits);
 	RUN(test_session);
 	RUN(test_session_close);

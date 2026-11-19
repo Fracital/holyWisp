@@ -179,4 +179,12 @@ const char *hw_wt_protocol(const hw_wt *w);
 // it is sent as a structured-field string.
 int hw_wt_protocol_first(const char *list, char *out, size_t cap);
 
+// Whether a session request's :authority and :path are what a webtransport-path rule names. The
+// rule's host (NULL, "" or "*" for any) is compared with the authority's host whole and without
+// case, its port, an IPv6 literal's brackets and a trailing dot left aside. The rule's path is the
+// request's path (the query and fragment left aside) exactly, or a prefix of it ending where a
+// "/" follows: "/pipe/k" names "/pipe/k" and "/pipe/k/x", never "/pipe/kx", and a rule ending
+// in "/" ("/" itself) names that path alone. Both paths must start with "/". 1 or 0.
+int hw_wt_route_match(const char *rule_host, const char *rule_path, const char *authority, const char *path);
+
 #endif

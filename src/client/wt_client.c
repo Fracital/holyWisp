@@ -263,7 +263,13 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	memset(&qc, 0, sizeof(qc));
 	qc.tls.alpn = alpn;
 	qc.tls.alpn_count = 1;
-	qc.tls.server_name = is_literal ? NULL : o->host; // SNI never carries an address (RFC 6066)
+	const char *name = o->server_name && o->server_name[0] ? o->server_name : o->host;
+	if (name != o->host) {
+		struct sockaddr_storage ns;
+		socklen_t nl;
+		is_literal = hw_addr_parse(name, o->port, &ns, &nl) == 1;
+	}
+	qc.tls.server_name = is_literal ? NULL : name; // SNI never carries an address (RFC 6066)
 	qc.tls.pin_sha256 = o->pin_sha256;
 	qc.max_idle_ms = WTC_IDLE_MS;
 	qc.initial_max_data = WTC_WINDOW;
@@ -292,10 +298,10 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 		snprintf(err, err_cap, "cannot start a QUIC connection");
 		goto fail;
 	}
-	if (strchr(o->host, ':')) {
-		snprintf(t->authority, sizeof(t->authority), "[%s]:%u", o->host, o->port);
+	if (strchr(name, ':')) {
+		snprintf(t->authority, sizeof(t->authority), "[%s]:%u", name, o->port);
 	} else {
-		snprintf(t->authority, sizeof(t->authority), "%s:%u", o->host, o->port);
+		snprintf(t->authority, sizeof(t->authority), "%s:%u", name, o->port);
 	}
 	hw_wt_config wc = {
 	    .max_packet = o->max_packet ? o->max_packet : 1024 * 1024 + HW_WISP_HEADER_LEN,

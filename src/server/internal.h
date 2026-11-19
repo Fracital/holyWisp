@@ -69,6 +69,12 @@ typedef struct wt_cert {
 	int nhashes;
 } wt_cert;
 
+// webtransport-cert-dir: one host's certificate, shared by every table that lists it, and the
+// table itself, sorted by name. Both immutable once made and freed by their last reference, so
+// the workers share one table instead of a copy each (a directory can hold thousands).
+typedef struct wt_hosts wt_hosts;
+void wt_hosts_unref(wt_hosts *t);
+
 // What stat(2) says of an operator's certificate or key file. Any field that differs is another
 // file, or the same file rewritten.
 typedef struct {
@@ -210,6 +216,14 @@ struct hw_server {
 	// they were when the pair was last read, whether it loaded or not.
 	wt_file_id wt_files_seen[2];
 	wt_file_id wt_files_tried[2];
+	// webtransport-cert-dir (maintenance thread only): the table the workers were last given, the
+	// directory as the last look found it, when to look at every file again whatever it says, and
+	// whether a worker missed the table (no memory) and gets it again at the next look.
+	wt_hosts *wt_hosts_cur;
+	wt_file_id wt_dir_seen;
+	uint64_t wt_dir_rescan_ms;
+	int wt_dir_failed;
+	int wt_hosts_unpublished;
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;

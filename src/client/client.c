@@ -591,6 +591,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char *err, size_t err_cap) {
 	hw_wtc_opts wo = {
 	    .host = o->host,
+	    .server_name = o->server_name,
 	    .port = o->port,
 	    .path = o->path,
 	    .origin = o->origin,

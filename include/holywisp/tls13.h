@@ -71,6 +71,14 @@ typedef struct {
 	const hw_der *chain;
 	size_t chain_len;
 	const uint8_t *key; // HW_P256_PRIV_LEN bytes
+	// Server, optional: called once the ClientHello is read, with its SNI (NULL when it sent
+	// none). Returning 1 with *chain, *chain_len and *key set answers with that certificate
+	// instead (copied during the call, so the caller's may change after it); 0 keeps the one
+	// above. A chain that would not have been accepted above fails the handshake
+	// (internal_error). The function and cert_ud are copied, not what cert_ud points at.
+	int (*cert_for)(void *cert_ud, const char *server_name, const hw_der **chain, size_t *chain_len,
+	                const uint8_t **key);
+	void *cert_ud;
 	// Both: ALPN protocols. The server's are acceptable ones in preference order; the client's
 	// are offered.
 	const char *const *alpn;

@@ -70,6 +70,20 @@ P-256 key and a validity of at most 14 days. So by default the server makes its 
 - With `webtransport-cert` and `webtransport-key` (PEM files, ECDSA P-256 only: the TLS layer
   signs with P-256 only), that chain is used instead, nothing rotates, and `/webtransport.json`
   lists no hashes. The browser then verifies it through the Web PKI.
+- With `webtransport-cert-dir`, a server that answers for many names (the edge's TCP vhosts
+  each have their own certificate) picks one by the ClientHello's SNI: the TLS layer asks
+  (`hw_tls_config.cert_for`) once the ClientHello is read, and the listener looks the name up,
+  in lower case and without the root's dot, in a table of `<host>.pem` files. Any other name,
+  and no name, gets the certificate above. The table is immutable and shared: the maintenance
+  thread makes a new one when the directory changes, reusing every certificate whose file is
+  the same file, and posts each worker a reference (an atomic count; a directory can hold
+  thousands, which would be thousands of copies per worker). A file younger than a second is
+  left for the next look, for a writer that writes in place.
+- `webtransport-path` rules admit a session only on the paths the WebSocket side reaches the
+  relay on (a keyed path behind nginx, say). A request no rule names is answered 404 before a
+  connection is made for it or anything is counted. Any HTTP/3 request that is not a CONNECT
+  is answered 421 with `alt-svc: clear`: a browser that holds an h3 alternative service for
+  the host from a CDN once in front of it sends it again over TCP and forgets the alternative.
 - Those files are renewed in place (certbot, lego) without a restart. The maintenance thread
   stats both once a second (device, inode, size, mtime; `stat` follows certbot's symlinks).
   When either has changed it waits until neither changes for one more look, because a renewer
@@ -215,6 +229,8 @@ places in the code. On top of it:
 | `webtransport-port` | `port` | UDP port to bind (the same number as the TCP port by default). |
 | `webtransport-url` | empty | The URL `/webtransport.json` names, for when the client should not derive it from the page's origin. |
 | `webtransport-cert`, `webtransport-key` | empty | PEM files (ECDSA P-256) to use instead of the rotating self-signed certificate. Read again when they change, for new sessions. |
+| `webtransport-cert-dir` | empty | `<host>.pem` files (chain and P-256 key in one) picked by the client's SNI; any other name gets the certificate above. Read again when it changes. |
+| `webtransport-path` | every path | `[host] /path`, repeatable: the paths (and hosts) a session is admitted on; any other is a 404. |
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout. |
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |

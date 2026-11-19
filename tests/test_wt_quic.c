@@ -546,7 +546,7 @@ static void test_wt_refused(void) {
 }
 
 // A raw client, as Chrome's bytes: its SETTINGS, then a GET, which gets a 404 and FIN.
-static void test_wt_get_404(void) {
+static void test_wt_get_421(void) {
 	net *n = net_new(9, 256 * 1024);
 	net_start(n, 1);
 	CHECK(net_run(n, cond_established, 30000), "handshake");
@@ -573,7 +573,10 @@ static void test_wt_get_404(void) {
 	CHECK(k < n->c.n_raw && n->c.raw[k].fin, "the response ends");
 	const uint8_t *r = hw_buf_head(&n->c.raw[k].rx);
 	size_t rl = hw_buf_avail(&n->c.raw[k].rx);
-	CHECK(rl >= 5 && r[0] == HW_H3_FRAME_HEADERS && r[2] == 0 && r[3] == 0 && r[4] == 0xdb, "HEADERS :status 404");
+	// :status 421, QPACK static index 69 (a 6-bit prefix of 63, then 6).
+	CHECK_STR(hw_qpack_static_value(69), "421");
+	CHECK(rl >= 6 && r[0] == HW_H3_FRAME_HEADERS && r[2] == 0 && r[3] == 0 && r[4] == 0xff && r[5] == 0x06,
+	      "HEADERS :status 421");
 	CHECK_EQ(n->s.requests, 0);
 	// The server's control stream carried its SETTINGS.
 	int saw = 0;
@@ -638,7 +641,7 @@ int main(void) {
 	RUN(test_wt_session_lossy);
 	RUN(test_wt_server_close);
 	RUN(test_wt_refused);
-	RUN(test_wt_get_404);
+	RUN(test_wt_get_421);
 	RUN(test_wt_pause);
 	hw_der_free(&g_cert);
 	return 0;

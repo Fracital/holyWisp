@@ -87,6 +87,8 @@ struct hw_tls {
 	hw_der chain[HW_CERT_CHAIN_MAX];
 	size_t chain_len;
 	uint8_t key[HW_P256_PRIV_LEN];
+	int (*cert_for)(void *, const char *, const hw_der **, size_t *, const uint8_t **);
+	void *cert_ud;
 	char **alpn;
 	size_t alpn_count;
 	uint8_t *tp;
@@ -319,6 +321,42 @@ static void cv_digest(const uint8_t th[TLS_HASH], uint8_t out[TLS_HASH]) {
 }
 
 // ---- failure, sending, secrets -------------------------------------------------------------
+
+// A server chain of 1 to HW_CERT_CHAIN_MAX certificates whose Certificate message fits what a
+// peer reassembles, as this side's own does.
+static int chain_usable(const hw_der *chain, size_t n) {
+	if (!chain || n == 0 || n > HW_CERT_CHAIN_MAX) return 0;
+	size_t total = 4 + 1 + 3;
+	for (size_t i = 0; i < n; i++) {
+		if (!chain[i].der || chain[i].len == 0 || chain[i].len > TLS_MSG_MAX) return 0;
+		total += 3 + chain[i].len + 2;
+	}
+	return total <= TLS_MSG_MAX;
+}
+
+static void chain_clear(hw_tls *t) {
+	for (size_t i = 0; i < t->chain_len; i++) free(t->chain[i].der);
+	memset(t->chain, 0, sizeof t->chain);
+	t->chain_len = 0;
+}
+
+// Replace the chain and key with copies of these (already checked by chain_usable). 0, or -1 with
+// no chain at all (no memory).
+static int chain_set(hw_tls *t, const hw_der *chain, size_t n, const uint8_t *key) {
+	chain_clear(t);
+	for (size_t i = 0; i < n; i++) {
+		t->chain[i].der = malloc(chain[i].len);
+		if (!t->chain[i].der) {
+			chain_clear(t);
+			return -1;
+		}
+		memcpy(t->chain[i].der, chain[i].der, chain[i].len);
+		t->chain[i].len = chain[i].len;
+		t->chain_len = i + 1;
+	}
+	memcpy(t->key, key, sizeof t->key);
+	return 0;
+}
 
 static int tls_fail(hw_tls *t, uint8_t alert) {
 	if (!t->alert) t->alert = alert;
@@ -736,6 +774,16 @@ static int server_on_client_hello(hw_tls *t, const uint8_t *msg, size_t len) {
 		memcpy(t->server_name, ch.sni.p, ch.sni.n);
 		t->server_name[ch.sni.n] = '\0';
 	}
+	if (t->cert_for) {
+		const hw_der *chain = NULL;
+		const uint8_t *key = NULL;
+		size_t n = 0;
+		if (t->cert_for(t->cert_ud, t->server_name, &chain, &n, &key) == 1) {
+			if (!chain_usable(chain, n) || !key || chain_set(t, chain, n, key)) {
+				return tls_fail(t, HW_TLS_ALERT_INTERNAL_ERROR);
+			}
+		}
+	}
 	if (tls_set_peer_tp(t, &ch.tp)) return -1;
 
 	uint8_t ecdhe[HW_X25519_LEN];
@@ -1047,14 +1095,7 @@ hw_tls *hw_tls_new(const hw_tls_config *cfg, const hw_tls_callbacks *cb) {
 	}
 	if (alpn_total > 0xffff - 4) return NULL;
 	if (cfg->is_server) {
-		if (!cfg->chain || cfg->chain_len == 0 || cfg->chain_len > HW_CERT_CHAIN_MAX || !cfg->key) return NULL;
-		// The Certificate message has to fit what a peer reassembles, as this side's own does.
-		size_t total = 4 + 1 + 3;
-		for (size_t i = 0; i < cfg->chain_len; i++) {
-			if (!cfg->chain[i].der || cfg->chain[i].len == 0 || cfg->chain[i].len > TLS_MSG_MAX) return NULL;
-			total += 3 + cfg->chain[i].len + 2;
-		}
-		if (total > TLS_MSG_MAX) return NULL;
+		if (!chain_usable(cfg->chain, cfg->chain_len) || !cfg->key) return NULL;
 	} else if (cfg->server_name && (cfg->server_name[0] == '\0' || strlen(cfg->server_name) > 255)) {
 		return NULL;
 	}
@@ -1077,14 +1118,9 @@ hw_tls *hw_tls_new(const hw_tls_config *cfg, const hw_tls_callbacks *cb) {
 	if (cfg->transport_params_len) memcpy(t->tp, cfg->transport_params, cfg->transport_params_len);
 	t->tp_len = cfg->transport_params_len;
 	if (t->is_server) {
-		for (size_t i = 0; i < cfg->chain_len; i++) {
-			t->chain[i].der = malloc(cfg->chain[i].len);
-			if (!t->chain[i].der) goto fail;
-			memcpy(t->chain[i].der, cfg->chain[i].der, cfg->chain[i].len);
-			t->chain[i].len = cfg->chain[i].len;
-			t->chain_len = i + 1;
-		}
-		memcpy(t->key, cfg->key, sizeof t->key);
+		if (chain_set(t, cfg->chain, cfg->chain_len, cfg->key)) goto fail;
+		t->cert_for = cfg->cert_for;
+		t->cert_ud = cfg->cert_ud;
 	} else {
 		if (cfg->server_name) {
 			t->server_name = str_dup(cfg->server_name);

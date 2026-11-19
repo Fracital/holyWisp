@@ -170,6 +170,8 @@ typedef struct {
 	const char *origin;
 	const uint8_t *pin;
 	size_t max_queue;
+	const char *name; // SNI and :authority, the server still reached at 127.0.0.1
+	const char *path;
 } wt_opts;
 
 static hw_client *wt_try(hw_server *s, const wt_opts *w, char *err, size_t err_cap) {
@@ -182,6 +184,8 @@ static hw_client *wt_try(hw_server *s, const wt_opts *w, char *err, size_t err_c
 	o.origin = w ? w->origin : NULL;
 	o.pin_sha256 = w ? w->pin : NULL;
 	if (w && w->max_queue) o.max_queue_bytes = w->max_queue;
+	if (w && w->name) o.server_name = w->name;
+	if (w && w->path) o.path = w->path;
 	o.timeout_ms = 5000;
 	return hw_client_connect(&o, err, err_cap);
 }
@@ -1149,6 +1153,143 @@ static void test_operator_reload(void) {
 	unlink(key_path);
 }
 
+// A host's certificate and key in one file, dir/name.pem, put in place by rename as the edge's
+// exporter does.
+static void host_pem(const char *dir, const char *name, uint8_t hash[32]) {
+	uint8_t priv[HW_P256_PRIV_LEN], pub[HW_P256_PUB_LEN];
+	CHECK_EQ(hw_p256_keygen(priv, pub), 0);
+	hw_der cert = {0};
+	int64_t now = (int64_t)time(NULL);
+	CHECK_EQ(hw_cert_selfsigned(priv, pub, name, now - 3600, now + 7 * 86400, &cert), 0);
+	hw_sha256(cert.der, cert.len, hash);
+	uint8_t key[128];
+	size_t key_len = sec1_key(priv, pub, key);
+	char cpath[512], kpath[512], tmp[600], dst[600];
+	write_pem(cpath, sizeof(cpath), "CERTIFICATE", cert.der, cert.len);
+	write_pem(kpath, sizeof(kpath), "EC PRIVATE KEY", key, key_len);
+	snprintf(tmp, sizeof(tmp), "%s/.%s.tmp", dir, name);
+	snprintf(dst, sizeof(dst), "%s/%s.pem", dir, name);
+	FILE *out = fopen(tmp, "w");
+	CHECK(out != NULL, "fopen %s", tmp);
+	const char *parts[2] = {cpath, kpath};
+	for (int i = 0; i < 2; i++) {
+		FILE *in = fopen(parts[i], "r");
+		CHECK(in != NULL, "fopen %s", parts[i]);
+		static char buf[8192];
+		size_t n = fread(buf, 1, sizeof(buf), in);
+		CHECK(n > 0 && n < sizeof(buf), "read %s", parts[i]);
+		CHECK_EQ(fwrite(buf, 1, n, out), n);
+		fclose(in);
+		unlink(parts[i]);
+	}
+	fclose(out);
+	file_replace(tmp, dst);
+	hw_der_free(&cert);
+}
+
+// Whether a session as name for path, pinned to hash, opens; err says why not.
+static int named_ok(hw_server *s, const char *name, const char *path, const uint8_t *hash, char *err, size_t cap) {
+	wt_opts w = {.pin = hash, .name = name, .path = path};
+	hw_client *c = wt_try(s, &w, err, cap);
+	if (!c) return 0;
+	hw_client_free(c);
+	return 1;
+}
+
+static int named_wait(hw_server *s, const char *name, const uint8_t *hash, int timeout_ms) {
+	char err[256];
+	uint64_t until = hw_now_ms() + (uint64_t)timeout_ms;
+	while (hw_now_ms() < until) {
+		if (named_ok(s, name, "/pipe/k", hash, err, sizeof(err))) {
+			usleep(100000); // the other workers' posted tables
+			for (int i = 0; i < 8; i++) {
+				if (!named_ok(s, name, "/pipe/k", hash, err, sizeof(err))) return 0;
+			}
+			return 1;
+		}
+		usleep(100000);
+	}
+	return 0;
+}
+
+// webtransport-cert-dir and webtransport-path: the certificate for the SNI a client sends, the
+// operator's for any other name; sessions only on the paths the rules name; the directory read
+// again as files come, change and go.
+static void test_host_certificates(void) {
+	char dir[512], cert_path[512], key_path[512], err[256];
+	uint8_t hd[32], ha[32], ha2[32], hb[32];
+	hw_test_tmp(dir, sizeof(dir), "hw-wt-hosts");
+	CHECK(mkdtemp(dir) != NULL, "mkdtemp: %s", strerror(errno));
+	operator_pair(cert_path, key_path, hd);
+	host_pem(dir, "a.example", ha);
+	// Not a certificate; names the directory never looks at.
+	char junk[600];
+	snprintf(junk, sizeof(junk), "%s/bad.example.pem", dir);
+	FILE *f = fopen(junk, "w");
+	CHECK(f != NULL, "fopen");
+	fputs("-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n", f);
+	fclose(f);
+
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	snprintf(cfg.webtransport_cert, sizeof(cfg.webtransport_cert), "%s", cert_path);
+	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", key_path);
+	snprintf(cfg.webtransport_cert_dir, sizeof(cfg.webtransport_cert_dir), "%s", dir);
+	strcpy(cfg.webtransport_paths[0].path, "/pipe/k");
+	strcpy(cfg.webtransport_paths[1].host, "relay.example");
+	strcpy(cfg.webtransport_paths[1].path, "/");
+	cfg.webtransport_path_count = 2;
+	hw_server *s = server_with(&cfg);
+
+	// The name's own certificate, whatever its case; the operator's for every other name.
+	CHECK(named_ok(s, "a.example", "/pipe/k", ha, err, sizeof(err)), "a.example: %s", err);
+	CHECK(named_ok(s, "A.Example", "/pipe/k", ha, err, sizeof(err)), "A.Example: %s", err);
+	CHECK(!named_ok(s, "a.example", "/pipe/k", hd, err, sizeof(err)), "a.example got the default");
+	CHECK(named_ok(s, "other.example", "/pipe/k", hd, err, sizeof(err)), "other.example: %s", err);
+	CHECK(!named_ok(s, "other.example", "/pipe/k", ha, err, sizeof(err)), "a's certificate for another name");
+	CHECK(named_ok(s, NULL, "/pipe/k", hd, err, sizeof(err)), "no SNI: %s", err);
+	CHECK(named_ok(s, "bad.example", "/pipe/k", hd, err, sizeof(err)), "a file that does not load: %s", err);
+
+	// The paths: under /pipe/k on any host, / on relay.example alone.
+	CHECK(named_ok(s, "a.example", "/pipe/k/x", ha, err, sizeof(err)), "under the path: %s", err);
+	CHECK(!named_ok(s, "a.example", "/pipe/kx", ha, err, sizeof(err)), "beside the path");
+	CHECK(strstr(err, "404") != NULL, "a path no rule names is a 404: %s", err);
+	CHECK(!named_ok(s, "a.example", "/", ha, err, sizeof(err)), "/ on a.example");
+	CHECK(named_ok(s, "relay.example", "/", hd, err, sizeof(err)), "/ on relay.example: %s", err);
+	CHECK(!named_ok(s, "relay.example", "/x", hd, err, sizeof(err)), "/ names / alone");
+
+	// A new host, a renewed one, one that goes.
+	second_turn();
+	host_pem(dir, "b.example", hb);
+	CHECK(named_wait(s, "b.example", hb, 6000), "b.example's new certificate is not served");
+	host_pem(dir, "a.example", ha2);
+	CHECK(named_wait(s, "a.example", ha2, 6000), "a.example's renewed certificate is not served");
+	CHECK(!named_ok(s, "a.example", "/pipe/k", ha, err, sizeof(err)), "a.example's old certificate");
+	char b_path[600];
+	snprintf(b_path, sizeof(b_path), "%s/b.example.pem", dir);
+	CHECK_EQ(unlink(b_path), 0);
+	CHECK(named_wait(s, "b.example", hd, 6000), "b.example kept its certificate after its file went");
+	CHECK(named_ok(s, "a.example", "/pipe/k", ha2, err, sizeof(err)), "a.example: %s", err);
+	hw_server_free(s);
+
+	// A directory that cannot be read keeps the server from starting, as a certificate would.
+	char missing[600];
+	snprintf(missing, sizeof(missing), "%s/missing", dir);
+	snprintf(cfg.webtransport_cert_dir, sizeof(cfg.webtransport_cert_dir), "%s", missing);
+	hw_server *none = hw_server_new(&cfg);
+	CHECK(none == NULL, "started without its certificate directory");
+	hw_server_free(none);
+
+	char a_path[600];
+	snprintf(a_path, sizeof(a_path), "%s/a.example.pem", dir);
+	unlink(a_path);
+	unlink(junk);
+	rmdir(dir);
+	unlink(cert_path);
+	unlink(key_path);
+}
+
 static void test_stats_json(void) {
 	char buf[8192];
 	http_get(g_server, "/stats", buf, sizeof(buf));
@@ -1175,6 +1316,7 @@ int main(void) {
 	RUN(test_admission);
 	RUN(test_certificate_json);
 	RUN(test_operator_certificate);
+	RUN(test_host_certificates);
 	RUN(test_retry);
 	RUN(test_idle_timeout);
 	RUN(test_stalled_reader);

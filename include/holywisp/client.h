@@ -60,6 +60,10 @@ typedef struct hw_client_opts {
 	int webtransport;
 	const uint8_t *pin_sha256; // 32 bytes the server's certificate must hash to; NULL takes any
 	const char *origin;        // the origin header to send; NULL sends none
+	// WebTransport: the name to send as SNI and as the :authority's host instead of host, which
+	// is then only where to connect (an address, or another name), as curl's --connect-to.
+	// NULL: host.
+	const char *server_name;
 } hw_client_opts;
 
 enum hw_client_event_type {

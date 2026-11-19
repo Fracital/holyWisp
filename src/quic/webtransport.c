@@ -26,6 +26,7 @@
 #include "h3.h"
 #include "quic_wire.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -337,6 +338,10 @@ static void respond(hw_wt *w, wt_stream *s, int status, const char *protocol, in
 	char st[4] = {(char)('0' + status / 100 % 10), (char)('0' + status / 10 % 10), (char)('0' + status % 10), 0};
 	size_t n = hw_qpack_prefix_put(block, sizeof(block));
 	n += block_put(block + n, sizeof(block) - n, ":status", st);
+	// A request for a page lands here when a browser holds an h3 alternative service for this
+	// host from somewhere else (a CDN that was in front of it). 421 makes Chrome and Firefox send
+	// it again over TCP without the alternative, and the clear drops what they hold.
+	if (status == 421) n += block_put(block + n, sizeof(block) - n, "alt-svc", "clear");
 	if (status == 200) {
 		n += block_put(block + n, sizeof(block) - n, "sec-webtransport-http3-draft", "draft02");
 		char quoted[2 * WT_PROTOCOL_MAX + 3];
@@ -400,7 +405,7 @@ static void server_request(hw_wt *w, wt_stream *s) {
 		goto done;
 	}
 	if (strcmp(r.method, "CONNECT") != 0) {
-		respond_refuse(w, s, 404);
+		respond_refuse(w, s, 421); // not a server of pages: misdirected
 		goto done;
 	}
 	if (!r.protocol || (strcmp(r.protocol, "webtransport") != 0 && strcmp(r.protocol, "webtransport-h3") != 0)) {
@@ -1178,4 +1183,51 @@ int hw_wt_protocol_first(const char *list, char *out, size_t cap) {
 	}
 	out[o] = '\0';
 	return 0;
+}
+
+// The host of an :authority: what is before the port, without an IPv6 literal's brackets and a
+// trailing dot. 0, or -1 when it does not fit cap or is empty.
+static int authority_host(const char *authority, char *out, size_t cap) {
+	const char *p = authority, *end;
+	if (*p == '[') {
+		p++;
+		end = strchr(p, ']');
+		if (!end) return -1;
+	} else {
+		end = strchr(p, ':');
+		if (!end) end = p + strlen(p);
+	}
+	size_t n = (size_t)(end - p);
+	if (n > 0 && p[n - 1] == '.') n--;
+	if (n == 0 || n >= cap) return -1;
+	for (size_t i = 0; i < n; i++) out[i] = (char)tolower((unsigned char)p[i]);
+	out[n] = '\0';
+	return 0;
+}
+
+int hw_wt_route_match(const char *rule_host, const char *rule_path, const char *authority, const char *path) {
+	if (!rule_path || !path || rule_path[0] != '/' || path[0] != '/') return 0;
+	if (rule_host && rule_host[0] && strcmp(rule_host, "*") != 0) {
+		char want[256], got[256];
+		// The rule names a host alone (no port), an IPv6 literal with or without its brackets.
+		size_t rn = strlen(rule_host);
+		const char *rh = rule_host;
+		if (rn >= 2 && rh[0] == '[' && rh[rn - 1] == ']') {
+			rh++;
+			rn -= 2;
+		}
+		if (rn > 0 && rh[rn - 1] == '.') rn--;
+		if (rn == 0 || rn >= sizeof(want)) return 0;
+		for (size_t i = 0; i < rn; i++) want[i] = (char)tolower((unsigned char)rh[i]);
+		want[rn] = '\0';
+		if (!authority || authority_host(authority, got, sizeof(got)) != 0 || strcmp(want, got) != 0) {
+			return 0;
+		}
+	}
+	size_t plen = strcspn(path, "?#");
+	size_t rlen = strlen(rule_path);
+	if (plen == rlen) return memcmp(path, rule_path, rlen) == 0;
+	// Under the rule's path, never beside it: /pipe/key covers /pipe/key/x, not /pipe/keyx. A rule
+	// that ends in a slash (/ itself) is that path alone.
+	return plen > rlen && rule_path[rlen - 1] != '/' && memcmp(path, rule_path, rlen) == 0 && path[rlen] == '/';
 }

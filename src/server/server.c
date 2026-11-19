@@ -875,6 +875,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		free(s->warp_read);
 		free(s->warp_given);
 		wt_cert_free(s->wt_cert_cur);
+		wt_hosts_unref(s->wt_hosts_cur);
 		errno = EINVAL;
 		goto fail;
 	}
@@ -997,6 +998,7 @@ void hw_server_free(hw_server *s) {
 	free(s->warp_read);
 	free(s->warp_given);
 	wt_cert_free(s->wt_cert_cur);
+	wt_hosts_unref(s->wt_hosts_cur);
 	free(s->webclient_page);
 	free(s->workers);
 	free(s);

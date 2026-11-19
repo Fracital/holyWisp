@@ -202,6 +202,8 @@ lists them all; `holywisp.conf.example` is the fully annotated reference. The mo
 | `webtransport` | off | Also listen for [WebTransport](docs/webtransport.md) (HTTP/3 over QUIC, on UDP): Wisp over a session, the same packets, limits and policy, with UDP streams on QUIC datagrams. TLS 1.3 for this listener is in-tree |
 | `webtransport-host`, `webtransport-port` | `host`, `port` | UDP address and port the WebTransport listener binds (by default the TCP listener's own address and port number) |
 | `webtransport-url` | empty | `https://` URL that `GET /webtransport.json` names, for a page that should not derive it from its own origin |
+| `webtransport-cert-dir` | empty | A directory of `<host>.pem` files, each a certificate chain and its ECDSA P-256 key in one file, named by the host in lower case. A client whose SNI is one of those names gets that certificate, any other name the one above. Read again when it changes (once a second for the directory, once a minute for every file, a file replaced by rename at once); a file that does not load is logged and that host gets the default. An unreadable directory keeps the server from starting |
+| `webtransport-path` | every path | `[host] /path`, repeatable: a session request is admitted only when a rule names its `:path` (that path and anything under it; `/` names `/` alone) and, when the rule has one, its `:authority`'s host. Any other is answered 404 before anything is counted. For a relay that sits behind keyed paths on its WebSocket side. The value is never logged |
 | `webtransport-cert`, `webtransport-key` | empty | PEM certificate chain and ECDSA P-256 key to use instead of the self-signed certificate, read again within a few seconds when either file changes: a renewal (certbot, lego) needs no restart, new sessions get the new certificate, open ones keep theirs, and a pair that does not load is logged and leaves the current one in use. Without them the server makes a P-256 certificate valid for 13 days and renews it every 6, and `GET /webtransport.json` lists the SHA-256 of the current and the previous one for `serverCertificateHashes` |
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout; the server sends a keepalive PING after 20 s without sending |
 | `webtransport-max-handshakes`, `webtransport-retry-threshold` | 1024, 64 | QUIC handshakes in progress per worker; past the threshold every new Initial gets a Retry, so the client must prove its address first |
@@ -254,7 +256,9 @@ build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-25
 An `https://` server URL is WebTransport (UDP, port 443 unless the URL says otherwise). There is no
 certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what authenticates the
 server, and `--insecure` takes any certificate, for loopback tests. `--origin` sends an origin
-header, for a server with `allow-origin`.
+header, for a server with `allow-origin`. `--connect-to ADDR` sends the datagrams to `ADDR` while the
+URL's host stays the SNI and `:authority`, as curl's option of that name does: one host of a server
+with `webtransport-cert-dir`, reached by its address.
 
 The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events
 (`hw_client_opts.webtransport` for WebTransport). `tests/test_e2e.c`, `tests/test_e2e_wt.c` and

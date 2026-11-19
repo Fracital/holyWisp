@@ -349,6 +349,84 @@ static void handshake_with(size_t step) {
 	side_clear(&s);
 }
 
+// cert_for: the certificate for the SNI the client sent, the config's for any other.
+static uint8_t g_b_priv[HW_P256_PRIV_LEN];
+static hw_der g_b_cert;
+static uint8_t g_b_pin[32];
+static char g_seen_sni[256];
+static int g_cert_for_calls, g_cert_for_bad;
+
+static int pick_cert(void *ud, const char *sni, const hw_der **chain, size_t *chain_len, const uint8_t **key) {
+	CHECK(ud == &g_b_cert, "cert_ud is passed through");
+	g_cert_for_calls++;
+	snprintf(g_seen_sni, sizeof g_seen_sni, "%s", sni ? sni : "(none)");
+	if (g_cert_for_bad) {
+		*chain = &g_b_cert;
+		*chain_len = 0;
+		*key = g_b_priv;
+		return 1;
+	}
+	if (!sni || strcmp(sni, "b.example") != 0) return 0;
+	*chain = &g_b_cert;
+	*chain_len = 1;
+	*key = g_b_priv;
+	return 1;
+}
+
+static void server_init_picking(side *s) {
+	memset(s, 0, sizeof *s);
+	hw_tls_config cfg = {
+	    .is_server = 1,
+	    .chain = &g_cert,
+	    .chain_len = 1,
+	    .key = g_priv,
+	    .cert_for = pick_cert,
+	    .cert_ud = &g_b_cert,
+	    .alpn = H3,
+	    .alpn_count = 1,
+	    .transport_params = SERVER_TP,
+	    .transport_params_len = sizeof SERVER_TP,
+	};
+	hw_tls_callbacks cb = {.ud = s, .emit = emit_cb, .secret = secret_cb};
+	s->t = hw_tls_new(&cfg, &cb);
+	CHECK(s->t != NULL, "server new");
+}
+
+static int handshake_picking(const char *sni, const uint8_t *pin) {
+	side c, s;
+	server_init_picking(&s);
+	client_init(&c, H3, 1, sni, pin);
+	int rc = hw_tls_start(c.t) == 0 && pump(&c, &s, 0) == 0 && hw_tls_done(c.t) && hw_tls_done(s.t) ? 0 : -1;
+	if (rc != 0 && g_cert_for_bad) CHECK_EQ(hw_tls_alert(s.t), HW_TLS_ALERT_INTERNAL_ERROR);
+	side_clear(&c);
+	side_clear(&s);
+	return rc;
+}
+
+static void test_cert_for(void) {
+	uint8_t pub[HW_P256_PUB_LEN];
+	CHECK(hw_p256_keygen(g_b_priv, pub) == 0, "p256 keygen");
+	int64_t now = (int64_t)time(NULL);
+	CHECK(hw_cert_selfsigned(g_b_priv, pub, "b.example", now - 3600, now + 86400, &g_b_cert) == 0, "cert");
+	hw_sha256(g_b_cert.der, g_b_cert.len, g_b_pin);
+	// The name it has a certificate for gets that one, and only that one.
+	CHECK_EQ(handshake_picking("b.example", g_b_pin), 0);
+	CHECK_STR(g_seen_sni, "b.example");
+	CHECK(handshake_picking("b.example", g_pin) != 0, "not the default for b.example");
+	// Any other name, and no name, get the config's.
+	CHECK_EQ(handshake_picking("wt.example", g_pin), 0);
+	CHECK_STR(g_seen_sni, "wt.example");
+	CHECK(handshake_picking("wt.example", g_b_pin) != 0, "not b.example's for another name");
+	CHECK_EQ(handshake_picking(NULL, g_pin), 0);
+	CHECK_STR(g_seen_sni, "(none)");
+	CHECK_EQ(g_cert_for_calls, 5);
+	// A chain the config would have refused fails the handshake, never sends an empty Certificate.
+	g_cert_for_bad = 1;
+	CHECK(handshake_picking("b.example", g_b_pin) != 0, "bad chain");
+	g_cert_for_bad = 0;
+	hw_der_free(&g_b_cert);
+}
+
 static void test_handshake(void) {
 	handshake_with(0);
 }
@@ -1603,6 +1681,7 @@ int main(void) {
 	fixture_cert();
 	RUN(test_config_refusals);
 	RUN(test_handshake);
+	RUN(test_cert_for);
 	RUN(test_handshake_bytewise);
 	RUN(test_alpn_preference);
 	RUN(test_hello_retry);

@@ -8,6 +8,7 @@
 #include "holywisp/limits.h"
 #include "holywisp/log.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	STR_KEY("webtransport-url", webtransport_url)
 	STR_KEY("webtransport-cert", webtransport_cert)
 	STR_KEY("webtransport-key", webtransport_key)
+	STR_KEY("webtransport-cert-dir", webtransport_cert_dir)
 	INT_KEY("webtransport-idle-timeout-s", webtransport_idle_timeout_s, 1, 3600)
 	INT_KEY("webtransport-max-handshakes", webtransport_max_handshakes, 1, 1 << 20)
 	INT_KEY("webtransport-retry-threshold", webtransport_retry_threshold, 0, 1 << 20)
@@ -268,6 +270,41 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		}
 		if (set_str(cfg->allow_origins[cfg->allow_origin_count], 128, value) != 0) goto bad_value;
 		cfg->allow_origin_count++;
+		return 0;
+	}
+	if (!strcmp(key, "webtransport-path")) {
+		// [host] /path. The path may hold a gate key: it is never repeated in a message.
+		if (cfg->webtransport_path_count >= HW_MAX_WT_PATHS) {
+			snprintf(err, err_cap, "too many webtransport-path entries");
+			return -1;
+		}
+		const char *path = value, *sp = strpbrk(value, " \t");
+		size_t hlen = 0;
+		if (sp) {
+			hlen = (size_t)(sp - value);
+			path = sp + strspn(sp, " \t");
+		}
+		int ok = path[0] == '/' && strlen(path) < 256 && hlen < 256;
+		for (const char *p = path; ok && *p; p++) {
+			if ((unsigned char)*p <= ' ' || (unsigned char)*p >= 0x7f || *p == '?' || *p == '#') ok = 0;
+		}
+		for (size_t i = 0; ok && i < hlen; i++) {
+			unsigned char ch = (unsigned char)value[i];
+			if (!(isalnum(ch) || ch == '.' || ch == '-' || ch == '_' || ch == ':' || ch == '[' || ch == ']' ||
+			      ch == '*')) {
+				ok = 0;
+			}
+		}
+		if (!ok) {
+			snprintf(err, err_cap,
+			         "webtransport-path: expected [host] /path, the path without spaces, '?' or '#' (not shown: "
+			         "it may hold a key)");
+			return -1;
+		}
+		int i = cfg->webtransport_path_count++;
+		memcpy(cfg->webtransport_paths[i].host, value, hlen);
+		cfg->webtransport_paths[i].host[hlen] = '\0';
+		snprintf(cfg->webtransport_paths[i].path, sizeof(cfg->webtransport_paths[i].path), "%s", path);
 		return 0;
 	}
 	if (!strcmp(key, "trusted-header")) {
@@ -486,6 +523,11 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-cert, webtransport-key       PEM chain and ECDSA P-256 key to use instead of the\n"
 	       "                                            rotating self-signed certificate, read again for new\n"
 	       "                                            sessions when either file changes (none)\n"
+	       "  webtransport-cert-dir DIR                 <host>.pem files (chain and P-256 key) picked by the\n"
+	       "                                            client's SNI, read again when they change (none)\n"
+	       "  webtransport-path [HOST] /PATH            admit sessions only for this path, and what is under\n"
+	       "                                            it (/ alone for /), on HOST or any host; repeatable\n"
+	       "                                            (every path)\n"
 	       "  webtransport-idle-timeout-s               QUIC idle timeout (30)\n"
 	       "  webtransport-max-handshakes               QUIC handshakes in progress per worker (1024)\n"
 	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"

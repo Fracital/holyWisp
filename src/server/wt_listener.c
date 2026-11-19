@@ -39,9 +39,12 @@
 
 #include "internal.h"
 
+#include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,6 +130,7 @@ struct wt_worker {
 	int in_io; // a socket or timer callback is running and settles the dirty list at its end
 	int handshakes;
 	wt_cert *cert;   // NULL until one is published
+	wt_hosts *hosts; // webtransport-cert-dir's, NULL for none (a reference of this worker's)
 	uint8_t *rx;     // rx_slots slots of rx_cap bytes
 	size_t rx_slots; // HW_SYS_BATCH_MAX of WT_RX_SLOT, or with GRO WT_RX_GRO_SLOTS of HW_SYS_GRO_SLOT
 	size_t rx_cap;
@@ -521,11 +525,31 @@ static void q_closed(void *ud, uint64_t error, int app, const char *reason) {
 
 // ---- hw_wt callbacks
 
+static int wt_route_ok(const hw_server_config *cfg, const char *authority, const char *path) {
+	if (cfg->webtransport_path_count == 0) return 1;
+	for (int i = 0; i < cfg->webtransport_path_count; i++) {
+		if (hw_wt_route_match(cfg->webtransport_paths[i].host, cfg->webtransport_paths[i].path, authority, path)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int w_session_request(void *ud, const hw_wt_request *req, const char **protocol_out) {
 	wt_session *s = ud;
 	hw_server *srv = s->ww->w->server;
 	if (s->c || s->refused) return 400; // one session per connection
 	s->connect_id = s->in_stream;
+	// The paths a WebSocket reaches the relay on behind the operator's proxy, and nothing else:
+	// a session for any other is a 404, before anything is charged or counted for it. The path
+	// is not logged (it may hold a gate key).
+	if (!wt_route_ok(&srv->cfg, req->authority, req->path)) {
+		HW_DEBUG("wt", "%s: session for a path no webtransport-path names", s->ip);
+		s->refused = 1;
+		s->refuse_at = hw_now_ms() + WT_REFUSE_MS;
+		session_touch(s);
+		return 404;
+	}
 	socklen_t pl = 0;
 	const struct sockaddr *peer = hw_quic_peer(s->q, &pl);
 	hw_conn *c = peer ? conn_wt_new(s->ww->w, s, peer) : NULL;
@@ -651,6 +675,8 @@ void wt_conn_detach(wt_session *s, uint32_t code) {
 
 // ---------------------------------------------------------------------------------- receiving
 
+static int ww_cert_for(void *ud, const char *sni, const hw_der **chain, size_t *chain_len, const uint8_t **key);
+
 static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	static const char *const alpn[] = {HW_WT_ALPN};
 	const hw_server *srv = ww->w->server;
@@ -661,6 +687,10 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	qc->tls.chain = ww->cert->chain;
 	qc->tls.chain_len = ww->cert->chain_len;
 	qc->tls.key = ww->cert->key;
+	if (ww->hosts) {
+		qc->tls.cert_for = ww_cert_for;
+		qc->tls.cert_ud = (void *)ww; // read on this worker, when the ClientHello is
+	}
 	qc->tls.alpn = alpn;
 	qc->tls.alpn_count = 1;
 	qc->max_idle_ms = (uint64_t)cfg->webtransport_idle_timeout_s * 1000;
@@ -879,10 +909,15 @@ static void wt_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 
 // ---------------------------------------------------------------------------------- certificates
 
+static void wt_cert_clear(wt_cert *c) {
+	for (size_t i = 0; i < c->chain_len; i++) hw_der_free(&c->chain[i]);
+	c->chain_len = 0;
+	memset(c->key, 0, sizeof(c->key));
+}
+
 void wt_cert_free(wt_cert *c) {
 	if (!c) return;
-	for (size_t i = 0; i < c->chain_len; i++) hw_der_free(&c->chain[i]);
-	memset(c->key, 0, sizeof(c->key));
+	wt_cert_clear(c);
 	free(c);
 }
 
@@ -1001,9 +1036,38 @@ static char *read_file(const char *path, size_t *len) {
 	return buf;
 }
 
-// webtransport-cert and webtransport-key, into *out. The key must be the leaf's and on P-256: that
-// is the only signature the TLS layer makes. The same checks at start and on every reload. 0, or
-// -1 and the reason in why (file names and what is wrong, never the key's bytes).
+// A chain and its key from PEM texts (the same text for a file that holds both), into c. The key
+// must be the leaf's and on P-256: that is the only signature the TLS layer makes. cname and kname
+// say where they came from in a message. 0, or -1 and the reason in why (names and what is wrong,
+// never the key's bytes).
+static int wt_cert_parse(wt_cert *c, const char *cpem, size_t clen, const char *kpem, size_t klen, const char *cname,
+                         const char *kname, char *why, size_t why_cap) {
+	uint8_t pub[HW_P256_PUB_LEN], want[HW_P256_PUB_LEN];
+	if (hw_cert_load_chain(cpem, clen, c->chain, HW_CERT_CHAIN_MAX, &c->chain_len) != 0) {
+		snprintf(why, why_cap, "%s: no certificate chain of at most %d PEM blocks", cname, HW_CERT_CHAIN_MAX);
+		return -1;
+	}
+	// Never the key's bytes in a message: only that it is not what is needed.
+	if (hw_cert_load_p256_key(kpem, klen, c->key) != 0) {
+		snprintf(why, why_cap, "%s: not an ECDSA P-256 private key", kname);
+		wt_cert_clear(c);
+		return -1;
+	}
+	if (hw_cert_p256_pubkey(c->chain[0].der, c->chain[0].len, want) != 0) {
+		snprintf(why, why_cap, "%s: the first certificate has no ECDSA P-256 key", cname);
+		wt_cert_clear(c);
+		return -1;
+	}
+	if (hw_p256_public(c->key, pub) != 0 || memcmp(pub, want, sizeof(pub)) != 0) {
+		snprintf(why, why_cap, "%s: the key is not the key of the first certificate in %s", kname, cname);
+		wt_cert_clear(c);
+		return -1;
+	}
+	c->nhashes = 0; // a certificate of the Web PKI is verified, not pinned
+	return 0;
+}
+
+// webtransport-cert and webtransport-key, into *out. The same checks at start and on every reload.
 static int wt_cert_load(const hw_server_config *cfg, wt_cert **out, char *why, size_t why_cap) {
 	*out = NULL;
 	size_t clen = 0, klen = 0;
@@ -1020,37 +1084,19 @@ static int wt_cert_load(const hw_server_config *cfg, wt_cert **out, char *why, s
 	}
 	wt_cert *c = calloc(1, sizeof(*c));
 	int rc = -1;
-	uint8_t pub[HW_P256_PUB_LEN], want[HW_P256_PUB_LEN];
 	if (!c) {
 		snprintf(why, why_cap, "webtransport-cert %s: %s", cfg->webtransport_cert, strerror(ENOMEM));
-		goto done;
+	} else {
+		char cname[600], kname[600];
+		snprintf(cname, sizeof(cname), "webtransport-cert %s", cfg->webtransport_cert);
+		snprintf(kname, sizeof(kname), "webtransport-key %s", cfg->webtransport_key);
+		if (wt_cert_parse(c, cpem, clen, kpem, klen, cname, kname, why, why_cap) == 0) {
+			*out = c;
+			c = NULL;
+			rc = 0;
+		}
 	}
-	if (hw_cert_load_chain(cpem, clen, c->chain, HW_CERT_CHAIN_MAX, &c->chain_len) != 0) {
-		snprintf(why, why_cap, "webtransport-cert %s: no certificate chain of at most %d PEM blocks",
-		         cfg->webtransport_cert, HW_CERT_CHAIN_MAX);
-		goto done;
-	}
-	// Never the key's bytes in a message: only that it is not what is needed.
-	if (hw_cert_load_p256_key(kpem, klen, c->key) != 0) {
-		snprintf(why, why_cap, "webtransport-key %s: not an ECDSA P-256 private key", cfg->webtransport_key);
-		goto done;
-	}
-	if (hw_cert_p256_pubkey(c->chain[0].der, c->chain[0].len, want) != 0) {
-		snprintf(why, why_cap, "webtransport-cert %s: the first certificate has no ECDSA P-256 key",
-		         cfg->webtransport_cert);
-		goto done;
-	}
-	if (hw_p256_public(c->key, pub) != 0 || memcmp(pub, want, sizeof(pub)) != 0) {
-		snprintf(why, why_cap, "webtransport-key %s is not the key of the first certificate in %s",
-		         cfg->webtransport_key, cfg->webtransport_cert);
-		goto done;
-	}
-	c->nhashes = 0; // a certificate of the Web PKI is verified, not pinned
-	*out = c;
-	c = NULL;
-	rc = 0;
-done:
-	wt_cert_free(c);
+	free(c);
 	memset(kpem, 0, klen);
 	free(kpem);
 	free(cpem);
@@ -1072,14 +1118,12 @@ static wt_file_id file_id(const char *path) {
 	return id;
 }
 
+static int file_id_same(const wt_file_id *a, const wt_file_id *b) {
+	return a->ok == b->ok && a->dev == b->dev && a->ino == b->ino && a->size == b->size && a->mtime == b->mtime;
+}
+
 static int file_ids_same(const wt_file_id a[2], const wt_file_id b[2]) {
-	for (int i = 0; i < 2; i++) {
-		if (a[i].ok != b[i].ok || a[i].dev != b[i].dev || a[i].ino != b[i].ino || a[i].size != b[i].size ||
-		    a[i].mtime != b[i].mtime) {
-			return 0;
-		}
-	}
-	return 1;
+	return file_id_same(&a[0], &b[0]) && file_id_same(&a[1], &b[1]);
 }
 
 // The operator's pair as it is on disk now. Taken before the files are read, so a change after
@@ -1129,8 +1173,269 @@ static void wt_cert_watch(hw_server *s, int running) {
 	        s->cfg.webtransport_cert, until, b64);
 }
 
+// ---------------------------------------------------------------------------------- per-host certificates
+
+// webtransport-cert-dir holds one <host>.pem per name, the chain and its key in the one file, so a
+// renewal is one rename and never a new certificate beside the old key. The maintenance thread
+// looks at the directory once a second and at every file once a minute; a file is read again only
+// when it is another file (wt_file_id). The table is immutable: a change makes a new one, which
+// every worker is posted a reference to.
+#define WT_HOSTS_MAX     65536
+#define WT_DIR_RESCAN_MS 60000
+
+typedef struct {
+	_Atomic int refs;
+	int ok; // 0: the file did not load; kept so that it is not tried again until it changes
+	wt_file_id id;
+	char name[256]; // lower case, the file's name less ".pem"
+	wt_cert cert;
+} wt_hcert;
+
+struct wt_hosts {
+	_Atomic int refs;
+	size_t n;
+	wt_hcert **v; // sorted by name
+};
+
+static void hcert_unref(wt_hcert *h) {
+	if (!h || atomic_fetch_sub(&h->refs, 1) != 1) return;
+	wt_cert_clear(&h->cert);
+	free(h);
+}
+
+void wt_hosts_unref(wt_hosts *t) {
+	if (!t || atomic_fetch_sub(&t->refs, 1) != 1) return;
+	for (size_t i = 0; i < t->n; i++) hcert_unref(t->v[i]);
+	free(t->v);
+	free(t);
+}
+
+static int hcert_cmp(const void *a, const void *b) {
+	return strcmp((*(wt_hcert *const *)a)->name, (*(wt_hcert *const *)b)->name);
+}
+
+static const wt_hcert *hosts_find(const wt_hosts *t, const char *name) {
+	size_t lo = 0, hi = t ? t->n : 0;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		int c = strcmp(name, t->v[mid]->name);
+		if (c == 0) return t->v[mid];
+		if (c < 0) {
+			hi = mid;
+		} else {
+			lo = mid + 1;
+		}
+	}
+	return NULL;
+}
+
+// A file name the directory may hold: a host name in lower case, then ".pem". Anything else (a
+// renewer's temporary file, a dotfile, a backup) is not looked at. The name goes to out.
+static int host_file_name(const char *file, char out[256]) {
+	size_t n = strlen(file);
+	if (n < 5 || n - 4 > 253 || strcmp(file + n - 4, ".pem") != 0 || file[0] == '.' || file[0] == '-') return 0;
+	for (size_t i = 0; i < n - 4; i++) {
+		char c = file[i];
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '.' || c == '-' || c == '_')) return 0;
+	}
+	memcpy(out, file, n - 4);
+	out[n - 4] = '\0';
+	return 1;
+}
+
+// The TLS layer asks once the ClientHello is read: the SNI as the client sent it, in any case and
+// with or without the root's dot.
+static int ww_cert_for(void *ud, const char *sni, const hw_der **chain, size_t *chain_len, const uint8_t **key) {
+	const wt_worker *ww = ud;
+	if (!sni || !ww->hosts) return 0;
+	char name[256];
+	size_t n = strlen(sni);
+	if (n > 0 && sni[n - 1] == '.') n--;
+	if (n == 0 || n >= sizeof(name)) return 0;
+	for (size_t i = 0; i < n; i++) name[i] = (char)tolower((unsigned char)sni[i]);
+	name[n] = '\0';
+	const wt_hcert *h = hosts_find(ww->hosts, name);
+	if (!h || !h->ok) return 0;
+	*chain = h->cert.chain;
+	*chain_len = h->cert.chain_len;
+	*key = h->cert.key;
+	return 1;
+}
+
+static wt_hcert *hcert_load(const char *dir, const char *file, const char *name, wt_file_id id) {
+	wt_hcert *h = calloc(1, sizeof(*h));
+	if (!h) return NULL;
+	atomic_init(&h->refs, 1);
+	h->id = id;
+	snprintf(h->name, sizeof(h->name), "%s", name);
+	char path[1024];
+	snprintf(path, sizeof(path), "%s/%s", dir, file);
+	size_t len = 0;
+	char *pem = read_file(path, &len);
+	char why[WT_WHY_LEN];
+	if (!pem) {
+		HW_WARN("wt", "webtransport-cert-dir: %s: %s; %s keeps no certificate of its own until it changes", file,
+		        strerror(errno), name);
+		return h;
+	}
+	if (wt_cert_parse(&h->cert, pem, len, pem, len, file, file, why, sizeof(why)) == 0) {
+		h->ok = 1;
+	} else {
+		HW_WARN("wt", "webtransport-cert-dir: %s; %s keeps no certificate of its own until it changes", why, name);
+	}
+	memset(pem, 0, len);
+	free(pem);
+	return h;
+}
+
+typedef struct {
+	wt_worker *ww;
+	wt_hosts *hosts;
+} hosts_msg;
+
+static void hosts_swap_task(hw_loop *loop, void *ud) {
+	(void)loop;
+	hosts_msg *m = ud;
+	wt_hosts_unref(m->ww->hosts);
+	m->ww->hosts = m->hosts;
+	free(m);
+}
+
+// s->wt_hosts_cur to every worker, a reference each: in place before the loops run, by a posted
+// task after. A handshake under way copied its certificate when it asked (hw_tls), so the table a
+// swap lets go of is never in use. 0, or -1 when a worker kept the previous one (no memory).
+static int wt_hosts_publish(hw_server *s, int running) {
+	int rc = 0;
+	for (int i = 0; i < s->nworkers; i++) {
+		wt_worker *ww = s->workers[i].wt;
+		wt_hosts *t = s->wt_hosts_cur;
+		atomic_fetch_add(&t->refs, 1);
+		if (!running) {
+			wt_hosts_unref(ww->hosts);
+			ww->hosts = t;
+			continue;
+		}
+		hosts_msg *m = malloc(sizeof(*m));
+		if (m) {
+			m->ww = ww;
+			m->hosts = t;
+		}
+		if (!m || hw_loop_post(s->workers[i].loop, hosts_swap_task, m) != 0) {
+			free(m);
+			wt_hosts_unref(t);
+			rc = -1;
+		}
+	}
+	return rc;
+}
+
+// One look at every file. Returns 0, or -1 when the directory cannot be read (the table stays).
+// *recent is set when a file was too new to read: one being written in place is read once it has
+// sat for a second. recent NULL (at start, with nothing to keep meanwhile) reads every file.
+static int wt_hosts_scan(hw_server *s, int running, int *recent) {
+	const char *dir = s->cfg.webtransport_cert_dir;
+	DIR *d = opendir(dir);
+	if (!d) return -1;
+	const wt_hosts *old = s->wt_hosts_cur;
+	wt_hosts *t = calloc(1, sizeof(*t));
+	size_t cap = 0, added = 0, replaced = 0, removed = 0;
+	int full = 0;
+	int64_t now = (int64_t)time(NULL);
+	struct dirent *e;
+	while (t && (e = readdir(d)) != NULL) {
+		char name[256], path[1024];
+		if (!host_file_name(e->d_name, name)) continue;
+		if (snprintf(path, sizeof(path), "%s/%s", dir, e->d_name) >= (int)sizeof(path)) continue;
+		wt_file_id id = file_id(path);
+		struct stat sb;
+		if (!id.ok || stat(path, &sb) != 0 || !S_ISREG(sb.st_mode)) continue;
+		wt_hcert *prev = (wt_hcert *)hosts_find(old, name);
+		wt_hcert *h = NULL;
+		if (prev && file_id_same(&prev->id, &id)) {
+			h = prev;
+		} else if (recent && id.mtime >= now - 1) {
+			*recent = 1;
+			h = prev; // the old one until this one has settled, or nothing yet
+		}
+		if (h) {
+			atomic_fetch_add(&h->refs, 1);
+		} else {
+			if (t->n >= WT_HOSTS_MAX) {
+				full = 1;
+				continue;
+			}
+			h = hcert_load(dir, e->d_name, name, id);
+			if (!h) continue; // no memory: the next look tries again
+			if (prev) {
+				replaced++;
+			} else {
+				added++;
+			}
+		}
+		if (t->n == cap) {
+			size_t nc = cap ? cap * 2 : 64;
+			wt_hcert **nv = realloc(t->v, nc * sizeof(*nv));
+			if (!nv) {
+				hcert_unref(h);
+				break;
+			}
+			t->v = nv;
+			cap = nc;
+		}
+		t->v[t->n++] = h;
+	}
+	closedir(d);
+	if (!t) return 0;
+	atomic_init(&t->refs, 1);
+	if (full) {
+		HW_ERROR("wt", "webtransport-cert-dir %s holds more than %d certificates: the rest are not read", dir,
+		         WT_HOSTS_MAX);
+	}
+	if (t->n) qsort(t->v, t->n, sizeof(*t->v), hcert_cmp);
+	for (size_t i = 0; old && i < old->n; i++) removed += hosts_find(t, old->v[i]->name) == NULL;
+	if (added == 0 && replaced == 0 && removed == 0 && old && !s->wt_hosts_unpublished) {
+		wt_hosts_unref(t);
+		return 0;
+	}
+	size_t usable = 0;
+	for (size_t i = 0; i < t->n; i++) usable += t->v[i]->ok;
+	wt_hosts_unref(s->wt_hosts_cur);
+	s->wt_hosts_cur = t;
+	s->wt_hosts_unpublished = wt_hosts_publish(s, running) != 0;
+	if (added || replaced || removed || !old) {
+		HW_INFO("wt", "webtransport-cert-dir: %zu certificates (%zu new, %zu replaced, %zu gone, %zu unusable)", usable,
+		        added, replaced, removed, t->n - usable);
+	}
+	return 0;
+}
+
+static void wt_hosts_watch(hw_server *s, int running) {
+	const char *dir = s->cfg.webtransport_cert_dir;
+	if (!dir[0]) return;
+	wt_file_id d = file_id(dir);
+	uint64_t now = hw_now_ms();
+	if (file_id_same(&d, &s->wt_dir_seen) && now < s->wt_dir_rescan_ms && !s->wt_hosts_unpublished) return;
+	int recent = 0;
+	if (wt_hosts_scan(s, running, &recent) != 0) {
+		if (!s->wt_dir_failed) {
+			HW_ERROR("wt", "webtransport-cert-dir %s: %s; new sessions keep the certificates loaded before", dir,
+			         strerror(errno));
+		}
+		s->wt_dir_failed = 1;
+		memset(&s->wt_dir_seen, 0, sizeof(s->wt_dir_seen));
+		s->wt_dir_rescan_ms = now + WT_DIR_RESCAN_MS;
+		return;
+	}
+	s->wt_dir_failed = 0;
+	// A directory changed within its mtime's second may change again in that second: look again.
+	s->wt_dir_seen = d;
+	if (recent || d.mtime >= (int64_t)time(NULL) - 1) memset(&s->wt_dir_seen, 0, sizeof(s->wt_dir_seen));
+	s->wt_dir_rescan_ms = now + WT_DIR_RESCAN_MS;
+}
+
 void wt_cert_tick(hw_server *s, int running) {
 	if (!s->cfg.webtransport) return;
+	wt_hosts_watch(s, running);
 	if (s->cfg.webtransport_cert[0]) {
 		wt_cert_watch(s, running);
 		return;
@@ -1259,6 +1564,16 @@ int wt_listener_init(hw_server *s) {
 		s->workers[i].wt = wt_worker_new(&s->workers[i]);
 		if (!s->workers[i].wt) return -1;
 	}
+	if (cfg->webtransport_cert_dir[0]) {
+		// What is in it is read at start like the rest of the configuration; a file that does not
+		// load is only that host without a certificate of its own.
+		s->wt_dir_seen = file_id(cfg->webtransport_cert_dir);
+		s->wt_dir_rescan_ms = hw_now_ms() + WT_DIR_RESCAN_MS;
+		if (wt_hosts_scan(s, 0, NULL) != 0) {
+			HW_ERROR("wt", "webtransport-cert-dir %s: %s", cfg->webtransport_cert_dir, strerror(errno));
+			return -1;
+		}
+	}
 	if (cfg->webtransport_cert[0]) {
 		char why[WT_WHY_LEN];
 		wt_files_stat(s, s->wt_files_seen);
@@ -1351,6 +1666,7 @@ void wt_worker_free(hw_worker *w) {
 	free(ww->tx);
 	free(ww->pkt);
 	wt_cert_free(ww->cert);
+	wt_hosts_unref(ww->hosts);
 	free(ww);
 	w->wt = NULL;
 }

@@ -17,7 +17,8 @@
 typedef struct hw_wtc hw_wtc;
 
 typedef struct {
-	const char *host;
+	const char *host;        // where to connect
+	const char *server_name; // SNI and :authority; NULL: host
 	uint16_t port;
 	const char *path;
 	const char *origin;        // NULL: none sent

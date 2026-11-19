@@ -197,6 +197,31 @@ static void test_webtransport_keys(void) {
 		snprintf(cfg.webtransport_url, sizeof(cfg.webtransport_url), "%s", bad[i]);
 		CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "accepted %s", bad[i]);
 	}
+	cfg.webtransport_url[0] = '\0';
+	// The certificate directory, and the paths: [host] /path, repeatable.
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-cert-dir", "/etc/wt/hosts", err, sizeof(err)), 0);
+	CHECK_STR(cfg.webtransport_cert_dir, "/etc/wt/hosts");
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-path", "/pipe/0123456789abcdef", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-path", "relay.example   /", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport_path_count, 2);
+	CHECK_STR(cfg.webtransport_paths[0].host, "");
+	CHECK_STR(cfg.webtransport_paths[0].path, "/pipe/0123456789abcdef");
+	CHECK_STR(cfg.webtransport_paths[1].host, "relay.example");
+	CHECK_STR(cfg.webtransport_paths[1].path, "/");
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "paths: %s", err);
+	// Not a path, or not one rule; and the value is never repeated (it may hold a gate key).
+	const char *bad_paths[] = {
+	    "pipe/secretkey", "", "relay.example", "/a b", "/secretkey?x", "a/b /secretkey", "relay.example /secretkey x"};
+	for (size_t i = 0; i < sizeof(bad_paths) / sizeof(bad_paths[0]); i++) {
+		CHECK(hw_config_set(&cfg, "webtransport-path", bad_paths[i], err, sizeof(err)) != 0, "accepted '%s'",
+		      bad_paths[i]);
+		CHECK(strstr(err, "secretkey") == NULL, "the value is in the message: %s", err);
+	}
+	CHECK_EQ(cfg.webtransport_path_count, 2);
+	for (int i = 2; i < HW_MAX_WT_PATHS; i++) {
+		CHECK_EQ(hw_config_set(&cfg, "webtransport-path", "/x", err, sizeof(err)), 0);
+	}
+	CHECK(hw_config_set(&cfg, "webtransport-path", "/x", err, sizeof(err)) != 0, "past HW_MAX_WT_PATHS");
 }
 
 static void test_shipped_configs(void) {

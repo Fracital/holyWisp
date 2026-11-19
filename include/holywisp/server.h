@@ -19,6 +19,7 @@
 #define HW_MAX_PASSWORD_USERS  64
 #define HW_MAX_TRUSTED_HEADERS 8
 #define HW_MAX_ORIGINS         32
+#define HW_MAX_WT_PATHS        32
 #define HW_MAX_DNS_SERVERS     8
 
 typedef struct hw_password_user {
@@ -177,6 +178,16 @@ typedef struct hw_server_config {
 	// certificate valid for 13 days, renewed every 6, whose hashes /webtransport.json publishes.
 	char webtransport_cert[512];
 	char webtransport_key[512];
+	// A directory of <host>.pem files (chain and P-256 key in one file) picked by the SNI a client
+	// sends; any other name gets the certificate above. Read again when it changes. "" = none.
+	char webtransport_cert_dir[512];
+	// webtransport-path rules: a session request is admitted only when one names its :authority
+	// and :path (hw_wt_route_match); none at all admits every path. host "" is any host.
+	struct {
+		char host[256];
+		char path[256];
+	} webtransport_paths[HW_MAX_WT_PATHS];
+	int webtransport_path_count;
 	int webtransport_idle_timeout_s;  // QUIC idle timeout
 	int webtransport_max_handshakes;  // handshakes in progress per worker
 	int webtransport_retry_threshold; // handshakes in progress per worker past which an Initial gets a Retry

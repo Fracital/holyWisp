@@ -369,7 +369,7 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 - **Logs.** `hw_log` writes every control byte of the tag and message as `\xNN`; callers pass
   client strings as they are. A failed login is logged without the user name it tried, and a
   config error never echoes the value of `proxy`, `trusted-proxy-secret`,
-  `proxy-client-key-secret` or a `password-user`.
+  `proxy-client-key-secret`, a `webtransport-path` or a `password-user`.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
   lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits
@@ -599,7 +599,14 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   rotation still connects. With operator files nothing rotates and no hash is listed; the key
   must be P-256 and match the leaf, or the server does not start. Operator files are re-read when
   they change (`wt_cert_watch`: once neither has changed for one look, with the checks made at
-  start, kept only if they pass), for new sessions only.
+  start, kept only if they pass), for new sessions only. With `webtransport-cert-dir`, the
+  client's SNI picks a `<host>.pem` (chain and key in one file) from a table the maintenance
+  thread rebuilds when the directory changes and shares between the workers by reference
+  (`wt_hosts`, `hosts_swap_task`; immutable, freed by its last reference); any other name gets
+  the certificate above. `webtransport-path` rules (`hw_wt_route_match`) admit a session only on
+  the paths and hosts they name, 404 otherwise, before `conn_wt_new`; the value may hold a gate
+  key and is never logged. A request that is not a CONNECT is 421 with `alt-svc: clear`, so a
+  page load sent here by a CDN's cached alternative service goes back to TCP.
 - **The idle timeout is mandatory** (`webtransport-idle-timeout-s`, 1 to 3600), and the server
   sends a keepalive after 20 s without sending (divide's conntrack forgets a UDP flow at 30 s).
 - **A session ends promptly, whoever ends it.** Chrome never sends CONNECTION_CLOSE and goes

@@ -32,6 +32,8 @@ static void usage(const char *argv0) {
 	        "                       (a value of the server's /webtransport.json)\n"
 	        "      --insecure       WebTransport: take any certificate (loopback tests only)\n"
 	        "      --origin ORIGIN  WebTransport: send this origin header\n"
+	        "      --connect-to A   WebTransport: connect to address or name A, the URL's host still\n"
+	        "                       the SNI and :authority (as curl's --connect-to)\n"
 	        "  -u, --udp            open a UDP stream instead of TCP\n"
 	        "  -2, --v2             negotiate wisp-v2\n"
 	        "      --user U         v2 password auth username (with --pass)\n"
@@ -293,6 +295,7 @@ int main(int argc, char **argv) {
 	size_t bench = 0;
 	int insecure = 0;
 	const char *pin = NULL;
+	const char *connect_to = NULL;
 	uint8_t pin_hash[32];
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
@@ -327,6 +330,8 @@ int main(int argc, char **argv) {
 			insecure = 1;
 		} else if (!strcmp(a, "--origin") && i + 1 < argc) {
 			o.origin = argv[++i];
+		} else if (!strcmp(a, "--connect-to") && i + 1 < argc) {
+			connect_to = argv[++i];
 		} else if (!strcmp(a, "-v") || !strcmp(a, "--verbose")) {
 			g_verbose = 1;
 		} else if (a[0] == '-' && a[1]) {
@@ -362,8 +367,8 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "an https:// server needs --pin (or --insecure, which takes any certificate)\n");
 			return 2;
 		}
-	} else if (pin || insecure || o.origin) {
-		fprintf(stderr, "--pin, --insecure and --origin are for an https:// (WebTransport) server\n");
+	} else if (pin || insecure || o.origin || connect_to) {
+		fprintf(stderr, "--pin, --insecure, --origin and --connect-to are for an https:// (WebTransport) server\n");
 		return 2;
 	}
 	long target_port = strtol(positional[1], NULL, 10);
@@ -372,6 +377,10 @@ int main(int argc, char **argv) {
 		return 2;
 	}
 	o.host = host;
+	if (connect_to) {
+		o.server_name = host;
+		o.host = connect_to;
+	}
 	o.port = port;
 	o.path = path;
 
