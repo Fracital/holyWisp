@@ -10,9 +10,9 @@
   response and log from Google Fonts (Holo already loads Roboto from there; offline, both fall back
   to the system stacks below), and the only local code is the WispClient class below. Laid out like
   an Android settings screen, Holo dark.
-  Set the Wisp server field to a local ws:// server or an external wss:// domain. With the transport
-  on Automatic, the page reads that relay's /webtransport.json and races WebTransport (Wisp over
-  HTTP/3, UDP stream data as QUIC datagrams) against a WebSocket, and remembers the winner per relay.
+  Set the Wisp server field to a local ws:// server or an external wss:// domain. With UDP on, the
+  page reads that relay's /webtransport.json and races WebTransport (Wisp over HTTP/3, on QUIC over
+  UDP) against a WebSocket, and remembers the winner per relay; off, it uses the WebSocket alone.
 -->
 		<link
 			rel="stylesheet"
@@ -35,7 +35,11 @@
 			href="https://fonts.googleapis.com/css2?family=Roboto+Mono:wght@400;500&display=swap"
 		/>
 		<style>
-			/* Layout and type only. Colours, borders and controls are Holo's. */
+			/* Holo (pinned above) styles buttons, checkboxes, the list and the action bar. It has no
+			   text field or text area, so those are drawn here the way Holo draws its own fields:
+			   transparent, with the select's underline, blue when focused. Every colour below is
+			   one of Holo dark's: #33B5E5 (ICS blue), the divider rgba(255, 255, 255, 0.15), the
+			   underline rgba(204, 204, 204, 0.37), #99CC00 and #FF4444. */
 			:root {
 				--sans:
 					Roboto, ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
@@ -43,6 +47,11 @@
 				--mono:
 					'Roboto Mono', ui-monospace, 'SF Mono', 'Cascadia Code',
 					'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
+				--blue: #33b5e5;
+				--divider: rgba(255, 255, 255, 0.15);
+				--underline: rgba(204, 204, 204, 0.37);
+				--secondary: rgba(255, 255, 255, 0.6);
+				color-scheme: dark; /* native scrollbars and resize handles to match */
 			}
 			/* Hiding the log can drop the scrollbar; keep its gutter so the centred column (and
 			   the row under the pointer) does not shift sideways on a toggle. */
@@ -68,18 +77,48 @@
 				max-width: 720px;
 				margin: 0 auto;
 			}
+
+			/* Section headers: Holo's preference category, blue caps over a rule. */
+			h2 {
+				margin: 24px 0 0;
+				padding: 0 16px 6px;
+				border-bottom: 2px solid var(--blue);
+				color: var(--blue);
+				font-size: 13px;
+				font-weight: 700;
+				letter-spacing: 0.04em;
+				text-transform: uppercase;
+			}
+			h2 .count {
+				color: var(--secondary);
+				font-weight: 400;
+				letter-spacing: 0;
+				text-transform: none;
+			}
+			h2 + .holo-list > li:first-child {
+				border-top-width: 0;
+			}
+
+			/* Every row, field or toggle, has a title and a summary in the same type. */
 			.holo-list li .title {
 				display: block;
+				font-size: 16px;
 			}
 			.holo-list li .summary {
 				display: block;
-				font-size: 12px;
-				opacity: 0.6;
 				margin-top: 2px;
+				color: var(--secondary);
+				font-size: 12px;
 			}
+			.holo-list li .summary code {
+				font-family: var(--mono);
+				font-size: 11.5px;
+			}
+
 			/* A toggle row is one <label>: a click anywhere on it is a click on its checkbox,
 			   through the browser's own label activation, so the control's change listener runs
-			   once and the keyboard still works on the checkbox itself. */
+			   once and the keyboard still works on the checkbox itself. Pressed and focused are
+			   Holo's list colours. */
 			.holo-list li.row {
 				padding: 0;
 			}
@@ -95,6 +134,7 @@
 				transition: background-color 0.12s ease;
 			}
 			.holo-list li.row input[type='checkbox'] {
+				margin: 0 4px 0 0;
 				cursor: pointer;
 			}
 			@media (hover: hover) {
@@ -102,95 +142,107 @@
 					background-color: rgba(255, 255, 255, 0.04);
 				}
 			}
+			.holo-list li.row > label:has(input:focus-visible) {
+				background-color: rgba(51, 181, 229, 0.31);
+			}
 			.holo-list li.row > label:active {
-				background-color: rgba(51, 181, 229, 0.18);
+				background-color: rgba(51, 181, 229, 0.6);
 			}
 			.holo-list li.row .grow {
 				flex: 1;
 				min-width: 0;
 			}
-			.holo-list li label.lbl {
+
+			/* Text fields: Holo's field, an underline that turns blue and thicker on focus. */
+			.holo-list li input[type='text'] {
 				display: block;
-				font-size: 12px;
-				opacity: 0.7;
-				margin-bottom: 6px;
-			}
-			.holo-list li input[type='text'],
-			.holo-list li select {
 				width: 100%;
 				box-sizing: border-box;
-				padding: 7px 10px;
-				border: 1px solid #bdbdbd;
-				border-radius: 2px;
+				margin: 6px 0 6px;
+				padding: 6px 0 5px;
+				background: transparent;
+				color: inherit;
+				border: 0;
+				border-bottom: 1px solid var(--underline);
+				border-radius: 0;
+				outline: none;
 				font-size: 15px;
 				line-height: 1.4;
-				letter-spacing: 0.01em;
+				cursor: text;
 			}
-			/* Holo gives a select a margin of its own; line it up with the text fields. */
-			.holo-list li select {
-				margin: 0;
+			.holo-list li input[type='text']:focus {
+				padding-bottom: 4px;
+				border-bottom: 2px solid var(--blue);
 			}
-			.hint {
-				font-size: 11px;
-				opacity: 0.55;
-				margin-top: 5px;
-			}
-			.hint code {
-				font-family: var(--mono);
-			}
+
+			/* Buttons are Holo's; the bar only lines them up with the rows' left edge. */
 			.bar {
 				display: flex;
 				gap: 12px;
 				flex-wrap: wrap;
 				align-items: center;
-				padding: 16px;
+				padding: 16px 16px 12px;
+			}
+			.bar button {
+				margin: 0;
 			}
 			.status {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 6px 16px;
+				padding: 0 16px 4px;
+				color: var(--secondary);
 				font-family: var(--mono);
 				font-size: 12px;
-				opacity: 0.85;
-				display: flex;
-				gap: 16px;
-				flex-wrap: wrap;
-				padding: 0 16px 8px;
+			}
+			.status b {
+				color: #fff;
+				font-weight: 500;
 			}
 			.dot {
 				display: inline-block;
 				width: 9px;
 				height: 9px;
+				margin-right: 6px;
 				border-radius: 50%;
-				background: #888;
-				margin-right: 5px;
+				background: rgba(255, 255, 255, 0.3);
 				vertical-align: middle;
 			}
+			.dot.busy {
+				background: var(--blue);
+			}
 			.dot.on {
-				background: #8bc34a;
+				background: #99cc00;
 			}
 			.dot.err {
-				background: #e05252;
+				background: #ff4444;
 			}
-			h2 {
-				font-size: 11px;
-				text-transform: uppercase;
-				letter-spacing: 0.1em;
-				opacity: 0.6;
-				margin: 16px;
-				font-weight: 700;
-			}
+
+			/* Output: read-only panels edged like the list, focus as the fields. */
 			textarea {
 				display: block;
 				width: calc(100% - 32px);
-				margin: 0 16px;
 				box-sizing: border-box;
 				min-height: 140px;
+				margin: 12px 16px 0;
 				padding: 8px 10px;
-				border: 1px solid #bdbdbd;
-				border-radius: 2px;
+				background: rgba(255, 255, 255, 0.04);
+				color: inherit;
+				border: 1px solid var(--divider);
+				border-radius: 1px;
+				outline: none;
 				font-family: var(--mono);
 				font-size: 12.5px;
 				line-height: 1.55;
 				white-space: pre-wrap;
 				word-break: break-word;
+			}
+			textarea:focus {
+				border-color: rgba(51, 181, 229, 0.6);
+			}
+			textarea::placeholder,
+			input::placeholder {
+				color: rgba(255, 255, 255, 0.35);
 			}
 			.hidden {
 				display: none;
@@ -216,59 +268,50 @@
 		</header>
 
 		<div class="wrap">
+			<h2>Connection</h2>
 			<ul class="holo-list">
 				<li>
-					<label class="lbl" for="wisp">Wisp server</label>
+					<label class="title" for="wisp">Wisp server</label>
 					<input
 						id="wisp"
 						type="text"
 						value="ws://127.0.0.1:6001/"
 						spellcheck="false"
+						autocomplete="off"
 					/>
-					<div class="hint">
-						Local <code>ws://127.0.0.1:6001/</code>, external
-						<code>wss://wisp.example.com/</code>
-					</div>
+					<span class="summary"
+						>Local <code>ws://127.0.0.1:6001/</code>, external
+						<code>wss://wisp.example.com/</code></span
+					>
 				</li>
 				<li>
-					<label class="lbl" for="transport">Transport</label>
-					<select id="transport">
-						<option value="auto" selected>
-							Automatic: WebTransport, else WebSocket
-						</option>
-						<option value="webtransport">WebTransport only</option>
-						<option value="websocket">WebSocket only</option>
-					</select>
-					<div class="hint">
-						Automatic reads the relay's <code>/webtransport.json</code>, races
-						WebTransport against a WebSocket, and remembers the winner for this
-						relay.
-					</div>
-				</li>
-				<li>
-					<label class="lbl" for="target">Target URL</label>
+					<label class="title" for="target">Target URL</label>
 					<input
 						id="target"
 						type="text"
 						value="http://api.ipify.org/"
 						spellcheck="false"
+						autocomplete="off"
 					/>
-					<div class="hint">
-						The server relays a plain GET to this host and port.
-					</div>
+					<span class="summary"
+						>The server relays a plain GET to this host and port.</span
+					>
 				</li>
-				<li>
-					<label class="lbl" for="dns">DNS server (UDP)</label>
-					<input
-						id="dns"
-						type="text"
-						value="one.one.one.one:53"
-						spellcheck="false"
-					/>
-					<div class="hint">
-						With UDP on, the target's host is also resolved here, over a Wisp
-						UDP stream.
-					</div>
+			</ul>
+
+			<h2>Options</h2>
+			<ul class="holo-list">
+				<li class="row">
+					<label>
+						<span class="grow">
+							<span class="title">UDP</span>
+							<span class="summary"
+								>Carry Wisp over WebTransport (QUIC), falling back to a
+								WebSocket</span
+							>
+						</span>
+						<input id="udp" type="checkbox" checked />
+					</label>
 				</li>
 				<li class="row">
 					<label>
@@ -279,17 +322,6 @@
 							>
 						</span>
 						<input id="v2" type="checkbox" checked />
-					</label>
-				</li>
-				<li class="row">
-					<label>
-						<span class="grow">
-							<span class="title">UDP</span>
-							<span class="summary"
-								>Resolve the target's host over a Wisp UDP stream (DNS)</span
-							>
-						</span>
-						<input id="udp" type="checkbox" checked />
 					</label>
 				</li>
 				<li class="row">
@@ -314,14 +346,13 @@
 				<span>version <b id="ver">-</b></span>
 				<span>window <b id="win">-</b></span>
 				<span>bytes in/out <b id="bytes">0 / 0</b></span>
-				<span>udp <b id="udp-out">-</b></span>
 			</div>
 
-			<h2>Response <span id="respcount"></span></h2>
+			<h2>Response <span id="respcount" class="count"></span></h2>
 			<textarea
 				id="resp"
 				readonly
-				placeholder="The destination HTTP response appears here."
+				placeholder="The destination's HTTP response appears here."
 			></textarea>
 
 			<div id="logcard">
@@ -346,14 +377,8 @@
 				INFO: 0x05,
 			};
 			const STREAM_TCP = 0x01;
-			const STREAM_UDP = 0x02;
 			// Wisp v2 extensions (INFO: id u8, length u32 LE, metadata).
-			const EXT = {
-				UDP: 0x01,
-				PASSWORD: 0x02,
-				MOTD: 0x04,
-				STREAM_CONFIRM: 0x05,
-			};
+			const EXT = { PASSWORD: 0x02, MOTD: 0x04, STREAM_CONFIRM: 0x05 };
 			const CLOSE_REASONS = {
 				0x01: 'unknown',
 				0x02: 'voluntary (remote closed)',
@@ -416,8 +441,7 @@
 				}
 			}
 
-			// One bidirectional stream of packets, each behind a u32 LE length. UDP DATA may also
-			// travel as a QUIC datagram (one packet, no length), both ways.
+			// One bidirectional stream of packets, each behind a u32 LE length.
 			class WtTransport {
 				constructor(cfg, v2) {
 					this.name = 'webtransport';
@@ -459,8 +483,6 @@
 						onLog('info', 'webtransport session ready');
 						const bidi = await this.wt.createBidirectionalStream();
 						this.writer = bidi.writable.getWriter();
-						this.dgWriter = this.wt.datagrams.writable.getWriter();
-						this._readDatagrams(onPacket);
 						const reader = bidi.readable.getReader();
 						let buf = new Uint8Array(0);
 						for (;;) {
@@ -483,34 +505,12 @@
 						end('webtransport: the Wisp stream ended');
 					})().catch((e) => end(`webtransport failed: ${e.message || e}`));
 				}
-				async _readDatagrams(onPacket) {
-					const r = this.wt.datagrams.readable.getReader();
-					try {
-						for (;;) {
-							const { value, done } = await r.read();
-							if (done) return;
-							onPacket(value, 'datagram');
-						}
-					} catch {
-						// the session ended
-					}
-				}
 				send(buf) {
 					if (!this.writer) return;
 					const f = new Uint8Array(4 + buf.length);
 					new DataView(f.buffer).setUint32(0, buf.length, true);
 					f.set(buf, 4);
 					this.writer.write(f).catch(() => {});
-				}
-				// 1 when it went as a datagram, 0 when it did not fit and went on the stream.
-				sendDatagram(buf) {
-					const max = this.wt && this.wt.datagrams.maxDatagramSize;
-					if (!this.dgWriter || !max || buf.length > max) {
-						this.send(buf);
-						return 0;
-					}
-					this.dgWriter.write(buf).catch(() => {});
-					return 1;
 				}
 				close() {
 					this.closed = true;
@@ -527,11 +527,10 @@
 			class WispClient {
 				constructor(
 					transport,
-					{ v2 = true, udp = true, onLog, onState, onData, onClose } = {},
+					{ v2 = true, onLog, onState, onData, onClose } = {},
 				) {
 					this.t = transport;
 					this.v2 = v2;
-					this.udp = udp;
 					this.onLog = onLog || (() => {});
 					this.onState = onState || (() => {});
 					this.onData = onData || (() => {});
@@ -539,7 +538,7 @@
 					this.ready = false;
 					this.nextId = 1;
 					this.sentInfo = false;
-					this.server = { version: null, udp: null, motd: '', password: false };
+					this.server = { version: null, motd: '', password: false };
 					this.confirm = false;
 				}
 
@@ -563,18 +562,11 @@
 					this.t.close();
 				}
 
-				_send(type, streamId, payload, { datagram = false } = {}) {
-					const buf = packet(type, streamId, payload);
-					let via = this.t.name === 'webtransport' ? 'stream' : 'message';
-					if (datagram && this.t.sendDatagram) {
-						via = this.t.sendDatagram(buf) ? 'datagram' : 'stream';
-					} else {
-						this.t.send(buf);
-					}
+				_send(type, streamId, payload) {
+					this.t.send(packet(type, streamId, payload));
 					this.onLog(
 						'tx',
-						`${typeName(type)} stream=${streamId} len=${payload ? payload.length : 0}` +
-							(via === 'datagram' ? ' (datagram)' : ''),
+						`${typeName(type)} stream=${streamId} len=${payload ? payload.length : 0}`,
 					);
 				}
 
@@ -592,15 +584,13 @@
 						const meta = payload.subarray(o + 5, o + 5 + len);
 						o += 5 + len;
 						exts.push(id);
-						if (id === EXT.UDP) this.server.udp = true;
 						if (id === EXT.MOTD) this.server.motd = dec.decode(meta);
 						if (id === EXT.PASSWORD) this.server.password = !!meta[0];
 					}
-					if (this.server.udp === null) this.server.udp = false;
 					return exts;
 				}
 
-				_onPacket(buf, via) {
+				_onPacket(buf) {
 					if (buf.length < 5) return;
 					const type = buf[0];
 					const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -612,10 +602,7 @@
 							(type === PKT.CLOSE
 								? ` reason=${CLOSE_REASONS[payload[0]] || payload[0]}`
 								: '') +
-							(type === PKT.CONTINUE
-								? ` window=${dv.getUint32(5, true)}`
-								: '') +
-							(via === 'datagram' ? ' (datagram)' : ''),
+							(type === PKT.CONTINUE ? ` window=${dv.getUint32(5, true)}` : ''),
 					);
 
 					if (type === PKT.INFO && streamId === 0) {
@@ -648,14 +635,8 @@
 						});
 						if (!this.sentInfo) {
 							this.sentInfo = true;
-							// Ours: UDP when we want it and the server has it, and stream confirmation.
-							const want = [];
-							if (this.udp && this.server.udp) want.push(EXT.UDP);
-							want.push(EXT.STREAM_CONFIRM);
-							const p = new Uint8Array(2 + 5 * want.length);
-							p[0] = 2;
-							p[1] = 0;
-							want.forEach((id, i) => (p[2 + 5 * i] = id)); // each with empty metadata
+							// Ours: stream confirmation, with empty metadata.
+							const p = new Uint8Array([2, 0, EXT.STREAM_CONFIRM, 0, 0, 0, 0]);
 							this._send(PKT.INFO, 0, p);
 							this.confirm = true;
 						}
@@ -686,41 +667,29 @@
 							`stream ${streamId} connected (stream confirmation)`,
 						);
 					}
-					if (type === PKT.DATA) this.onData(streamId, payload, via);
+					if (type === PKT.DATA) this.onData(streamId, payload);
 					if (type === PKT.CLOSE) this.onClose(streamId, payload[0]);
 				}
 
-				_open(kind, host, port) {
+				openTCP(host, port) {
 					const id = this.nextId++;
 					const hostBytes = enc.encode(host);
 					const payload = new Uint8Array(3 + hostBytes.length);
-					payload[0] = kind;
+					payload[0] = STREAM_TCP;
 					new DataView(payload.buffer).setUint16(1, port, true);
 					payload.set(hostBytes, 3);
 					this._send(PKT.CONNECT, id, payload);
-					if (kind === STREAM_TCP)
-						(this.confirmed = this.confirmed || new Set()).delete(id);
+					(this.confirmed = this.confirmed || new Set()).delete(id);
 					return id;
 				}
 
-				openTCP(host, port) {
-					return this._open(STREAM_TCP, host, port);
-				}
-
-				openUDP(host, port) {
-					return this._open(STREAM_UDP, host, port);
-				}
-
-				sendData(streamId, bytes, opts) {
-					this._send(PKT.DATA, streamId, bytes, opts);
-				}
-
-				closeStream(streamId) {
-					this._send(PKT.CLOSE, streamId, new Uint8Array([0x02]));
+				sendData(streamId, bytes) {
+					this._send(PKT.DATA, streamId, bytes);
 				}
 			}
 
-			// ---- Picking a transport, as STomp does. ------------------------------------------
+			// ---- Picking a transport, as STomp does: with UDP on, WebTransport when the relay has it,
+			// raced against a WebSocket; with UDP off, the WebSocket alone. --------------------
 
 			// The relay's /webtransport.json lives at the root of the origin that serves its
 			// WebSocket: ws(s)://host/... -> http(s)://host/webtransport.json.
@@ -796,7 +765,6 @@
 					if (typeof WebTransport === 'undefined') {
 						log('info', 'this browser has no WebTransport');
 					} else if (
-						mode === 'auto' &&
 						memo &&
 						memo.transport === 'websocket' &&
 						Date.now() - memo.at < MEMO_WS_MS
@@ -812,18 +780,12 @@
 							log('info', `no WebTransport for this relay (${e.message || e})`);
 						}
 					}
-					if (mode === 'webtransport' && !wtCfg)
-						throw new Error('WebTransport is not available');
 				}
 				return new Promise((resolve, reject) => {
 					let wsTimer = null;
 					const settle = () => {
 						if (!winner && attempts.length && attempts.every((a) => a.dead)) {
-							if (
-								mode === 'auto' &&
-								wtCfg &&
-								!attempts.some((a) => a.kind === 'websocket')
-							) {
+							if (wtCfg && !attempts.some((a) => a.kind === 'websocket')) {
 								startWs();
 								return;
 							}
@@ -852,7 +814,7 @@
 								winner = c;
 								clearTimeout(wsTimer);
 								for (const o of attempts) if (o.client !== c) o.client.close();
-								if (mode === 'auto' && wtCfg) memoSet(relay, transport.name);
+								if (wtCfg) memoSet(relay, transport.name);
 								log('info', `using ${transport.name}`);
 								resolve({ client: c, extra });
 							},
@@ -865,68 +827,19 @@
 					};
 					let wsStarted = false;
 					const startWs = () => {
-						if (wsStarted || winner || mode === 'webtransport') return;
+						if (wsStarted || winner) return;
 						wsStarted = true;
 						start(new WsTransport(wsUrl, opts.v2));
 					};
 					if (wtCfg) {
 						start(new WtTransport(wtCfg, opts.v2));
-						if (mode === 'auto') {
-							const head =
-								memo && memo.transport === 'webtransport' ? 3000 : 1000;
-							wsTimer = setTimeout(startWs, head);
-						}
+						const head =
+							memo && memo.transport === 'webtransport' ? 3000 : 1000;
+						wsTimer = setTimeout(startWs, head);
 					} else {
 						startWs();
 					}
 				});
-			}
-
-			// ---- DNS over the UDP stream: one A query for the target's host. ------------------
-
-			function dnsQuery(name) {
-				const labels = name.replace(/\.$/, '').split('.');
-				const q = [];
-				const id = (Math.random() * 65536) | 0;
-				q.push(id >> 8, id & 255, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0);
-				for (const l of labels) {
-					const b = enc.encode(l);
-					q.push(b.length, ...b);
-				}
-				q.push(0, 0, 1, 0, 1); // root, type A, class IN
-				return { id, bytes: new Uint8Array(q) };
-			}
-
-			function dnsAnswers(msg, id) {
-				const dv = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
-				if (msg.length < 12 || dv.getUint16(0) !== id) return null;
-				const rcode = msg[3] & 15;
-				const qd = dv.getUint16(4);
-				const an = dv.getUint16(6);
-				let o = 12;
-				const skipName = () => {
-					while (o < msg.length) {
-						const l = msg[o];
-						if (l === 0) return void o++;
-						if ((l & 0xc0) === 0xc0) return void (o += 2);
-						o += 1 + l;
-					}
-				};
-				for (let i = 0; i < qd; i++) {
-					skipName();
-					o += 4;
-				}
-				const ips = [];
-				for (let i = 0; i < an && o + 10 <= msg.length; i++) {
-					skipName();
-					const type = dv.getUint16(o);
-					const len = dv.getUint16(o + 8);
-					o += 10;
-					if (type === 1 && len === 4)
-						ips.push(Array.from(msg.subarray(o, o + 4)).join('.'));
-					o += len;
-				}
-				return { rcode, ips };
 			}
 
 			// ---- The page. ---------------------------------------------------------------------
@@ -961,7 +874,9 @@
 						? ' on'
 						: state === 'error' || state === 'closed'
 							? ' err'
-							: '');
+							: state === 'idle'
+								? ''
+								: ' busy');
 				$('state').textContent = state;
 				if (extra.ver) $('ver').textContent = extra.ver;
 				if (extra.window !== undefined) $('win').textContent = extra.window;
@@ -992,61 +907,6 @@
 				};
 			}
 
-			function parseHostPort(s, defPort) {
-				const m = /^\[?([^\]]+?)\]?(?::(\d+))?$/.exec(s);
-				if (!m) throw new Error(`not host:port: ${s}`);
-				return { host: m[1], port: m[2] ? parseInt(m[2], 10) : defPort };
-			}
-
-			const isIpLiteral = (h) =>
-				/^\d+\.\d+\.\d+\.\d+$/.test(h) || h.includes(':');
-
-			// The DNS lookup: the query goes on the reliable path first (a datagram could overtake the
-			// CONNECT), then again every second, as a datagram where the transport has them.
-			function resolveOverUdp(c, sid, target, dnsSrv) {
-				const q = dnsQuery(target.host);
-				const t0 = performance.now();
-				let tries = 0;
-				let timer = null;
-				let udpDone = false;
-				$('udp-out').textContent = 'asking…';
-				const finish = (text) => {
-					clearTimeout(timer);
-					$('udp-out').textContent = text;
-					c.closeStream(sid);
-					udpDone = true;
-				};
-				const ask = () => {
-					if (udpDone) return;
-					if (tries++ >= 4) return finish('no answer');
-					c.sendData(sid, q.bytes, { datagram: tries > 1 });
-					bump(0, q.bytes.length);
-					timer = setTimeout(ask, 1000);
-				};
-				ask();
-				return {
-					onData(payload, via) {
-						if (udpDone) return;
-						bump(payload.length, 0);
-						const a = dnsAnswers(payload, q.id);
-						if (!a) return;
-						const ms = Math.round(performance.now() - t0);
-						const what = a.ips.length
-							? a.ips.join(', ')
-							: `rcode ${a.rcode}, no A record`;
-						logLine(
-							'info',
-							`udp: ${target.host} is ${what} (from ${dnsSrv.host}:${dnsSrv.port}, ${ms} ms, ${via})`,
-						);
-						finish(`${a.ips[0] || 'none'} (${ms} ms, ${via})`);
-					},
-					closed() {
-						clearTimeout(timer);
-						udpDone = true;
-					},
-				};
-			}
-
 			async function start() {
 				stop();
 				const me = ++run;
@@ -1057,15 +917,11 @@
 				outBytes = 0;
 				bump(0, 0);
 				$('tr').textContent = '-';
-				$('udp-out').textContent = '-';
 				setState('connecting', { ver: '-', window: '-' });
 
 				let target;
-				let dnsSrv = null;
-				const wantUdp = $('udp').checked;
 				try {
 					target = parseTarget($('target').value.trim());
-					if (wantUdp) dnsSrv = parseHostPort($('dns').value.trim(), 53);
 				} catch (e) {
 					logLine('err', e.message);
 					setState('error');
@@ -1075,14 +931,10 @@
 				$('go').disabled = true;
 				$('stop').disabled = false;
 				let tcpId = null;
-				let udpId = null;
-				let udp = null;
 				const opts = {
 					v2: $('v2').checked,
-					udp: wantUdp,
 					onState: (s, extra) => setState(s, extra),
-					onData: (sid, payload, via) => {
-						if (sid === udpId && udp) return udp.onData(payload, via);
+					onData: (sid, payload) => {
 						if (sid !== tcpId) return;
 						bump(payload.length, 0);
 						respBytes += payload.length;
@@ -1092,12 +944,6 @@
 					},
 					onClose: (sid, reason) => {
 						const why = CLOSE_REASONS[reason] || reason;
-						if (sid === udpId) {
-							if (udp) udp.closed();
-							$('udp-out').textContent = `closed: ${why}`;
-							logLine('info', `udp stream ${sid} closed: ${why}`);
-							return;
-						}
 						if (sid !== tcpId) return;
 						logLine('info', `stream ${sid} closed: ${why}`);
 						setState('done', {});
@@ -1107,12 +953,8 @@
 				};
 				let got;
 				try {
-					got = await connectBest(
-						$('wisp').value.trim(),
-						$('transport').value,
-						opts,
-						logLine,
-					);
+					const mode = $('udp').checked ? 'auto' : 'websocket';
+					got = await connectBest($('wisp').value.trim(), mode, opts, logLine);
 				} catch (e) {
 					if (me !== run) return;
 					logLine('err', e.message || String(e));
@@ -1140,17 +982,6 @@
 					'info',
 					`sent HTTP request to ${target.host}:${target.port} on stream ${tcpId}`,
 				);
-
-				if (!wantUdp) return;
-				if (client.server.udp === false) {
-					$('udp-out').textContent = 'not offered';
-					logLine('info', 'udp: the server does not offer UDP streams');
-				} else if (isIpLiteral(target.host)) {
-					$('udp-out').textContent = 'target is an address';
-				} else {
-					udpId = client.openUDP(dnsSrv.host, dnsSrv.port);
-					udp = resolveOverUdp(client, udpId, target, dnsSrv);
-				}
 			}
 
 			function stop() {

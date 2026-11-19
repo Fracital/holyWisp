@@ -270,22 +270,19 @@ one TCP stream to a destination, sends a plain HTTP request, and prints the resp
 per-packet trace. The **Wisp server URL** field is front-and-center so you can point it at a local
 `ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain.
 
-Everything current is on by default:
+Two toggles, both on by default:
 
-- **Transport: Automatic.** The page reads the relay's `/webtransport.json` (pinned hashes, or none
-  for a Web PKI certificate, and the URL to dial, `""` meaning the relay's own host and port) and
-  races WebTransport against a WebSocket. WebTransport gets a 1 s head start, and the WebSocket
-  starts at once if WebTransport fails. The first to finish the Wisp handshake wins, and the page
-  remembers it per relay: a WebSocket win keeps WebTransport off for that relay for an hour. A
-  browser without WebTransport, or a relay without the JSON, goes straight to the WebSocket. The
-  choice can be pinned to either transport.
-- **Wisp v2.** The page shows the server's extensions and MOTD, and asks for UDP and stream
-  confirmation.
-- **UDP.** The page resolves the target's host with a DNS query over a Wisp UDP stream (default
-  resolver `one.one.one.one:53`). Over WebTransport the answer arrives as a QUIC datagram, and the
-  page retries as datagrams.
+- **UDP** carries Wisp over WebTransport (HTTP/3 on QUIC, so UDP) instead of a WebSocket. The page
+  reads the relay's `/webtransport.json`: pinned hashes, or none for a Web PKI certificate, and the
+  URL to dial, where `""` means the relay's own host and port. It races WebTransport against a
+  WebSocket. WebTransport gets a 1 s head start, and the WebSocket starts at once if WebTransport
+  fails. The first to finish the Wisp handshake wins, and the winner is remembered per relay: a
+  WebSocket win keeps WebTransport off for that relay for an hour. A browser without WebTransport,
+  or a relay without the JSON, uses the WebSocket. With UDP off, the WebSocket is used alone.
+- **Wisp v2** shows the server's extensions and MOTD, and asks for stream confirmation.
 
-The default target is `http://api.ipify.org/`.
+The request to the target is a TCP stream from the relay either way; the toggle chooses only how
+the page reaches the relay. The default target is `http://api.ipify.org/`.
 
 ## Node.js
 
