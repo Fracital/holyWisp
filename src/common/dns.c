@@ -198,48 +198,105 @@ static uint16_t next_id(void) {
 	return (uint16_t)(c ^ (uint32_t)getpid() ^ (uint32_t)hw_now_ms());
 }
 
-// One question to one server. 0 ok (res appended), >0 getaddrinfo error.
-static int query_one(const struct sockaddr *server, socklen_t slen, const char *host, uint16_t qtype, int timeout_ms,
-                     hw_dns_result *res) {
-	uint8_t q[512];
-	uint16_t id = next_id();
-	size_t qlen = hw_dns_build_query(q, sizeof(q), id, host, qtype);
-	if (!qlen) return EAI_NONAME;
-	int fd = hw_sys_socket(server->sa_family, SOCK_DGRAM, 0, 0);
-	if (fd < 0) return EAI_SYSTEM;
-	if (connect(fd, server, slen) != 0 || send(fd, q, qlen, 0) != (ssize_t)qlen) {
-		close(fd);
-		return EAI_AGAIN;
+// One question in flight to one server: its own socket (so its own source port, as a resolver
+// that sends A and AAAA from two sockets does) and its own answer, merged once both are in.
+typedef struct dns_question {
+	uint16_t qtype;
+	uint16_t id;
+	int fd;
+	int err; // -1 while it waits for its answer, then 0 or a getaddrinfo error
+	hw_dns_result res;
+} dns_question;
+
+static void question_send(dns_question *q, const struct sockaddr *server, socklen_t slen, const char *host) {
+	uint8_t msg[512];
+	q->fd = -1;
+	q->id = next_id();
+	memset(&q->res, 0, sizeof(q->res));
+	size_t qlen = hw_dns_build_query(msg, sizeof(msg), q->id, host, q->qtype);
+	if (!qlen) {
+		q->err = EAI_NONAME;
+		return;
 	}
+	q->fd = hw_sys_socket(server->sa_family, SOCK_DGRAM, 0, 0);
+	if (q->fd < 0) {
+		q->err = EAI_SYSTEM;
+		return;
+	}
+	if (connect(q->fd, server, slen) != 0 || send(q->fd, msg, qlen, 0) != (ssize_t)qlen) {
+		q->err = EAI_AGAIN;
+		return;
+	}
+	q->err = -1;
+}
+
+// The socket is readable: take the datagram, and settle the question if it is the answer.
+static void question_read(dns_question *q, const char *host) {
 	uint8_t buf[DNS_MAX_MSG];
+	ssize_t n = recv(q->fd, buf, sizeof(buf), 0);
+	if (n < 0) {
+		q->err = EAI_AGAIN;
+		return;
+	}
+	// Parsed apart from the answer kept, so that a message that turns out not to be ours, or to
+	// be malformed past its first records, leaves nothing behind.
+	hw_dns_result res;
+	memset(&res, 0, sizeof(res));
+	int rcode = 0;
+	int pr = hw_dns_parse_response(buf, (size_t)n, q->id, host, q->qtype, &res, &rcode);
+	if (pr == HW_ERR_INVALID) return; // not ours; keep waiting
+	if (pr == HW_ERR_AGAIN) {
+		q->err = EAI_AGAIN;
+	} else if (rcode == 3) {
+		q->err = EAI_NONAME;
+	} else if (rcode != 0) {
+		q->err = EAI_FAIL;
+	} else {
+		q->res = res;
+		q->err = 0;
+	}
+}
+
+// A and AAAA to one server at once, both within one timeout: a lookup holds its resolver thread
+// for the slower of the two, not for their sum. The answers are merged in the order they were
+// once asked in, A first, so dns-order verbatim sees what it always saw.
+static void query_server(const struct sockaddr *server, socklen_t slen, const char *host, int timeout_ms,
+                         hw_dns_result *res, int *ra, int *raaaa) {
+	dns_question qs[2] = {{.qtype = DNS_TYPE_A}, {.qtype = DNS_TYPE_AAAA}};
+	for (int i = 0; i < 2; i++) question_send(&qs[i], server, slen, host);
 	uint64_t deadline = hw_now_ms() + (uint64_t)timeout_ms;
 	for (;;) {
-		uint64_t now = hw_now_ms();
-		if (now >= deadline) {
-			close(fd);
-			return EAI_AGAIN;
+		struct pollfd pfd[2];
+		dns_question *of[2];
+		int n = 0;
+		for (int i = 0; i < 2; i++) {
+			if (qs[i].err != -1) continue;
+			pfd[n] = (struct pollfd){.fd = qs[i].fd, .events = POLLIN};
+			of[n++] = &qs[i];
 		}
-		struct pollfd pfd = {.fd = fd, .events = POLLIN};
-		int r = poll(&pfd, 1, (int)(deadline - now));
+		if (n == 0) break;
+		uint64_t now = hw_now_ms();
+		int r = now >= deadline ? 0 : poll(pfd, (nfds_t)n, (int)(deadline - now));
 		if (r < 0 && errno == EINTR) continue;
 		if (r <= 0) {
-			close(fd);
-			return EAI_AGAIN;
+			for (int i = 0; i < n; i++) of[i]->err = EAI_AGAIN;
+			break;
 		}
-		ssize_t n = recv(fd, buf, sizeof(buf), 0);
-		if (n < 0) {
-			close(fd);
-			return EAI_AGAIN;
+		for (int i = 0; i < n; i++) {
+			if (pfd[i].revents) question_read(of[i], host);
 		}
-		int rcode = 0;
-		int pr = hw_dns_parse_response(buf, (size_t)n, id, host, qtype, res, &rcode);
-		if (pr == HW_ERR_INVALID) continue; // not ours; keep waiting
-		close(fd);
-		if (pr == HW_ERR_AGAIN) return EAI_AGAIN;
-		if (rcode == 3) return EAI_NONAME;
-		if (rcode != 0) return EAI_FAIL;
-		return 0;
 	}
+	for (int i = 0; i < 2; i++) {
+		if (qs[i].fd >= 0) close(qs[i].fd);
+		for (int k = 0; k < qs[i].res.count && res->count < HW_DNS_MAX_ADDRS; k++) {
+			res->addrs[res->count] = qs[i].res.addrs[k];
+			res->lens[res->count] = qs[i].res.lens[k];
+			res->count++;
+		}
+		if (qs[i].res.ttl_known) note_ttl(res, qs[i].res.ttl_s);
+	}
+	*ra = qs[0].err;
+	*raaaa = qs[1].err;
 }
 
 int hw_dns_query(const struct sockaddr_storage *servers, const socklen_t *server_lens, int nservers, const char *host,
@@ -250,9 +307,8 @@ int hw_dns_query(const struct sockaddr_storage *servers, const socklen_t *server
 	for (int s = 0; s < nservers; s++) {
 		hw_dns_result res;
 		memset(&res, 0, sizeof(res));
-		const struct sockaddr *sa = (const struct sockaddr *)&servers[s];
-		int ra = query_one(sa, server_lens[s], host, DNS_TYPE_A, timeout_ms, &res);
-		int raaaa = query_one(sa, server_lens[s], host, DNS_TYPE_AAAA, timeout_ms, &res);
+		int ra = 0, raaaa = 0;
+		query_server((const struct sockaddr *)&servers[s], server_lens[s], host, timeout_ms, &res, &ra, &raaaa);
 		if (res.count > 0) {
 			*out = res;
 			return 0;

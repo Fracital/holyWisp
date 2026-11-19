@@ -445,6 +445,152 @@ static void test_query_ids_are_random(void) {
 	stub_stop(&st, 0);
 }
 
+// ---------------------------------------------------------------------------------- both families
+
+// hw_dns_query on a thread of its own, against a socket the test answers by hand, in whatever
+// order a case wants.
+typedef struct query_run {
+	struct sockaddr_storage server;
+	socklen_t sl;
+	const char *host;
+	int timeout_ms;
+	int err;
+	hw_dns_result res;
+	pthread_t thread;
+} query_run;
+
+static void *query_main(void *arg) {
+	query_run *qr = arg;
+	qr->err = hw_dns_query(&qr->server, &qr->sl, 1, qr->host, qr->timeout_ms, &qr->res);
+	return NULL;
+}
+
+static void query_start(query_run *qr, const dns_stub *st, const char *host, int timeout_ms) {
+	memset(qr, 0, sizeof(*qr));
+	stub_server(st, &qr->server, &qr->sl);
+	qr->host = host;
+	qr->timeout_ms = timeout_ms;
+	CHECK_EQ(pthread_create(&qr->thread, NULL, query_main, qr), 0);
+}
+
+typedef struct asked_q {
+	uint8_t q[512];
+	size_t len;
+	uint16_t qtype;
+	struct sockaddr_storage from;
+	socklen_t fl;
+} asked_q;
+
+// The next question that reaches the stub's socket within wait_ms; 0 when none came.
+static int question_receive(int fd, asked_q *a, int wait_ms) {
+	struct pollfd pfd = {.fd = fd, .events = POLLIN};
+	if (poll(&pfd, 1, wait_ms) != 1) return 0;
+	a->fl = sizeof(a->from);
+	ssize_t n = recvfrom(fd, a->q, sizeof(a->q), 0, (struct sockaddr *)&a->from, &a->fl);
+	if (n < 17) return 0;
+	a->len = (size_t)n;
+	a->qtype = (uint16_t)(a->q[n - 4] << 8 | a->q[n - 3]);
+	return 1;
+}
+
+// Answer a question with an RCODE and, with `record`, one record of the type it asked for:
+// 192.0.2.1 or 2001:db8::1.
+static void question_answer(int fd, const asked_q *a, int rcode, int record, uint32_t ttl) {
+	static const uint8_t v4[4] = {192, 0, 2, 1};
+	static const uint8_t v6[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+	uint8_t resp[600];
+	memcpy(resp, a->q, a->len);
+	resp[2] = 0x81;
+	resp[3] = (uint8_t)(0x80 | rcode);
+	memset(resp + 6, 0, 6);
+	size_t o = a->len;
+	if (record) {
+		uint8_t rdlen = a->qtype == 1 ? 4 : 16;
+		uint8_t rr[12] = {0xC0, 0x0C, (uint8_t)(a->qtype >> 8), (uint8_t)a->qtype, 0, 1};
+		rr[6] = (uint8_t)(ttl >> 24);
+		rr[7] = (uint8_t)(ttl >> 16);
+		rr[8] = (uint8_t)(ttl >> 8);
+		rr[9] = (uint8_t)ttl;
+		rr[11] = rdlen;
+		resp[7] = 1;
+		memcpy(resp + o, rr, sizeof(rr));
+		o += sizeof(rr);
+		memcpy(resp + o, rdlen == 4 ? v4 : v6, rdlen);
+		o += rdlen;
+	}
+	CHECK_EQ(sendto(fd, resp, o, 0, (const struct sockaddr *)&a->from, a->fl), (ssize_t)o);
+}
+
+// A and AAAA go out together. They used to go one after the other, each with the whole timeout,
+// so a server that answered neither held a resolver thread for twice dns-timeout-ms, and every
+// first connect to a name waited for two round trips. Here both questions must arrive before
+// either is answered, well inside the timeout; the answers come back AAAA first and are still
+// merged A first.
+static void test_query_both_families_at_once(void) {
+	dns_stub st;
+	stub_start(&st, 0); // the test reads the socket itself
+	query_run qr;
+	query_start(&qr, &st, "both.test", 3000);
+	asked_q a[2];
+	CHECK(question_receive(st.fd, &a[0], 2000), "the first question");
+	CHECK(question_receive(st.fd, &a[1], 1000), "the second question before the first was answered");
+	CHECK(a[0].qtype != a[1].qtype, "one A and one AAAA");
+	int ia = a[0].qtype == 1 ? 0 : 1;
+	question_answer(st.fd, &a[1 - ia], 0, 1, 30);
+	question_answer(st.fd, &a[ia], 0, 1, 300);
+	pthread_join(qr.thread, NULL);
+	CHECK_EQ(qr.err, 0);
+	CHECK_EQ(qr.res.count, 2);
+	CHECK_EQ(qr.res.addrs[0].ss_family, AF_INET);
+	CHECK_EQ(qr.res.addrs[1].ss_family, AF_INET6);
+	CHECK_EQ(qr.res.ttl_known, 1);
+	CHECK_EQ(qr.res.ttl_s, 30);
+	stub_stop(&st, 0);
+}
+
+// What a lookup returns is what it returned when the questions went one by one: NONAME when both
+// were NXDOMAIN, NODATA when both were answered with nothing, an address from either family
+// whatever the other did, and otherwise the A question's error before the AAAA one's.
+static void test_query_family_outcomes(void) {
+	enum {
+		SILENT = -1
+	};
+	static const struct {
+		int rcode_a, rec_a, rcode_aaaa, rec_aaaa;
+		int err, count;
+	} cases[] = {
+	    {3, 0, 3, 0, EAI_NONAME, 0},
+	    {0, 0, 0, 0, EAI_NODATA, 0},
+	    {3, 0, 0, 1, 0, 1},
+	    {0, 1, 3, 0, 0, 1},
+	    {0, 1, SILENT, 0, 0, 1},
+	    {SILENT, 0, 0, 1, 0, 1},
+	    {0, 0, SILENT, 0, EAI_AGAIN, 0},
+	    {2, 0, 2, 0, EAI_FAIL, 0},
+	    {3, 0, SILENT, 0, EAI_NONAME, 0},
+	    {SILENT, 0, 3, 0, EAI_AGAIN, 0},
+	};
+	for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		dns_stub st;
+		stub_start(&st, 0);
+		query_run qr;
+		query_start(&qr, &st, "outcome.test", 400);
+		asked_q a[2];
+		CHECK(question_receive(st.fd, &a[0], 2000) && question_receive(st.fd, &a[1], 2000), "case %zu: two questions",
+		      i);
+		for (int k = 0; k < 2; k++) {
+			int is_a = a[k].qtype == 1;
+			int rcode = is_a ? cases[i].rcode_a : cases[i].rcode_aaaa;
+			int rec = is_a ? cases[i].rec_a : cases[i].rec_aaaa;
+			if (rcode != SILENT) question_answer(st.fd, &a[k], rcode, rec, 60);
+		}
+		pthread_join(qr.thread, NULL);
+		CHECK(qr.err == cases[i].err, "case %zu: %d, not %d", i, qr.err, cases[i].err);
+		CHECK_EQ(qr.res.count, cases[i].count);
+		stub_stop(&st, 0);
+	}
+}
+
 // ---------------------------------------------------------------------------------- the pool
 
 typedef struct lookup {
@@ -602,6 +748,8 @@ static void test_pool_queue_is_bounded(void) {
 
 int main(void) {
 	RUN(test_query_ids_are_random);
+	RUN(test_query_both_families_at_once);
+	RUN(test_query_family_outcomes);
 	RUN(test_query_roundtrip);
 	RUN(test_question_must_match);
 	RUN(test_query_label_bytes);

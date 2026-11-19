@@ -2,7 +2,8 @@
  * holywisp/dns.h - a small DNS client and a result cache.
  *
  * The client sends A and AAAA queries over UDP to the configured servers (RFC 1035, with
- * compression pointers and CNAME chains inside one response), retrying across servers. It is
+ * compression pointers and CNAME chains inside one response), the two at once, retrying across
+ * servers. It is
  * blocking and used from the resolver's threads only. The cache is shared and locked.
  */
 #ifndef HOLYWISP_DNS_H
@@ -30,8 +31,11 @@ typedef struct hw_dns_result {
 	int ttl_known;  // 0: the answer came without one (getaddrinfo), and ttl_s says nothing
 } hw_dns_result;
 
-// Query every configured server in turn for A and AAAA records of host. 0 on success with at
-// least one address, otherwise a getaddrinfo-style error (EAI_NONAME, EAI_AGAIN, EAI_FAIL).
+// Query every configured server in turn for A and AAAA records of host, both questions at once,
+// each server given timeout_ms for both. 0 on success with at least one address (the A answer's
+// first, then the AAAA answer's), otherwise a getaddrinfo-style error: EAI_NONAME when both
+// questions were answered NXDOMAIN, EAI_NODATA when both were answered with no address, else
+// EAI_AGAIN or EAI_FAIL.
 int hw_dns_query(const struct sockaddr_storage *servers, const socklen_t *server_lens, int nservers, const char *host,
                  int timeout_ms, hw_dns_result *out);
 
