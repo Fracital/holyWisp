@@ -1274,9 +1274,7 @@ static void test_host_certificates(void) {
 	hw_server_free(s);
 
 	// A directory that cannot be read keeps the server from starting, as a certificate would.
-	char missing[600];
-	snprintf(missing, sizeof(missing), "%s/missing", dir);
-	snprintf(cfg.webtransport_cert_dir, sizeof(cfg.webtransport_cert_dir), "%s", missing);
+	snprintf(cfg.webtransport_cert_dir, sizeof(cfg.webtransport_cert_dir), "%.400s/missing", dir);
 	hw_server *none = hw_server_new(&cfg);
 	CHECK(none == NULL, "started without its certificate directory");
 	hw_server_free(none);
