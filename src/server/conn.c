@@ -298,11 +298,61 @@ void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
 // keeps the sum near one pipeline, which is plenty for one stream and keeps many streams on the
 // fast path. It is its own key because the mark is also how long a small reply waits behind a
 // download, and a short queue there is not a reason for a slow upload.
-uint32_t conn_window(const hw_conn *c) {
+//
+// The budget is shared by the streams that upload, not by every stream open: a browser keeps
+// dozens of idle keep-alive sockets and UDP streams on one connection, and dividing by them gave
+// an upload beside 30 idle streams 4 packets per refill where it should have had 128. A stream
+// counts from the window it spends for UPLOAD_ACTIVE_MS to twice that (two periods, so that no
+// stream drops out at a period's edge), and for as long as its refill is held behind a slow
+// remote, which is when it holds the server's memory. Each share is in packets of the size that
+// stream sends, not the connection's average, which a stream of small packets would drag down.
+// O(1): a stream is in one of three counts, and a new period moves the current one to the last.
+#define UPLOAD_ACTIVE_MS 2000
+
+static void conn_upload_unlink(hw_conn *c, hw_stream *s) {
+	if (s->up_held) {
+		c->up_held--;
+		s->up_held = 0;
+	} else if (s->up_epoch != 0 && s->up_epoch == c->up_epoch) {
+		c->up_cur--;
+	} else if (s->up_epoch != 0 && s->up_epoch + 1 == c->up_epoch) {
+		c->up_prev--;
+	}
+	s->up_epoch = 0;
+}
+
+static void conn_upload_mark(hw_conn *c, hw_stream *s) {
+	uint64_t epoch = hw_now_ms() / UPLOAD_ACTIVE_MS + 2; // never 0 or 1: 0 is "never"
+	conn_upload_unlink(c, s);
+	if (epoch != c->up_epoch) {
+		c->up_prev = epoch == c->up_epoch + 1 ? c->up_cur : 0;
+		c->up_cur = 0;
+		c->up_epoch = epoch;
+	}
+	s->up_epoch = epoch;
+	c->up_cur++;
+}
+
+void conn_upload_hold(hw_conn *c, hw_stream *s, int held) {
+	if (!held) {
+		conn_upload_mark(c, s);
+		return;
+	}
+	conn_upload_unlink(c, s);
+	s->up_held = 1;
+	c->up_held++;
+}
+
+void conn_upload_forget(hw_conn *c, hw_stream *s) {
+	conn_upload_unlink(c, s);
+}
+
+uint32_t conn_window(hw_conn *c, hw_stream *s) {
 	const hw_server *srv = c->w->server;
-	size_t streams = hw_map_count(&c->streams);
-	size_t pkt = c->pkt_avg ? c->pkt_avg : 64 * 1024;
-	size_t w = cfg_upload_window(&srv->cfg) / (streams ? streams : 1) / pkt;
+	conn_upload_mark(c, s);
+	size_t streams = (size_t)c->up_cur + c->up_prev + c->up_held; // s is one of them
+	size_t pkt = s->pkt_avg ? s->pkt_avg : c->pkt_avg ? c->pkt_avg : 64 * 1024;
+	size_t w = cfg_upload_window(&srv->cfg) / streams / pkt;
 	if (w < CONN_WINDOW_MIN) w = CONN_WINDOW_MIN;
 	if (w > srv->window) w = srv->window;
 	return (uint32_t)w;
@@ -1441,6 +1491,7 @@ static void handle_message(hw_conn *c, const uint8_t *data, size_t len) {
 		atomic_fetch_add(&c->w->bytes_in, p.payload_len);
 		conn_charge_bandwidth(c, p.payload_len);
 		c->pkt_avg = c->pkt_avg ? (c->pkt_avg * 7 + p.payload_len) / 8 : p.payload_len;
+		s->pkt_avg = s->pkt_avg ? (s->pkt_avg * 7 + p.payload_len) / 8 : p.payload_len;
 		stream_on_data(s, p.payload, p.payload_len);
 		break;
 	}
@@ -1513,6 +1564,8 @@ static int ws_frames(hw_conn *c) {
 				memcpy(c->pt_mask, f.mask, sizeof(c->pt_mask));
 				c->pt_off = HW_WISP_HEADER_LEN & 3;
 				c->pkt_avg = c->pkt_avg ? (c->pkt_avg * 7 + c->pt_left) / 8 : c->pt_left;
+				hw_stream *ps = hw_map_get(&c->streams, c->pt_stream);
+				if (ps) ps->pkt_avg = ps->pkt_avg ? (ps->pkt_avg * 7 + c->pt_left) / 8 : c->pt_left;
 				hw_buf_consume(&c->rbuf, f.header_len + HW_WISP_HEADER_LEN);
 				continue;
 			}

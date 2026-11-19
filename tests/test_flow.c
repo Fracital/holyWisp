@@ -408,10 +408,41 @@ static void test_ingress_window_stalled_upstream(void) {
 	hw_server_free(s);
 }
 
+// Opens a TCP stream to a fresh sink and returns the sink's socket.
+static int open_to_sink(hw_client *c, int lfd, uint16_t port, uint32_t *sid) {
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, sid), 0);
+	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
+	CHECK_EQ(poll(&pfd, 1, 5000), 1);
+	int sink = accept(lfd, NULL, NULL);
+	CHECK(sink >= 0, "accept");
+	set_blocking(sink);
+	return sink;
+}
+
+// Spends stream sid's window of `window` packets of pkt bytes into its sink, reads them there and
+// returns what the refill CONTINUE grants.
+static uint32_t spend_window(hw_client *c, uint32_t sid, int sink, uint32_t window, size_t pkt) {
+	size_t total = (size_t)window * pkt;
+	uint8_t *data = malloc(total);
+	fill_pattern(data, total, 9 + sid);
+	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, sid, data + (size_t)i * pkt, pkt), 0);
+	uint8_t *back = malloc(total);
+	CHECK_EQ(read_full(sink, back, total), 0);
+	CHECK(memcmp(data, back, total) == 0, "window intact");
+	hw_client_event ev;
+	CHECK_EQ(wait_event(c, sid, HW_CEV_CONTINUE, &ev, 5000), 1);
+	free(data);
+	free(back);
+	return ev.buffer_remaining;
+}
+
 // The refill CONTINUE grants the connection's upload budget in packets of the size the client
 // sends: ws-write-high-water by default, upload-window when set. The mark bounds how long a reply
-// waits behind a download; with only it, a short mark capped every upload too.
-static uint32_t refill_after_window(size_t mark, size_t upload) {
+// waits behind a download; with only it, a short mark capped every upload too. The budget is
+// shared by the streams that are uploading: `idle` streams that each did one small exchange and a
+// UDP stream take none of it, and with `second` another stream that spends a window right after
+// the first one gets half. Returns the first stream's refill, or the second's.
+static uint32_t refill_after_window(size_t mark, size_t upload, int idle, int second) {
 	enum {
 		PKT = 16 * 1024
 	};
@@ -422,41 +453,40 @@ static uint32_t refill_after_window(size_t mark, size_t upload) {
 	hw_server *s = start_server(&cfg);
 
 	uint16_t port = 0;
-	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 64, &port);
 	CHECK(lfd >= 0, "sink listen");
 	hw_client *c = connect_plain(s, 0);
 	uint32_t window = hw_client_buffer_size(c);
 	CHECK(window > 32, "advertised window %u leaves room for the budgets below", window);
+	for (int i = 0; i < idle; i++) {
+		uint32_t isid;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &isid), 0);
+		CHECK(echo_once(c, isid, "keep-alive"), "idle stream %d echoes", i);
+	}
+	uint32_t usid;
+	if (idle > 0) CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", 9, &usid), 0);
 	uint32_t sid;
-	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sid), 0);
-	struct pollfd pfd = {.fd = lfd, .events = POLLIN};
-	CHECK_EQ(poll(&pfd, 1, 5000), 1);
-	int sink = accept(lfd, NULL, NULL);
-	CHECK(sink >= 0, "accept");
-	set_blocking(sink);
-
-	size_t total = (size_t)window * PKT;
-	uint8_t *data = malloc(total);
-	fill_pattern(data, total, 9);
-	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, sid, data + (size_t)i * PKT, PKT), 0);
-	uint8_t *back = malloc(total);
-	CHECK_EQ(read_full(sink, back, total), 0);
-	CHECK(memcmp(data, back, total) == 0, "window intact");
-	hw_client_event ev;
-	CHECK_EQ(wait_event(c, sid, HW_CEV_CONTINUE, &ev, 5000), 1);
-	free(data);
-	free(back);
+	int sink = open_to_sink(c, lfd, port, &sid);
+	uint32_t got = spend_window(c, sid, sink, window, PKT);
+	if (second) {
+		uint32_t sid2;
+		int sink2 = open_to_sink(c, lfd, port, &sid2);
+		got = spend_window(c, sid2, sink2, window, PKT);
+		close(sink2);
+	}
 	close(sink);
 	close(lfd);
 	hw_client_free(c);
 	hw_server_free(s);
-	return ev.buffer_remaining;
+	return got;
 }
 
 static void test_upload_window(void) {
-	CHECK_EQ(refill_after_window(256 * 1024, 0), 16);          // the mark: 256 KiB / 16 KiB
-	CHECK_EQ(refill_after_window(256 * 1024, 512 * 1024), 32); // upload-window: 512 KiB / 16 KiB
-	CHECK_EQ(refill_after_window(256 * 1024, 64 * 1024), 4);   // never under 4 packets
+	CHECK_EQ(refill_after_window(256 * 1024, 0, 0, 0), 16);          // the mark: 256 KiB / 16 KiB
+	CHECK_EQ(refill_after_window(256 * 1024, 512 * 1024, 0, 0), 32); // upload-window: 512 KiB / 16 KiB
+	CHECK_EQ(refill_after_window(256 * 1024, 64 * 1024, 0, 0), 4);   // never under 4 packets
+	CHECK_EQ(refill_after_window(256 * 1024, 0, 30, 0), 16);         // idle and UDP streams take no share
+	CHECK_EQ(refill_after_window(256 * 1024, 0, 30, 1), 8);          // two uploading streams split it
 }
 
 // A sender thread for the connection-budget test: hw_client_send blocks once the server stops

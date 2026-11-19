@@ -165,9 +165,11 @@ every test still passes, so each item has a test and a change to it needs a reas
   the mark. Nothing is closed for staying inside its window. The value a *refill* CONTINUE carries
   is dynamic (`conn_window`): the connection's in-flight budget (`upload-window`, by default
   `ws-write-high-water`) shared by
-  its live streams in packets of the size that client actually sends, clamped to [4, the advertised
-  maximum], so one stream gets the whole window and ten streams do not make the server buffer ten
-  windows. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
+  the streams that are uploading (spent a window in the last 2 to 4 s, or have their refill held
+  behind a slow remote; `conn_upload_*`, O(1)) in packets of the size that stream sends, clamped
+  to [4, the advertised maximum], so one stream gets the whole window, ten uploading streams do
+  not make the server buffer ten windows, and idle keep-alive streams beside an upload take none
+  of it. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
   never counted. Toward the
   client, one remote read is split into as many DATA packets as it takes (`conn_send_data`), each
   within the negotiated size and within `CONN_FRAME_MAX` (128 KiB of payload, `frame_payload_max`

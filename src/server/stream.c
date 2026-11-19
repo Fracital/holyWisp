@@ -209,6 +209,7 @@ void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	atomic_fetch_sub(&c->w->server->streams_active, 1);
 	HW_DEBUG("stream", "%s: stream %u closed: %s", c->peer, s->id, hw_close_reason_str(reason));
 	conn_queue_sub(c, hw_buf_avail(&s->out));
+	conn_upload_forget(c, s);
 	conn_pipe_drop(s);
 	if (c->w->batch_stream == s) { // bytes batched for a stream that is going away are dropped
 		c->w->batch_stream = NULL;
@@ -817,6 +818,7 @@ static int stream_flush(hw_stream *s) {
 	hw_buf_shrink(&s->out, STREAM_OUT_KEEP); // drained: a burst's allocation is not kept for the stream's life
 	if (s->continue_due) {
 		s->continue_due = 0;
+		conn_upload_hold(c, s, 0);
 		conn_send_continue(c, s->id, s->remaining);
 		if (c->closing) return -1;
 	}
@@ -879,7 +881,7 @@ void stream_batch_flush(hw_worker *w) {
 	int spent = 0;
 	for (int i = 0; i < pkts; i++) {
 		if (--s->remaining == 0) {
-			s->remaining = conn_window(c);
+			s->remaining = conn_window(c, s);
 			spent = 1;
 		}
 	}
@@ -888,6 +890,7 @@ void stream_batch_flush(hw_worker *w) {
 		conn_send_continue(c, s->id, s->remaining);
 	} else {
 		s->continue_due = 1;
+		conn_upload_hold(c, s, 1);
 	}
 }
 
@@ -964,11 +967,12 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 
 	// Flow control: one CONTINUE per window of packets, held back while the remote is slow.
 	if (s->type != HW_STREAM_UDP && final && --s->remaining == 0) {
-		s->remaining = conn_window(c);
+		s->remaining = conn_window(c, s);
 		if (hw_buf_avail(&s->out) == 0) {
 			conn_send_continue(c, s->id, s->remaining);
 		} else {
 			s->continue_due = 1;
+			conn_upload_hold(c, s, 1);
 		}
 	}
 }

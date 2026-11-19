@@ -303,6 +303,11 @@ typedef struct hw_conn {
 	int bp_paused;     // the send queue passed the high-water mark and has not drained yet
 	size_t queued_out; // bytes waiting in every stream's `out` toward its remote
 	size_t pkt_avg;    // running average DATA payload from this client, 0 until the first
+	// The streams that share the upload budget (conn_window): those that spent a window in the
+	// current period of UPLOAD_ACTIVE_MS (up_cur) or the one before (up_prev), and those whose
+	// refill is held behind a slow remote (up_held). Idle streams and UDP are in none of them.
+	uint64_t up_epoch;
+	uint32_t up_cur, up_prev, up_held;
 	size_t read_chunk; // room offered to each recv: grows while reads fill it, decays when idle
 	// A large DATA frame being forwarded as it arrives (ws_frames): its stream, the payload bytes
 	// still to come, and the frame's mask with the position in its cycle.
@@ -365,6 +370,9 @@ typedef struct hw_stream {
 	hw_buf out;         // toward the remote; UDP entries are [u32 len][datagram]
 	uint32_t remaining; // DATA packets left before we owe the client a CONTINUE
 	int continue_due;   // the window closed while `out` still had bytes queued
+	uint64_t up_epoch;  // the period it last spent a window in (conn_window), 0 for never
+	int up_held;        // counted in conn->up_held instead: its refill waits for `out` to drain
+	size_t pkt_avg;     // running average DATA payload on this stream, 0 until the first
 	int bulk;           // the remote delivers full reads: relay through the pipe (conn_splice_data)
 	int bulk_miss;      // consecutive small splices; enough of them end bulk mode
 	int parked;         // reads stopped until the stream's own pipe has drained into the client
@@ -514,10 +522,17 @@ int webclient_page_build(hw_server *s);
 int conn_violation(hw_conn *c, const char *reason);
 // Bandwidth accounting for `bytes` in either direction; pauses the connection when over budget.
 void conn_charge_bandwidth(hw_conn *c, size_t bytes);
-// The window to hand a TCP stream on its next CONTINUE: the connection's in-flight byte budget
-// (ws-write-high-water) shared between its streams, in packets of the size this client sends,
-// never above the advertised maximum (server->window) and never below a few packets.
-uint32_t conn_window(const hw_conn *c);
+// The window to hand TCP stream s on its next CONTINUE, called when s has just spent one: the
+// connection's in-flight byte budget (upload-window) shared between the streams that are
+// uploading now, in packets of the size s sends, never above the advertised maximum
+// (server->window) and never below a few packets. Counts s as uploading from now on.
+uint32_t conn_window(hw_conn *c, hw_stream *s);
+// held 1: s has spent its window and its CONTINUE is held until its queue drains, and it keeps
+// its share of the upload budget for as long as that takes. held 0: the CONTINUE has gone, and s
+// counts as uploading from now on, as after conn_window.
+void conn_upload_hold(hw_conn *c, hw_stream *s, int held);
+// s is closing: it no longer shares the upload budget.
+void conn_upload_forget(hw_conn *c, hw_stream *s);
 // What one client may have in flight toward its remotes across its streams: upload-window, or
 // ws-write-high-water when that is 0 (the budget the refill CONTINUE and QUIC's credit share out).
 static inline size_t cfg_upload_window(const hw_server_config *cfg) {
