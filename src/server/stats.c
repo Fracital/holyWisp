@@ -65,9 +65,15 @@ int stats_json(const hw_worker *w, hw_buf *out) {
 	hw_server_stats_get(w->server, &st);
 	json_out j = {out, 0};
 	jprintf(&j, "{\"uptimeSeconds\":%llu,", ull(st.uptime_s));
-	jprintf(&j, "\"connections\":{\"total\":%llu,\"active\":%llu,\"perWorkerMin\":%llu,\"perWorkerMax\":%llu},",
+	jprintf(&j, "\"connections\":{\"total\":%llu,\"active\":%llu,\"perWorkerMin\":%llu,\"perWorkerMax\":%llu",
 	        ull(st.connections_total), ull(st.connections_active), ull(st.worker_connections_min),
 	        ull(st.worker_connections_max));
+	// total and active count every socket, the /health and /stats polls with the rest: these say
+	// how many were Wisp clients, and over which transport.
+	jprintf(&j, ",\"webSocket\":{\"total\":%llu,\"active\":%llu},\"webTransport\":{\"total\":%llu,\"active\":%llu}",
+	        ull(st.ws_connections_total), ull(st.ws_connections_active), ull(st.wt_sessions_total),
+	        ull(st.wt_sessions_active));
+	jprintf(&j, ",\"httpReplies\":%llu},", ull(st.http_replies));
 	jprintf(&j, "\"streams\":{\"total\":%llu,\"active\":%llu},", ull(st.streams_total), ull(st.streams_active));
 	jprintf(&j, "\"bytes\":{\"in\":%llu,\"out\":%llu},", ull(st.bytes_in), ull(st.bytes_out));
 	jprintf(&j, "\"refused\":{\"connectionRate\":%llu,\"connectionLimit\":%llu,\"reputation\":%llu},",
@@ -88,9 +94,17 @@ int stats_json(const hw_worker *w, hw_buf *out) {
 	        ull(st.dns_cache_entries), ull(st.reputation_sources), ull(st.reputation_dests));
 	jprintf(&j,
 	        "\"webTransport\":{\"sessions\":{\"total\":%llu,\"active\":%llu},\"handshakes\":%llu,"
-	        "\"retries\":%llu,\"refusedHandshakes\":%llu,\"dropped\":%llu}",
+	        "\"retries\":%llu,\"refusedHandshakes\":%llu,\"dropped\":%llu",
 	        ull(st.wt_sessions_total), ull(st.wt_sessions_active), ull(st.wt_handshakes), ull(st.wt_retries),
 	        ull(st.wt_refused_handshakes), ull(st.wt_dropped));
+	jprintf(&j,
+	        ",\"quic\":{\"sessionsEnded\":%llu,\"packetsSent\":%llu,\"packetsReceived\":%llu,\"packetsLost\":%llu,"
+	        "\"spuriousLost\":%llu,\"bytesSent\":%llu,\"bytesReceived\":%llu,\"congestionEvents\":%llu,"
+	        "\"ptos\":%llu,\"srttUsSum\":%llu}}",
+	        ull(st.wt_quic_sessions), ull(st.wt_quic_packets_sent), ull(st.wt_quic_packets_received),
+	        ull(st.wt_quic_packets_lost), ull(st.wt_quic_spurious_lost), ull(st.wt_quic_bytes_sent),
+	        ull(st.wt_quic_bytes_received), ull(st.wt_quic_congestion_events), ull(st.wt_quic_ptos),
+	        ull(st.wt_quic_srtt_us));
 	// Which build answers, and whether UDP and TCP go through WARP right now: the state the
 	// workers were given at the last look (once a second), not the file's path or its marks.
 	jprintf(&j, ",\"version\":\"%s%s\"", HW_VERSION, HW_VERSION_SUFFIX);

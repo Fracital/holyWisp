@@ -227,7 +227,12 @@ streams, bytes, and every refusal/throttle/block tally), both on the same port. 
 names the running build (`version`) and, as `warpState`, what the WARP state file means at the
 last look: `configured`, `canMark` (the process may mark sockets), `usable`, `state` (`ok`,
 `missing`, `unreadable`, `malformed`, `stale`, `noCapability` or `off`), `ageSeconds` since the
-router last rewrote it and the usable `tunnels` per family. Fields are only ever added. With
+router last rewrote it and the usable `tunnels` per family. `connections.total` counts every
+socket, `/health` and `/stats` polls included; `connections.webSocket` and
+`connections.webTransport` count the Wisp clients by transport and `connections.httpReplies` the
+plain HTTP answers. `webTransport.quic` sums what QUIC counted over the sessions that have ended
+(packets sent, received and lost, spurious losses, bytes, congestion events, PTOs, and the sum of
+each session's last smoothed RTT). Fields are only ever added. With
 `webtransport`, `GET /webtransport.json` on that port is `{"url": ..., "hashes": [...]}`: the URL
 to open (`webtransport-url`, or `""`) and the certificate hashes a page passes to
 `new WebTransport(url, {serverCertificateHashes})`.

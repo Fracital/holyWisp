@@ -88,6 +88,24 @@ typedef struct hw_auth hw_auth;
 typedef struct hw_auth_req hw_auth_req;
 typedef void (*hw_auth_cb)(hw_loop *loop, int ok, void *ud);
 
+// A per-worker counter's add: only its worker's thread writes it (or the thread that frees the
+// worker, after joining it), so a relaxed load and store do what a locked add would, without the
+// lock. hw_server_stats_get reads and sums them from any thread.
+#define HW_WSTAT_ADD(field, n)                                                                            \
+	atomic_store_explicit(&(field), atomic_load_explicit(&(field), memory_order_relaxed) + (uint64_t)(n), \
+	                      memory_order_relaxed)
+
+// The counters a worker keeps for /stats. Bumped once per session or stream, never per packet.
+typedef struct hw_worker_stats {
+	// WebTransport sessions that have ended on this worker, and what QUIC counted over their lives
+	// (folded in at the end, so a long session shows only once it is over). srtt_us is the sum of
+	// each one's last smoothed RTT.
+	_Atomic uint64_t quic_sessions;
+	_Atomic uint64_t quic_packets_sent, quic_packets_received, quic_packets_lost, quic_spurious_lost;
+	_Atomic uint64_t quic_bytes_sent, quic_bytes_received;
+	_Atomic uint64_t quic_congestion_events, quic_ptos, quic_srtt_us;
+} hw_worker_stats;
+
 typedef struct hw_worker {
 	hw_server *server;
 	hw_loop *loop;
@@ -130,6 +148,7 @@ typedef struct hw_worker {
 	pthread_mutex_t inbox_lock;
 	struct hw_handoff *inbox;
 	wt_worker *wt; // NULL without webtransport
+	hw_worker_stats st;
 } hw_worker;
 
 enum proxy_kind {
@@ -235,6 +254,9 @@ struct hw_server {
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
+	_Atomic uint64_t ws_connections_total; // upgraded to a WebSocket (a 101 sent)
+	_Atomic uint64_t ws_connections_active;
+	_Atomic uint64_t http_replies; // answered with plain HTTP: polls, pages, refused upgrades
 	_Atomic uint64_t streams_total;
 	_Atomic uint64_t streams_active;
 	_Atomic uint64_t refused_connection_rate;
@@ -343,6 +365,7 @@ typedef struct hw_conn {
 	uint64_t active_ms; // last frame from the client, for idle-timeout-s
 	int closing;
 	int violations;
+	int ws_counted;      // counted in server->ws_connections_active
 	int conn_slot;       // holds one of server->connections
 	int ip_slot;         // holds one of server->conns_per_ip for c->ip
 	int head_slot;       // holds one of server->heads_per_ip for c->ip, the peer's until the head is read

@@ -233,8 +233,11 @@ enum hw_warp_status {
 
 typedef struct hw_server_stats {
 	uint64_t uptime_s;
-	uint64_t connections_total;
+	uint64_t connections_total; // every accepted socket and WebTransport CONNECT, polls included
 	uint64_t connections_active;
+	uint64_t ws_connections_total; // of those, the ones upgraded to a WebSocket
+	uint64_t ws_connections_active;
+	uint64_t http_replies; // ... and the ones answered with plain HTTP (/health, /stats, pages, refusals)
 	uint64_t streams_total;
 	uint64_t streams_active;
 	uint64_t bytes_in;  // client -> remote
@@ -281,6 +284,13 @@ typedef struct hw_server_stats {
 	uint64_t wt_retries;
 	uint64_t wt_refused_handshakes;
 	uint64_t wt_dropped;
+	// QUIC over the WebTransport sessions that have ended, summed: what a slow session report is
+	// read against. wt_quic_srtt_us is the sum of each session's last smoothed RTT (divide by
+	// wt_quic_sessions for the mean).
+	uint64_t wt_quic_sessions;
+	uint64_t wt_quic_packets_sent, wt_quic_packets_received, wt_quic_packets_lost, wt_quic_spurious_lost;
+	uint64_t wt_quic_bytes_sent, wt_quic_bytes_received;
+	uint64_t wt_quic_congestion_events, wt_quic_ptos, wt_quic_srtt_us;
 	// UDP and TCP on WARP: the state file as the workers were last given it. The age is of the
 	// file's last rewrite, -1 when there is none to be had; the tunnels are those usable now,
 	// per family (0 unless warp_state is HW_WARP_STATUS_OK).

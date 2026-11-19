@@ -243,6 +243,7 @@ void conn_close(hw_conn *c) {
 		c->budget_held = 0;
 	}
 	atomic_fetch_sub(&c->w->server->connections_active, 1);
+	if (c->ws_counted) atomic_fetch_sub(&c->w->server->ws_connections_active, 1);
 	HW_DEBUG("conn", "%s: closed", c->peer);
 	hw_loop_post(c->w->loop, conn_free_task, c);
 }
@@ -1097,6 +1098,7 @@ static void http_reply_x(hw_conn *c, int status, const char *reason, const char 
 		return;
 	}
 	c->state = CONN_HTTP_REPLY;
+	atomic_fetch_add(&c->w->server->http_replies, 1);
 	conn_apply_events(c); // nothing more is read from this client (conn_reads_stopped)
 	conn_flush(c);
 }
@@ -1395,6 +1397,10 @@ static int http_process(hw_conn *c) {
 	c->state = CONN_WS;
 	c->fr_end = c->wsent + hw_buf_avail(&c->wbuf); // the head is no frame: the first one starts here
 	c->is_v2 = v2;
+	// A WebSocket, as /stats counts them apart from the HTTP polls on the same port.
+	c->ws_counted = 1;
+	atomic_fetch_add(&srv->ws_connections_total, 1);
+	atomic_fetch_add(&srv->ws_connections_active, 1);
 	// c->ip is no address only for a peer that is none (a Unix socket): it then has no key.
 	if (cfg->proxy_client_key) {
 		hw_warp_client_key(srv->client_key_secret, srv->client_key_secret_len, c->ip, c->client_key);

@@ -340,6 +340,18 @@ static void session_free(wt_session *s) {
 		         st.ssthresh == UINT64_MAX ? -1LL : (long long)st.ssthresh, (unsigned long long)st.congestion_events,
 		         (unsigned long long)st.ptos, (unsigned long long)st.acked_limited, (unsigned long long)st.bandwidth,
 		         (unsigned long long)st.mds, (unsigned long long)st.pmtu_black_holes);
+		// The session's whole life, into this worker's sums for /stats.
+		hw_worker_stats *ws = &ww->w->st;
+		HW_WSTAT_ADD(ws->quic_sessions, 1);
+		HW_WSTAT_ADD(ws->quic_packets_sent, st.packets_sent);
+		HW_WSTAT_ADD(ws->quic_packets_received, st.packets_received);
+		HW_WSTAT_ADD(ws->quic_packets_lost, st.packets_lost);
+		HW_WSTAT_ADD(ws->quic_spurious_lost, st.spurious_lost);
+		HW_WSTAT_ADD(ws->quic_bytes_sent, st.bytes_sent);
+		HW_WSTAT_ADD(ws->quic_bytes_received, st.bytes_received);
+		HW_WSTAT_ADD(ws->quic_congestion_events, st.congestion_events);
+		HW_WSTAT_ADD(ws->quic_ptos, st.ptos);
+		HW_WSTAT_ADD(ws->quic_srtt_us, st.srtt_us);
 	}
 	session_hs_done(s);
 	for (size_t i = 0; i < s->ncids; i++) {

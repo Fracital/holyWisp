@@ -1737,11 +1737,26 @@ static void test_stats_json(void) {
 	char buf[8192];
 	http_get(g_server, "/stats", buf, sizeof(buf));
 	CHECK(strstr(buf, "\"webTransport\":{\"sessions\":{\"total\":") != NULL, "stats: %s", buf);
+	const char *body = strstr(buf, "\r\n\r\n");
+	CHECK(body && hw_test_json_valid(body + 4), "not JSON: %s", buf);
+	CHECK(strstr(body, "\"quic\":{\"sessionsEnded\":") != NULL, "quic: %s", body);
 	hw_server_stats st = stats(g_server);
 	CHECK(st.wt_sessions_total >= 4, "sessions total %llu", (unsigned long long)st.wt_sessions_total);
 	// A gauge: every handshake has ended, in a session or not.
 	CHECK_EQ(st.wt_handshakes, 0);
 	CHECK_EQ(st.wt_sessions_active, 0);
+	// Every session has ended, so each one's QUIC counters are in the sums: packets both ways,
+	// some bytes, an RTT for each.
+	CHECK(st.wt_quic_sessions >= 4 && st.wt_quic_sessions <= st.wt_sessions_total, "quic sessions %llu of %llu",
+	      (unsigned long long)st.wt_quic_sessions, (unsigned long long)st.wt_sessions_total);
+	CHECK(st.wt_quic_packets_sent > st.wt_quic_sessions && st.wt_quic_packets_received > st.wt_quic_sessions,
+	      "packets %llu sent, %llu received", (unsigned long long)st.wt_quic_packets_sent,
+	      (unsigned long long)st.wt_quic_packets_received);
+	CHECK(st.wt_quic_bytes_sent > 0 && st.wt_quic_bytes_received > 0, "bytes");
+	CHECK(st.wt_quic_srtt_us > 0, "srtt");
+	CHECK(st.wt_quic_packets_lost <= st.wt_quic_packets_sent, "lost %llu", (unsigned long long)st.wt_quic_packets_lost);
+	// None of them is a WebSocket.
+	CHECK_EQ(st.ws_connections_total, 0);
 }
 
 // A CREDIT is taken from the session's streams only: one in a datagram, which could be lost or

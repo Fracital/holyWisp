@@ -881,6 +881,18 @@ static void test_connection_counts(void) {
 	hw_server_stats_get(g_server, &after);
 	// total only ever increments (at accept), so its delta is race-free.
 	CHECK_EQ(after.connections_total, before.connections_total + 2);
+	// Both are WebSockets; a poll of /health on the same port is a connection, but not one of those.
+	CHECK_EQ(after.ws_connections_total, before.ws_connections_total + 2);
+	CHECK(after.ws_connections_active >= before.ws_connections_active + 2, "websockets active %llu -> %llu",
+	      (unsigned long long)before.ws_connections_active, (unsigned long long)after.ws_connections_active);
+	char page[1024];
+	const char *body;
+	http_get_path(g_server, "/health", page, sizeof(page), &body);
+	hw_server_stats polled;
+	hw_server_stats_get(g_server, &polled);
+	CHECK_EQ(polled.connections_total, after.connections_total + 1);
+	CHECK_EQ(polled.ws_connections_total, after.ws_connections_total);
+	CHECK_EQ(polled.http_replies, after.http_replies + 1);
 	CHECK(after.connections_active >= before.connections_active + 2, "active grew by at least 2 (%llu -> %llu)",
 	      (unsigned long long)before.connections_active, (unsigned long long)after.connections_active);
 	hw_client_free(a);
@@ -891,6 +903,7 @@ static void test_connection_counts(void) {
 		usleep(10000);
 	}
 	CHECK(after.connections_active <= before.connections_active, "active settled back");
+	CHECK(after.ws_connections_active <= before.ws_connections_active, "websockets settled back");
 	CHECK(after.bytes_in > 0 && after.bytes_out > 0, "byte counters moved");
 }
 
