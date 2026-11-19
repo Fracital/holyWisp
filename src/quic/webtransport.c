@@ -1103,7 +1103,7 @@ int hw_wt_send(hw_wt *w, const uint8_t *pkt, size_t len, int unreliable) {
 
 size_t hw_wt_queued(const hw_wt *w) {
 	size_t mine = w->wisp_s ? hw_buf_avail(&w->wisp_s->out.tx) : 0;
-	return mine + (w->dead ? 0 : hw_quic_queued(w->q));
+	return mine + (w->dead ? 0 : hw_quic_unsent(w->q));
 }
 
 void hw_wt_pause(hw_wt *w, int paused) {

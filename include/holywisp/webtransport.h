@@ -143,9 +143,12 @@ int hw_wt_ready(const hw_wt *w);
 // more (nothing taken: wait for writable), -1 when the session is not open or has ended.
 int hw_wt_send(hw_wt *w, const uint8_t *pkt, size_t len, int unreliable);
 
-// Bytes of Wisp stream data queued and not yet acknowledged, here and in QUIC (hw_quic_queued).
-// The QUIC part falls as acknowledgements arrive, with no callback: re-check it after
-// hw_quic_input.
+// Bytes of Wisp stream data queued and not yet sent, here and in QUIC (hw_quic_unsent): what a
+// WebSocket's wbuf would hold. What is in flight is not counted: a window of BBR's two BDPs is
+// more than a high-water mark, and counting it paused the remotes with the window full and
+// resumed them only once it had drained (11 MB/s on a path that carries 20). QUIC's own
+// conn_send_max bounds what it holds, in flight or not. The QUIC part falls as packets go out,
+// with no callback: re-check it after hw_quic_input and hw_quic_output.
 size_t hw_wt_queued(const hw_wt *w);
 
 // The largest Wisp packet that fits one datagram on the session now, 0 when there are none.

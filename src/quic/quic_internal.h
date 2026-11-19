@@ -632,6 +632,7 @@ struct hw_quic_conn {
 	uint64_t rx_max_data, rx_highest, rx_consumed;
 	uint64_t db_value;
 	size_t tx_buffered; // unacknowledged + unsent stream bytes
+	size_t tx_unsent;   // stream bytes written and never sent (end - sent, over the streams)
 	hw_qc_smap streams;
 	hw_qc_stream *all, *send_cur, *ctl_head, *ctl_tail, *blk_head;
 	uint64_t next_local[2];       // [bidi, uni] next index of our streams

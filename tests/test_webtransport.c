@@ -1027,6 +1027,10 @@ size_t hw_quic_queued(const hw_quic_conn *q) {
 	return q->queued;
 }
 
+size_t hw_quic_unsent(const hw_quic_conn *q) {
+	return q->queued;
+}
+
 // ---- Endpoints --------------------------------------------------------------------------------
 
 #define EP_PKTS 256

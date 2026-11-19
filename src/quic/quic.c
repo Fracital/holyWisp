@@ -283,6 +283,7 @@ static void stream_reset_send(hw_quic_conn *q, hw_qc_stream *s, uint64_t err) {
 	s->tx_reset_err = err;
 	s->tx_reset_final = s->sb.end;
 	q->tx_buffered -= (size_t)(s->sb.end - s->sb.base);
+	q->tx_unsent -= (size_t)(s->sb.end - s->sb.sent);
 	uint64_t end = s->sb.end;
 	hw_qc_sendbuf_clear(&s->sb);
 	s->sb.base = s->sb.end = s->sb.sent = end;
@@ -2017,7 +2018,9 @@ static void put_streams(hw_quic_conn *q, pkt_build *b) {
 		pkt_put(b, h, 1);
 		hw_qc_sendbuf_copy(&s->sb, off, len, pkt_cur(b));
 		pkt_put(b, len, 1);
+		uint64_t sent_before = s->sb.sent;
 		hw_qc_sendbuf_sent(&s->sb, off, len, fin);
+		q->tx_unsent -= (size_t)(s->sb.sent - sent_before);
 		rec_frame(q, b, HW_QC_R_STREAM, s->id, off, len, fin);
 		// Round robin: the next frame is the next stream's.
 		q->send_cur = s->send_next;
@@ -2686,6 +2689,7 @@ int64_t hw_quic_stream_write(hw_quic_conn *q, uint64_t id, const uint8_t *data, 
 	if (n && hw_qc_sendbuf_write(&s->sb, data, n) < 0) n = 0;
 	q->tx_data += n;
 	q->tx_buffered += n;
+	q->tx_unsent += n;
 	if (n < len) {
 		blk_add(q, s);
 		if (why == 1 && room == n) {
@@ -2772,6 +2776,10 @@ void hw_quic_close(hw_quic_conn *q, uint64_t app_error, const char *reason) {
 
 size_t hw_quic_queued(const hw_quic_conn *q) {
 	return q->tx_buffered;
+}
+
+size_t hw_quic_unsent(const hw_quic_conn *q) {
+	return q->tx_unsent;
 }
 
 int hw_quic_is_drained(const hw_quic_conn *q) {

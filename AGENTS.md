@@ -552,7 +552,9 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   and nowhere else; the WebSocket path through them is unchanged and must stay so (the loopback
   bench before and after).
 - **What replaces the socket.** `hw_wt_queued` stands in for `wbuf` in `conn_queued`, so
-  `ws-write-high-water` pauses the remotes exactly as for a WebSocket; `conn_reads_stopped`
+  `ws-write-high-water` pauses the remotes exactly as for a WebSocket. It counts what is not sent
+  yet (`hw_quic_unsent`), never what is in flight, as `wbuf` never counts the kernel's: BBR's
+  window is two BDPs, and counting it paused the remotes whenever the window was full; `conn_reads_stopped`
   becomes `hw_wt_pause` (no QUIC credit for the client) in `conn_apply_events`. A WebTransport
   connection never splices (`conn_splice_data` refuses, `stream_read` never sets `s->bulk` for
   it): its bytes are copied into QUIC packets and encrypted anyway. `test_stalled_reader` in
