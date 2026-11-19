@@ -896,6 +896,34 @@ static void test_bbr2_startup_burst(void) {
 	}
 }
 
+// ACKs that come in clumps: one every 5 or 10 ms for everything since (a receiver that decimates
+// them, a Wi-Fi hop), on the edge's path. Startup's window is twice the BDP of an estimate that
+// lags a rate doubling each round, and while the sender waits for a clump it is at that window.
+// Version 3 gives startup the aggregation estimate's room as well, which this had only after
+// startup: bbr2 reached the path 100 and 70 ms after BBR, two rounds and more. With the room it
+// is within a round. What startup measured as aggregation is mostly its own growth (ACKs ahead of
+// an estimate a round old), so it is forgotten when startup ends.
+static void test_bbr2_startup_acks(void) {
+	static const uint64_t every[] = {5000, 10000};
+	for (size_t i = 0; i < HW_ARRAY_LEN(every); i++) {
+		ccsim_result v1, v2;
+		g_ccsim = (ccsim_path){45000, 20000, 1, every[i]};
+		g_cclink = (ccsim_link){125, 0, 0, 0, 0, 0};
+		ccsim_run(1, 333, 1500000, 1000000, 0, 0, &v1);
+		ccsim_run(2, 333, 1500000, 1000000, 0, 0, &v2);
+		g_ccsim = CCSIM_DEFAULT;
+		g_cclink = CCLINK_DEFAULT;
+		printf("  an ACK every %llu ms: at 90%% of the path at %llu ms, bbr's at %llu; dropped %llu, bbr %llu\n",
+		       (unsigned long long)(every[i] / 1000), (unsigned long long)(v2.time_to_rate / 1000),
+		       (unsigned long long)(v1.time_to_rate / 1000), (unsigned long long)v2.lost, (unsigned long long)v1.lost);
+		CHECK(v1.time_to_rate && v2.time_to_rate && v2.time_to_rate < v1.time_to_rate + 45000,
+		      "an ACK every %llu us: at 90%% of the path at %llu us, bbr's at %llu", (unsigned long long)every[i],
+		      (unsigned long long)v2.time_to_rate, (unsigned long long)v1.time_to_rate);
+		CHECK(v2.lost * 4 < v1.lost, "dropped: bbr2 %llu, bbr %llu", (unsigned long long)v2.lost,
+		      (unsigned long long)v1.lost);
+	}
+}
+
 // The path's capacity halves (440 to 220 Mbit/s at 5 s). The max filter remembers the old rate
 // for two probe cycles; a round of too much loss outside a probe lowers bw_lo and inflight_lo,
 // and a probe starts from bw_lo, so the loss ends within a second and does not come back.
@@ -1259,6 +1287,7 @@ static void cc_table(int only_row, int only_v) {
 	     6000000},
 	    {"40 Mbit/s, 40 ms, 40 ms queue, 1% loss", {40000, 40000, 1, 0}, {5, 0, 0, 0, 0, 0}, 100, 20000000, 5000000},
 	    {"1 Gbit/s, 45 ms, 20 ms queue, 0.3% loss", {45000, 20000, 1, 0}, {125, 0, 0, 0, 0, 0}, 333, 4000000, 1000000},
+	    {"the same, ACKs every 2 ms", {45000, 20000, 1, 2000}, {125, 0, 0, 0, 0, 0}, 333, 4000000, 1000000},
 	    {"the same, a 20 ms burst of 1 in 4 lost at 150 ms",
 	     {45000, 20000, 1, 0},
 	     {125, 0, 0, 150000, 20000, 4},
@@ -2792,6 +2821,7 @@ int main(int argc, char **argv) {
 	RUN(test_bbr2_random_loss);
 	RUN(test_bbr2_startup_loss);
 	RUN(test_bbr2_startup_burst);
+	RUN(test_bbr2_startup_acks);
 	RUN(test_bbr2_capacity_drop);
 	RUN(test_bbr2_app_limited);
 	RUN(test_bbr2_fairness);

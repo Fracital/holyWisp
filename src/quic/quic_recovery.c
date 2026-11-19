@@ -441,6 +441,17 @@ static void bbr2_raise_slope(hw_qc_cc *c) {
 	c->b.probe_up_cnt = HW_MAX(c->cwnd / growth, c->mds);
 }
 
+// Startup is over. What it measured as ACK aggregation (bbr_update_ack_aggregation) was mostly its
+// own growth, ACKs running ahead of an estimate a round behind a rate that doubles, and that is
+// not room the rounds after it need.
+static void bbr2_end_startup(hw_qc_cc *c, uint64_t now) {
+	c->b.mode = HW_QC_BBR_DRAIN;
+	c->b.extra_acked[0] = c->b.extra_acked[1] = 0;
+	c->b.extra_acked_rounds = 0;
+	c->b.ack_epoch_start = now;
+	c->b.ack_epoch_acked = 0;
+}
+
 // DOWN after startup, a probe or PROBE_RTT. After PROBE_RTT the wait for the next probe goes on.
 static void bbr2_start_down(hw_qc_cc *c, uint64_t now) {
 	if (c->b.mode != HW_QC_BBR_PROBE_RTT) {
@@ -538,7 +549,7 @@ static void bbr2_on_loss_batch(hw_qc_cc *c, uint64_t now) {
 		c->b.pend = 0;
 		c->b.full_bw_reached = 1;
 		bbr2_set_inflight_hi(c, HW_MAX(bbr_bdp(c, BBR_UNIT), c->b.pend_hi));
-		c->b.mode = HW_QC_BBR_DRAIN;
+		bbr2_end_startup(c, now);
 		return;
 	}
 	if (!c->b.pend) return;
@@ -760,8 +771,12 @@ static void bbr_update_ack_aggregation(hw_qc_cc *c, uint64_t acked, uint64_t now
 	if (extra > c->b.extra_acked[c->b.extra_acked_idx]) c->b.extra_acked[c->b.extra_acked_idx] = extra;
 }
 
+// The room for ACKs that come late or in clumps. Version 1 has it once startup is over; bbr2 has it
+// in startup too, as version 3 does, whose window there is only twice a BDP that lags a rate
+// doubling each round: with an ACK every 5 ms the sender waited at that window and reached the
+// path two rounds after BBR (test_bbr2_startup_acks).
 static uint64_t bbr_ack_aggregation_cwnd(const hw_qc_cc *c) {
-	if (!c->b.full_bw_reached) return 0;
+	if (!c->b.full_bw_reached && !c->b.v2) return 0;
 	uint64_t a = HW_MAX(c->b.extra_acked[0], c->b.extra_acked[1]);
 	return HW_MIN(a, c->b.bw * BBR_EXTRA_ACKED_MAX_US / 1000000);
 }
@@ -826,7 +841,7 @@ static void bbr2_update(hw_qc_cc *c, uint64_t rate, uint64_t delivered, uint64_t
 	bbr2_update_signals(c, rate, delivered);
 	bbr_update_ack_aggregation(c, c->rs.acked, now);
 	bbr2_check_full_bw(c, rate);
-	if (c->b.mode == HW_QC_BBR_STARTUP && c->b.full_bw_reached) c->b.mode = HW_QC_BBR_DRAIN;
+	if (c->b.mode == HW_QC_BBR_STARTUP && c->b.full_bw_reached) bbr2_end_startup(c, now);
 	if (c->b.mode == HW_QC_BBR_DRAIN && c->in_flight <= bbr_bdp(c, BBR_UNIT)) bbr2_start_down(c, now);
 	bbr2_update_cycle(c, rate, now);
 	bbr_update_min_rtt(c, rtt_us, now);
