@@ -324,7 +324,8 @@ static void bbr_check_full_bw(hw_qc_cc *c) {
 // loss since that packet was sent, and a test made at a loss always counts one, so random loss
 // well under the threshold crossed it every few rounds on a small window. On 40 Mbit/s, 40 ms
 // and 1% random loss the draft's test kept 79% of the path, one round of too much loss 81%, and
-// two rounds 95%.
+// two rounds 95%. Startup's loss ends it only with a queue standing (bbr2_on_loss_batch), which
+// the draft does not ask.
 // Sharing a path, the draft is slow to make room for a newcomer. Its startup meets the queue
 // another flow keeps full and ends at a sixth of the path (440 Mbit/s, 30 ms, a 5 ms queue),
 // bounded there until it probes 2 to 3 s later. The flow already there cruises at its bound less
@@ -413,6 +414,11 @@ static uint64_t bbr2_probe_rtt_cwnd(const hw_qc_cc *c) {
 // Too much loss: more than the threshold of what was in flight, and a few packets at least.
 static int bbr2_too_much_loss(const hw_qc_cc *c, uint64_t lost, uint64_t in_flight) {
 	return lost >= BBR2_LOSS_MIN_PACKETS * c->mds && lost * 100 > in_flight * BBR2_LOSS_THRESH_PCT;
+}
+
+// A queue stands: the round's largest RTT is more than BBR2_QUEUE_PCT over the minimum.
+static int bbr2_queue_standing(const hw_qc_cc *c) {
+	return c->b.min_rtt_raw != UINT64_MAX && c->b.round_max_rtt * 100 > c->b.min_rtt_raw * (100 + BBR2_QUEUE_PCT);
 }
 
 static int bbr2_cwnd_limited(const hw_qc_cc *c) {
@@ -518,11 +524,17 @@ void hw_qc_cc_on_lost(hw_qc_cc *c, const hw_qc_sent *s, uint64_t pn) {
 	c->b.pend_app_limited = s->rs_app_limited;
 }
 
-// After a batch of losses: startup ends on too much of it, in enough places, and a probe stops at
-// it. Startup's bound is where the loss began, or the path's BDP if that is more.
+// After a batch of losses: startup ends on too much of it, in enough places, with a queue standing,
+// and a probe stops at it. Startup's bound is where the loss began, or the path's BDP if that is
+// more. The queue is what says the loss is the overflow startup looks for: a burst of loss with no
+// queue behind it (a policer, a receive buffer, a radio) ended startup at the rate it had reached,
+// 15 Mbit/s of a gigabit path in the simulator (test_bbr2_startup_burst), and the probes took 1.7 s
+// to climb from there. Behind a buffer of less than BBR2_QUEUE_PCT of the RTT no queue shows
+// either, and startup ends as version 1's does, when the bandwidth stops growing.
 static void bbr2_on_loss_batch(hw_qc_cc *c, uint64_t now) {
 	if (c->b.mode == HW_QC_BBR_STARTUP) {
 		if (c->b.full_bw_reached || !c->b.pend || c->b.loss_events < BBR2_STARTUP_LOSS_EVTS) return;
+		if (!bbr2_queue_standing(c)) return;
 		c->b.pend = 0;
 		c->b.full_bw_reached = 1;
 		bbr2_set_inflight_hi(c, HW_MAX(bbr_bdp(c, BBR_UNIT), c->b.pend_hi));
@@ -649,8 +661,7 @@ static void bbr2_update_signals(hw_qc_cc *c, uint64_t rate, uint64_t delivered) 
 	}
 	// Another flow's overflow: the loss is of what this one sent since its own probe, and a queue
 	// stands behind it.
-	int queue = c->b.min_rtt_raw != UINT64_MAX && c->b.round_max_rtt * 100 > c->b.min_rtt_raw * (100 + BBR2_QUEUE_PCT);
-	int overflow = !bbr2_probing(c) && queue &&
+	int overflow = !bbr2_probing(c) && bbr2_queue_standing(c) &&
 	               bbr2_too_much_loss(c, c->b.round_lost_since_probe, c->b.round_in_flight);
 	c->b.overflow_rounds = overflow ? c->b.overflow_rounds + 1 : 0;
 	if (c->b.overflow_rounds == BBR2_LOSS_ROUNDS) {
