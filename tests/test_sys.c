@@ -669,8 +669,20 @@ static void test_udp_batch(void) {
 #define CO_LEN   1000
 #define CO_TOTAL 32
 
+// Fills the stack below the caller, where the next call's frame will be, with a word that read
+// as a length is 2^64 - 2^44: added to a pointer it wraps round to 16 TiB below it, under any
+// end it is compared with, and what is there is not mapped. Called through a pointer so that it is
+// never inlined into the caller's own frame.
+static void stack_poison(void) {
+	volatile uint64_t junk[4096];
+	for (size_t i = 0; i < sizeof(junk) / sizeof(junk[0]); i++) junk[i] = 0xfffff00000000000ull;
+}
+static void (*volatile g_stack_poison_fn)(void) = stack_poison;
+
 // The datagrams waiting on rx, taken apart where a read holds several (hw_sys_udp_gro), into
-// lens/tags (each datagram's first byte) in order. How many there were.
+// lens/tags (each datagram's first byte) in order. How many there were. The receive finds its
+// stack poisoned (stack_poison): past the last control message a read would take that for a
+// length that wraps a pointer round the end of the buffer, which once crashed a worker.
 static int coalesced_take(int rx, size_t cap, int want, size_t lens[], uint8_t tags[]) {
 	uint8_t *room = malloc(HW_SYS_BATCH_MAX * cap);
 	CHECK(room != NULL, "malloc");
@@ -684,6 +696,7 @@ static int coalesced_take(int rx, size_t cap, int want, size_t lens[], uint8_t t
 		}
 		struct pollfd p = {rx, POLLIN, 0};
 		poll(&p, 1, 200);
+		g_stack_poison_fn();
 		int r = hw_sys_recv_batch(rx, rd, HW_SYS_BATCH_MAX);
 		if (r < 0) {
 			CHECK(errno == EAGAIN || errno == EWOULDBLOCK, "recv_batch: errno %d", errno);
@@ -775,6 +788,49 @@ static void test_udp_coalesce(void) {
 	close(rx);
 	close(rx2);
 	close(tx);
+}
+
+// A coalesced read and then a single datagram in one batch: the single one has no control
+// message, so its slot holds what the stack held (stack_poison), and the walk over the
+// coalesced read's message must end at its last byte rather than read that as a length. It read
+// it once, made a pointer that wrapped round the end check, and took a worker down.
+static void test_udp_gro_then_single(void) {
+	uint16_t rport = 0, sport = 0, s2port = 0;
+	int rx = udp_bound(&rport, 0);
+	int tx = udp_bound(&sport, 0);
+	int tx2 = udp_bound(&s2port, 0);
+	if (hw_sys_udp_gro(rx) != 1) {
+		close(rx);
+		close(tx);
+		close(tx2);
+		return; // no GRO here: nothing is coalesced and there is no control message to walk
+	}
+	struct sockaddr_in to = loopback_to(rport);
+	static uint8_t bufs[8][CO_LEN];
+	hw_sys_dgram d[8];
+	for (int i = 0; i < 8; i++) {
+		memset(bufs[i], 'A' + i, CO_LEN);
+		d[i].buf = bufs[i];
+		d[i].len = CO_LEN;
+		memcpy(&d[i].addr, &to, sizeof(to));
+		d[i].addr_len = sizeof(to);
+	}
+	for (int sent = 0; sent < 8;) {
+		int r = hw_sys_send_batch(tx, d + sent, (size_t)(8 - sent));
+		CHECK(r >= 1, "send_batch: %d errno %d", r, errno);
+		sent += r;
+	}
+	uint8_t one[500];
+	memset(one, 'z', sizeof(one));
+	CHECK_EQ(sendto(tx2, one, sizeof(one), 0, (struct sockaddr *)&to, sizeof(to)), (ssize_t)sizeof(one));
+	size_t lens[CO_TOTAL + 8];
+	uint8_t tags[CO_TOTAL + 8];
+	CHECK_EQ(coalesced_take(rx, HW_SYS_GRO_SLOT, 9, lens, tags), 9);
+	for (int i = 0; i < 8; i++) CHECK(lens[i] == CO_LEN && tags[i] == 'A' + i, "datagram %d", i);
+	CHECK(lens[8] == sizeof(one) && tags[8] == 'z', "the single datagram");
+	close(rx);
+	close(tx);
+	close(tx2);
 }
 
 // The buffers asked for are what the socket reports afterwards, whatever the cap made of them.
@@ -922,6 +978,7 @@ int main(void) {
 	RUN(test_udp_steer);
 	RUN(test_udp_batch);
 	RUN(test_udp_coalesce);
+	RUN(test_udp_gro_then_single);
 	RUN(test_udp_buffers);
 	RUN(test_udp_no_fragment);
 	RUN(test_mark);

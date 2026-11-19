@@ -194,15 +194,25 @@ int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n) {
 		d[i].segment = d[i].len;
 		d[i].addr_len = mh->msg_namelen;
 		// The walk is written out: musl's CMSG_NXTHDR compares a size_t with a ptrdiff_t, which
-		// -Wsign-compare makes an error in the static npm build.
-		const char *ctl_end = (const char *)mh->msg_control + mh->msg_controllen;
-		for (struct cmsghdr *cm = CMSG_FIRSTHDR(mh);
-		     cm && cm->cmsg_len >= sizeof(*cm) && (const char *)cm + cm->cmsg_len <= ctl_end;
-		     cm = (struct cmsghdr *)((char *)cm + CMSG_ALIGN(cm->cmsg_len))) {
-			if (cm->cmsg_level != SOL_UDP || cm->cmsg_type != UDP_GRO) continue;
-			int seg;
-			memcpy(&seg, CMSG_DATA(cm), sizeof(seg));
-			if (seg > 0 && (size_t)seg < d[i].len) d[i].segment = (size_t)seg;
+		// -Wsign-compare makes an error in the static npm build. It counts the bytes left and
+		// reads a header only when one fits in them: past the last message the buffer is
+		// whatever the stack held, and a length read there once made a pointer that wrapped
+		// round the end check and took the worker down.
+		const char *p = (const char *)mh->msg_control;
+		size_t left = mh->msg_controllen <= sizeof(ctl[i].buf) ? (size_t)mh->msg_controllen : 0;
+		while (left >= sizeof(struct cmsghdr)) {
+			struct cmsghdr cm;
+			memcpy(&cm, p, sizeof(cm));
+			if (cm.cmsg_len < sizeof(cm) || cm.cmsg_len > left) break;
+			if (cm.cmsg_level == SOL_UDP && cm.cmsg_type == UDP_GRO && cm.cmsg_len >= CMSG_LEN(sizeof(int))) {
+				int seg;
+				memcpy(&seg, p + CMSG_LEN(0), sizeof(seg));
+				if (seg > 0 && (size_t)seg < d[i].len) d[i].segment = (size_t)seg;
+			}
+			size_t step = CMSG_ALIGN(cm.cmsg_len);
+			if (step >= left) break;
+			p += step;
+			left -= step;
 		}
 	}
 	return r;
