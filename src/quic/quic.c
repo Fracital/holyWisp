@@ -25,9 +25,17 @@
  * limit and none is needed: ChaCha20-Poly1305's is past 2^62 packets, more than a packet number
  * space holds, and AES-128-GCM (2^23) protects only Initial packets, a handful per connection.
  *
+ * Datagram size (RFC 9000 14): every connection starts at HW_QUIC_MIN_DGRAM, which every QUIC
+ * path carries, and probes for more once the handshake is confirmed (DPLPMTUD, RFC 8899): a PING
+ * padded to the size, alone in its datagram. An acknowledged probe raises the size; a lost one is
+ * tried HW_QC_PMTU_TRIES times, then the search halves the gap. A probe is never in flight and
+ * never ack-eliciting in the books, so its loss is no congestion signal and no PTO. The ceiling is
+ * HW_QUIC_MAX_DGRAM and the peer's max_udp_payload_size; a new path starts again at the floor.
+ * Starting at 1452 instead lost every full-size packet on a path under 1480 (a VPN, PPPoE) whose
+ * ICMP does not come back, and a datagram of that size is most of what a busy session sends.
+ *
  * Not implemented (docs/webtransport.md, "QUIC"): 0-RTT, active migration and preferred_address,
- * ECN, PMTU discovery (datagrams are at most HW_QUIC_MAX_DGRAM and the peer's
- * max_udp_payload_size).
+ * ECN, and noticing a path MTU that shrinks after the search (black-hole detection).
  */
 #include "holywisp/quic.h"
 
@@ -645,10 +653,10 @@ static void tp_apply(hw_quic_conn *q) {
 	q->peer_tp_applied = 1;
 	uint64_t ours = q->cfg.max_idle_ms, theirs = tp.max_idle_timeout;
 	q->idle_ms = !ours ? theirs : !theirs ? ours : HW_MIN(ours, theirs);
-	uint64_t mds = HW_MIN((uint64_t)HW_QUIC_MAX_DGRAM, tp.max_udp_payload_size);
-	if (mds < q->mds) {
-		q->mds = mds;
-		q->cc.mds = mds;
+	q->pmtu_max = HW_MIN((uint64_t)HW_QUIC_MAX_DGRAM, tp.max_udp_payload_size);
+	if (q->pmtu_max < q->mds) {
+		q->mds = q->pmtu_max;
+		q->cc.mds = q->mds;
 	}
 	q->tx_max_data = tp.initial_max_data;
 	q->peer_max_streams[0] = tp.initial_max_streams_bidi;
@@ -754,7 +762,12 @@ static void frame_lost(hw_quic_conn *q, hw_qc_space *sp, const hw_qc_frec *r) {
 	}
 }
 
+static void pmtu_result(hw_quic_conn *q, int passed);
+
 static void packet_resolve(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, int acked) {
+	if ((s->flags & HW_QC_SENT_PMTU) && q->pmtu_probe && hw_qc_ring_get(&sp->ring, q->pmtu_pn) == s) {
+		pmtu_result(q, acked);
+	}
 	for (uint16_t i = 0; i < s->nframes; i++) {
 		const hw_qc_frec *r = hw_qc_ring_frame(&sp->ring, s->frame0 + i);
 		if (acked) {
@@ -1561,6 +1574,16 @@ static int stateless_reset_match(const hw_quic_conn *q, const uint8_t *d, size_t
 	return hit;
 }
 
+// A new path's MTU is unknown: back to the floor, and the search starts over.
+static void pmtu_restart(hw_quic_conn *q) {
+	q->mds = HW_QUIC_MIN_DGRAM;
+	q->pmtu_bad = 0;
+	q->pmtu_probe = 0;
+	q->pmtu_deadline = 0;
+	q->pmtu_next = 0;
+	q->pmtu_tries = 0;
+}
+
 static void path_migrate(hw_quic_conn *q, const struct sockaddr *from, socklen_t from_len, size_t dgram_len) {
 	int ip_changed = !addr_eq(from, &q->peer, 1);
 	if (q->path_validated) {
@@ -1576,6 +1599,7 @@ static void path_migrate(hw_quic_conn *q, const struct sockaddr *from, socklen_t
 		// A new path: its own window, RTT and reordering. The epoch goes on, so that packets
 		// the old path's periods declared lost are never taken for the new one's.
 		uint16_t epoch = q->cc.epoch;
+		pmtu_restart(q);
 		hw_qc_cc_init(&q->cc, q->mds, q->now);
 		q->cc.epoch = (uint16_t)(epoch + 1);
 		hw_qc_rtt_init(&q->rtt);
@@ -2141,6 +2165,72 @@ static size_t output_probe_response(hw_quic_conn *q, uint8_t *out, size_t cap, s
 	return len;
 }
 
+// ---- PMTU discovery ------------------------------------------------------------------------------
+
+// The size to probe next, or 0 when the search is over: the ceiling first (most paths carry it),
+// then halfway between what passed and what failed.
+static uint64_t pmtu_candidate(const hw_quic_conn *q) {
+	if (q->mds >= q->pmtu_max) return 0;
+	if (!q->pmtu_bad) return q->pmtu_max;
+	if (q->pmtu_bad <= q->mds + HW_QC_PMTU_STEP) return 0;
+	return (q->mds + q->pmtu_bad) / 2;
+}
+
+static void pmtu_result(hw_quic_conn *q, int passed) {
+	uint64_t size = q->pmtu_probe;
+	q->pmtu_probe = 0;
+	q->pmtu_deadline = 0;
+	if (passed) {
+		if (size > q->mds) {
+			q->mds = size;
+			q->cc.mds = size;
+		}
+		q->pmtu_tries = 0;
+		q->pmtu_next = q->now;
+		return;
+	}
+	if (++q->pmtu_tries >= HW_QC_PMTU_TRIES) {
+		q->pmtu_bad = size;
+		q->pmtu_tries = 0;
+	}
+	// The next one after a round trip: a probe lost to a burst of loss is not a verdict.
+	q->pmtu_next = q->now + pto_base(q);
+}
+
+static int pmtu_due(const hw_quic_conn *q, size_t cap) {
+	if (!q->handshake_confirmed || !q->path_validated || q->state != HW_QC_ST_ACTIVE) return 0;
+	if (q->pmtu_probe || q->now < q->pmtu_next) return 0;
+	uint64_t size = pmtu_candidate(q);
+	return size && size <= cap && space_can_send(q, HW_QC_SP_APP) && hw_qc_cc_can_send(&q->cc);
+}
+
+// A PING padded to the candidate size, alone in a datagram. The record keeps neither IN_FLIGHT
+// nor ACK_ELICITING: the probe is answered by its own ACK or by pmtu_deadline, never by the
+// congestion controller or the PTO.
+static size_t output_pmtu_probe(hw_quic_conn *q, uint8_t *out, struct sockaddr_storage *to, socklen_t *to_len) {
+	hw_qc_space *sp = &q->sp[HW_QC_SP_APP];
+	size_t size = (size_t)pmtu_candidate(q);
+	if (hw_qc_ring_reserve(&sp->ring, 1) < 0) return 0;
+	pkt_build b;
+	if (!pkt_header(q, HW_QC_SP_APP, out, size, &b) || b.room < 1) return 0;
+	*pkt_cur(&b) = HW_QC_F_PING;
+	pkt_put(&b, 1, 1);
+	size_t len = pkt_finish(q, &b, size);
+	if (!len) return 0;
+	hw_qc_sent *rec = hw_qc_ring_get(&sp->ring, b.pn);
+	if (rec->flags & HW_QC_SENT_IN_FLIGHT) hw_qc_cc_remove(&q->cc, rec->size);
+	if (rec->flags & HW_QC_SENT_ACK_ELICITING) sp->ae_in_flight--;
+	rec->flags = (uint8_t)((rec->flags & ~(HW_QC_SENT_IN_FLIGHT | HW_QC_SENT_ACK_ELICITING)) | HW_QC_SENT_PMTU);
+	q->pmtu_probe = len;
+	q->pmtu_pn = b.pn;
+	q->pmtu_deadline = q->now + 3 * (pto_base(q) + q->peer_max_ack_delay);
+	q->stats.bytes_sent += len;
+	q->last_sent = q->now;
+	*to = q->peer;
+	*to_len = q->peer_len;
+	return len;
+}
+
 size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr_storage *to, socklen_t *to_len,
                       uint64_t now_ms) {
 	q->now = now_ms * 1000;
@@ -2148,6 +2238,10 @@ size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr
 	if (q->state >= HW_QC_ST_DRAINING) return 0;
 	if (q->probe_pending) {
 		size_t n = output_probe_response(q, out, cap, to, to_len);
+		if (n) return n;
+	}
+	if (pmtu_due(q, cap)) {
+		size_t n = output_pmtu_probe(q, out, to, to_len);
 		if (n) return n;
 	}
 	size_t dmax = (size_t)HW_MIN((uint64_t)cap, q->mds);
@@ -2258,6 +2352,10 @@ static uint64_t timeout_us(const hw_quic_conn *q) {
 		if (q->path_deadline && q->path_deadline < t) t = q->path_deadline;
 	}
 	if (q->has_rx_prev && q->rx_prev_discard < t) t = q->rx_prev_discard;
+	if (q->pmtu_probe && q->pmtu_deadline < t) t = q->pmtu_deadline;
+	// A probe that is due now waits for the next output, as data does: a timer for it would fire
+	// again and again while the window holds it back.
+	if (!q->pmtu_probe && q->pmtu_next > q->now && q->pmtu_next < t && pmtu_candidate(q)) t = q->pmtu_next;
 	return t;
 }
 
@@ -2320,6 +2418,7 @@ void hw_quic_on_timeout(hw_quic_conn *q, uint64_t now_ms) {
 		q->has_rx_prev = 0;
 	}
 	if (q->pacer_wait && now >= q->pacer_wait) q->pacer_wait = 0;
+	if (q->pmtu_probe && now >= q->pmtu_deadline) pmtu_result(q, 0);
 done:
 	after_events(q);
 }
@@ -2400,7 +2499,8 @@ static hw_quic_conn *conn_new(const hw_quic_config *cfg, const hw_quic_callbacks
 	for (int i = 0; i < HW_QC_SPACES; i++) space_init(&q->sp[i]);
 	hw_qw_tp_defaults(&q->peer_tp);
 	q->peer_max_ack_delay = HW_QC_MAX_ACK_DELAY_US;
-	q->mds = HW_QUIC_MAX_DGRAM;
+	q->mds = HW_QUIC_MIN_DGRAM;
+	q->pmtu_max = HW_QUIC_MAX_DGRAM;
 	hw_qc_rtt_init(&q->rtt);
 	hw_qc_cc_init(&q->cc, q->mds, q->now);
 	q->pkt_threshold = HW_QC_PACKET_THRESHOLD;
@@ -2684,4 +2784,5 @@ void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out) {
 	*out = q->stats;
 	out->srtt_us = q->rtt.smoothed;
 	out->cwnd = q->cc.cwnd;
+	out->mds = q->mds;
 }

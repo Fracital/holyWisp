@@ -42,6 +42,8 @@
 #define HW_QC_REASON_MAX        128u    // CONNECTION_CLOSE reason bytes kept or sent
 #define HW_QC_CHALLENGES        4u      // outstanding PATH_CHALLENGE values remembered
 #define HW_QC_ACK_ONLY_PING     16u     // ACK-only packets in a row before one carries a PING
+#define HW_QC_PMTU_TRIES        3u      // RFC 8899 MAX_PROBES: lost probes before a size counts as too big
+#define HW_QC_PMTU_STEP         32u     // the search ends when the bounds are this close
 #define HW_QC_SENT_RING_MAX     65536u  // packets tracked per space before ACK-only ones are forgotten
 // RFC 9001 6.6: packets that may fail authentication in a connection, across all keys, under
 // ChaCha20-Poly1305 (the AEAD TLS selects; AES-128-GCM, Initial packets only, allows 2^52).
@@ -336,6 +338,7 @@ enum {
 	HW_QC_SENT_PHASE = 0x10,   // 1-RTT: sent with key phase 1
 	HW_QC_SENT_LIMITED = 0x20, // sent while the sender was not using the congestion window
 	HW_QC_SENT_STAMPED = 0x40, // lost in flight, loss_epoch says in which recovery period
+	HW_QC_SENT_PMTU = 0x80,    // a PMTU probe: neither in flight nor counted as ack-eliciting
 };
 
 typedef struct {
@@ -543,6 +546,15 @@ struct hw_quic_conn {
 	uint64_t pto_anchor; // client before validation: base of the PTO with nothing in flight
 	uint64_t pacer_wait; // the pacer holds data until then (0 = not holding)
 	uint64_t mds;        // datagram size limit on this path
+	// Datagram packetization layer PMTU discovery (RFC 9000 14.3, RFC 8899): mds starts at
+	// HW_QUIC_MIN_DGRAM and rises only when a probe of a larger size is acknowledged.
+	uint64_t pmtu_max;      // HW_QUIC_MAX_DGRAM, or the peer's max_udp_payload_size if smaller
+	uint64_t pmtu_bad;      // the smallest size that failed HW_QC_PMTU_TRIES probes (0: none)
+	uint64_t pmtu_probe;    // the size of the probe awaiting its answer (0: none)
+	uint64_t pmtu_pn;       // its packet number
+	uint64_t pmtu_deadline; // it counts as lost if not acknowledged by then
+	uint64_t pmtu_next;     // no probe before then
+	unsigned pmtu_tries;    // probes of the current size lost
 	uint64_t peer_max_ack_delay;
 	uint64_t spurious_lost; // packets declared lost that were acknowledged later
 	uint64_t pkt_threshold; // adaptive packet threshold (RFC 9002 6.1.1), raised by spurious losses

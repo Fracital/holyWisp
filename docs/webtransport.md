@@ -82,7 +82,19 @@ level, with receive credit granted only when the application consumes (`hw_quic_
 which is how backpressure reaches a client; stream limits (MAX_STREAMS); NEW_CONNECTION_ID and
 RETIRE_CONNECTION_ID; path validation on a peer address change (NAT rebinding: the client's
 port changes, and the connection survives); key update; idle timeout; stateless reset;
-Retry. Not implemented: 0-RTT, server migration, preferred_address, ECN, QUIC v2.
+Retry; datagram packetization layer PMTU discovery (RFC 8899). Not implemented: 0-RTT, server
+migration, preferred_address, ECN, QUIC v2, and noticing a path MTU that shrinks later.
+
+Datagram size: a connection starts at 1200 bytes, which every QUIC path must carry, and once the
+handshake is confirmed it probes for more: a PING padded to the size, alone in a datagram, first
+at the ceiling (1452, or the peer's `max_udp_payload_size` if smaller), then halfway between what
+passed and what failed, three tries per size. An acknowledged probe raises the size; the probes
+are never counted in flight, so a lost one is not a congestion signal and arms no PTO. A new path
+starts at 1200 again. Until 2026-11-18 every connection started at 1452, and a path under 1480
+bytes that drops instead of answering with ICMP (a VPN, PPPoE, some mobile links) lost every
+full-size packet: the handshake went through and the session then carried nothing
+(`test_pmtu` in `test_quic`). The sockets keep the kernel's default don't-fragment behaviour, so
+where ICMP does come back a probe can pass fragmented.
 
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per

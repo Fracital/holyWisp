@@ -36,7 +36,7 @@
 #define HW_QUIC_VERSION_1 0x00000001u
 #define HW_QUIC_CID_LEN   8    // length of every connection ID this endpoint issues
 #define HW_QUIC_MIN_DGRAM 1200 // a client's Initial datagram is padded to at least this
-#define HW_QUIC_MAX_DGRAM 1452 // the largest datagram this endpoint sends
+#define HW_QUIC_MAX_DGRAM 1452 // the largest datagram this endpoint sends, once a probe shows the path takes it
 #define HW_QUIC_RESET_LEN 16   // stateless reset token
 #define HW_QUIC_KEY_LEN   32   // the listener's token and reset keys
 
@@ -239,6 +239,7 @@ const struct sockaddr *hw_quic_peer(const hw_quic_conn *q, socklen_t *len);
 typedef struct {
 	uint64_t packets_sent, packets_received, packets_lost, bytes_sent, bytes_received;
 	uint64_t srtt_us, cwnd;
+	uint64_t mds; // the datagram size in use: HW_QUIC_MIN_DGRAM until a larger one is probed
 } hw_quic_stats;
 void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out);
 

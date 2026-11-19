@@ -487,6 +487,8 @@ struct sim {
 	uint64_t c2s, s2c, dropped;
 	int block_c2s, block_s2c;
 	int check_amp; // assert the server's 3x limit at every send
+	size_t mtu;    // datagrams longer than this vanish without a word (0 = none): ICMP that never comes back
+	uint64_t mtu_dropped;
 	uint64_t steps;
 };
 
@@ -548,6 +550,10 @@ static void sim_send(sim *s, int to_server, const uint8_t *data, size_t len) {
 		s->s2c += len;
 	}
 	if ((to_server && s->block_c2s) || (!to_server && s->block_s2c)) return;
+	if (s->mtu && len > s->mtu) {
+		s->mtu_dropped++;
+		return;
+	}
 	int dir = to_server ? 0 : 1;
 	uint64_t depart = s->now * 1000;
 	if (s->bw) {
@@ -1008,6 +1014,60 @@ static void test_bulk_64m(void) {
 	CHECK_EQ(hw_quic_queued(s->c.q), 0);
 	printf("  64 MiB each way: %.0f MB/s of payload per CPU second (both endpoints, %.2f s CPU, %llu ms simulated)\n",
 	       2 * 64.0 * 1048576 / 1e6 / t, t, (unsigned long long)(s->now - 1000));
+	sim_free(s);
+}
+
+// PMTU discovery: both ends start at the floor and find what the path carries, whatever it
+// drops in silence, without a loss counted against the window.
+static void test_pmtu(void) {
+	static const struct {
+		size_t mtu;
+		uint64_t lo, hi;
+	} paths[] = {
+	    {0, HW_QUIC_MAX_DGRAM, HW_QUIC_MAX_DGRAM},
+	    {1500, HW_QUIC_MAX_DGRAM, HW_QUIC_MAX_DGRAM},
+	    {1360, 1360 - HW_QC_PMTU_STEP, 1360},
+	    {1280, 1280 - HW_QC_PMTU_STEP, 1280},
+	    {HW_QUIC_MIN_DGRAM, HW_QUIC_MIN_DGRAM, HW_QUIC_MIN_DGRAM},
+	};
+	for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
+		sim *s = sim_new(60 + i);
+		s->mtu = paths[i].mtu;
+		s->delay_ms = 20;
+		sim_handshake(s);
+		hw_quic_stats cs, ss;
+		hw_quic_get_stats(s->c.q, &cs);
+		CHECK(cs.mds <= HW_QUIC_MAX_DGRAM, "mds bounded");
+		bulk(s, 2u << 20, 2u << 20, 120000);
+		sim_advance(s, 2000);
+		hw_quic_get_stats(s->c.q, &cs);
+		hw_quic_get_stats(s->sv.q, &ss);
+		CHECK(cs.mds >= paths[i].lo && cs.mds <= paths[i].hi, "path %zu: client mds %llu", paths[i].mtu,
+		      (unsigned long long)cs.mds);
+		CHECK(ss.mds >= paths[i].lo && ss.mds <= paths[i].hi, "path %zu: server mds %llu", paths[i].mtu,
+		      (unsigned long long)ss.mds);
+		CHECK_EQ(cs.packets_lost, 0);
+		CHECK_EQ(ss.packets_lost, 0);
+		if (!paths[i].mtu || paths[i].mtu >= HW_QUIC_MAX_DGRAM) CHECK_EQ(s->mtu_dropped, 0);
+		// A probe at most every round trip, and the search is over: a few of them, not a stream.
+		CHECK(s->mtu_dropped <= 2 * HW_QC_PMTU_TRIES * 8, "path %zu: %llu dropped", paths[i].mtu,
+		      (unsigned long long)s->mtu_dropped);
+		uint64_t dropped = s->mtu_dropped;
+		sim_advance(s, 10000);
+		CHECK_EQ(s->mtu_dropped, dropped);
+		sim_free(s);
+	}
+	// A path that loses one datagram in twenty still finds its size: a lost probe is retried.
+	sim *s = sim_new(70);
+	s->mtu = 1400;
+	s->loss_ppm = 50000;
+	s->delay_ms = 10;
+	sim_handshake(s);
+	bulk(s, 1u << 20, 1u << 20, 120000);
+	sim_advance(s, 3000);
+	hw_quic_stats cs;
+	hw_quic_get_stats(s->c.q, &cs);
+	CHECK(cs.mds > HW_QUIC_MIN_DGRAM && cs.mds <= 1400, "lossy path: mds %llu", (unsigned long long)cs.mds);
 	sim_free(s);
 }
 
@@ -1662,6 +1722,7 @@ int main(int argc, char **argv) {
 	RUN(test_key_update);
 	RUN(test_migration);
 	RUN(test_loss);
+	RUN(test_pmtu);
 	RUN(test_bulk_64m);
 	hw_der_free(&g_cert);
 	return 0;
