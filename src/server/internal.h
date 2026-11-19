@@ -239,6 +239,7 @@ struct hw_server {
 	hw_gauge *heads_per_ip;  // connections still in their HTTP head, per socket peer address
 	hw_budget *queue_budget; // server-queue-max and its per-IP share (conn_budget_sync)
 	hw_bandwidth *bandwidth;
+	size_t bw_quantum; // bytes a connection buys from it at a time: 10 ms of the rate, 1 to 64 KiB
 	hw_reputation *reputation;
 
 	// Maintenance thread: evictions, reputation decay and saves, DNS cache expiry.
@@ -382,6 +383,8 @@ typedef struct hw_conn {
 	hw_auth_req *auth_req; // a hashed password is being checked: the INFO exchange waits for it
 	hw_timer *handshake_timer;
 	hw_timer *throttle_timer; // bandwidth pause
+	uint64_t throttle_until;  // hw_now_ms when the pause may end (the timer re-arms short of it)
+	size_t bw_credit;         // bytes bought from the bandwidth limiter and not yet spent
 	int throttled;            // reads suspended until throttle_timer fires
 	int write_armed;          // HW_EV_WRITE requested
 	int flush_queued;         // on the worker's flush list

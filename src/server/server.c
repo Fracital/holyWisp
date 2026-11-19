@@ -976,8 +976,10 @@ static int build_limiters(hw_server *s) {
 		if (!s->conn_rate) return -1;
 	}
 	if (cfg->bandwidth_limit_kbps > 0) {
-		s->bandwidth = hw_bandwidth_new((uint64_t)cfg->bandwidth_limit_kbps * 1000 / 8);
+		uint64_t rate = (uint64_t)cfg->bandwidth_limit_kbps * 1000 / 8;
+		s->bandwidth = hw_bandwidth_new(rate);
 		if (!s->bandwidth) return -1;
+		s->bw_quantum = (size_t)HW_MAX(HW_MIN(rate / 100, 64 * 1024), 1);
 	}
 	if (cfg->server_queue_max > 0 || cfg->server_queue_max_per_ip > 0) {
 		s->queue_budget = hw_budget_new(cfg->server_queue_max, cfg->server_queue_max_per_ip);

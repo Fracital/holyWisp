@@ -320,23 +320,46 @@ static void conn_sync_streams(hw_conn *c) {
 static void throttle_wake_cb(hw_loop *loop, void *ud) {
 	hw_conn *c = ud;
 	c->throttle_timer = NULL;
+	// Charges made while it waited moved the end later: wait for that instead. A timer that cannot
+	// be made lets the connection go (fail open on allocation, as the limiter does).
+	uint64_t now = hw_now_ms();
+	if (c->throttle_until > now) {
+		c->throttle_timer = hw_loop_add_timer(loop, c->throttle_until - now, 0, throttle_wake_cb, c);
+		if (c->throttle_timer) return;
+	}
 	c->throttled = 0;
 	conn_apply_events(c);
 	conn_sync_streams(c);
 }
 
 void conn_charge_bandwidth(hw_conn *c, size_t bytes) {
-	if (!c->w->server->bandwidth || c->closing) return;
+	hw_server *srv = c->w->server;
+	if (!srv->bandwidth || c->closing) return;
+	// The limiter is the process's (one virtual clock per client address, whatever worker its
+	// connections are on), so a charge takes its lock and hashes the address. It is not paid per
+	// packet: the connection buys bw_quantum bytes (10 ms of the rate) at a time and spends them
+	// here, so a client of small packets costs one lookup per quantum, not one per packet. What is
+	// bought and not spent is charged anyway: the limit is as strict as before, never looser, and
+	// off by at most a quantum per connection.
+	if (bytes <= c->bw_credit) {
+		c->bw_credit -= bytes;
+		return;
+	}
+	size_t need = bytes - c->bw_credit;
+	size_t buy = need > srv->bw_quantum ? need : srv->bw_quantum;
+	c->bw_credit = buy - need;
 	// Charged even while paused: the bytes of a pass that was under way when the pause began still
 	// moved, and skipping them made every pause too short (and a download free, since its bytes
 	// arrive while the client's reads are the only thing stopped).
-	uint64_t wait = hw_bandwidth_charge(c->w->server->bandwidth, c->ip, bytes);
+	uint64_t wait = hw_bandwidth_charge(srv->bandwidth, c->ip, buy);
 	if (wait == 0) return;
 	// Both directions stop until the virtual clock catches up: reads from the client, and reads
-	// from every remote. Nothing is dropped; what is queued still drains.
-	if (c->throttle_timer) hw_loop_cancel_timer(c->w->loop, c->throttle_timer);
-	c->throttle_timer = hw_loop_add_timer(c->w->loop, wait, 0, throttle_wake_cb, c);
-	if (c->throttled) return;
+	// from every remote. Nothing is dropped; what is queued still drains. A pause under way is
+	// lengthened, not re-armed: its timer looks at throttle_until when it fires.
+	uint64_t until = hw_now_ms() + wait;
+	if (until > c->throttle_until) c->throttle_until = until;
+	if (!c->throttle_timer) c->throttle_timer = hw_loop_add_timer(c->w->loop, wait, 0, throttle_wake_cb, c);
+	if (c->throttled || !c->throttle_timer) return;
 	c->throttled = 1;
 	conn_apply_events(c);
 	conn_sync_streams(c);
