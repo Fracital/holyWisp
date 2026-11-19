@@ -483,14 +483,14 @@ static void test_connection_refused(void) {
 // The server's own end of the TCP connection that `remote` accepted: the in-process socket whose
 // local port is the accepted socket's peer port and whose peer is remote's port. -1 when none.
 static int server_side_of(int remote) {
-	struct sockaddr_in mine, theirs;
+	struct sockaddr_in mine = {0}, theirs = {0};
 	socklen_t sl = sizeof(mine);
 	if (getsockname(remote, (struct sockaddr *)&mine, &sl) != 0) return -1;
 	sl = sizeof(theirs);
 	if (getpeername(remote, (struct sockaddr *)&theirs, &sl) != 0) return -1;
 	for (int fd = 3; fd < 4096; fd++) {
 		if (fd == remote) continue;
-		struct sockaddr_in a, b;
+		struct sockaddr_in a = {0}, b = {0};
 		socklen_t al = sizeof(a), bl = sizeof(b);
 		if (getsockname(fd, (struct sockaddr *)&a, &al) != 0 || a.sin_family != AF_INET) continue;
 		if (getpeername(fd, (struct sockaddr *)&b, &bl) != 0 || b.sin_family != AF_INET) continue;
