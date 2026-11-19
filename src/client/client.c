@@ -937,8 +937,9 @@ int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t le
 			if (!s) return HW_ERR_CLOSED;
 		}
 		s->up_sent += len;
-	} else if (s->type == HW_STREAM_TCP) {
-		// The window is counted in packets; wait for a CONTINUE when it is spent, for as long as
+	} else if (s->type != HW_STREAM_UDP) {
+		// The window is counted in packets, on every stream but UDP (a terminal's too, as the
+		// server counts it); wait for a CONTINUE when it is spent, for as long as
 		// the client was told to wait for anything. What arrives meanwhile is queued, within the
 		// queue's budget: a server that withholds the CONTINUE decides neither how long this
 		// takes nor how much memory it costs.

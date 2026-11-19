@@ -397,6 +397,31 @@ static void test_send_waits_no_longer_than_the_timeout(void) {
 	CHECK(f.data_packets == 1, "the send that timed out put %d packets on the wire", f.data_packets - 1);
 }
 
+// A terminal (Twisp) stream's DATA counts against the window as a TCP stream's does, because the
+// server counts every stream but UDP: a client that sent past it would be closed 0x49. UDP is
+// never counted.
+static void test_send_counts_the_window_on_terminal_streams(void) {
+	fake f = {.script = script_withhold, .window = 1};
+	fake_start(&f);
+	hw_client_opts o;
+	client_opts(&o, &f, 300);
+	hw_client *c = client_connect(&o);
+	uint32_t term, udp;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TERM, "sh", 0, &term), 0);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "example.com", 53, &udp), 0);
+	CHECK_EQ(hw_client_send(c, term, "a", 1), 0);
+	int r = hw_client_send(c, term, "b", 1);
+	CHECK(r == HW_ERR_TIMEOUT, "a terminal stream's second packet in a window of one returned %d", r);
+	for (int i = 0; i < 3; i++) CHECK_EQ(hw_client_send(c, udp, "u", 1), 0);
+	atomic_store(&f.go, 1);
+	for (int i = 0; i < 10 && (r = hw_client_send(c, term, "b", 1)) == HW_ERR_TIMEOUT; i++) {
+	}
+	CHECK(r == 0, "send after the CONTINUE returned %d", r);
+	hw_client_free(c);
+	fake_join(&f);
+	CHECK(f.data_packets == 5, "%d DATA packets on the wire, 5 sent", f.data_packets);
+}
+
 // A window of one, never refilled, and a flood behind it. The second send has to wait for a
 // CONTINUE and queues what arrives: it must fail when the queue's budget is spent, with no more
 // than the budget held.
@@ -705,6 +730,7 @@ static void test_read_exact_counts_and_keeps_the_rest(void) {
 
 int main(void) {
 	RUN(test_send_waits_no_longer_than_the_timeout);
+	RUN(test_send_counts_the_window_on_terminal_streams);
 	RUN(test_send_queue_is_bounded_in_bytes);
 	RUN(test_send_queue_is_bounded_in_events);
 	RUN(test_read_exact_queue_is_bounded);

@@ -174,7 +174,8 @@ size_t hw_client_printable(char *out, size_t cap, const void *data, size_t len);
 // WebTransport lanes a CONNECT can still overtake the CLOSE that made room for it on another lane
 // and be refused 0x49; on one lane, or a WebSocket, it never is.
 int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t port, uint32_t *stream_id);
-// Send one DATA packet. For TCP streams this waits (pumping events into the queue) while the
+// Send one DATA packet. For TCP and terminal streams (every type but UDP, which the server never
+// counts) this waits (pumping events into the queue) while the
 // server's window is exhausted, for at most opts.timeout_ms: CONTINUE's packets, or with upload
 // credit the stream's bytes (then for terminal streams too, and the CONTINUE named below is the
 // grant). 0 on success, HW_ERR_CLOSED when the
