@@ -84,6 +84,12 @@ typedef struct hw_client_opts {
 	uint32_t credit_window;
 	// With credit_window: the library grants nothing by itself, the caller does (hw_client_credit).
 	int credit_manual;
+	// Upload credit, v2 on either transport: name INFO extension 0xE4 when the server's INFO
+	// offers it with a window (hw_client_upload_window then says which; docs/extensions.md). Each
+	// TCP or terminal stream's sends are then counted in bytes against a limit that starts at that
+	// window and that the server raises as its remote takes them, and hw_client_send waits for a
+	// grant instead of a CONTINUE. 0 (the default): not named, and nothing changes.
+	int upload_credit;
 	// WebTransport: the UDP socket's receive and send buffers, in bytes as setsockopt takes them
 	// (Linux grants double). 0: 4 MiB. A browser's is the system's cap, often 208 KiB on Linux
 	// (net.core.rmem_max): this is how a test receives as a browser would.
@@ -132,6 +138,9 @@ int hw_client_server_has_stream_confirm(const hw_client *c);
 // (extension 0xE3, docs/extensions.md), which the client names back. 0 when the server has no
 // limit or did not say (v1, or a server without the extension). hw_client_open keeps to it.
 uint32_t hw_client_max_streams(const hw_client *c);
+// Upload credit as the session has it: the initial window per stream in bytes, 0 when it is off
+// (not asked for, v1, or a server whose INFO does not offer it).
+uint32_t hw_client_upload_window(const hw_client *c);
 // WebTransport: the lanes open, lane 0 included (1 on a WebSocket), the lane a stream rides (-1
 // for none), and whether the server opened lane 0 (opts.wt_server_stream answered).
 int hw_client_lanes(const hw_client *c);
@@ -166,7 +175,9 @@ size_t hw_client_printable(char *out, size_t cap, const void *data, size_t len);
 // and be refused 0x49; on one lane, or a WebSocket, it never is.
 int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t port, uint32_t *stream_id);
 // Send one DATA packet. For TCP streams this waits (pumping events into the queue) while the
-// server's window is exhausted, for at most opts.timeout_ms. 0 on success, HW_ERR_CLOSED when the
+// server's window is exhausted, for at most opts.timeout_ms: CONTINUE's packets, or with upload
+// credit the stream's bytes (then for terminal streams too, and the CONTINUE named below is the
+// grant). 0 on success, HW_ERR_CLOSED when the
 // stream or socket is gone, HW_ERR_TIMEOUT when no CONTINUE came in time: nothing was sent and the
 // client is intact, so the caller may poll and try again. HW_ERR_TOOBIG when what the server sent
 // during the wait passed max_queue_bytes or max_queue_events: the client is then closed, events

@@ -273,6 +273,54 @@ static void test_stream_limit(void) {
 	CHECK(!info.has_stream_limit && !info.has_max_streams, "absent");
 }
 
+// Upload credit: INFO extension 0xE4 (a u32 window from the server, empty from the client, a
+// shorter meta as no window) and the UPLOAD_CREDIT packet.
+static void test_upload_credit(void) {
+	uint8_t pkt[64];
+	hw_wisp_packet p;
+	hw_wisp_info info;
+	uint8_t meta[6] = {0x00, 0x00, 0x80, 0x00, 0xaa, 0xbb}; // 8 MiB, then two reserved bytes
+	size_t n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UPLOAD_CREDIT, meta, 6);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
+	CHECK_EQ(pkt[7], 0xE4);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_upload_credit && info.has_upload_window, "server's 0xE4");
+	CHECK_EQ(info.upload_window, 8 * 1024 * 1024);
+	CHECK(info.has_udp, "the extension after it");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UPLOAD_CREDIT, NULL, 0);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_upload_credit && !info.has_upload_window, "client's 0xE4");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UPLOAD_CREDIT, meta, 3);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_upload_credit && !info.has_upload_window, "3 bytes are no window");
+	CHECK_EQ(info.upload_window, 0);
+
+	CHECK_EQ(hw_wisp_build_upload_credit(pkt, 9, 0x1112131415161718ull), HW_WISP_HEADER_LEN + 8);
+	static const uint8_t want[] = {0xE4, 9, 0, 0, 0, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11};
+	CHECK(memcmp(pkt, want, sizeof(want)) == 0, "UPLOAD_CREDIT bytes");
+	CHECK_EQ(hw_wisp_parse(pkt, 13, &p), 0);
+	uint64_t limit = 0;
+	CHECK_EQ(hw_wisp_parse_upload_credit(&p, &limit), 0);
+	CHECK(limit == 0x1112131415161718ull, "limit %llx", (unsigned long long)limit);
+	CHECK_EQ(hw_wisp_parse_credit(&p, &limit), HW_ERR_INVALID); // the other direction's packet
+	CHECK_STR(hw_wisp_type_str(HW_WISP_UPLOAD_CREDIT), "UPLOAD_CREDIT");
+	pkt[13] = 0x77; // a reserved byte after the limit
+	CHECK_EQ(hw_wisp_parse(pkt, 14, &p), 0);
+	CHECK_EQ(hw_wisp_parse_upload_credit(&p, &limit), 0);
+	CHECK(limit == 0x1112131415161718ull, "limit with a reserved byte");
+	CHECK_EQ(hw_wisp_parse(pkt, 12, &p), 0); // 7 bytes of limit
+	CHECK_EQ(hw_wisp_parse_upload_credit(&p, &limit), HW_ERR_INVALID);
+	hw_wisp_build_credit(pkt, 9, 1);
+	CHECK_EQ(hw_wisp_parse(pkt, 13, &p), 0);
+	CHECK_EQ(hw_wisp_parse_upload_credit(&p, &limit), HW_ERR_INVALID); // a CREDIT is not one
+}
+
 int main(void) {
 	RUN(test_le16);
 	RUN(test_header_roundtrip);
@@ -283,5 +331,6 @@ int main(void) {
 	RUN(test_lanes);
 	RUN(test_credit);
 	RUN(test_stream_limit);
+	RUN(test_upload_credit);
 	return 0;
 }

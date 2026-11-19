@@ -86,6 +86,14 @@ int hw_wisp_parse_info(const hw_wisp_packet *p, hw_wisp_info *out) {
 				out->max_streams = hw_le32(meta);
 			}
 			break;
+		case HW_EXT_UPLOAD_CREDIT:
+			// The client's is empty; the server's starts with its window, and the rest is for later.
+			out->has_upload_credit = 1;
+			if (meta_len >= 4) {
+				out->has_upload_window = 1;
+				out->upload_window = hw_le32(meta);
+			}
+			break;
 		default:
 			// Unknown extensions are skipped by design (spec: "ignore extensions you don't know").
 			break;
@@ -164,6 +172,18 @@ int hw_wisp_parse_credit(const hw_wisp_packet *p, uint64_t *limit) {
 	return HW_OK;
 }
 
+size_t hw_wisp_build_upload_credit(uint8_t out[HW_WISP_HEADER_LEN + 8], uint32_t stream_id, uint64_t limit) {
+	hw_wisp_write_header(out, HW_WISP_UPLOAD_CREDIT, stream_id);
+	hw_put_le64(out + HW_WISP_HEADER_LEN, limit);
+	return HW_WISP_HEADER_LEN + 8;
+}
+
+int hw_wisp_parse_upload_credit(const hw_wisp_packet *p, uint64_t *limit) {
+	if (p->type != HW_WISP_UPLOAD_CREDIT || p->payload_len < 8) return HW_ERR_INVALID;
+	*limit = hw_le64(p->payload);
+	return HW_OK;
+}
+
 const char *hw_wisp_type_str(uint8_t type) {
 	switch (type) {
 	case HW_WISP_CONNECT:
@@ -180,6 +200,8 @@ const char *hw_wisp_type_str(uint8_t type) {
 		return "LANE";
 	case HW_WISP_CREDIT:
 		return "CREDIT";
+	case HW_WISP_UPLOAD_CREDIT:
+		return "UPLOAD_CREDIT";
 	default:
 		return "UNKNOWN";
 	}

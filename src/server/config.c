@@ -86,6 +86,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	BOOL_KEY("enable-v2", enable_v2)
 	BOOL_KEY("enable-twisp", enable_twisp)
 	BOOL_KEY("stream-credit", stream_credit)
+	BOOL_KEY("upload-credit", upload_credit)
 	STR_KEY("motd", motd)
 	BOOL_KEY("password-required", password_required)
 	BOOL_KEY("parse-real-ip", parse_real_ip)
@@ -517,6 +518,8 @@ void hw_config_usage(const char *argv0) {
 	    "  enable-twisp                              PTY terminal streams; needs v2 + an authenticated client (off)\n"
 	    "  stream-credit                             v2: offer per-stream byte windows the client grants (INFO\n"
 	    "                                            0xE2), so a stream reads its remote only as the client reads (on)\n"
+	    "  upload-credit                             v2: offer per-stream byte windows for uploads (INFO 0xE4),\n"
+	    "                                            granted as the remote takes them, for a client that asks (on)\n"
 	    "  password-user USER:PASS                   v2 auth user; PASS may be a crypt(3) hash (repeatable)\n"
 	    "  password-required                         refuse unauthenticated v2 clients (off)\n"
 	    "  parse-real-ip, trusted-proxy CIDR,        honour proxy headers from trusted sources\n"

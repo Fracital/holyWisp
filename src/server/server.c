@@ -41,6 +41,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->allow_udp = 1;
 	cfg->enable_v2 = 1;
 	cfg->stream_credit = 1;
+	cfg->upload_credit = 1;
 	cfg->parse_real_ip = 1;
 	// One header by default, and the one every proxy rewrites. A header a proxy passes through
 	// untouched (CF-Connecting-IP behind anything but Cloudflare) would let the client name itself.
@@ -284,6 +285,22 @@ static uint32_t server_ingress_window(const hw_server_config *cfg) {
 	size_t by_mem = cfg->stream_queue_max / payload;
 	if (by_mem < 1) by_mem = 1;
 	return by_mem < cfg->buffer_remaining ? (uint32_t)by_mem : cfg->buffer_remaining;
+}
+
+// Upload credit's initial window, the most a stream may send before its first grant: upload-window,
+// within stream-queue-max with room for the one packet a client may start while it has any credit
+// left (docs/extensions.md), so a client inside its credit is never closed 0x49. 0 when upload-credit
+// is off or the queue has no such room: the extension is then not offered.
+static uint32_t server_upload_credit_window(const hw_server_config *cfg) {
+	if (!cfg->upload_credit || !cfg->enable_v2) return 0;
+	size_t payload = cfg->max_message_size > HW_WISP_HEADER_LEN ? cfg->max_message_size - HW_WISP_HEADER_LEN : 1;
+	if (cfg->stream_queue_max < payload + 4 + UPLOAD_CREDIT_MIN) return 0;
+	size_t room = cfg->stream_queue_max - payload - 4;
+	size_t w = cfg_upload_window(cfg);
+	if (w < UPLOAD_CREDIT_MIN) w = UPLOAD_CREDIT_MIN;
+	if (w > room) w = room;
+	if (w > UINT32_MAX) w = UINT32_MAX;
+	return (uint32_t)w;
 }
 
 // ---------------------------------------------------------------------------------- socket tuning
@@ -1047,6 +1064,12 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	if (policy_init(s) != 0) goto fail;
 	if (webclient_page_build(s) != 0) goto fail;
 	s->window = server_ingress_window(cfg);
+	s->upload_credit_window = server_upload_credit_window(cfg);
+	if (cfg->upload_credit && cfg->enable_v2 && !s->upload_credit_window) {
+		HW_INFO("server",
+		        "upload-credit not offered: stream-queue-max %zu has no room for a window beside a %zu-byte packet",
+		        cfg->stream_queue_max, cfg->max_message_size);
+	}
 	s->client_rcvbuf = server_fixed_buffer(cfg, cfg->client_recv_buffer, "/proc/sys/net/core/rmem_max",
 	                                       "client-recv-buffer");
 	if (s->window < cfg->buffer_remaining) {

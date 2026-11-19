@@ -42,6 +42,10 @@ typedef struct cstream {
 	uint64_t taken;
 	uint64_t granted_at;
 	int owed;
+	// Upload credit: DATA payload bytes sent on the stream, and the most the server lets it have
+	// sent before the next DATA starts; up_limit 0 when the stream is paced by CONTINUE instead.
+	uint64_t up_sent;
+	uint64_t up_limit;
 } cstream;
 
 typedef struct qevent {
@@ -73,9 +77,11 @@ struct hw_client {
 	int authenticated;    // the password extension went out and the server completed the handshake
 	int timeout_ms;       // opts.timeout_ms: the longest a send waits for a CONTINUE
 	uint32_t buffer_size;
-	uint32_t credit;   // stream credit's window, 0 when off
-	int credit_manual; // opts.credit_manual: no grants but the caller's
-	int credit_owed;   // a stream has a grant that could not be sent at once (credit_flush)
+	uint32_t credit;    // stream credit's window, 0 when off
+	int credit_manual;  // opts.credit_manual: no grants but the caller's
+	int credit_owed;    // a stream has a grant that could not be sent at once (credit_flush)
+	uint32_t up_window; // upload credit's initial window, 0 when off
+	int up_granted;     // an upload credit grant raised a limit (pump_one returns for it)
 	char motd[512];
 	size_t max_message;
 
@@ -384,6 +390,15 @@ static int packet_to_event(hw_client *c, const uint8_t *msg, size_t len, hw_clie
 		if (p.stream_id == 0) c->buffer_size = ev->buffer_remaining;
 		return 1;
 	}
+	case HW_WISP_UPLOAD_CREDIT: {
+		// Not an event: it only lets a send go on. A lower or repeated limit changes nothing.
+		uint64_t limit;
+		cstream *s = stream_find(c, p.stream_id);
+		if (!s || !s->up_limit || hw_wisp_parse_upload_credit(&p, &limit) != 0 || limit <= s->up_limit) return 0;
+		s->up_limit = limit;
+		c->up_granted = 1;
+		return 0;
+	}
 	case HW_WISP_CLOSE:
 		if (p.payload_len < 1) return 0;
 		ev->type = HW_CEV_CLOSE;
@@ -468,13 +483,23 @@ static int next_event(hw_client *c, ctimer *t, hw_client_event *ev) {
 	}
 }
 
-// Read the next event from the socket and queue it. 1 queued, 0 time is up, <0 error.
+// Read the next event from the socket and queue it. 1 queued, or an upload credit grant raised a
+// limit and there is nothing to queue, 0 time is up, <0 error.
 static int pump_one(hw_client *c, ctimer *t) {
 	hw_client_event ev;
-	int r = next_event(c, t, &ev);
-	if (r <= 0) return r;
+	for (;;) {
+		const uint8_t *msg;
+		size_t len;
+		int r = read_message(c, t, &msg, &len);
+		if (r <= 0) return r;
+		if (packet_to_event(c, msg, len, &ev)) break;
+		if (c->up_granted) { // nothing to queue: a send may go on
+			c->up_granted = 0;
+			return 1;
+		}
+	}
 	qevent *q;
-	r = qevent_new(c, &ev, &q);
+	int r = qevent_new(c, &ev, &q);
 	if (r != 0) return r;
 	queue_push(c, q);
 	return 1;
@@ -635,7 +660,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				c->motd[ml] = '\0';
 			}
 			uint8_t meta[1 + CLIENT_USER_MAX + CLIENT_PASS_MAX];
-			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 * 5 + 4 + sizeof(meta)];
+			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 6 * 5 + 4 + sizeof(meta)];
 			size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 			n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 			if (o->stream_confirm) {
@@ -649,6 +674,12 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, window, sizeof(window));
 				c->credit = o->credit_window > HW_WISP_CREDIT_MIN ? o->credit_window : HW_WISP_CREDIT_MIN;
 				c->credit_manual = o->credit_manual;
+			}
+			// Upload credit only toward a server that offered a window: its grants are what a stream
+			// then waits for, instead of a CONTINUE.
+			if (o->upload_credit && info.has_upload_window && info.upload_window) {
+				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UPLOAD_CREDIT, NULL, 0);
+				c->up_window = info.upload_window;
 			}
 			// The stream limit is kept to (hw_client_open), and naming it says so.
 			if (info.has_stream_limit) {
@@ -807,6 +838,10 @@ uint32_t hw_client_max_streams(const hw_client *c) {
 	return c->max_streams;
 }
 
+uint32_t hw_client_upload_window(const hw_client *c) {
+	return c->up_window;
+}
+
 int hw_client_lanes(const hw_client *c) {
 	return c->lanes;
 }
@@ -873,6 +908,8 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	s->taken = 0;
 	s->granted_at = 0;
 	s->owed = 0;
+	s->up_sent = 0;
+	s->up_limit = c->up_window && stream_type != HW_STREAM_UDP ? c->up_window : 0;
 	int r = send_packet_lane(c, lane, pkt, n);
 	if (r != 0) {
 		c->nstreams--;
@@ -887,7 +924,20 @@ int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t le
 	credit_flush(c);
 	cstream *s = stream_find(c, stream_id);
 	if (!s) return HW_ERR_CLOSED;
-	if (s->type == HW_STREAM_TCP) {
+	if (s->up_limit) {
+		// Upload credit: a DATA may start while the stream has sent less than its limit, and may
+		// run past it by its own length (docs/extensions.md). The wait is the CONTINUE's below.
+		ctimer t = timer_start(c->timeout_ms);
+		while (s->up_sent >= s->up_limit) {
+			c->up_granted = 0; // one from before: the limit it raised is already counted
+			int r = pump_one(c, &t);
+			if (r == 0) return HW_ERR_TIMEOUT;
+			if (r < 0) return r;
+			s = stream_find(c, stream_id);
+			if (!s) return HW_ERR_CLOSED;
+		}
+		s->up_sent += len;
+	} else if (s->type == HW_STREAM_TCP) {
 		// The window is counted in packets; wait for a CONTINUE when it is spent, for as long as
 		// the client was told to wait for anything. What arrives meanwhile is queued, within the
 		// queue's budget: a server that withholds the CONTINUE decides neither how long this

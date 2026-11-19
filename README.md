@@ -169,6 +169,7 @@ would not: a gate to run before a restart. The most important keys:
 | `enable-v2`, `motd` | on, `""` | Wisp v2 handshake, message of the day |
 | `enable-twisp` | off | PTY terminal streams; needs v2 and an authenticated client |
 | `stream-credit` | on | Offer stream credit in the v2 INFO (extension `0xE2`). A client that names it with a window grants each TCP or terminal stream its bytes as it reads them (CREDIT, packet `0xE2`), and the server reads that stream's remote no further than the grant, so a body nobody reads holds up only its own stream. Off leaves `0xE2` out of the INFO; a client that does not name it sees no difference |
+| `upload-credit` | on | Offer upload credit in the v2 INFO (extension `0xE4`, [docs/extensions.md](docs/extensions.md)). A client that names it counts each TCP or terminal stream's uploads in bytes against a limit the server raises (UPLOAD_CREDIT, packet `0xE4`) once half a budget has reached the remote, instead of waiting for a CONTINUE at the end of each packet window. The budget is `upload-window` shared by the client's streams, within `stream-queue-max`. Off leaves `0xE4` out of the INFO; a client that does not name it sees no difference |
 | `password-user USER:PASS`, `password-required` | none, off | v2 password auth (hash or plaintext); refuse unauthenticated clients |
 | `trusted-proxy`, `trusted-header`, `trusted-proxy-secret` | none, `X-Forwarded-For`, none | Whose proxy headers name the client, which header, and a secret the proxy must also send |
 | `parse-real-ip`, `trusted-headers-reset` | on, off | Read the client's address from a trusted proxy's header at all; empty the header list (`X-Forwarded-For`) before the `trusted-header` lines add theirs |
@@ -294,6 +295,9 @@ client grants more as it reads (a CREDIT once it has read half a window). `--rea
 the client read what arrives no faster than `BPS` bytes a second, a slow reader; with `--credit`
 that holds the server, and the remote behind it, to that rate. Over `--bench` with `--credit`, each
 stream keeps at most half a window in flight, so the window bounds the rate as it does natively.
+`--upload-credit` asks a v2 server for upload credit (extension `0xE4`): the client's sends on each
+TCP stream are counted in bytes against the limit the server raises as its remote takes them,
+instead of CONTINUE's window of packets.
 
 An `https://` server URL is WebTransport (UDP, port 443 unless the URL says otherwise). There is no
 certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what authenticates the

@@ -50,6 +50,8 @@ static void usage(const char *argv0) {
 	        "      --credit BYTES   v2: ask for stream credit with an initial window of BYTES per\n"
 	        "                       stream (at least 16384): the server sends each stream only what\n"
 	        "                       this client has read, and a window more (off)\n"
+	        "      --upload-credit  v2: count uploads in bytes against the server's grants (INFO 0xE4)\n"
+	        "                       instead of CONTINUE's packet window, when the server offers it\n"
 	        "      --read-rate BPS  read what arrives no faster than BPS bytes a second, a slow\n"
 	        "                       reader; with --credit the server is held to that rate (off)\n"
 	        "      --udp-buffer N   WebTransport: the UDP socket's buffers in bytes (4 MiB); 212992 is\n"
@@ -458,6 +460,9 @@ int main(int argc, char **argv) {
 			}
 			o.credit_window = (uint32_t)w;
 			o.v2 = 1;
+		} else if (!strcmp(a, "--upload-credit")) {
+			o.upload_credit = 1;
+			o.v2 = 1;
 		} else if (!strcmp(a, "--read-rate") && i + 1 < argc) {
 			g_read_rate = strtoull(argv[++i], NULL, 10);
 			if (g_read_rate == 0) {
@@ -543,6 +548,9 @@ int main(int argc, char **argv) {
 	if (o.credit_window && !hw_client_credit_window(c)) {
 		fprintf(stderr, "warning: the server does not offer stream credit: --credit has no effect\n");
 	}
+	if (o.upload_credit && !hw_client_upload_window(c)) {
+		fprintf(stderr, "warning: the server does not offer upload credit: --upload-credit has no effect\n");
+	}
 	if (o.user && o.pass && !hw_client_authenticated(c)) {
 		fprintf(stderr, "warning: the server did not ask for a password, so none was sent: not authenticated\n");
 	}
@@ -551,10 +559,13 @@ int main(int argc, char **argv) {
 		const char *motd = hw_client_motd(c);
 		char shown[MOTD_SHOWN];
 		hw_client_printable(shown, sizeof(shown), motd, strlen(motd));
-		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s, stream credit %u, stream limit %u%s%s\n",
-		        hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c), hw_client_lanes(c),
-		        hw_client_lanes(c) == 1 ? "" : "s", hw_client_server_stream(c) ? ", server-opened" : "",
-		        hw_client_credit_window(c), hw_client_max_streams(c), shown[0] ? ", motd: " : "", shown);
+		fprintf(
+		    stderr,
+		    "connected: wisp-v%d, window %u, %d lane%s%s, stream credit %u, upload credit %u, stream limit %u%s%s\n",
+		    hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c), hw_client_lanes(c),
+		    hw_client_lanes(c) == 1 ? "" : "s", hw_client_server_stream(c) ? ", server-opened" : "",
+		    hw_client_credit_window(c), hw_client_upload_window(c), hw_client_max_streams(c),
+		    shown[0] ? ", motd: " : "", shown);
 	}
 	if (!bench) streams = 1;
 	uint32_t *sid = calloc((size_t)streams, sizeof(*sid));

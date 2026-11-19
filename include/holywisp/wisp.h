@@ -39,6 +39,11 @@ enum hw_stream_type {
 #define HW_WISP_CREDIT 0xE2
 // The smallest initial window: a client that names a smaller one gets this.
 #define HW_WISP_CREDIT_MIN 16384
+// Upload credit (docs/extensions.md; a byte window per TCP or Twisp stream toward the server):
+// server -> client, payload limit(u64 LE), the total DATA payload bytes the client may have sent on
+// the stream from its start. Bytes after it are reserved. Only on a session where both INFOs named
+// HW_EXT_UPLOAD_CREDIT.
+#define HW_WISP_UPLOAD_CREDIT 0xE4
 
 enum hw_close_reason {
 	HW_CLOSE_UNKNOWN = 0x01,
@@ -78,7 +83,12 @@ enum hw_wisp_extension {
 	// streams the connection may have open at once, 0 for no limit; further bytes are reserved, and
 	// a meta under 4 bytes is as if the extension were absent. Client -> server: meta empty (any
 	// bytes are reserved).
-	HW_EXT_STREAM_LIMIT = 0xE3
+	HW_EXT_STREAM_LIMIT = 0xE3,
+	// Upload credit. Server -> client: meta initial_window(u32 LE), the bytes each TCP or Twisp
+	// stream may send before its first grant; further bytes are reserved, and a meta under 4 bytes
+	// is as if the extension were absent. Client -> server, only when the server's INFO had it:
+	// meta empty (any bytes are reserved).
+	HW_EXT_UPLOAD_CREDIT = 0xE4
 };
 
 typedef struct hw_wisp_packet {
@@ -116,6 +126,9 @@ typedef struct hw_wisp_info {
 	int has_stream_limit;   // HW_EXT_STREAM_LIMIT present, whatever its meta
 	int has_max_streams;    // ... with a limit (server->client: a meta of 4 bytes or more)
 	uint32_t max_streams;   // that limit as sent (0: none), 0 without one
+	int has_upload_credit;  // HW_EXT_UPLOAD_CREDIT present, whatever its meta
+	int has_upload_window;  // ... with an initial window (server->client: a meta of 4 bytes or more)
+	uint32_t upload_window; // that window as sent, 0 without one
 } hw_wisp_info;
 
 static inline uint32_t hw_le32(const uint8_t *p) {
@@ -168,6 +181,12 @@ size_t hw_wisp_build_credit(uint8_t out[HW_WISP_HEADER_LEN + 8], uint32_t stream
 // payload under 8 bytes). Any stream id is taken; whether the packet applies to it is the
 // receiver's question. Bytes after the limit are reserved and ignored.
 int hw_wisp_parse_credit(const hw_wisp_packet *p, uint64_t *limit);
+// UPLOAD_CREDIT: type HW_WISP_UPLOAD_CREDIT, the stream, limit as u64 LE. Returns
+// HW_WISP_HEADER_LEN + 8.
+size_t hw_wisp_build_upload_credit(uint8_t out[HW_WISP_HEADER_LEN + 8], uint32_t stream_id, uint64_t limit);
+// The limit an UPLOAD_CREDIT packet carries: 0, or HW_ERR_INVALID when p is not one (another
+// type, a payload under 8 bytes). Bytes after the limit are reserved and ignored.
+int hw_wisp_parse_upload_credit(const hw_wisp_packet *p, uint64_t *limit);
 
 const char *hw_wisp_type_str(uint8_t type);
 const char *hw_close_reason_str(uint8_t reason);

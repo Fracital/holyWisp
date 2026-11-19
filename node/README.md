@@ -137,6 +137,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `whitelist.hostnames`, `whitelist.ports` | `allow-host`, `allow-port` |
 | `enableV2`, `enableTwisp`, `motd` | `enable-v2`, `enable-twisp`, `motd` |
 | `streamCredit` (default `true`: offer per-stream byte windows the client grants, INFO extension `0xE2`) | `stream-credit` |
+| `uploadCredit` (default `true`: offer per-stream byte windows for uploads that the server grants, INFO extension `0xE4`) | `upload-credit` |
 | `passwordUsers` (a name of 1 to 63 bytes without `:`, a password of at most 127 bytes on one line), `passwordAuth`, `passwordAuthRequired` | `password-user`, `password-required` |
 | `parseRealIP`, `trustedProxies`, `trustedHeaders` (default `X-Forwarded-For`) | `trusted-proxy`, `trusted-header`; `trusted-proxy-secret` is set by the wrapper |
 | `allowedOrigins` (each `scheme://host[:port]`; empty means any page may connect) | `allow-origin` |

@@ -165,6 +165,8 @@ hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, s
 	s->remaining = c->w->server->window;
 	// Stream credit counts what a TCP or terminal stream sends the client; UDP is never counted.
 	s->credit_limit = c->credit_window && type != HW_STREAM_UDP ? c->credit_window : UINT64_MAX;
+	// Upload credit likewise counts what a TCP or terminal stream takes from the client.
+	s->up_limit = c->up_window && type != HW_STREAM_UDP ? c->up_window : 0;
 	hw_buf_init(&s->out);
 	hw_buf_init(&s->pin);
 	if (host_len >= sizeof(s->host)) host_len = sizeof(s->host) - 1;
@@ -887,6 +889,27 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 
 // ---------------------------------------------------------------------------------- client -> remote
 
+// Upload credit: what the client has sent that reached the kernel is out of the queue, and the
+// client may have sent that plus a budget (conn_upload_budget). A grant goes once it would raise
+// the limit by half a budget, so a busy upload gets one per half budget that reaches the remote
+// and is never out of credit while the remote keeps up. It is never lower than the last: the
+// queue toward the remote never holds more than a budget plus the one packet a client may start
+// with credit left, which the initial window leaves room for in stream-queue-max. Returns -1 when
+// the connection closed.
+static int stream_upload_grant(hw_stream *s) {
+	hw_conn *c = s->conn;
+	hw_worker *w = c->w;
+	if (!s->up_limit) return 0;
+	// Bytes in the ingress batch are counted but not yet written: its flush grants for them.
+	if (w->batch_n > 0 && w->batch_stream == s) return 0;
+	uint64_t written = s->up_recv - hw_buf_avail(&s->out);
+	uint64_t budget = conn_upload_budget(c);
+	uint64_t target = written + budget;
+	if (target < s->up_limit + budget / 2) return 0;
+	s->up_limit = target;
+	return conn_send_upload_credit(c, s->id, target);
+}
+
 // Drain s->out into the socket. Returns 0 when the stream is still alive, -1 when it was closed.
 static int stream_flush(hw_stream *s) {
 	hw_conn *c = s->conn;
@@ -927,6 +950,7 @@ static int stream_flush(hw_stream *s) {
 		conn_send_continue(c, s->id, s->remaining);
 		if (c->closing) return -1;
 	}
+	if (stream_upload_grant(s) != 0) return -1;
 	return 0;
 }
 
@@ -981,6 +1005,11 @@ void stream_batch_flush(hw_worker *w) {
 		conn_queue_add(c, rest);
 		stream_update_events(s);
 	}
+	// Upload credit counts bytes, and grants as they reach the remote: no CONTINUE for the stream.
+	if (s->up_limit) {
+		stream_upload_grant(s);
+		return;
+	}
 	// Flow control, one count per packet: a CONTINUE once the window is spent, held back while
 	// the remote is slow.
 	int spent = 0;
@@ -1010,6 +1039,7 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 	if (s->state == STREAM_CLOSED) return;
 	s->heard = 0;
 	if (!(s->timed & STREAM_TIMED_DATA)) stream_time_data(s);
+	s->up_recv += len; // with upload credit, every byte counts where the packet window counts packets
 
 	if (w->batch_n > 0 && w->batch_stream != s) {
 		stream_batch_flush(w);
@@ -1071,6 +1101,10 @@ void stream_on_data_part(hw_stream *s, const uint8_t *data, size_t len, int fina
 		if (s->state == STREAM_OPEN) stream_update_events(s);
 	}
 
+	if (s->up_limit) {
+		stream_upload_grant(s);
+		return;
+	}
 	// Flow control: one CONTINUE per window of packets, held back while the remote is slow.
 	if (s->type != HW_STREAM_UDP && final && --s->remaining == 0) {
 		s->remaining = conn_window(c, s);

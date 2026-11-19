@@ -215,6 +215,8 @@ struct hw_server {
 	// The CONTINUE window actually advertised: buffer-remaining, capped so a full window of
 	// maximum-size DATA packets fits in half of stream-queue-max (server_ingress_window).
 	uint32_t window;
+	// Upload credit's initial window (INFO 0xE4), 0 when it is not offered (server_upload_credit_window).
+	uint32_t upload_credit_window;
 	// SO_RCVBUF applied to accepted client sockets, 0 for none (server_client_rcvbuf decides).
 	int client_rcvbuf;
 	uint16_t port;
@@ -430,6 +432,10 @@ typedef struct hw_conn {
 	// is set starts with that window (stream_new).
 	int credit_offered;
 	uint32_t credit_window;
+	// Upload credit: the initial window per stream once both INFOs named it, 0 while it is off. Every
+	// TCP and Twisp stream opened while it is set counts its uploads in bytes (stream_new).
+	int up_offered;
+	uint32_t up_window;
 	int heard;      // a read from the client since the worker's last sweep
 	int stream_cap; // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
@@ -507,6 +513,11 @@ typedef struct hw_stream {
 	uint64_t t_us;
 	uint8_t timed;
 	uint8_t warp_slot;
+	// Upload credit: DATA payload bytes the client has sent on the stream, and the most it may
+	// have sent (raised by the server's UPLOAD_CREDIT, never lowered). up_limit 0: the stream is
+	// paced by CONTINUE's packet window instead (UDP, or upload credit off).
+	uint64_t up_recv;
+	uint64_t up_limit;
 } hw_stream;
 
 #define STREAM_TIMED_DATA  1 // the client has sent DATA
@@ -626,6 +637,11 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max);
 void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
 // A CLOSE for a CONNECT refused before it was a stream (counted so in the stats), or for stream 0.
+// UPLOAD_CREDIT for a stream: written at once like a CONTINUE, for the same reason.
+int conn_send_upload_credit(hw_conn *c, uint32_t stream_id, uint64_t limit);
+// Upload credit's per-stream budget now: upload-window shared by the client's streams, at least
+// UPLOAD_BUDGET_MIN, at most the initial window.
+uint64_t conn_upload_budget(const hw_conn *c);
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason);
 // The same for a stream that is gone already, on the lane it rode (WebTransport; a WebSocket has
 // one): stream_close's CLOSE.
@@ -659,6 +675,9 @@ void conn_upload_hold(hw_conn *c, hw_stream *s, int held);
 void conn_upload_forget(hw_conn *c, hw_stream *s);
 // What one client may have in flight toward its remotes across its streams: upload-window, or
 // ws-write-high-water when that is 0 (the budget the refill CONTINUE and QUIC's credit share out).
+// Upload credit's smallest initial window and per-stream budget (docs/extensions.md).
+#define UPLOAD_CREDIT_MIN (64 * 1024)
+#define UPLOAD_BUDGET_MIN (256 * 1024)
 static inline size_t cfg_upload_window(const hw_server_config *cfg) {
 	return cfg->upload_window ? cfg->upload_window : cfg->ws_write_high_water;
 }

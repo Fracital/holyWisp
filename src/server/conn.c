@@ -463,6 +463,16 @@ static void conn_budget_sync(hw_conn *c) {
 	conn_sync_streams(c);
 }
 
+// The same budget in bytes for upload credit, which needs no packet size: a stream may have this
+// much queued or in flight toward its remote past what reached it.
+uint64_t conn_upload_budget(const hw_conn *c) {
+	size_t streams = hw_map_count(&c->streams);
+	size_t b = cfg_upload_window(&c->w->server->cfg) / (streams ? streams : 1);
+	if (b < UPLOAD_BUDGET_MIN) b = UPLOAD_BUDGET_MIN;
+	if (b > c->up_window) b = c->up_window;
+	return b;
+}
+
 void conn_queue_add(hw_conn *c, size_t n) {
 	c->queued_out += n;
 	if (!c->read_paused && c->queued_out > c->w->server->cfg.conn_queue_max) {
@@ -1059,6 +1069,13 @@ int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining) {
 	return c->closing ? -1 : 0;
 }
 
+int conn_send_upload_credit(hw_conn *c, uint32_t stream_id, uint64_t limit) {
+	uint8_t pkt[HW_WISP_HEADER_LEN + 8];
+	if (conn_send_packet(c, pkt, hw_wisp_build_upload_credit(pkt, stream_id, limit)) != 0) return -1;
+	if (!c->write_armed) conn_flush(c);
+	return c->closing ? -1 : 0;
+}
+
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason) {
 	// For a stream other than 0, this is a CONNECT refused before it was a stream: a stream's own
 	// CLOSE goes through conn_send_close_lane, and is counted by stream_close.
@@ -1211,7 +1228,7 @@ static int apply_reputation(hw_conn *c) {
 
 static void send_server_info(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 5 + 6 + 5 + 9];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 5 + 6 + 5 + 9 + 9];
 	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 	if (cfg->allow_udp) n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 	// Stream-open confirmation is always honoured (stream_connected), so it is always offered: a
@@ -1237,6 +1254,13 @@ static void send_server_info(hw_conn *c) {
 	uint8_t cap[4];
 	hw_put_le32(cap, c->stream_cap > 0 ? (uint32_t)c->stream_cap : 0);
 	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, cap, sizeof(cap));
+	uint32_t up_window = c->w->server->upload_credit_window;
+	if (up_window) {
+		uint8_t meta[4];
+		hw_put_le32(meta, up_window);
+		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UPLOAD_CREDIT, meta, sizeof(meta));
+		c->up_offered = 1;
+	}
 	conn_send_packet(c, pkt, n);
 }
 
@@ -1557,6 +1581,8 @@ static void handle_info(hw_conn *c, const hw_wisp_packet *p) {
 	if (c->credit_offered && info.has_credit_window) {
 		c->credit_window = info.credit_window > HW_WISP_CREDIT_MIN ? info.credit_window : HW_WISP_CREDIT_MIN;
 	}
+	// Upload credit likewise: the client's meta is empty, and the window is the server's.
+	if (c->up_offered && info.has_upload_credit) c->up_window = c->w->server->upload_credit_window;
 	if (cfg->password_user_count > 0 && info.has_password && info.user) {
 		int r = password_check(c, info.user, info.user_len, info.pass, info.pass_len);
 		if (r == PASS_PENDING) return; // auth_done carries on

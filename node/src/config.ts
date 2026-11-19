@@ -135,6 +135,13 @@ export type holyWispConfig = {
 	 * stream's remote no further. A client that does not name it sees no difference.
 	 */
 	streamCredit?: boolean;
+	/**
+	 * Offer upload credit in the v2 INFO (extension 0xE4, default true): a client that names it
+	 * counts each TCP or terminal stream's uploads in bytes against a limit the server raises as
+	 * the remote takes them, instead of CONTINUE's packet window. A client that does not name it
+	 * sees no difference.
+	 */
+	uploadCredit?: boolean;
 	motd?: string;
 	/** Defaults to true when `passwordUsers` has entries. False ignores them. */
 	passwordAuth?: boolean;
@@ -431,6 +438,7 @@ export function workerArgs(
 	bool("enable-v2", "enableV2", config.enableV2);
 	bool("enable-twisp", "enableTwisp", config.enableTwisp);
 	bool("stream-credit", "streamCredit", config.streamCredit);
+	bool("upload-credit", "uploadCredit", config.uploadCredit);
 	str("motd", "motd", config.motd);
 	const users = Object.entries(config.passwordUsers ?? {});
 	if (config.passwordAuth ?? users.length > 0) {

@@ -152,7 +152,8 @@ every test still passes, so each item has a test and a change to it needs a reas
   when any `password-user` exists, `0x04` MOTD when set, `0xE1` lanes (meta = the count) on a
   WebTransport session with `webtransport-lanes` of 2 or more, `0xE2` stream credit (meta empty)
   with `stream-credit` (on by default), `0xE3` stream limit (meta = the connection's stream cap
-  as admission left it, u32 LE, 0 for none) always, and `0x05` stream-confirm (meta empty) always.
+  as admission left it, u32 LE, 0 for none) always, `0xE4` upload credit (meta = the initial
+  window, u32 LE) with `upload-credit` (on by default), and `0x05` stream-confirm (meta empty) always.
   The private ones (`0xE_`) are specified in docs/extensions.md and held by `tests/ext_cases.h`. Stream-confirm
   is honoured when the client asks for it: a connected TCP stream gets `CONTINUE(id,
   buffer_remaining)`, and a UDP stream gets nothing, as in wispurr (the spec confirms a connected
@@ -173,7 +174,12 @@ every test still passes, so each item has a test and a change to it needs a reas
   to [4, the advertised maximum], so one stream gets the whole window, ten uploading streams do
   not make the server buffer ten windows, and idle keep-alive streams beside an upload take none
   of it. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
-  never counted. Toward the
+  never counted. A session where both INFOs named upload credit (`0xE4`, docs/extensions.md)
+  counts its TCP and Twisp streams' uploads in bytes instead (`up_recv`, `up_limit`), with no
+  refill CONTINUE: the server grants what has reached the remote's socket plus a budget
+  (`stream_upload_grant`, `conn_upload_budget`), so the queue never holds more than a budget and
+  one packet, which the initial window leaves room for in `stream-queue-max`
+  (`server_upload_credit_window`; `upload_credit_stalled_remote` in `tests/ext_cases.h`). Toward the
   client, one remote read is split into as many DATA packets as it takes (`conn_send_data`), each
   within the negotiated size and within `CONN_FRAME_MAX` (128 KiB of payload, `frame_payload_max`
   in `conn.c`) whatever that size allows: a client holds a whole message before it can use any of
