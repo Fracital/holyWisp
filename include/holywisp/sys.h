@@ -11,6 +11,7 @@
 #ifndef HOLYWISP_SYS_H
 #define HOLYWISP_SYS_H
 
+#include <poll.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -87,7 +88,7 @@ int hw_sys_udp_steer(const int fds[], size_t n);
 // dropped). buf then holds len bytes, which are one datagram, or on a socket with hw_sys_udp_gro
 // on several datagrams of one sender back to back: each `segment` bytes long but the last, which
 // may be shorter (segment == len for one). To send: buf, len, addr, addr_len and alone are the
-// caller's, and an addr_len of 0 sends to a connected socket's peer.
+// caller's, and an addr_len of 0 sends to a connected socket's peer; run_start too.
 typedef struct hw_sys_dgram {
 	uint8_t *buf;
 	size_t cap;
@@ -98,6 +99,10 @@ typedef struct hw_sys_dgram {
 	// Sending: never in one write with others (Linux UDP_SEGMENT). A QUIC PMTU probe is one: a
 	// hop that cannot carry it drops the whole write, and the packets that shared it with it.
 	int alone;
+	// Sending: never in one write with the datagram before it. One write of a run leaves the NIC
+	// back to back however it was paced, so a sender marks the first datagram of each of its
+	// pacer's releases, and a run is never more than one release.
+	int run_start;
 } hw_sys_dgram;
 
 #define HW_SYS_BATCH_MAX 32    // the most datagrams (or coalesced reads) one batch call moves
@@ -112,7 +117,8 @@ int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n);
 // could not go (EAGAIN: the socket buffer is full). Where the kernel can (hw_sys_has_udp_gso), a
 // run of datagrams to one address, all of one length but the last, which may be shorter, is
 // handed to it as one write that it cuts up again (Linux UDP_SEGMENT): the datagrams on the wire
-// are the same, and a batch costs the kernel a few writes instead of one per datagram.
+// are the same, and a batch costs the kernel a few writes instead of one per datagram. A run ends
+// before a datagram marked run_start, and never takes one marked alone.
 int hw_sys_send_batch(int fd, const hw_sys_dgram *d, size_t n);
 // Whether hw_sys_send_batch coalesces runs at all here.
 int hw_sys_has_udp_gso(void);
@@ -137,6 +143,13 @@ size_t hw_sys_udp_buffers(int fd, int bytes);
 // fit to be lost: a probe that got through fragmented made every packet after it two fragments,
 // and the loss of either cost the packet. 0, or -1 with errno.
 int hw_sys_udp_no_fragment(int fd);
+
+// poll(2) with the timeout in microseconds (-1: none, 0: do not wait), never cut short: where the
+// kernel waits only in milliseconds (macOS, Windows) it is rounded up to the next one. Linux
+// waits in ppoll, to within its timer slack. What poll returns, EINTR included.
+int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us);
+// The unit hw_sys_poll_us keeps a timeout in: 1 (microseconds) on Linux, 1000 where it rounds up.
+unsigned hw_sys_poll_resolution_us(void);
 
 // Whether hw_sys_set_mark can work at all here.
 int hw_sys_has_mark(void);

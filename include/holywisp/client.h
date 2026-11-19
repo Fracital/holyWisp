@@ -84,6 +84,10 @@ typedef struct hw_client_opts {
 	uint32_t credit_window;
 	// With credit_window: the library grants nothing by itself, the caller does (hw_client_credit).
 	int credit_manual;
+	// WebTransport: the UDP socket's receive and send buffers, in bytes as setsockopt takes them
+	// (Linux grants double). 0: 4 MiB. A browser's is the system's cap, often 208 KiB on Linux
+	// (net.core.rmem_max): this is how a test receives as a browser would.
+	size_t wt_udp_buffer;
 } hw_client_opts;
 
 enum hw_client_event_type {
@@ -133,6 +137,10 @@ int hw_client_fd(const hw_client *c); // for poll(2) alongside other fds
 // milliseconds: QUIC's timers (retransmission, acknowledgements, keepalive) run only inside the
 // client's calls. -1 on a WebSocket, which has none.
 int hw_client_wait_ms(const hw_client *c);
+// The same in microseconds, not rounded up (-1 on a WebSocket): what QUIC's pacer waits for is
+// often well under a millisecond, and a caller that waits in milliseconds slows its uploads to a
+// few datagrams per millisecond. hw_sys_poll_us waits for it.
+int64_t hw_client_wait_us(const hw_client *c);
 
 // Copy len bytes to out as printable ASCII for a terminal or a log line: every byte below 0x20 or
 // above 0x7e becomes \xNN (four characters), so no escape sequence, line break or UTF-8 encoded

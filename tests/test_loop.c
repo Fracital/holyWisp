@@ -7,6 +7,8 @@
 
 #include <poll.h>
 #include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include <sys/socket.h>
@@ -72,6 +74,145 @@ static void test_repeating_timer_cancels_itself(void) {
 	CHECK_EQ(hw_loop_run(loop), 0);
 	CHECK_EQ(g_repeats, 5);
 	CHECK(g_repeat_timer == NULL, "cancelled");
+	hw_loop_free(loop);
+}
+
+// When a timer fired (hw_now_us), for the microsecond timer tests.
+static uint64_t g_fired_us;
+static int g_us_order[8];
+static int g_us_norder;
+
+static void fired_cb(hw_loop *loop, void *ud) {
+	g_fired_us = hw_now_us();
+	hw_loop_stop(loop);
+}
+
+static void us_order_cb(hw_loop *loop, void *ud) {
+	g_us_order[g_us_norder++] = (int)(intptr_t)ud;
+	if (g_us_norder == 4) hw_loop_stop(loop);
+}
+
+static int cmp_u64(const void *a, const void *b) {
+	uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+	return x < y ? -1 : x > y;
+}
+
+// A microsecond timer fires no earlier than its delay, and where the loop's waits keep microseconds
+// (hw_loop_timer_resolution_us 1) well within a millisecond of it: a pacer releasing a few
+// datagrams every hundred microseconds is woken for each release, not on the next millisecond.
+// Judged by the median of 25 tries, so that a busy machine's odd late wakeup does not fail it.
+static void test_timer_us_resolution(void) {
+	hw_loop *loop = hw_loop_new();
+	unsigned res = hw_loop_timer_resolution_us(loop);
+	CHECK(res == 1 || res == 1000, "resolution %u", res);
+	enum {
+		TRIES = 25,
+		DELAY_US = 300
+	};
+	uint64_t late[TRIES];
+	for (int i = 0; i < TRIES; i++) {
+		uint64_t set = hw_now_us();
+		CHECK(hw_loop_add_timer_us(loop, DELAY_US, 0, fired_cb, NULL) != NULL, "add");
+		CHECK_EQ(hw_loop_run(loop), 0);
+		// hw_loop_run returns at once on a stopped loop; a fresh one per try would do as well.
+		hw_loop_free(loop);
+		loop = hw_loop_new();
+		CHECK(g_fired_us >= set + DELAY_US, "try %d fired %llu us after it was set, delay %d", i,
+		      (unsigned long long)(g_fired_us - set), DELAY_US);
+		late[i] = g_fired_us - set - DELAY_US;
+	}
+	qsort(late, TRIES, sizeof(late[0]), cmp_u64);
+	printf("  a %d us timer fired late by %llu us (median), %llu us (worst of %d)\n", DELAY_US,
+	       (unsigned long long)late[TRIES / 2], (unsigned long long)late[TRIES - 1], TRIES);
+	if (res == 1) {
+		CHECK(late[TRIES / 2] < 500, "median lateness %llu us on a loop that waits in microseconds",
+		      (unsigned long long)late[TRIES / 2]);
+	}
+	hw_loop_free(loop);
+}
+
+// Microsecond and millisecond timers share one heap and fire in the order they are due, and a
+// repeating microsecond timer repeats at its period.
+static int g_us_repeats;
+static hw_timer *g_us_repeat_timer;
+
+static void us_repeat_cb(hw_loop *loop, void *ud) {
+	if (++g_us_repeats == 10) {
+		hw_loop_cancel_timer(loop, g_us_repeat_timer);
+		hw_loop_stop(loop);
+	}
+}
+
+static void test_timer_us_mixed(void) {
+	hw_loop *loop = hw_loop_new();
+	g_us_norder = 0;
+	// A millisecond timer of n is due between n - 1 and n ms from now (on a tick): 2 between 1000
+	// and 2000 us, 4 between 3000 and 4000.
+	hw_loop_add_timer(loop, 4, 0, us_order_cb, (void *)4);
+	hw_loop_add_timer_us(loop, 2500, 0, us_order_cb, (void *)3);
+	hw_loop_add_timer(loop, 2, 0, us_order_cb, (void *)2);
+	hw_loop_add_timer_us(loop, 200, 0, us_order_cb, (void *)1);
+	CHECK_EQ(hw_loop_run(loop), 0);
+	CHECK_EQ(g_us_norder, 4);
+	for (int i = 0; i < 4; i++) CHECK(g_us_order[i] == i + 1, "fired %d as %d", g_us_order[i], i + 1);
+	hw_loop_free(loop);
+
+	loop = hw_loop_new();
+	g_us_repeats = 0;
+	uint64_t start = hw_now_us();
+	g_us_repeat_timer = hw_loop_add_timer_us(loop, 100, 200, us_repeat_cb, NULL);
+	CHECK_EQ(hw_loop_run(loop), 0);
+	CHECK_EQ(g_us_repeats, 10);
+	uint64_t took = hw_now_us() - start;
+	CHECK(took >= 100 + 9 * 200, "ten repeats took %llu us", (unsigned long long)took);
+	hw_loop_free(loop);
+}
+
+// A millisecond timer is due on a tick of hw_now_ms, as before the heap was in microseconds: one
+// of 2 ms fires once hw_now_ms has moved on by 2, never before.
+static void test_timer_ms_ticks(void) {
+	hw_loop *loop = hw_loop_new();
+	for (int i = 0; i < 5; i++) {
+		uint64_t set_ms = hw_now_ms();
+		hw_loop_add_timer(loop, 2, 0, fired_cb, NULL);
+		CHECK_EQ(hw_loop_run(loop), 0);
+		hw_loop_free(loop);
+		loop = hw_loop_new();
+		CHECK(g_fired_us / 1000 >= set_ms + 2, "fired at %llu us, set at %llu ms", (unsigned long long)g_fired_us,
+		      (unsigned long long)set_ms);
+	}
+	hw_loop_free(loop);
+}
+
+static void wake_once_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
+	char c;
+	ssize_t r = read(fd, &c, 1);
+	(void)r;
+}
+
+// Busy polling never makes a timer late: one due sooner than the polling would end fires on time.
+// The polling used to run its whole course before the loop looked at the timers again, which with
+// a millisecond's waits was within the tick, and with a pacer's 300 us is ten times late.
+static void test_busy_poll_keeps_timers(void) {
+	hw_loop *loop = hw_loop_new();
+	hw_loop_set_busy_poll(loop, 20000);
+	int p[2];
+	CHECK_EQ(pipe(p), 0);
+	hw_set_nonblock(p[0]);
+	CHECK_EQ(hw_loop_add_fd(loop, p[0], HW_EV_READ, wake_once_cb, NULL), 0);
+	// An event, so that the next iteration polls.
+	CHECK_EQ(write(p[1], "x", 1), 1);
+	CHECK_EQ(hw_loop_run_once(loop, 0), 0);
+	uint64_t set = hw_now_us();
+	hw_loop_add_timer_us(loop, 500, 0, fired_cb, NULL);
+	g_fired_us = 0;
+	while (!hw_loop_stopped(loop) && hw_now_us() - set < 1000000) CHECK_EQ(hw_loop_run_once(loop, -1), 0);
+	CHECK(g_fired_us >= set + 500, "fired early");
+	CHECK(g_fired_us - set < 10000, "a 500 us timer fired after %llu us of a 20 ms busy poll",
+	      (unsigned long long)(g_fired_us - set));
+	hw_loop_del_fd(loop, p[0]);
+	close(p[0]);
+	close(p[1]);
 	hw_loop_free(loop);
 }
 
@@ -288,6 +429,10 @@ int main(void) {
 	RUN(test_clock_us);
 	RUN(test_timers_fire_in_order);
 	RUN(test_repeating_timer_cancels_itself);
+	RUN(test_timer_us_resolution);
+	RUN(test_timer_us_mixed);
+	RUN(test_timer_ms_ticks);
+	RUN(test_busy_poll_keeps_timers);
 	RUN(test_post_from_other_thread);
 	RUN(test_loop_stopped);
 	RUN(test_fd_events);

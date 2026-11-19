@@ -301,6 +301,10 @@ static void test_v1_tcp_echo(void) {
 	CHECK(!hw_client_is_v2(c), "v1");
 	CHECK_EQ(hw_client_buffer_size(c), 16);
 	CHECK(hw_client_wait_ms(c) >= 0, "QUIC has a timer");
+	// In microseconds the same deadline, not rounded to a millisecond (asked second, so it is no later).
+	int wait_ms = hw_client_wait_ms(c);
+	int64_t wait_us = hw_client_wait_us(c);
+	CHECK(wait_us >= 0 && wait_us <= ((int64_t)wait_ms + 1) * 1000, "wait %lld us, %d ms", (long long)wait_us, wait_ms);
 	uint32_t sid;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
 	CHECK_EQ(hw_client_send(c, sid, "hello wisp", 10), 0);

@@ -3,7 +3,9 @@
  *
  * Fds live in a table indexed by fd with a generation counter: events carry (fd, gen) so an fd
  * closed and reused inside the same dispatch batch is never handed to the wrong watcher. Timers
- * are a binary min-heap of heap-allocated nodes that know their index, so cancel is O(log n).
+ * are a binary min-heap of heap-allocated nodes that know their index, so cancel is O(log n). The
+ * heap is in microseconds; a millisecond timer is due on a millisecond's tick, as it was when the
+ * heap was in milliseconds, and only a microsecond timer is due in between.
  * Posted tasks sit on a mutex-protected queue and wake the loop through a descriptor it watches.
  *
  * Waiting for readiness is the kernel's part and lives behind loop_backend.h (loop_epoll.c on
@@ -36,9 +38,10 @@ typedef struct fd_watch {
 } fd_watch;
 
 struct hw_timer {
-	uint64_t when;
-	uint64_t repeat;
-	size_t index; // position in the heap
+	uint64_t when;   // microseconds of hw_now_us
+	uint64_t repeat; // microseconds, or for a millisecond timer milliseconds
+	int ms;          // a millisecond timer: due on a tick of hw_now_ms
+	size_t index;    // position in the heap
 	hw_timer_cb cb;
 	void *ud;
 };
@@ -251,7 +254,7 @@ static void heap_remove(hw_loop *loop, size_t i) {
 	}
 }
 
-hw_timer *hw_loop_add_timer(hw_loop *loop, uint64_t delay_ms, uint64_t repeat_ms, hw_timer_cb cb, void *ud) {
+static hw_timer *timer_add(hw_loop *loop, uint64_t when, uint64_t repeat, int ms, hw_timer_cb cb, void *ud) {
 	if (loop->ntimers == loop->timer_cap) {
 		size_t cap = loop->timer_cap ? loop->timer_cap * 2 : 32;
 		hw_timer **p = realloc(loop->timers, cap * sizeof(*p));
@@ -261,14 +264,28 @@ hw_timer *hw_loop_add_timer(hw_loop *loop, uint64_t delay_ms, uint64_t repeat_ms
 	}
 	hw_timer *t = malloc(sizeof(*t));
 	if (!t) return NULL;
-	t->when = hw_now_ms() + delay_ms;
-	t->repeat = repeat_ms;
+	t->when = when;
+	t->repeat = repeat;
+	t->ms = ms;
 	t->cb = cb;
 	t->ud = ud;
 	t->index = loop->ntimers;
 	loop->timers[loop->ntimers++] = t;
 	heap_up(loop, t->index);
 	return t;
+}
+
+hw_timer *hw_loop_add_timer(hw_loop *loop, uint64_t delay_ms, uint64_t repeat_ms, hw_timer_cb cb, void *ud) {
+	return timer_add(loop, (hw_now_ms() + delay_ms) * 1000, repeat_ms, 1, cb, ud);
+}
+
+hw_timer *hw_loop_add_timer_us(hw_loop *loop, uint64_t delay_us, uint64_t repeat_us, hw_timer_cb cb, void *ud) {
+	return timer_add(loop, hw_now_us() + delay_us, repeat_us, 0, cb, ud);
+}
+
+unsigned hw_loop_timer_resolution_us(const hw_loop *loop) {
+	(void)loop; // the backend's, the same for every loop of the process
+	return hw_poller_resolution_us();
 }
 
 void hw_loop_cancel_timer(hw_loop *loop, hw_timer *t) {
@@ -278,13 +295,13 @@ void hw_loop_cancel_timer(hw_loop *loop, hw_timer *t) {
 }
 
 static void timers_run(hw_loop *loop) {
-	uint64_t now = hw_now_ms();
+	uint64_t now = hw_now_us();
 	while (loop->ntimers > 0 && loop->timers[0]->when <= now) {
 		hw_timer *t = loop->timers[0];
 		hw_timer_cb cb = t->cb;
 		void *ud = t->ud;
 		if (t->repeat) {
-			t->when = now + t->repeat;
+			t->when = t->ms ? (now / 1000 + t->repeat) * 1000 : now + t->repeat;
 			heap_down(loop, 0);
 		} else {
 			heap_remove(loop, 0);
@@ -294,13 +311,14 @@ static void timers_run(hw_loop *loop) {
 	}
 }
 
-static int timers_next_ms(const hw_loop *loop) {
+// Microseconds until the first timer is due, 0 when one is, -1 for none.
+static int64_t timers_next_us(const hw_loop *loop) {
 	if (loop->ntimers == 0) return -1;
-	uint64_t now = hw_now_ms();
+	uint64_t now = hw_now_us();
 	uint64_t when = loop->timers[0]->when;
 	if (when <= now) return 0;
 	uint64_t d = when - now;
-	return d > 1000000 ? 1000000 : (int)d;
+	return d > 1000000000 ? 1000000000 : (int64_t)d;
 }
 
 // ---------------------------------------------------------------------------------- tasks
@@ -362,20 +380,28 @@ void hw_loop_set_busy_poll(hw_loop *loop, unsigned us) {
 int hw_loop_run_once(hw_loop *loop, int timeout_ms) {
 	tasks_run(loop);
 	if (loop->batch_cb) loop->batch_cb(loop, loop->batch_ud);
-	int next = timers_next_ms(loop);
-	if (next >= 0 && (timeout_ms < 0 || next < timeout_ms)) timeout_ms = next;
-	if (tasks_pending(loop) || atomic_load(&loop->stop)) timeout_ms = 0;
+	int64_t timeout_us = timeout_ms < 0 ? -1 : (int64_t)timeout_ms * 1000;
+	int64_t next = timers_next_us(loop);
+	if (next >= 0 && (timeout_us < 0 || next < timeout_us)) timeout_us = next;
+	if (tasks_pending(loop) || atomic_load(&loop->stop)) timeout_us = 0;
 
 	hw_poll_event events[LOOP_MAX_EVENTS];
 	int n = 0;
-	if (loop->busy_poll_us > 0 && loop->was_busy && timeout_ms != 0) {
+	if (loop->busy_poll_us > 0 && loop->was_busy && timeout_us != 0) {
 		// The peer that was just served usually answers before a sleep and a wakeup would be over.
-		uint64_t until = hw_now_us() + loop->busy_poll_us;
+		// A timer due sooner ends the polling, and the sleep after it is what is left of the wait:
+		// a pacer's deadline is microseconds away.
+		uint64_t start = hw_now_us(), now = start, until = start + loop->busy_poll_us;
+		if (timeout_us > 0 && start + (uint64_t)timeout_us < until) until = start + (uint64_t)timeout_us;
 		do {
 			n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, 0);
-		} while (n == 0 && hw_now_us() < until && !atomic_load(&loop->stop));
+		} while (n == 0 && (now = hw_now_us()) < until && !atomic_load(&loop->stop));
+		if (timeout_us > 0) {
+			uint64_t end = start + (uint64_t)timeout_us;
+			timeout_us = now >= end ? 0 : (int64_t)(end - now);
+		}
 	}
-	if (n == 0) n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, timeout_ms);
+	if (n == 0) n = hw_poller_wait(loop->poller, events, LOOP_MAX_EVENTS, timeout_us);
 	if (n < 0) {
 		loop->was_busy = 0;
 		if (errno == EINTR) return 0;

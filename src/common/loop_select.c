@@ -253,20 +253,28 @@ static int report_closed(poller *p, hw_poll_event *out, int max) {
 	return n;
 }
 
-int hw_poller_wait(int poller_fd, hw_poll_event *out, int max, int timeout_ms) {
+unsigned hw_poller_resolution_us(void) {
+	return 1000; // hw_poller_wait rounds up to a millisecond
+}
+
+int hw_poller_wait(int poller_fd, hw_poll_event *out, int max, int64_t timeout_us) {
 	poller *p = poller_of(poller_fd);
 	if (!p) return -1;
 	if (p->rd->count == 0 && p->wr->count == 0) {
-		// select with nothing to watch is an error here, not a sleep.
-		if (timeout_ms != 0) Sleep(timeout_ms < 0 ? INFINITE : (DWORD)timeout_ms);
+		// select with nothing to watch is an error here, not a sleep; Sleep takes milliseconds.
+		if (timeout_us != 0) Sleep(timeout_us < 0 ? INFINITE : (DWORD)((timeout_us + 999) / 1000));
 		return 0;
 	}
 	set_copy(p->rd_out, p->rd);
 	set_copy(p->wr_out, p->wr);
 	set_copy(p->ex_out, p->wr);
-	struct timeval tv = {.tv_sec = timeout_ms / 1000, .tv_usec = (timeout_ms % 1000) * 1000};
+	// select's timeval holds microseconds, but Winsock is not known to wait less than a millisecond
+	// (one shorter may come back at once, and the loop would poll until the timer is due): rounded
+	// up to the next one, as loop_backend.h allows.
+	int64_t ms = (timeout_us + 999) / 1000;
+	struct timeval tv = {.tv_sec = (long)(ms / 1000), .tv_usec = (long)(ms % 1000) * 1000};
 	int r = select(0, p->rd_out->count ? (fd_set *)p->rd_out : NULL, p->wr_out->count ? (fd_set *)p->wr_out : NULL,
-	               p->ex_out->count ? (fd_set *)p->ex_out : NULL, timeout_ms < 0 ? NULL : &tv);
+	               p->ex_out->count ? (fd_set *)p->ex_out : NULL, timeout_us < 0 ? NULL : &tv);
 	if (r == SOCKET_ERROR) {
 		if (WSAGetLastError() == WSAENOTSOCK) return report_closed(p, out, max);
 		return hw_w32_fail();

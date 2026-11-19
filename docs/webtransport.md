@@ -219,6 +219,48 @@ Across the change:
 
 `bbr` stays the default until `bbr2` has run on the edges.
 
+**Pacing** is a token bucket at the congestion controller's rate, and what it may let go at once
+is set by how late the caller's timers fire. Until 2026-11-19 the listener's timers were
+milliseconds, and a burst was two milliseconds of the rate: 250 KB back to back at a gigabit.
+A browser receives into what Linux's `net.core.rmem_max` allows, 208 KiB by default (twice that
+counted by the kernel), and on a fast path Chrome's receive buffer errors matched the server's
+losses almost exactly, in runs of 50 to 340 packets. So the loop has microsecond timers (`hw_loop_add_timer_us`, `epoll_pwait2`
+on Linux, falling back to milliseconds where the kernel or a seccomp filter refuses it), QUIC
+reports its deadline in microseconds (`hw_quic_timeout_us`), and the listener and the client tell
+the pacer how late their timers may be (`timer_tick_us`, 100 us). On that tick a burst is two
+ticks of the rate, 2 to 32 datagrams (`HW_QC_PACER_BURST_MAX`), and a sender held back wakes when
+the bucket is a tick short of full, so that a timer a tick late finds a full burst and loses none
+of the rate: at most 9 datagrams of 1200 bytes at once at 440 Mbit/s, 20 at a gigabit, and never
+more than 38 KB in any 100 us at a gigabit (`test_pacer_fine_tick`, which the millisecond pacer
+fails). Where a tick of the rate is a whole burst or more, past about 1.5 Gbit/s, it is a burst
+per wakeup, which caps one session at about 5 Gbit/s with timers 50 us late on average. A session's timer is rounded up to a 50 us grid so that the sessions of a worker share
+their wakeups, and a GSO write never holds two releases (`run_start` in `hw_sys_dgram`,
+`test_udp_run_start`): one write leaves the NIC back to back. Before the first RTT sample there
+is no rate, and the initial window goes as one burst. Applies to `newreno`, `bbr` and `bbr2`.
+
+`SO_TXTIME` with the `fq` qdisc (earliest departure time) was considered and is not used. It
+needs `fq` on the egress device, which is not the default (`fq_codel`), and the edges' UDP leaves
+through WireGuard (WARP) devices that have no queue and build a new packet, which carries no
+departure time onward; a GSO write has one time for all its segments, so spacing within a release
+would take a write per datagram; and the pacer in user space has to be right anyway, on macOS,
+Windows and any host without `fq`. Nothing depends on it.
+
+Measured 2026-11-19 on netns (server, a router with netem's rate and queue toward the client,
+30 ms; one download of 400 MB; the same client both times). At a gigabit the server's most
+datagrams in any 100 us went from 64 to 41 to 47, in any millisecond from 265 to 269 to 132 to 154,
+its longest back-to-back train from 32 to 23 (99th percentile 32 to 15 to 18), and what the
+receiver saw in 100 us behind the router from 37 to 44 to 17 to 21; at 440 Mbit/s 64 to 24 to 28,
+trains 32 to 10. A receiver with a 208 KiB buffer at a gigabit counted fewer receive buffer errors
+(median of four runs, `bbr` 9,450 to 6,470, `bbr2` 4,050 to 1,410, both noisy); at 440 Mbit/s
+there were none either way, and with 2 MiB none either way. What remains is the receiver's own
+pace: a client that stalls 3 ms in every 20 misses 375 KB at a gigabit each time, which no pacing
+can help (its errors were the same before and after). Throughput was the same within the noise
+(400 Mbit/s at 440; 870 to 890 at a gigabit; at 138 ms with 0.3% loss 420 to 490 either way). The
+cost is wakeups: the server's CPU for a download was 4 to 8% more at 440 Mbit/s and within the noise
+at a gigabit, and on loopback, where one session runs a core flat out and the pacer, not the
+window, sets each write, a WebTransport echo moves 4 to 6% fewer bytes per server CPU second
+(WebSocket unchanged).
+
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per
 level is CRYPTO_BUFFER_EXCEEDED, out-of-order stream data beyond the credit granted is

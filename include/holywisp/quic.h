@@ -79,6 +79,12 @@ typedef struct {
 	size_t datagram_queue_max; // datagrams queued for sending before the newest is dropped
 	uint64_t keepalive_ms;     // 0 = none: send a PING after this long without sending anything
 	int congestion;            // HW_QUIC_CC_BBR (the default), HW_QUIC_CC_NEWRENO or HW_QUIC_CC_BBR2
+	// How late after its deadline the caller's timer may fire, in microseconds; 0 is a millisecond,
+	// the tick of hw_quic_timeout. The pacer's bursts are two ticks of its rate (a burst smaller
+	// than what comes in while a timer is late caps the rate), so a caller that waits for
+	// hw_quic_timeout_us with timers of microseconds passes how fine they are, and the pacer then
+	// lets a few datagrams go at a time instead of two milliseconds of the rate.
+	uint64_t timer_tick_us;
 	// Server: the first byte of every connection ID issued (the owning worker's index), the
 	// listener's stateless reset key (reset tokens are HMAC-SHA-256(key, cid) truncated), and
 	// the original DCID and Retry SCID when the client went through a Retry.
@@ -202,12 +208,17 @@ size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr
 int hw_quic_output_alone(const hw_quic_conn *q);
 
 // The absolute time (ms, the caller's clock) of the next timer: loss detection, PTO, ACK delay,
-// pacing, idle, keepalive, draining. UINT64_MAX when there is none.
+// pacing, idle, keepalive, draining. UINT64_MAX when there is none. A deadline inside a
+// millisecond is rounded up to the next one.
 uint64_t hw_quic_timeout(const hw_quic_conn *q);
+// The same deadline in microseconds (hw_now_us's clock, as the _us calls take it), not rounded:
+// the pacer's next release is often a few hundred microseconds away. UINT64_MAX for none.
+uint64_t hw_quic_timeout_us(const hw_quic_conn *q);
 void hw_quic_on_timeout(hw_quic_conn *q, uint64_t now_ms);
 
 // hw_quic_input, hw_quic_output and hw_quic_on_timeout with the same clock in microseconds
-// (now_us / 1000 is the ms clock of the other calls; the timer is still hw_quic_timeout's, in ms).
+// (now_us / 1000 is the ms clock of the other calls; the timer is hw_quic_timeout's in ms, or
+// hw_quic_timeout_us's).
 // A caller that has a finer clock than its timers passes it here: BBR measures the delivery rate
 // over intervals of a round trip, and on a clock of whole milliseconds a 30 ms interval is known
 // only to 3%. The bandwidth filter keeps the highest sample, so it kept the ones whose error made

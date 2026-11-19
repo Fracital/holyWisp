@@ -765,6 +765,7 @@ static void frame_lost(hw_quic_conn *q, hw_qc_space *sp, const hw_qc_frec *r) {
 
 static void cc_init(hw_quic_conn *q) {
 	hw_qc_cc_init(&q->cc, q->mds, q->now);
+	if (q->cfg.timer_tick_us) hw_qc_pacer_set_tick(&q->cc, q->cfg.timer_tick_us);
 	if (q->cfg.congestion == HW_QUIC_CC_BBR2) {
 		hw_qc_cc_use_bbr2(&q->cc, q->now);
 	} else if (q->cfg.congestion != HW_QUIC_CC_NEWRENO) {
@@ -2433,6 +2434,11 @@ uint64_t hw_quic_timeout(const hw_quic_conn *q) {
 	uint64_t t = timeout_us(q);
 	if (t == HW_QC_NONE) return UINT64_MAX;
 	return (t + 999) / 1000;
+}
+
+uint64_t hw_quic_timeout_us(const hw_quic_conn *q) {
+	uint64_t t = timeout_us(q);
+	return t == HW_QC_NONE ? UINT64_MAX : t;
 }
 
 void hw_quic_on_timeout(hw_quic_conn *q, uint64_t now_ms) {

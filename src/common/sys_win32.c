@@ -18,6 +18,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <mstcpip.h>
 #include <stdlib.h>
 #include <string.h>
@@ -236,4 +237,14 @@ int hw_sys_udp_no_fragment(int fd) {
 	int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_DONTFRAG, (const void *)&v6, sizeof(v6));
 	if (family == AF_INET6) return r6 == 0 ? 0 : -1;
 	return r4 == 0 || r6 == 0 ? 0 : -1;
+}
+
+int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us) {
+	// poll's timeout is in milliseconds: rounded up, so a timer is not polled for in a loop.
+	int64_t ms = timeout_us < 0 ? -1 : (timeout_us + 999) / 1000;
+	return poll(fds, n, ms > INT_MAX ? INT_MAX : (int)ms);
+}
+
+unsigned hw_sys_poll_resolution_us(void) {
+	return 1000;
 }

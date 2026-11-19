@@ -24,6 +24,7 @@
 // ---- Constants ------------------------------------------------------------------------------
 #define HW_QC_GRANULARITY_US    1000u   // RFC 9002 kGranularity
 #define HW_QC_INITIAL_RTT_US    333000u // RFC 9002 kInitialRtt
+#define HW_QC_PACER_BURST_MAX   32u     // datagrams: the most a pacer on a fine tick lets go at once
 #define HW_QC_PACKET_THRESHOLD  3u      // RFC 9002 kPacketThreshold: the start of the adaptive one
 #define HW_QC_PACKET_THRESH_MAX 256u    // the adaptive packet threshold goes no higher
 #define HW_QC_TIME_SHIFT        3u      // time threshold 1 + 2^-3 = RFC 9002 kTimeThreshold, at first
@@ -300,8 +301,9 @@ typedef struct {
 	uint16_t epoch; // recovery periods entered (mod 2^16), stamped on the packets each declared lost
 	int undo_ok;    // the current period may still be undone
 	// Pacer: a token bucket refilled at 5/4 * cwnd / smoothed RTT (NewReno) or at BBR's
-	// pacing rate.
+	// pacing rate, and how late the caller's timers fire, which sizes its bursts (pacer_burst).
 	uint64_t tokens, last_refill;
+	uint64_t tick_us;
 	// Delivery rate estimation (draft-cheng-iccrg-delivery-rate-estimation), kept by both
 	// algorithms and used by BBR: bytes acknowledged so far and when the latest was, the send
 	// time of the packet that started the current interval, and the app-limited mark (the
@@ -422,8 +424,15 @@ static inline int hw_qc_cc_can_send(const hw_qc_cc *c) {
 	return c->in_flight < c->cwnd;
 }
 // The pacer: refills, then returns now when a packet of mds bytes may go, or the time when it
-// may.
+// may. On a tick of a millisecond (HW_QC_GRANULARITY_US, what hw_qc_cc_init sets) a burst is
+// the larger of ten datagrams and two ticks of the rate, and it waits for one datagram. On a finer
+// tick (hw_qc_pacer_set_tick) a burst is two ticks of the rate, at least two datagrams and at
+// most HW_QC_PACER_BURST_MAX, and when held back it waits until the bucket is a tick's worth short
+// of full, so that a fine timer is not woken for every datagram and one a tick late wastes none.
 uint64_t hw_qc_pacer_next(hw_qc_cc *c, const hw_qc_rtt *r, uint64_t now);
+// The resolution of the caller's timers in microseconds: how late after its deadline it may be
+// woken. HW_QC_GRANULARITY_US or more is the millisecond pacer above.
+void hw_qc_pacer_set_tick(hw_qc_cc *c, uint64_t tick_us);
 void hw_qc_pacer_on_sent(hw_qc_cc *c, uint64_t bytes);
 
 // ---- Sent packets --------------------------------------------------------------------------

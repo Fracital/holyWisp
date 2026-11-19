@@ -408,6 +408,92 @@ static void test_rtt_cc(void) {
 	CHECK_EQ(hw_qc_pacer_next(&c, &r, t), t);
 }
 
+// The pacer on a microsecond timer of the given tick, woken at each deadline it asks for plus a
+// random lateness of up to a tick. Returns the bytes sent over run_us; *win_max is the most that
+// left within any window of win_us, *train the most datagrams that left at one instant (back to
+// back, as one write).
+static uint64_t pace_run(uint64_t rate, uint64_t tick, uint64_t run_us, uint64_t win_us, uint64_t *win_max,
+                         unsigned *train) {
+	enum {
+		MDS = 1200,
+		MAXSENT = 1 << 20
+	};
+	hw_qc_cc c;
+	hw_qc_rtt r;
+	hw_qc_cc_init(&c, MDS, 0);
+	hw_qc_pacer_set_tick(&c, tick);
+	hw_qc_rtt_init(&r);
+	hw_qc_rtt_sample(&r, 10000, 0, 0);
+	c.cwnd = rate / 100 * 4 / 5; // NewReno paces at 5/4 of cwnd per smoothed RTT (10 ms)
+	uint64_t *at = malloc(MAXSENT * sizeof(*at));
+	CHECK(at, "alloc");
+	size_t n = 0;
+	uint64_t now = 0, rng = rate | 1;
+	unsigned run = 0;
+	*train = 0;
+	while (now < run_us && n < MAXSENT) {
+		uint64_t t = hw_qc_pacer_next(&c, &r, now);
+		if (t <= now) {
+			hw_qc_pacer_on_sent(&c, MDS);
+			at[n++] = now;
+			run = n > 1 && at[n - 2] == now ? run + 1 : 1;
+			if (run > *train) *train = run;
+			continue;
+		}
+		rng ^= rng << 13;
+		rng ^= rng >> 7;
+		rng ^= rng << 17;
+		now = t + rng % (tick + 1);
+	}
+	*win_max = 0;
+	for (size_t i = 0, j = 0; i < n; i++) {
+		while (at[i] - at[j] >= win_us) j++;
+		uint64_t b = (uint64_t)(i - j + 1) * MDS;
+		if (b > *win_max) *win_max = b;
+	}
+	free(at);
+	return (uint64_t)n * MDS;
+}
+
+// The pacer's bursts on a fine tick (100 us, as the listener and the client set it): at each rate
+// no window of 100 us carries more than a burst (two ticks of the rate, two to
+// HW_QC_PACER_BURST_MAX datagrams) plus 100 us of the rate, no write is more than a burst, and the
+// rate is kept although every wakeup is late. At a gigabit that is under 40 KB in any 100 us, where
+// the millisecond pacer let 250 KB go back to back, more than a browser's UDP receive buffer.
+static void test_pacer_fine_tick(void) {
+	static const uint64_t rates[] = {1250000, 55000000, 125000000, 1250000000}; // 10M, 440M, 1G, 10G bit/s
+	for (size_t i = 0; i < sizeof(rates) / sizeof(rates[0]); i++) {
+		uint64_t rate = rates[i], win_max;
+		unsigned train;
+		uint64_t sent = pace_run(rate, 100, 200000, 100, &win_max, &train);
+		uint64_t burst = HW_MAX(HW_MIN(rate * 200 / 1000000, HW_QC_PACER_BURST_MAX * 1200ull), 2400ull);
+		CHECK(win_max <= burst + rate * 100 / 1000000 + 1200, "rate %llu: %llu bytes in 100 us",
+		      (unsigned long long)rate, (unsigned long long)win_max);
+		CHECK(train * 1200ull <= burst, "rate %llu: %u datagrams at once", (unsigned long long)rate, train);
+		// Up to the rate where two ticks of it are a whole HW_QC_PACER_BURST_MAX, the rate is kept.
+		if (rate * 200 / 1000000 <= HW_QC_PACER_BURST_MAX * 1200ull) {
+			CHECK(sent >= rate / 5 * 99 / 100, "rate %llu: %llu bytes in 200 ms", (unsigned long long)rate,
+			      (unsigned long long)sent);
+		}
+		if (rate == 125000000) CHECK(win_max <= 40000, "a gigabit: %llu bytes in 100 us", (unsigned long long)win_max);
+		printf("  pacer at %llu Mbit/s: at most %llu bytes in 100 us, %u datagrams at once, %.1f%% of the rate\n",
+		       (unsigned long long)(rate * 8 / 1000000), (unsigned long long)win_max, train,
+		       500.0 * (double)sent / (double)rate); // 200 ms of the rate
+	}
+	// Before the first RTT sample the initial window still goes at once, whatever the tick.
+	hw_qc_cc c;
+	hw_qc_rtt r;
+	hw_qc_cc_init(&c, 1200, 0);
+	hw_qc_pacer_set_tick(&c, 100);
+	hw_qc_rtt_init(&r);
+	int sent = 0;
+	while (hw_qc_pacer_next(&c, &r, 0) == 0 && sent < 100) {
+		hw_qc_pacer_on_sent(&c, 1200);
+		sent++;
+	}
+	CHECK_EQ(sent, 10);
+}
+
 // A path for the congestion controller alone: a bottleneck of g_cclink.rate bytes per microsecond
 // (CCSIM_RATE when 0; from rate2_at on, rate2) with a queue of g_ccsim.queue_us, g_ccsim.rtt_us of
 // propagation, an ACK for every packet, a loss detected when the packet three after it is
@@ -1756,6 +1842,10 @@ static void test_clock_us(void) {
 	CHECK_EQ(s->c.q->cc.b.min_rtt, HW_QC_GRANULARITY_US);
 	hw_quic_on_timeout_us(s->c.q, t0 + 250); // nothing is due: a no-op on the same clock
 	CHECK(hw_quic_timeout(s->c.q) > (t0 + 250) / 1000, "a timer is due at once");
+	// The same deadline in microseconds, which the millisecond call rounds up.
+	uint64_t at_us = hw_quic_timeout_us(s->c.q);
+	CHECK(at_us != UINT64_MAX && at_us > t0 + 250, "deadline %llu", (unsigned long long)at_us);
+	CHECK_EQ(hw_quic_timeout(s->c.q), (at_us + 999) / 1000);
 	sim_free(s);
 }
 
@@ -2563,6 +2653,7 @@ int main(int argc, char **argv) {
 	RUN(test_sendbuf);
 	RUN(test_recvbuf);
 	RUN(test_rtt_cc);
+	RUN(test_pacer_fine_tick);
 	RUN(test_bbr_random_loss);
 	RUN(test_bbr_model);
 	RUN(test_bbr_buffer_limited);

@@ -39,8 +39,15 @@ int hw_poller_set(int poller, int fd, int fresh, unsigned old, unsigned events, 
 // Forget fd, which had interest `events`. Harmless when the fd is already closed.
 void hw_poller_del(int poller, int fd, unsigned events);
 
-// Wait up to timeout_ms (-1 = forever, 0 = poll) and fill out[0..max). The count, 0 on timeout,
-// or -1 with errno (EINTR included).
-int hw_poller_wait(int poller, hw_poll_event *out, int max, int timeout_ms);
+// The unit hw_poller_wait keeps a timeout in, in microseconds: 1 where the kernel waits for a
+// timespec or a timeval, 1000 where it waits only in milliseconds (and hw_poller_wait rounds up).
+// Valid once a poller has been opened.
+unsigned hw_poller_resolution_us(void);
+
+// Wait up to timeout_us microseconds (-1 = forever, 0 = poll) and fill out[0..max). The count, 0
+// on timeout, or -1 with errno (EINTR included). A timeout is never cut short: where the kernel
+// waits only in milliseconds it is rounded up to the next one, never down, so a timer is not
+// polled for in a loop until it is due.
+int hw_poller_wait(int poller, hw_poll_event *out, int max, int64_t timeout_us);
 
 #endif

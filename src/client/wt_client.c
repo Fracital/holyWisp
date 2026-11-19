@@ -23,14 +23,15 @@
 
 #include <sys/socket.h>
 
-#define WTC_RX_SLOT       4096
-#define WTC_RX_GRO        16                  // receive slots with GRO, HW_SYS_GRO_SLOT each
-#define WTC_SOCKET_BUFFER (4 * 1024 * 1024)   // the server's flight, and ours, without drops (wt_listener.c)
-#define WTC_WINDOW        (32u * 1024 * 1024) // the server's credit, and the client's own send buffer
-#define WTC_SEND_MAX      (8u * 1024 * 1024)  // queued in hw_wt before a send waits
-#define WTC_IDLE_MS       30000
-#define WTC_KEEPALIVE     15000
-#define WTC_FOREVER       UINT64_MAX
+#define WTC_RX_SLOT        4096
+#define WTC_RX_GRO         16                  // receive slots with GRO, HW_SYS_GRO_SLOT each
+#define WTC_SOCKET_BUFFER  (4 * 1024 * 1024)   // the server's flight, and ours, without drops (wt_listener.c)
+#define WTC_WINDOW         (32u * 1024 * 1024) // the server's credit, and the client's own send buffer
+#define WTC_SEND_MAX       (8u * 1024 * 1024)  // queued in hw_wt before a send waits
+#define WTC_IDLE_MS        30000
+#define WTC_KEEPALIVE      15000
+#define WTC_PACING_TICK_US 100 // how late a wait for QUIC's timer ends: the listener's (wt_listener.c)
+#define WTC_FOREVER        UINT64_MAX
 
 struct hw_wtc {
 	int fd;
@@ -158,9 +159,11 @@ static void wtc_tx_flush(hw_wtc *t, size_t n) {
 }
 
 // Everything QUIC will send now, in batches (the socket is connected, so the destination is known).
+// One call is one release of the pacer and starts a run of its own, as on the server.
 static void wtc_output(hw_wtc *t) {
 	uint64_t now = hw_now_us(); // BBR times its rate samples with this clock (holywisp/quic.h)
 	size_t n = 0;
+	int first = 1;
 	for (;;) {
 		hw_sys_dgram *d = &t->txd[n];
 		struct sockaddr_storage to;
@@ -170,6 +173,8 @@ static void wtc_output(hw_wtc *t) {
 		if (d->len == 0) break;
 		d->addr_len = 0;
 		d->alone = hw_quic_output_alone(t->q);
+		d->run_start = first;
+		first = 0;
 		if (++n == HW_SYS_BATCH_MAX) {
 			wtc_tx_flush(t, n);
 			n = 0;
@@ -178,15 +183,22 @@ static void wtc_output(hw_wtc *t) {
 	if (n) wtc_tx_flush(t, n);
 }
 
+// Microseconds from now until at (hw_now_us's clock), -1 for UINT64_MAX.
+static int64_t wtc_wait_until(uint64_t at) {
+	if (at == UINT64_MAX) return -1;
+	uint64_t now = hw_now_us();
+	return at <= now ? 0 : (int64_t)HW_MIN(at - now, (uint64_t)INT64_MAX);
+}
+
 // Wait for the socket or QUIC's next timer, at most until deadline, and act on what came. 1 when
-// something was read or a timer ran, 0 when the deadline came first.
+// something was read or a timer ran, 0 when the deadline came first. QUIC's timer is waited for in
+// microseconds: the pacer's next release is often a few hundred of them away.
 static int wtc_pump(hw_wtc *t, uint64_t deadline) {
-	uint64_t now = hw_now_ms();
-	uint64_t at = hw_quic_timeout(t->q);
-	uint64_t until = at < deadline ? at : deadline;
-	int wait = until == WTC_FOREVER ? -1 : until <= now ? 0 : (int)HW_MIN(until - now, (uint64_t)INT_MAX);
+	uint64_t at = hw_quic_timeout_us(t->q);
+	uint64_t until = deadline == WTC_FOREVER ? WTC_FOREVER : deadline * 1000;
+	if (at < until) until = at;
 	struct pollfd p = {.fd = t->fd, .events = POLLIN};
-	int r = poll(&p, 1, wait);
+	int r = hw_sys_poll_us(&p, 1, wtc_wait_until(until));
 	if (r < 0 && errno != EINTR) {
 		t->closed = 1;
 		return 1;
@@ -217,13 +229,13 @@ static int wtc_pump(hw_wtc *t, uint64_t deadline) {
 			if ((size_t)n < t->rx_slots) break;
 		}
 	}
-	now = hw_now_ms();
-	if (now >= hw_quic_timeout(t->q)) {
-		hw_quic_on_timeout_us(t->q, hw_now_us());
+	uint64_t now_us = hw_now_us();
+	if (now_us >= hw_quic_timeout_us(t->q)) {
+		hw_quic_on_timeout_us(t->q, now_us);
 		did = 1;
 	}
 	wtc_output(t);
-	return did || now < deadline;
+	return did || now_us / 1000 < deadline;
 }
 
 hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_t err_cap) {
@@ -253,7 +265,7 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 		freeaddrinfo(res);
 		goto fail;
 	}
-	hw_sys_udp_buffers(t->fd, WTC_SOCKET_BUFFER);
+	hw_sys_udp_buffers(t->fd, (int)HW_MIN(o->udp_buffer ? o->udp_buffer : WTC_SOCKET_BUFFER, (size_t)INT_MAX));
 	(void)hw_sys_udp_no_fragment(t->fd); // the datagram size is probed, never left to fragmentation
 	int gro = hw_sys_udp_gro(t->fd);
 	t->rx_slots = gro ? WTC_RX_GRO : HW_SYS_BATCH_MAX;
@@ -290,6 +302,8 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	qc.conn_send_max = WTC_WINDOW;
 	qc.datagram_queue_max = 256;
 	qc.keepalive_ms = WTC_KEEPALIVE;
+	unsigned tick = hw_sys_poll_resolution_us();
+	qc.timer_tick_us = tick > WTC_PACING_TICK_US ? tick : WTC_PACING_TICK_US;
 	hw_quic_callbacks cb = {
 	    .ud = t,
 	    .established = q_established,
@@ -447,4 +461,8 @@ int hw_wtc_wait_ms(const hw_wtc *t) {
 	if (at == WTC_FOREVER) return -1;
 	uint64_t now = hw_now_ms();
 	return at <= now ? 0 : (int)HW_MIN(at - now, (uint64_t)INT_MAX);
+}
+
+int64_t hw_wtc_wait_us(const hw_wtc *t) {
+	return wtc_wait_until(hw_quic_timeout_us(t->q));
 }

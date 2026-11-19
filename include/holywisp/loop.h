@@ -39,9 +39,21 @@ void hw_loop_del_fd(hw_loop *loop, int fd);
 
 // Timers in monotonic milliseconds. repeat_ms 0 = one shot: the timer is freed before its callback
 // runs, so the callback forgets the handle and never cancels it. A repeating timer may be cancelled
-// from inside its own callback.
+// from inside its own callback. A millisecond timer is due on a tick of hw_now_ms (one of delay 1
+// set late in a millisecond fires early in the next), so the timers of a loop that are due within
+// the same millisecond fire in one wakeup.
 hw_timer *hw_loop_add_timer(hw_loop *loop, uint64_t delay_ms, uint64_t repeat_ms, hw_timer_cb cb, void *ud);
+// The same in microseconds of hw_now_us, for a deadline finer than a millisecond: a pacer releasing
+// a few datagrams at a time. It fires no earlier than its delay and as soon after as the kernel
+// wakes the thread (Linux: within its timer slack, 50 us by default; where the kernel waits only in
+// milliseconds, rounded up to the next one). Both kinds share one heap and may be mixed freely.
+hw_timer *hw_loop_add_timer_us(hw_loop *loop, uint64_t delay_us, uint64_t repeat_us, hw_timer_cb cb, void *ud);
 void hw_loop_cancel_timer(hw_loop *loop, hw_timer *t);
+// The unit this loop's waits keep a microsecond timer's deadline in: 1 where the kernel waits in
+// microseconds or finer, 1000 where it waits only in milliseconds (Linux before 5.11, or a
+// seccomp filter that refuses epoll_pwait2; Windows), and a timer then fires on the millisecond
+// after its deadline. A caller whose work is sized to how late its timers fire asks this.
+unsigned hw_loop_timer_resolution_us(const hw_loop *loop);
 
 // Run cb on the loop thread at the start of its next iteration. Thread-safe.
 int hw_loop_post(hw_loop *loop, hw_task_cb cb, void *ud);

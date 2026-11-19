@@ -166,6 +166,7 @@ static void test_v1_tcp_echo_small(void) {
 	hw_client *c = connect_to(g_server, 0, NULL, NULL, 0);
 	CHECK(!hw_client_is_v2(c), "v1");
 	CHECK_EQ(hw_client_buffer_size(c), 16);
+	CHECK(hw_client_wait_ms(c) == -1 && hw_client_wait_us(c) == -1, "a WebSocket has no timers");
 	uint32_t sid;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
 	CHECK_EQ(hw_client_send(c, sid, "hello wisp", 10), 0);

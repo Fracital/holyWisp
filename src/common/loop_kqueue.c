@@ -33,6 +33,10 @@ int hw_poller_open(void) {
 	return kq;
 }
 
+unsigned hw_poller_resolution_us(void) {
+	return 1; // kevent waits for a timespec
+}
+
 int hw_poller_wake_open(int fds[2]) {
 	if (pipe(fds) != 0) return -1;
 	for (int i = 0; i < 2; i++) {
@@ -71,13 +75,14 @@ void hw_poller_del(int poller, int fd, unsigned events) {
 	hw_poller_set(poller, fd, 0, events, 0, 0);
 }
 
-int hw_poller_wait(int poller, hw_poll_event *out, int max, int timeout_ms) {
+int hw_poller_wait(int poller, hw_poll_event *out, int max, int64_t timeout_us) {
 	struct kevent events[KQUEUE_BATCH];
 	struct timespec ts;
 	struct timespec *wait = NULL;
-	if (timeout_ms >= 0) {
-		ts.tv_sec = timeout_ms / 1000;
-		ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+	if (timeout_us >= 0) {
+		// kevent's timeout is a timespec: microseconds are kept as they are.
+		ts.tv_sec = (time_t)(timeout_us / 1000000);
+		ts.tv_nsec = (long)(timeout_us % 1000000) * 1000L;
 		wait = &ts;
 	}
 	int n = kevent(poller, NULL, 0, events, max < KQUEUE_BATCH ? max : KQUEUE_BATCH, wait);

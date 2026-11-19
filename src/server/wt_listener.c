@@ -65,6 +65,13 @@
 #define WT_REFUSE_MS    2000  // a refused CONNECT's answer gets this long to be delivered before the close
 #define WT_CLOSE_MS     3000  // after the server's close capsule, this long for the client's answer, then QUIC goes
 #define WT_KEEPALIVE_MS 20000 // a PING after this long without sending: divide's conntrack keeps a flow 30 s
+// A session's timer is due on a grid of WT_TIMER_GRID_US, so that the sessions of a worker whose
+// pacers release within that much of each other are served in one wakeup: a worker's wakeups for
+// pacing are bounded by the grid, not by its sessions. How late a timer then fires, which QUIC's
+// pacer sizes its bursts to (timer_tick_us), is the grid and the kernel's timer slack (50 us).
+// Where the loop waits only in milliseconds, it is that.
+#define WT_TIMER_GRID_US  50
+#define WT_PACING_TICK_US 100
 // Sized for a gigabit at 138 ms (17 MB): BBR's window is twice that, the receive credit once.
 #define WT_INFLIGHT_MAX  (32u * 1024 * 1024) // what QUIC may hold beyond the unsent high-water mark
 #define WT_RX_WINDOW_MIN (16u * 1024 * 1024)
@@ -92,7 +99,7 @@ struct wt_session {
 	int dirty;
 	int busy; // a call into QUIC or hw_wt is under way: callbacks only record what to do
 	hw_timer *timer;
-	uint64_t timer_at;
+	uint64_t timer_at; // microseconds
 	uint64_t created_ms;
 	int established;
 	int hs_counted;   // counts toward the worker's and the address's handshakes in progress
@@ -203,6 +210,7 @@ static void tx_commit(wt_worker *ww, size_t len, const struct sockaddr *to, sock
 	hw_sys_dgram *d = &ww->txd[ww->ntx];
 	d->len = len;
 	d->alone = 0;
+	d->run_start = 0;
 	if (to) {
 		memcpy(&d->addr, to, to_len);
 		d->addr_len = to_len;
@@ -210,11 +218,14 @@ static void tx_commit(wt_worker *ww, size_t len, const struct sockaddr *to, sock
 	ww->ntx++;
 }
 
-// Everything QUIC will send now for this connection, into the batch.
+// Everything QUIC will send now for this connection, into the batch. What one pass takes is one
+// release of the pacer, a few datagrams, and it starts a run of its own (run_start): a run is one
+// write the NIC sends back to back, and two releases in one would be the burst the pacer spaced.
 static void session_output(wt_session *s) {
 	wt_worker *ww = s->ww;
 	// Microseconds: BBR's rate samples are only as good as the clock they are timed with (quic.h).
 	uint64_t now = hw_now_us();
+	int first = 1;
 	for (;;) {
 		hw_sys_dgram *d = tx_slot(ww);
 		if (!d) return; // the socket is full; wt_writable comes back for it
@@ -222,6 +233,8 @@ static void session_output(wt_session *s) {
 		if (n == 0) return;
 		tx_commit(ww, n, NULL, 0);
 		d->alone = hw_quic_output_alone(s->q);
+		d->run_start = first;
+		first = 0;
 	}
 }
 
@@ -353,11 +366,11 @@ static void session_timer_cb(hw_loop *loop, void *ud) {
 	wt_session *s = ud;
 	wt_worker *ww = s->ww;
 	s->timer = NULL;
-	uint64_t now = hw_now_ms();
+	uint64_t now = hw_now_us();
 	ww->in_io = 1;
-	if (now >= hw_quic_timeout(s->q)) {
+	if (now >= hw_quic_timeout_us(s->q)) {
 		s->busy++;
-		hw_quic_on_timeout_us(s->q, hw_now_us());
+		hw_quic_on_timeout_us(s->q, now);
 		s->busy--;
 	}
 	session_settle(s);
@@ -368,19 +381,23 @@ static void session_timer_cb(hw_loop *loop, void *ud) {
 
 // One timer per session, at the earliest of QUIC's deadline, the handshake's expiry and a refusal's
 // close. A timer that is already due no later than that is left alone: when it fires early it
-// finds nothing due and is armed again, which is cheaper than moving it on every packet.
+// finds nothing due and is armed again, which is cheaper than moving it on every packet. It is a
+// microsecond timer: QUIC's deadline is often the pacer's next release, a few hundred
+// microseconds away (the session's own deadlines are milliseconds, made microseconds here).
 static void session_arm(wt_session *s) {
-	uint64_t at = hw_quic_timeout(s->q);
-	if (!s->established && s->created_ms + WT_HS_EXPIRY_MS < at) at = s->created_ms + WT_HS_EXPIRY_MS;
-	if (s->refused && !s->quic_closing && s->refuse_at < at) at = s->refuse_at;
-	if (s->close_by && !s->quic_closing && s->close_by < at) at = s->close_by;
-	if (s->close_pending && !s->quic_closing && s->capsule_at < at) at = s->capsule_at;
+	uint64_t at = hw_quic_timeout_us(s->q);
+	if (at != UINT64_MAX) at = (at + WT_TIMER_GRID_US - 1) / WT_TIMER_GRID_US * WT_TIMER_GRID_US;
+	uint64_t hs_end = (s->created_ms + WT_HS_EXPIRY_MS) * 1000;
+	if (!s->established && hs_end < at) at = hs_end;
+	if (s->refused && !s->quic_closing && s->refuse_at * 1000 < at) at = s->refuse_at * 1000;
+	if (s->close_by && !s->quic_closing && s->close_by * 1000 < at) at = s->close_by * 1000;
+	if (s->close_pending && !s->quic_closing && s->capsule_at * 1000 < at) at = s->capsule_at * 1000;
 	if (at == UINT64_MAX) return;
 	if (s->timer && s->timer_at <= at) return;
 	hw_loop *loop = s->ww->w->loop;
 	if (s->timer) hw_loop_cancel_timer(loop, s->timer);
-	uint64_t now = hw_now_ms();
-	s->timer = hw_loop_add_timer(loop, at > now ? at - now : 0, 0, session_timer_cb, s);
+	uint64_t now = hw_now_us();
+	s->timer = hw_loop_add_timer_us(loop, at > now ? at - now : 0, 0, session_timer_cb, s);
 	s->timer_at = at;
 }
 
@@ -771,6 +788,10 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	qc->conn_send_max = marks * cfg->ws_write_high_water + WT_INFLIGHT_MAX;
 	qc->datagram_queue_max = 256;
 	qc->keepalive_ms = WT_KEEPALIVE_MS;
+	// The pacer lets go what comes in over a tick of the timers at a time: a few datagrams, where on
+	// a millisecond's tick it was two milliseconds of the rate back to back (quic_recovery.c).
+	unsigned res = hw_loop_timer_resolution_us(ww->w->loop);
+	qc->timer_tick_us = res > WT_PACING_TICK_US ? res : WT_PACING_TICK_US;
 	qc->cid_prefix = (uint8_t)ww->w->index;
 	qc->reset_key = srv->wt_reset_key;
 }

@@ -64,6 +64,7 @@ void hw_qc_cc_init(hw_qc_cc *c, uint64_t mds, uint64_t now) {
 	c->ssthresh = UINT64_MAX;
 	c->tokens = c->cwnd;
 	c->last_refill = now;
+	c->tick_us = HW_QC_GRANULARITY_US;
 }
 
 void hw_qc_cc_on_sent(hw_qc_cc *c, uint64_t bytes) {
@@ -909,9 +910,23 @@ void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 }
 
 // ---- Pacer (section 7.7) -------------------------------------------------------------------
-// A token bucket: rate 5/4 * cwnd / smoothed_rtt, a burst of the larger of ten datagrams and
-// two milliseconds' worth (the caller's clock ticks in milliseconds, so a smaller burst would
-// cap the rate rather than smooth it), never more than the window.
+// A token bucket at rate 5/4 * cwnd / smoothed_rtt (NewReno) or BBR's pacing rate, never letting
+// more than the window go at once. What a burst may be depends on how late the caller's timers
+// fire (tick_us): the bucket must hold what comes in over a timer's lateness, or a late timer caps
+// the rate rather than smoothing it.
+//
+// On a millisecond's tick a burst is two ticks of the rate, at least ten datagrams: 250 KB at a
+// gigabit, sent back to back. A browser's UDP receive buffer is often 208 KB (Linux's rmem_max,
+// counted double), and Chrome's lost datagrams on a fast path were its receive buffer's errors,
+// in runs of 50 to 340, one for each of the server's losses. On a fine tick (the listener and the
+// client wait in microseconds) a burst is two ticks of the rate within two and
+// HW_QC_PACER_BURST_MAX datagrams, and a sender held back waits until the bucket is a tick's worth
+// short of full rather than for one datagram: a timer that fires up to a tick late then finds a
+// burst and wastes none of the rate, a few datagrams per wakeup. Where a tick's worth is a whole
+// burst or more (past about 1.5 Gbit/s on a tick of 100 us) it waits for one datagram, and the
+// timer's lateness fills the bucket: the rate a session can be paced at is then a burst per
+// wakeup, about 0.4 GB/s when wakeups are 100 us apart. Before the first RTT sample there is no
+// rate to pace at, and the initial window goes as one burst (RFC 9002 7.7).
 
 static uint64_t pacer_rate(const hw_qc_cc *c, const hw_qc_rtt *r) {
 	uint64_t srtt = HW_MAX(r->smoothed, (uint64_t)HW_QC_GRANULARITY_US);
@@ -924,10 +939,29 @@ static uint64_t pacer_rate(const hw_qc_cc *c, const hw_qc_rtt *r) {
 	return (c->cwnd * 5 / 4) * 1000000 / srtt;
 }
 
+static int pacer_fine(const hw_qc_cc *c) {
+	return c->tick_us < HW_QC_GRANULARITY_US;
+}
+
+static uint64_t pacer_burst(const hw_qc_cc *c, const hw_qc_rtt *r, uint64_t rate) {
+	uint64_t burst = rate * 2 * c->tick_us / 1000000;
+	if (!pacer_fine(c) || !r->has_sample) {
+		burst = HW_MAX(burst, 10 * c->mds);
+	} else {
+		burst = HW_MIN(burst, (uint64_t)HW_QC_PACER_BURST_MAX * c->mds);
+		burst = HW_MAX(burst, 2 * c->mds);
+	}
+	if (burst > c->cwnd) burst = HW_MAX(c->cwnd, 2 * c->mds);
+	return burst;
+}
+
+void hw_qc_pacer_set_tick(hw_qc_cc *c, uint64_t tick_us) {
+	c->tick_us = tick_us ? tick_us : 1;
+}
+
 uint64_t hw_qc_pacer_next(hw_qc_cc *c, const hw_qc_rtt *r, uint64_t now) {
 	uint64_t rate = pacer_rate(c, r);
-	uint64_t burst = HW_MAX(10 * c->mds, rate / 500);
-	if (burst > c->cwnd) burst = HW_MAX(c->cwnd, 2 * c->mds);
+	uint64_t burst = pacer_burst(c, r, rate);
 	if (now > c->last_refill) {
 		uint64_t add = (now - c->last_refill) * rate / 1000000;
 		if (add) {
@@ -939,7 +973,13 @@ uint64_t hw_qc_pacer_next(hw_qc_cc *c, const hw_qc_rtt *r, uint64_t now) {
 	}
 	if (c->tokens > burst) c->tokens = burst;
 	if (c->tokens >= c->mds) return now;
-	uint64_t wait = (c->mds - c->tokens) * 1000000 / (rate ? rate : 1) + 1;
+	uint64_t want = c->mds;
+	if (pacer_fine(c) && r->has_sample) {
+		// A tick short of full: a wakeup that is a tick late finds the bucket full, never past it.
+		uint64_t late = rate * c->tick_us / 1000000;
+		want = burst > late + c->mds ? burst - late : c->mds;
+	}
+	uint64_t wait = (want - c->tokens) * 1000000 / (rate ? rate : 1) + 1;
 	return c->last_refill + wait;
 }
 

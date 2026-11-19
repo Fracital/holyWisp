@@ -13,6 +13,7 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <linux/filter.h>
@@ -219,11 +220,12 @@ int hw_sys_recv_batch(int fd, hw_sys_dgram *d, size_t n) {
 }
 
 // How many datagrams from d[0] the kernel may take as one write: the same address, the same
-// length, and the last of them no longer than the others; one that goes alone, by itself.
+// length, and the last of them no longer than the others, up to one that starts a run of its own;
+// one that goes alone, by itself.
 static size_t gso_run(const hw_sys_dgram *d, size_t n) {
 	size_t seg = d[0].len, total = seg, k = 1;
 	if (d[0].alone) return 1;
-	while (k < n && k < GSO_SEGMENTS_MAX && !d[k].alone && d[k].len <= seg && d[k].len > 0 &&
+	while (k < n && k < GSO_SEGMENTS_MAX && !d[k].alone && !d[k].run_start && d[k].len <= seg && d[k].len > 0 &&
 	       total + d[k].len <= GSO_BYTES_MAX && d[k].addr_len == d[0].addr_len &&
 	       memcmp(&d[k].addr, &d[0].addr, d[0].addr_len) == 0) {
 		total += d[k].len;
@@ -383,4 +385,14 @@ int hw_sys_udp_no_fragment(int fd) {
 	int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_MTU_DISCOVER, (const void *)&v6, sizeof(v6));
 	if (family == AF_INET6) return r6 == 0 ? 0 : -1;
 	return r4 == 0 || r6 == 0 ? 0 : -1;
+}
+
+int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us) {
+	if (timeout_us < 0) return ppoll(fds, n, NULL, NULL);
+	struct timespec ts = {.tv_sec = (time_t)(timeout_us / 1000000), .tv_nsec = (long)(timeout_us % 1000000) * 1000};
+	return ppoll(fds, n, &ts, NULL);
+}
+
+unsigned hw_sys_poll_resolution_us(void) {
+	return 1;
 }

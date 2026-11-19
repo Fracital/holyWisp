@@ -530,7 +530,18 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   stream closes mid-frame the rest of the frame is read and dropped.
 - **Busy polling.** `busy-poll-us` (0 by default) makes a worker poll that long before it sleeps,
   but only after an iteration that delivered events, so an idle server never spins
-  (`hw_loop_set_busy_poll`). It trades CPU for round-trip latency and changes nothing else.
+  (`hw_loop_set_busy_poll`). It trades CPU for round-trip latency and changes nothing else: a
+  timer due sooner than the poll would end ends it, and the sleep after it is what is left of the
+  wait (`test_busy_poll_keeps_timers`), or a pacer's deadline would be late by the whole poll.
+- **Microsecond timers.** The timer heap is in microseconds. `hw_loop_add_timer` is due on a tick
+  of `hw_now_ms`, as it always was, so millisecond timers due in one millisecond still fire in
+  one wakeup; `hw_loop_add_timer_us` is due when it says, for the WebTransport pacer. On Linux a
+  wait is `epoll_pwait2` (a timespec), and where the kernel (before 5.11) or a seccomp filter
+  (ENOSYS or EPERM: systemd's `@system-service` before v249, with our unit's
+  `SystemCallErrorNumber=EPERM`) refuses it, `epoll_wait` rounded up to a millisecond, which
+  `hw_loop_timer_resolution_us` then reports as 1000 so the pacer sizes its bursts to it. kqueue
+  waits in microseconds; Windows' `select` rounds up to a millisecond. `test_loop` holds both
+  kinds and the lateness of a microsecond timer.
 - **The flush batch.** Small frames toward a client are not written one by one. `conn_kick` writes
   at once when the queue holds a pipe payload or has reached `CONN_DEFER_MAX` (16 KiB); otherwise
   the connection goes on its worker's flush list and `conn_batch_end`, the loop's batch-end hook
@@ -687,6 +698,22 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   floor) hold for it too.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
   lost, never sent in fragments that every later packet is then sent in too.
+- **The pacer releases a few datagrams at a time.** A burst used to be two milliseconds of the
+  rate (the timers' tick), 250 KB back to back at a gigabit, more than a browser's UDP receive
+  buffer (`rmem_max`, 208 KiB on a stock Linux): Chrome's receive buffer errors were the server's
+  losses. Now QUIC's deadline is in microseconds (`hw_quic_timeout_us`), the listener arms it as
+  a microsecond timer (`session_arm`, rounded up to a 50 us grid so a worker's sessions share
+  wakeups) and the client waits for it with `hw_sys_poll_us`, and both tell the pacer how late
+  their timers fire (`timer_tick_us`, 100 us, or the loop's resolution when it is coarser). On
+  that tick a burst is two ticks of the rate, 2 to `HW_QC_PACER_BURST_MAX` (32) datagrams, and a
+  held-back sender wakes when the bucket is a tick short of full (`hw_qc_pacer_next`), so a late
+  timer costs no rate: `test_pacer_fine_tick` bounds the bytes in any 100 us and the rate kept. A
+  GSO write never holds two releases (`run_start`, `test_udp_run_start`), or the kernel would
+  send the spaced releases back to back. The initial window still goes at once (no RTT yet). The
+  cost is wakeups: 4 to 8% more server CPU at 440 Mbit/s, 4 to 6% fewer bytes per CPU second on
+  the loopback echo (docs/webtransport.md has the numbers). `SO_TXTIME`/fq is not used: it needs
+  `fq` on the egress device, the edges' UDP leaves through WARP devices that do not carry a
+  departure time, and a GSO write has only one; nothing may depend on it.
 - **Lanes and the server-opened stream** (docs/webtransport.md has the rules). A session may
   ride up to `webtransport-lanes` bidirectional streams, each after the first opened with a LANE
   packet (`0xE1`); a Wisp stream stays on the lane its CONNECT came on and the server answers it
@@ -780,7 +807,9 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   one at a time), a failed connect is an
   error event (`select`'s third set; `WSAPoll` loses it on older Windows), and a descriptor is a
   small int that `close` accepts. A backend must keep what `loop_backend.h` promises (level-triggered readiness,
-  the generation carried with every event) and report a failed connect as an error event:
+  the generation carried with every event, a wait that never ends before its timeout, rounded up
+  where the kernel waits in milliseconds and `hw_poller_resolution_us` saying so) and report a
+  failed connect as an error event:
   `stream_io_cb` treats `HW_EV_ERROR` as failure even when `SO_ERROR` reads clean, because kqueue
   carries the error in the event.
 - If you touched the release build flags or added a platform: `make npm` (needs zig) and run the
@@ -813,7 +842,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
 | `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
 | `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
-| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys. |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys, a poll in microseconds. |
 | `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |

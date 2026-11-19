@@ -26,6 +26,7 @@ typedef struct {
 	const uint8_t *pin_sha256; // the server's leaf must hash to this; NULL accepts any (tests)
 	size_t max_packet;         // the largest Wisp packet accepted from the server
 	size_t max_queue;          // bytes of packets held before the server is paused
+	size_t udp_buffer;         // the socket's buffers (hw_sys_udp_buffers); 0: WTC_SOCKET_BUFFER
 } hw_wtc_opts;
 
 // Connect and open the session by deadline (hw_now_ms clock, UINT64_MAX for none). NULL with a
@@ -59,5 +60,7 @@ const char *hw_wtc_protocol(const hw_wtc *t);
 // hw_wtc_next for QUIC's timers: milliseconds, -1 for no limit.
 int hw_wtc_fd(const hw_wtc *t);
 int hw_wtc_wait_ms(const hw_wtc *t);
+// The same in microseconds, -1 for no limit (hw_sys_poll_us takes it).
+int64_t hw_wtc_wait_us(const hw_wtc *t);
 
 #endif

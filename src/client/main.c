@@ -7,6 +7,7 @@
  */
 #include "holywisp/client.h"
 #include "holywisp/hw.h"
+#include "holywisp/sys.h"
 #include "holywisp/wisp.h"
 
 #include <errno.h>
@@ -51,6 +52,8 @@ static void usage(const char *argv0) {
 	        "                       this client has read, and a window more (off)\n"
 	        "      --read-rate BPS  read what arrives no faster than BPS bytes a second, a slow\n"
 	        "                       reader; with --credit the server is held to that rate (off)\n"
+	        "      --udp-buffer N   WebTransport: the UDP socket's buffers in bytes (4 MiB); 212992 is\n"
+	        "                       a browser's on a Linux of stock settings\n"
 	        "  -v, --verbose        print events on stderr\n"
 	        "  -h, --help\n",
 	        argv0);
@@ -234,22 +237,23 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 	uint64_t idle_at = 0; // after stdin's EOF: when to stop if nothing has arrived
 	for (;;) {
 		struct pollfd pfds[2] = {{.fd = hw_client_fd(c), .events = POLLIN}, {.fd = STDIN_FILENO, .events = POLLIN}};
-		int wait = -1;
+		int64_t wait = -1;
 		if (!stdin_open) {
 			uint64_t now = hw_now_ms();
 			if (now >= idle_at) return 0; // idle after EOF
-			wait = (int)HW_MIN(idle_at - now, (uint64_t)INT_MAX);
+			wait = (int64_t)HW_MIN(idle_at - now, (uint64_t)INT_MAX) * 1000;
 		}
-		// Over WebTransport the client's timers run only when it is called.
-		int timers = hw_client_wait_ms(c);
+		// Over WebTransport the client's timers run only when it is called, and its pacer's are
+		// microseconds away.
+		int64_t timers = hw_client_wait_us(c);
 		if (timers >= 0 && (wait < 0 || timers < wait)) wait = timers;
 		// A reader that is ahead of --read-rate does not look at the server until it is due.
-		int paced = read_wait_ms();
+		int64_t paced = (int64_t)read_wait_ms() * 1000;
 		if (paced > 0) {
 			pfds[0].fd = -1;
 			if (wait < 0 || paced < wait) wait = paced;
 		}
-		int r = poll(pfds, stdin_open ? 2 : 1, wait);
+		int r = hw_sys_poll_us(pfds, stdin_open ? 2 : 1, wait);
 		if (r < 0 && errno == EINTR) continue;
 		if (r < 0) return 1;
 		if (r == 0) {
@@ -462,6 +466,8 @@ int main(int argc, char **argv) {
 			}
 		} else if (!strcmp(a, "--pin") && i + 1 < argc) {
 			pin = argv[++i];
+		} else if (!strcmp(a, "--udp-buffer") && i + 1 < argc) {
+			o.wt_udp_buffer = (size_t)strtoull(argv[++i], NULL, 10);
 		} else if (!strcmp(a, "--insecure")) {
 			insecure = 1;
 		} else if (!strcmp(a, "--origin") && i + 1 < argc) {
@@ -507,9 +513,9 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "an https:// server needs --pin (or --insecure, which takes any certificate)\n");
 			return 2;
 		}
-	} else if (pin || insecure || o.origin || connect_to || o.wt_lanes || o.wt_server_stream) {
-		fprintf(stderr, "--pin, --insecure, --origin, --connect-to, --lanes and --server-stream are for an https:// "
-		                "(WebTransport) server\n");
+	} else if (pin || insecure || o.origin || connect_to || o.wt_lanes || o.wt_server_stream || o.wt_udp_buffer) {
+		fprintf(stderr, "--pin, --insecure, --origin, --connect-to, --lanes, --server-stream and --udp-buffer are for "
+		                "an https:// (WebTransport) server\n");
 		return 2;
 	}
 	long target_port = strtol(positional[1], NULL, 10);

@@ -268,7 +268,9 @@ certificate authority check: `--pin` (the SHA-256 in base64 or hex) is what auth
 server, and `--insecure` takes any certificate, for loopback tests. `--origin` sends an origin
 header, for a server with `allow-origin`. `--connect-to ADDR` sends the datagrams to `ADDR` while the
 URL's host stays the SNI and `:authority`, as curl's option of that name does: one host of a server
-with `webtransport-cert-dir`, reached by its address.
+with `webtransport-cert-dir`, reached by its address. `--udp-buffer N` sets the UDP socket's buffers
+(4 MiB by default); `--udp-buffer 212992` receives as a browser does on a Linux with stock settings,
+which is how a server's bursts are tested against a receive buffer that small.
 
 The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events
 (`hw_client_opts.webtransport` for WebTransport). `tests/test_e2e.c`, `tests/test_e2e_wt.c` and

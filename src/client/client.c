@@ -692,6 +692,7 @@ static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char 
 	    .pin_sha256 = o->pin_sha256,
 	    .max_packet = c->max_message,
 	    .max_queue = c->max_queue_bytes,
+	    .udp_buffer = o->wt_udp_buffer,
 	};
 	c->wt = hw_wtc_connect(&wo, t->deadline, err, err_cap);
 	if (!c->wt) return -1;
@@ -820,6 +821,10 @@ int hw_client_fd(const hw_client *c) {
 int hw_client_wait_ms(const hw_client *c) {
 	if (c->credit_owed) return 0; // a grant is waiting for the next call, and the server for it
 	return c->wt ? hw_wtc_wait_ms(c->wt) : -1;
+}
+
+int64_t hw_client_wait_us(const hw_client *c) {
+	return c->wt ? hw_wtc_wait_us(c->wt) : -1;
 }
 
 int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t port, uint32_t *stream_id) {

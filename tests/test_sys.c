@@ -836,6 +836,108 @@ static void test_udp_gro_then_single(void) {
 	close(tx2);
 }
 
+// hw_sys_poll_us never returns before its timeout when nothing is ready, keeps a timeout under a
+// millisecond to its resolution (1 us, or a whole millisecond where it rounds up), and returns at
+// once for a descriptor that is ready.
+static void test_poll_us(void) {
+	unsigned res = hw_sys_poll_resolution_us();
+	CHECK(res == 1 || res == 1000, "resolution %u", res);
+	uint16_t port = 0;
+	int fd = udp_bound(&port, 0);
+	struct pollfd p = {fd, POLLIN, 0};
+	CHECK_EQ(hw_sys_poll_us(&p, 1, 0), 0);
+	uint64_t late[9];
+	for (int i = 0; i < 9; i++) {
+		uint64_t t0 = hw_now_us();
+		CHECK_EQ(hw_sys_poll_us(&p, 1, 300), 0);
+		uint64_t took = hw_now_us() - t0;
+		CHECK(took >= 300, "returned after %llu us of 300", (unsigned long long)took);
+		late[i] = took - 300;
+	}
+	// The median, against a machine that is busy now and then: a millisecond poll waits 1000.
+	for (int i = 0; i < 9; i++) {
+		for (int j = i + 1; j < 9; j++) {
+			if (late[j] < late[i]) {
+				uint64_t t = late[i];
+				late[i] = late[j];
+				late[j] = t;
+			}
+		}
+	}
+	if (res == 1) CHECK(late[4] < 500, "a poll of 300 us took %llu us more", (unsigned long long)late[4]);
+	if (res == 1000) CHECK(late[4] >= 600, "rounded up to a millisecond: %llu us late", (unsigned long long)late[4]);
+	uint16_t txport = 0;
+	int tx = udp_bound(&txport, 0);
+	struct sockaddr_in to = loopback_to(port);
+	CHECK_EQ(sendto(tx, "x", 1, 0, (struct sockaddr *)&to, sizeof(to)), 1);
+	CHECK_EQ(hw_sys_poll_us(&p, 1, 2000000), 1);
+	CHECK(p.revents & POLLIN, "readable");
+	close(tx);
+	close(fd);
+}
+
+// A run never spans run_start: a datagram that starts a run (a pacer's release) is not sent in
+// one write with the ones before it, where the kernel would put them on the wire back to back.
+// Received with GRO on loopback, a write arrives as one read, so no read may hold datagrams of two
+// releases. Where nothing is coalesced (no GSO or no GRO) every read is one datagram and that holds.
+static void test_udp_run_start(void) {
+	enum {
+		N = 12,
+		RELEASE = 4
+	};
+	uint16_t rport = 0, sport = 0;
+	int rx = udp_bound(&rport, 0);
+	int tx = udp_bound(&sport, 0);
+	int gro = hw_sys_udp_gro(rx);
+	size_t cap = gro == 1 ? HW_SYS_GRO_SLOT : 2048;
+	struct sockaddr_in to = loopback_to(rport);
+	static uint8_t bufs[N][CO_LEN];
+	hw_sys_dgram d[N];
+	memset(d, 0, sizeof(d));
+	for (int i = 0; i < N; i++) {
+		memset(bufs[i], 'A' + i, CO_LEN);
+		d[i].buf = bufs[i];
+		d[i].len = CO_LEN;
+		d[i].run_start = i % RELEASE == 0;
+		memcpy(&d[i].addr, &to, sizeof(to));
+		d[i].addr_len = sizeof(to);
+	}
+	for (int sent = 0; sent < N;) {
+		int r = hw_sys_send_batch(tx, d + sent, (size_t)(N - sent));
+		CHECK(r >= 1, "send_batch: %d errno %d", r, errno);
+		sent += r;
+	}
+	uint8_t *room = malloc(HW_SYS_BATCH_MAX * cap);
+	CHECK(room != NULL, "malloc");
+	hw_sys_dgram rd[HW_SYS_BATCH_MAX];
+	int got = 0, most = 0;
+	uint64_t until = hw_now_ms() + 2000;
+	while (got < N && hw_now_ms() < until) {
+		for (int i = 0; i < HW_SYS_BATCH_MAX; i++) {
+			rd[i].buf = room + (size_t)i * cap;
+			rd[i].cap = cap;
+		}
+		struct pollfd p = {rx, POLLIN, 0};
+		poll(&p, 1, 200);
+		int r = hw_sys_recv_batch(rx, rd, HW_SYS_BATCH_MAX);
+		if (r < 0) continue;
+		for (int i = 0; i < r; i++) {
+			CHECK(rd[i].segment > 0 && rd[i].len % rd[i].segment == 0, "read %zu of %zu", rd[i].len, rd[i].segment);
+			int first = rd[i].buf[0] - 'A', in = (int)(rd[i].len / rd[i].segment);
+			int last = rd[i].buf[rd[i].len - 1] - 'A';
+			CHECK(first == got && last == got + in - 1, "datagrams %d..%d in order: got %d", first, last, got);
+			CHECK(first / RELEASE == last / RELEASE, "one read holds datagrams %d to %d, of two releases", first, last);
+			if (in > most) most = in;
+			got += in;
+		}
+	}
+	CHECK_EQ(got, N);
+	if (gro == 1) CHECK(most > 1, "nothing was coalesced: the test shows nothing here");
+	free(room);
+	close(rx);
+	close(tx);
+}
+
 // The buffers asked for are what the socket reports afterwards, whatever the cap made of them.
 static void test_udp_buffers(void) {
 	uint16_t port = 0;
@@ -982,6 +1084,8 @@ int main(void) {
 	RUN(test_udp_batch);
 	RUN(test_udp_coalesce);
 	RUN(test_udp_gro_then_single);
+	RUN(test_poll_us);
+	RUN(test_udp_run_start);
 	RUN(test_udp_buffers);
 	RUN(test_udp_no_fragment);
 	RUN(test_mark);
