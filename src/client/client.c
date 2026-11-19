@@ -66,10 +66,11 @@ struct hw_client {
 	int closed;
 	int is_v2;
 	int server_udp;
-	int server_lanes;  // WebTransport: the lanes the server's INFO offers, 0 for none
-	int lanes;         // the lanes open, lane 0 included
-	int authenticated; // the password extension went out and the server completed the handshake
-	int timeout_ms;    // opts.timeout_ms: the longest a send waits for a CONTINUE
+	int server_confirm; // the server's INFO offers stream-open confirmation
+	int server_lanes;   // WebTransport: the lanes the server's INFO offers, 0 for none
+	int lanes;          // the lanes open, lane 0 included
+	int authenticated;  // the password extension went out and the server completed the handshake
+	int timeout_ms;     // opts.timeout_ms: the longest a send waits for a CONTINUE
 	uint32_t buffer_size;
 	uint32_t credit;   // stream credit's window, 0 when off
 	int credit_manual; // opts.credit_manual: no grants but the caller's
@@ -624,6 +625,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				return -1;
 			}
 			c->server_udp = info.has_udp;
+			c->server_confirm = info.has_stream_confirm;
 			c->server_lanes = info.lanes;
 			if (info.motd) {
 				size_t ml = HW_MIN(info.motd_len, sizeof(c->motd) - 1);
@@ -789,6 +791,10 @@ const char *hw_client_motd(const hw_client *c) {
 
 int hw_client_server_has_udp(const hw_client *c) {
 	return c->server_udp;
+}
+
+int hw_client_server_has_stream_confirm(const hw_client *c) {
+	return c->server_confirm;
 }
 
 int hw_client_lanes(const hw_client *c) {

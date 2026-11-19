@@ -415,7 +415,9 @@ int stream_connected(hw_stream *s) {
 	}
 	conn_rep_source(c, HW_REP_SUCCESSFUL_STREAM);
 	HW_DEBUG("stream", "%s: stream %u open to %s:%u", c->peer, s->id, s->host, s->port);
-	if (c->stream_confirm) {
+	// The spec's confirmation is for a connected TCP socket, as wispurr sends it. A UDP stream has
+	// no connection to confirm and no CONTINUE window, and a client is not waiting for one.
+	if (c->stream_confirm && s->type == HW_STREAM_TCP) {
 		conn_send_continue(c, s->id, s->remaining);
 		if (c->closing) return -1;
 	}

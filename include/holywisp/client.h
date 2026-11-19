@@ -42,7 +42,7 @@ typedef struct hw_client_opts {
 	// file). hw_client_authenticated() tells whether they were sent.
 	const char *user;
 	const char *pass;
-	int stream_confirm; // v2: ask the server to CONTINUE when a stream connects
+	int stream_confirm; // v2: ask the server to CONTINUE when a TCP stream connects
 	// One bound for hw_client_connect as a whole (TCP connect, upgrade and Wisp handshake), and
 	// the longest hw_client_send waits for a CONTINUE. Default 10000; negative waits without bound.
 	int timeout_ms;
@@ -123,6 +123,11 @@ int hw_client_authenticated(const hw_client *c);
 // "" when none. The server's bytes, cut to 511: they can hold terminal escape sequences.
 const char *hw_client_motd(const hw_client *c);
 int hw_client_server_has_udp(const hw_client *c);
+// 1 when the server's v2 INFO offers stream-open confirmation (0x05). opts.stream_confirm asks
+// for it whatever this says (a server may confirm without offering it, as wispurr does); a
+// confirmed TCP stream's first event is the CONTINUE, or its CLOSE. A UDP stream is never
+// confirmed. 0 on v1.
+int hw_client_server_has_stream_confirm(const hw_client *c);
 // WebTransport: the lanes open, lane 0 included (1 on a WebSocket), the lane a stream rides (-1
 // for none), and whether the server opened lane 0 (opts.wt_server_stream answered).
 int hw_client_lanes(const hw_client *c);

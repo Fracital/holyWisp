@@ -1211,9 +1211,12 @@ static int apply_reputation(hw_conn *c) {
 
 static void send_server_info(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 6 + 5];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 5 + 6 + 5];
 	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 	if (cfg->allow_udp) n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
+	// Stream-open confirmation is always honoured (stream_connected), so it is always offered: a
+	// client that enables it only on the server's word (moonbeam) otherwise never asks for it.
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_CONFIRM, NULL, 0);
 	if (cfg->password_user_count > 0) {
 		uint8_t required = cfg->password_required ? 1 : 0;
 		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_PASSWORD, &required, 1);

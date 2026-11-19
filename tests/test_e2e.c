@@ -614,6 +614,36 @@ static void test_v2_handshake_and_confirm(void) {
 	wait_streams_idle(g_server);
 }
 
+// Stream-open confirmation is offered in the server's INFO, since it is honoured: a client that
+// turns it on only on the server's word (moonbeam) would otherwise never ask. It confirms a
+// connected TCP socket, as the spec and wispurr have it; a UDP stream's first event is its data.
+static void test_stream_confirm_offered(void) {
+	hw_client *c = connect_to(g_server, 1, NULL, NULL, 1);
+	CHECK(hw_client_server_has_stream_confirm(c), "0x05 in the server's INFO");
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "127.0.0.1", g_udp_echo_port, &sid), 0);
+	CHECK_EQ(hw_client_send(c, sid, "u", 1), 0);
+	hw_client_event ev;
+	int got = 0;
+	// A datagram may be lost on its way to the echo even on loopback: send again until one is back.
+	for (int i = 0; i < 20 && !got; i++) {
+		int r = wait_event(c, sid, 0, &ev, 250);
+		if (r == 1) {
+			CHECK_EQ(ev.type, HW_CEV_DATA); // no CONTINUE for a UDP stream, before or after
+			got = 1;
+		} else {
+			CHECK_EQ(hw_client_send(c, sid, "u", 1), 0);
+		}
+	}
+	CHECK(got, "the UDP echo came back");
+	hw_client_free(c);
+	wait_streams_idle(g_server);
+
+	c = connect_to(g_server, 0, NULL, NULL, 0);
+	CHECK(!hw_client_server_has_stream_confirm(c), "v1 has no INFO");
+	hw_client_free(c);
+}
+
 // A raw v2 upgrade to port with uuid as the subprotocol (which must come back verbatim), then the
 // Wisp packets the server sends of its own accord within wait_ms, before the client says anything:
 // their types into types (at most max). Returns how many there were.
@@ -1219,6 +1249,7 @@ int main(void) {
 	RUN(test_invalid_connect);
 	RUN(test_egress_blocked);
 	RUN(test_v2_handshake_and_confirm);
+	RUN(test_stream_confirm_offered);
 	RUN(test_v2_any_subprotocol);
 	RUN(test_v2_continue_waits_for_password);
 	RUN(test_v2_password_auth);

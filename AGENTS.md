@@ -151,9 +151,10 @@ every test still passes, so each item has a test and a change to it needs a reas
 - **Extensions advertised.** `0x01` UDP when `allow-udp`, `0x02` password (meta = required byte)
   when any `password-user` exists, `0x04` MOTD when set, `0xE1` lanes (meta = the count) on a
   WebTransport session with `webtransport-lanes` of 2 or more, `0xE2` stream credit (meta empty)
-  with `stream-credit` (on by default). Stream-confirm (`0x05`) is honoured when
-  the client asks for it: a connected TCP stream gets `CONTINUE(id, buffer_remaining)`. Unknown
-  extension ids are skipped, never rejected.
+  with `stream-credit` (on by default), and `0x05` stream-confirm (meta empty) always. Stream-confirm
+  is honoured when the client asks for it: a connected TCP stream gets `CONTINUE(id,
+  buffer_remaining)`, and a UDP stream gets nothing, as in wispurr (the spec confirms a connected
+  TCP socket; `test_stream_confirm_offered`). Unknown extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
   the advertised window each time it hits zero. That window is `buffer-remaining` capped so a full
   window of `max-message-size` packets fits in `stream-queue-max` (`server_ingress_window` in
