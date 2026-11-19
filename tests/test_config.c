@@ -185,6 +185,20 @@ static void test_webtransport_keys(void) {
 	CHECK_EQ(hw_config_set(&cfg, "webtransport-congestion-control", "bbr", err, sizeof(err)), 0);
 	CHECK_EQ(cfg.webtransport_congestion, HW_QUIC_CC_BBR);
 	CHECK(hw_config_set(&cfg, "webtransport-congestion-control", "cubic", err, sizeof(err)) != 0, "no cubic");
+	// Lanes: 8 unless set, 0 to 16, and the validator holds a struct filled in by hand to that.
+	CHECK_EQ(cfg.webtransport_lanes, 8);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-lanes", "16", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport_lanes, 16);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-lanes", "0", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport_lanes, 0);
+	CHECK(hw_config_set(&cfg, "webtransport-lanes", "17", err, sizeof(err)) != 0, "17 lanes");
+	CHECK(hw_config_set(&cfg, "webtransport-lanes", "-1", err, sizeof(err)) != 0, "-1 lanes");
+	CHECK_EQ(cfg.webtransport_lanes, 0);
+	cfg.webtransport_lanes = 17;
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) != 0, "17 lanes set by hand");
+	CHECK(strstr(err, "webtransport-lanes") != NULL, "the error names it: %s", err);
+	cfg.webtransport_lanes = 4;
+	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "4 lanes: %s", err);
 	// An idle timeout is not optional, and neither is a handshake cap.
 	CHECK(hw_config_set(&cfg, "webtransport-idle-timeout-s", "0", err, sizeof(err)) != 0, "idle timeout 0");
 	CHECK(hw_config_set(&cfg, "webtransport-max-handshakes", "0", err, sizeof(err)) != 0, "no handshakes");

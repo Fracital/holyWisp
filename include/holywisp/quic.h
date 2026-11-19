@@ -239,6 +239,9 @@ size_t hw_quic_queued(const hw_quic_conn *q);
 // Of those, the bytes never sent yet: what is waiting for the window, the pacer or the peer's
 // credit. What is in flight is not counted, as a TCP socket's is not in a WebSocket's queue.
 size_t hw_quic_unsent(const hw_quic_conn *q);
+// The same for one stream of ours: its bytes queued and never sent yet. 0 for a stream that is
+// not ours to write, reset, or gone.
+size_t hw_quic_stream_unsent(const hw_quic_conn *q, uint64_t id);
 
 // 1 once the connection has closed and its draining period has passed: free it then.
 int hw_quic_is_drained(const hw_quic_conn *q);

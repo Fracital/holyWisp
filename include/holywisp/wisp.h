@@ -30,6 +30,9 @@ enum hw_stream_type {
 
 // Twisp resize: payload rows(u16 LE) cols(u16 LE).
 #define HW_WISP_TWISP_RESIZE 0xF0
+// Lanes (docs/webtransport.md, "Lanes"): the first packet of each extra WebTransport stream a
+// client opens, on stream 0, payload index(u8). Never valid anywhere else (an unknown type there).
+#define HW_WISP_LANE 0xE1
 
 enum hw_close_reason {
 	HW_CLOSE_UNKNOWN = 0x01,
@@ -57,7 +60,10 @@ enum hw_wisp_extension {
 	HW_EXT_PASSWORD = 0x02,
 	HW_EXT_CERTIFICATE = 0x03,
 	HW_EXT_MOTD = 0x04,
-	HW_EXT_STREAM_CONFIRM = 0x05
+	HW_EXT_STREAM_CONFIRM = 0x05,
+	// Lanes, server -> client over WebTransport: meta lanes(u8), the most a session may have with
+	// lane 0 included (0 or 1: none); further bytes are reserved.
+	HW_EXT_LANES = 0xE1
 };
 
 typedef struct hw_wisp_packet {
@@ -88,6 +94,7 @@ typedef struct hw_wisp_info {
 	size_t pass_len;
 	const char *motd; // server->client
 	size_t motd_len;
+	int lanes; // server->client HW_EXT_LANES: lanes offered, lane 0 included; 0 when absent
 } hw_wisp_info;
 
 static inline uint32_t hw_le32(const uint8_t *p) {
@@ -122,6 +129,11 @@ size_t hw_wisp_build_close(uint8_t out[HW_WISP_HEADER_LEN + 1], uint32_t stream_
 // INFO header (type, stream 0, major, minor); append extensions with hw_wisp_build_extension.
 size_t hw_wisp_build_info(uint8_t out[HW_WISP_HEADER_LEN + 2], uint8_t major, uint8_t minor);
 size_t hw_wisp_build_extension(uint8_t *out, size_t cap, uint8_t id, const void *meta, uint32_t meta_len);
+// LANE: type HW_WISP_LANE, stream 0, the index. Returns HW_WISP_HEADER_LEN + 1.
+size_t hw_wisp_build_lane(uint8_t out[HW_WISP_HEADER_LEN + 1], uint8_t index);
+// The index of a LANE packet: 0, or HW_ERR_INVALID when p is not one (another type, a stream other
+// than 0, no index). Bytes after the index are reserved and ignored.
+int hw_wisp_parse_lane(const hw_wisp_packet *p, uint8_t *index);
 
 const char *hw_wisp_type_str(uint8_t type);
 const char *hw_close_reason_str(uint8_t reason);

@@ -33,10 +33,18 @@ typedef struct {
 hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_t err_cap);
 void hw_wtc_free(hw_wtc *t);
 
-// Send one whole Wisp packet, as a datagram when unreliable and it fits one. Waits (receiving
-// meanwhile) while the session's send queue is full, until deadline. 0, HW_ERR_CLOSED, or
-// HW_ERR_TIMEOUT with nothing sent.
-int hw_wtc_send(hw_wtc *t, const uint8_t *pkt, size_t len, int unreliable, uint64_t deadline);
+// Send one whole Wisp packet on a lane (0, or one hw_wtc_open_lanes opened), as a datagram when
+// unreliable and it fits one. Waits (receiving meanwhile) while that lane's send queue is full,
+// until deadline. 0, HW_ERR_CLOSED, or HW_ERR_TIMEOUT with nothing sent.
+int hw_wtc_send(hw_wtc *t, int lane, const uint8_t *pkt, size_t len, int unreliable, uint64_t deadline);
+
+// Open lanes 1 to lanes - 1 (docs/webtransport.md, "Lanes"), each with its LANE packet, once the
+// handshake is over. Returns the lanes open, lane 0 included: fewer than asked when the server's
+// MAX_STREAMS stops them.
+int hw_wtc_open_lanes(hw_wtc *t, int lanes);
+
+// 1 when the server opened lane 0 itself (it answered "wisp-v2-server-stream").
+int hw_wtc_server_stream(const hw_wtc *t);
 
 // The next Wisp packet from the server: 1 with *pkt valid until the next hw_wtc_next or
 // hw_wtc_send (both may receive, and receiving may move the queue it points into), 0 when the

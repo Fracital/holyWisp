@@ -106,13 +106,12 @@ struct wt_session {
 	// After hw_wt_close the client answers with its FIN, and hw_wt closes QUIC then. One that never
 	// answers and keeps the connection busy (the idle timeout never comes) is closed at this time.
 	uint64_t close_by;
-	// The client's Wisp stream, once hw_wt has taken it as such (-1 until then), and whether the
-	// client has ended it: with nothing more to come on it, the session has no more use.
-	int64_t wisp_id;
-	int64_t connect_id; // the CONNECT's stream, which is never the Wisp stream
-	int64_t in_stream;  // the stream q_stream_data is handing hw_wt, -1 outside it
+	// Whether a lane has ended (hw_wt's lane_ended: the client's FIN, reset or STOP_SENDING on
+	// it): with nothing more to come on it, the session has no more use.
 	int wisp_ended;
 	int pause_want, paused;
+	int release_want;   // the handshake is done: hw_wt_release at the next settle
+	int lanes;          // the lanes this session takes (webtransport-lanes, v2 only), 0 for none
 	size_t last_queued; // hw_wt_queued at the last settle, to tell the sweep that the client reads
 	char ip[HW_IP_STR_LEN];
 	char odcid_key[WT_KEY_HEX]; // the client's first DCID, which finds this until it uses ours; "" once gone
@@ -398,6 +397,10 @@ static void session_settle(wt_session *s) {
 		s->paused = 0;
 		hw_wt_pause(s->wt, 0); // may hand over packets it held, and the connection may close on them
 	}
+	if (s->release_want) {
+		s->release_want = 0;
+		hw_wt_release(s->wt); // the lanes held until the INFO was done, likewise
+	}
 	if (s->c && !s->opened && hw_wt_ready(s->wt)) {
 		s->opened = 1;
 		conn_wt_open(s->c);
@@ -409,10 +412,10 @@ static void session_settle(wt_session *s) {
 		conn_wt_progress(s->c);
 	}
 	if (s->c && s->wisp_ended && !s->pause_want && !s->paused) {
-		// Every packet before the Wisp stream's end has been handed over (none is held while the
-		// session reads), as a WebSocket's EOF comes after its last frame: the connection closes as
-		// it would at that EOF, and the session with it.
-		HW_DEBUG("wt", "%s: the client ended its Wisp stream", s->ip);
+		// Every packet before the lane's end has been handed over (none is held while the session
+		// reads), as a WebSocket's EOF comes after its last frame: the connection closes as it
+		// would at that EOF, and the session with it. Any lane: a Wisp stream on it is cut off.
+		HW_DEBUG("wt", "%s: the client ended a lane", s->ip);
 		conn_close(s->c); // wt_conn_detach: close_pending, just below
 	}
 	if (s->close_pending) {
@@ -453,36 +456,14 @@ static void q_established(void *ud) {
 	if (s->wt) hw_wt_on_established(s->wt);
 }
 
-// hw_wt says nothing when the client ends its Wisp stream (to it, only the CONNECT stream ends a
-// session), so the end is seen here. The Wisp stream is the client's bidirectional stream, other
-// than the CONNECT's, that made the session ready or that a packet came from; its FIN or reset is
-// the client's last word on it.
-static void wisp_candidate(wt_session *s, int64_t id) {
-	if (s->wisp_id < 0 && id >= 0 && id != s->connect_id && (id & 3) == 0) s->wisp_id = id;
-}
-
 static void q_stream_data(void *ud, uint64_t id, const uint8_t *data, size_t len, int fin) {
 	wt_session *s = ud;
-	if (!s->wt) return;
-	int was_ready = hw_wt_ready(s->wt);
-	s->in_stream = (int64_t)id;
-	hw_wt_on_stream_data(s->wt, id, data, len, fin);
-	s->in_stream = -1;
-	if (!was_ready && hw_wt_ready(s->wt)) wisp_candidate(s, (int64_t)id);
-	if (fin && s->wisp_id == (int64_t)id && !s->wisp_ended) {
-		s->wisp_ended = 1;
-		session_touch(s);
-	}
+	if (s->wt) hw_wt_on_stream_data(s->wt, id, data, len, fin);
 }
 
 static void q_stream_reset(void *ud, uint64_t id, uint64_t app_error) {
 	wt_session *s = ud;
-	if (!s->wt) return;
-	hw_wt_on_stream_reset(s->wt, id, app_error);
-	if (s->wisp_id == (int64_t)id && !s->wisp_ended) {
-		s->wisp_ended = 1;
-		session_touch(s);
-	}
+	if (s->wt) hw_wt_on_stream_reset(s->wt, id, app_error);
 }
 
 static void q_stream_stop(void *ud, uint64_t id, uint64_t app_error) {
@@ -559,7 +540,6 @@ static int w_session_request(void *ud, const hw_wt_request *req, const char **pr
 	wt_session *s = ud;
 	hw_server *srv = s->ww->w->server;
 	if (s->c || s->refused) return 400; // one session per connection
-	s->connect_id = s->in_stream;
 	// The paths a WebSocket reaches the relay on behind the operator's proxy, and nothing else:
 	// a session for any other is a 404, before anything is charged or counted for it. The path
 	// is not logged (it may hold a gate key).
@@ -590,10 +570,21 @@ static int w_session_request(void *ud, const hw_wt_request *req, const char **pr
 		return status;
 	}
 	// The first protocol offered is echoed, as the WebSocket path echoes the subprotocol: a
-	// browser fails the session when the one it asked for does not come back.
-	if (c->is_v2 && req->protocols && hw_wt_protocol_first(req->protocols, s->protocol, sizeof(s->protocol)) == 0 &&
-	    s->protocol[0]) {
-		*protocol_out = s->protocol;
+	// browser fails the session when the one it asked for does not come back. A client that
+	// offers HW_WT_SERVER_STREAM (after "wisp-v2", for servers that know nothing of it) gets that
+	// one, and the server opens lane 0 behind the 200 (hw_wt).
+	if (c->is_v2 && req->protocols) {
+		if (hw_wt_protocol_offered(req->protocols, HW_WT_SERVER_STREAM)) {
+			snprintf(s->protocol, sizeof(s->protocol), "%s", HW_WT_SERVER_STREAM);
+			*protocol_out = s->protocol;
+		} else if (hw_wt_protocol_first(req->protocols, s->protocol, sizeof(s->protocol)) == 0 && s->protocol[0]) {
+			*protocol_out = s->protocol;
+		}
+	}
+	// Lanes are offered in the INFO, so a v1 session has none.
+	if (c->is_v2 && srv->cfg.webtransport_lanes >= 2) {
+		s->lanes = srv->cfg.webtransport_lanes;
+		hw_wt_accept_lanes(s->wt, s->lanes);
 	}
 	s->counted = 1;
 	atomic_fetch_add(&srv->wt_sessions_total, 1);
@@ -616,8 +607,14 @@ static void w_packet(void *ud, const uint8_t *data, size_t len, int datagram) {
 		conn_wt_open(s->c);
 		if (!s->c) return;
 	}
-	if (!datagram) wisp_candidate(s, s->in_stream);
-	conn_wt_packet(s->c, data, len, datagram);
+	conn_wt_packet(s->c, data, len, datagram ? -1 : hw_wt_packet_lane(s->wt));
+	session_touch(s);
+}
+
+static void w_lane_ended(void *ud, int lane) {
+	wt_session *s = ud;
+	(void)lane;
+	s->wisp_ended = 1;
 	session_touch(s);
 }
 
@@ -645,15 +642,36 @@ static void w_session_closed(void *ud, uint32_t code, const char *reason) {
 
 // ---------------------------------------------------------------------------------- conn.c's side
 
-int wt_conn_send(wt_session *s, const uint8_t *pkt, size_t len, int unreliable) {
+int wt_conn_send(wt_session *s, int lane, const uint8_t *pkt, size_t len, int unreliable) {
 	// send_max is 0, so hw_wt_send never refuses for a full queue (1): the bound is conn.c's
 	// backpressure on hw_wt_queued, as it is on a WebSocket's wbuf. Anything but 0 is a session
 	// that cannot take packets any more.
-	return hw_wt_send(s->wt, pkt, len, unreliable) == 0 ? 0 : -1;
+	return hw_wt_send_lane(s->wt, lane, pkt, len, unreliable) == 0 ? 0 : -1;
 }
 
 size_t wt_conn_queued(const wt_session *s) {
 	return hw_wt_queued(s->wt);
+}
+
+size_t wt_conn_lane_queued(const wt_session *s, int lane) {
+	return hw_wt_lane_queued(s->wt, lane);
+}
+
+uint32_t wt_conn_lanes(const wt_session *s) {
+	return hw_wt_lanes(s->wt);
+}
+
+int wt_conn_lanes_offered(const wt_session *s) {
+	return s->lanes;
+}
+
+int wt_conn_server_stream(const wt_session *s) {
+	return hw_wt_server_stream(s->wt);
+}
+
+void wt_conn_release(wt_session *s) {
+	s->release_want = 1;
+	session_defer(s);
 }
 
 size_t wt_conn_datagram_max(const wt_session *s) {
@@ -724,15 +742,20 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	if (window > WT_RX_WINDOW_MAX) window = WT_RX_WINDOW_MAX;
 	qc->initial_max_data = window;
 	qc->initial_max_stream_data = window;
-	qc->initial_max_streams_bidi = 16; // the CONNECT and the Wisp stream; the rest are refused
-	qc->initial_max_streams_uni = 16;  // control, the QPACK pair, and whatever is refused
+	// The CONNECT, the Wisp stream and its lanes; the rest are refused, and room is left for them
+	// (QUIC grants more as they end).
+	qc->initial_max_streams_bidi = 16 + (uint64_t)cfg->webtransport_lanes;
+	qc->initial_max_streams_uni = 16; // control, the QPACK pair, and whatever is refused
 	qc->max_datagram_frame_size = 65535;
 	// What QUIC holds counts bytes in flight as well as unsent ones, and only the unsent are the
 	// high-water mark's (hw_wt_queued): in flight is the kernel's send buffer on a WebSocket, and
 	// here is BBR's window, up to WT_INFLIGHT_MAX. With the mark alone, 2 MiB on the edge, a
 	// session never had more than that in flight: 120 Mbit/s at 138 ms, less behind any loss.
+	// With lanes, each lane's unsent bytes have the mark and the session the lanes' marks together
+	// (conn_backpressure), so QUIC holds that much unsent; in flight is still the session's.
+	size_t marks = cfg->webtransport_lanes >= 2 ? (size_t)cfg->webtransport_lanes : 1;
 	qc->stream_send_max = cfg->ws_write_high_water + WT_INFLIGHT_MAX;
-	qc->conn_send_max = cfg->ws_write_high_water + WT_INFLIGHT_MAX;
+	qc->conn_send_max = marks * cfg->ws_write_high_water + WT_INFLIGHT_MAX;
 	qc->datagram_queue_max = 256;
 	qc->keepalive_ms = WT_KEEPALIVE_MS;
 	qc->cid_prefix = (uint8_t)ww->w->index;
@@ -791,9 +814,6 @@ static void initial_new(wt_worker *ww, hw_sys_dgram *d, const hw_quic_header *h,
 	if (!s) return;
 	s->ww = ww;
 	s->created_ms = now;
-	s->wisp_id = -1;
-	s->connect_id = -1;
-	s->in_stream = -1;
 	snprintf(s->ip, sizeof(s->ip), "%s", ip);
 	hw_quic_config qc;
 	session_quic_config(ww, &qc);
@@ -828,6 +848,7 @@ static void initial_new(wt_worker *ww, hw_sys_dgram *d, const hw_quic_header *h,
 	    .packet = w_packet,
 	    .writable = w_writable,
 	    .session_closed = w_session_closed,
+	    .lane_ended = w_lane_ended,
 	};
 	if (s->q) s->wt = hw_wt_new(s->q, &wc, &wcb);
 	if (!s->q || !s->wt) {

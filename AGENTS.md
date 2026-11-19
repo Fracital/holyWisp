@@ -138,9 +138,14 @@ every test still passes, so each item has a test and a change to it needs a reas
   `wisp-v2`. The server echoes the offered token *verbatim* (a browser fails the handshake if the
   token it asked for does not come back), sends INFO first, waits for the client's INFO, then
   sends the stream-0 CONTINUE. Until that CONTINUE, the only packets honoured are
-  INFO and CLOSE on stream 0. Major version mismatch closes with `0x04`.
+  INFO and CLOSE on stream 0. Major version mismatch closes with `0x04`. Over WebTransport the
+  token rule is the same (`wt-available-protocols`, the first member echoed), with one opt-in
+  exception: a list holding `wisp-v2-server-stream` is answered with it, and the server opens
+  the Wisp stream and sends INFO and, without a required password, the CONTINUE at once (see
+  "WebTransport").
 - **Extensions advertised.** `0x01` UDP when `allow-udp`, `0x02` password (meta = required byte)
-  when any `password-user` exists, `0x04` MOTD when set. Stream-confirm (`0x05`) is honoured when
+  when any `password-user` exists, `0x04` MOTD when set, `0xE1` lanes (meta = the count) on a
+  WebTransport session with `webtransport-lanes` of 2 or more. Stream-confirm (`0x05`) is honoured when
   the client asks for it: a connected TCP stream gets `CONTINUE(id, buffer_remaining)`. Unknown
   extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
@@ -626,6 +631,17 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   bench ran at 5. `test_bbr_*` in `test_quic` run it on a simulated lossy path, beside NewReno.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
   lost, never sent in fragments that every later packet is then sent in too.
+- **Lanes and the server-opened stream** (docs/webtransport.md has the rules). A session may
+  ride up to `webtransport-lanes` bidirectional streams, each after the first opened with a LANE
+  packet (`0xE1`); a Wisp stream stays on the lane its CONNECT came on and the server answers it
+  there. Any lane ending ends the connection. `hw_wt` delivers nothing but lane 0's INFO (a
+  server-opened session) or lane 0 (a client-opened v2 one) until `handshake_done` calls
+  `wt_conn_release`; what arrives meanwhile is held uncredited, never dropped. On a server-opened
+  lane 0 the client's first packet must be INFO, or CLOSE `0x04`. Backpressure is per lane
+  (`conn_wt_lane_marks`): a lane past `ws-write-high-water` unsent pauses its own streams'
+  remotes (`conn_stream_paused`), and lanes x the mark pauses them all; reads from the client and
+  in-flight bytes stay session-wide. `test_lane_backpressure` holds it, `test_old_clients` holds
+  the clients that ask for neither.
 - **The idle timeout is mandatory** (`webtransport-idle-timeout-s`, 1 to 3600), and the server
   sends a keepalive after 20 s without sending (divide's conntrack forgets a UDP flow at 30 s).
 - **A session ends promptly, whoever ends it.** Chrome never sends CONNECTION_CLOSE and goes

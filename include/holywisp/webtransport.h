@@ -17,23 +17,28 @@
  *   answer (session_request); anything else (a plain GET, a second session) gets a 4xx response
  *   or H3_REQUEST_REJECTED, never a hang.
  * - On the session: the first client-opened WebTransport bidirectional stream (signal 0x41) is
- *   the Wisp stream. It carries Wisp packets, each preceded by its length as a u32 LE. Datagrams
- *   on the session (quarter stream id prefix) each carry one whole Wisp packet, which the server
- *   uses only for UDP stream DATA (hw_wt_send with unreliable = 1). Other WebTransport streams
- *   are refused with STOP_SENDING / RESET_STREAM (WEBTRANSPORT_BUFFERED_STREAM_REJECTED).
+ *   the Wisp stream, lane 0. It carries Wisp packets, each preceded by its length as a u32 LE.
+ *   Datagrams on the session (quarter stream id prefix) each carry one whole Wisp packet, which
+ *   the server uses only for UDP stream DATA (hw_wt_send with unreliable = 1). When the server
+ *   answers HW_WT_SERVER_STREAM, it opens lane 0 itself right behind the 200, and no client
+ *   stream is ever lane 0. With hw_wt_accept_lanes, a client stream after lane 0 whose first
+ *   packet is LANE (HW_WISP_LANE) is the lane it names; one whose first packet is not is reset
+ *   (STREAM_UNWANTED), and a LANE that names no lane it may have is reset (LANE_REFUSED). Streams
+ *   not on the session are refused with STOP_SENDING / RESET_STREAM
+ *   (WEBTRANSPORT_BUFFERED_STREAM_REJECTED), as are unidirectional ones.
  * - The session ends with a CLOSE_WEBTRANSPORT_SESSION capsule (0x2843) or the CONNECT stream's
- *   FIN in either direction. The Wisp stream's end is not the session's (a reset may overtake the
- *   capsule): after the peer's FIN on it no more packets come, and after its STOP_SENDING
- *   hw_wt_send returns -1, which the caller takes as the end.
+ *   FIN in either direction. A lane's end is not the session's (a reset may overtake the
+ *   capsule): its FIN, reset or STOP_SENDING is reported (lane_ended), and the caller decides.
  *
  * Bounds: a header block over 16 KiB (the MAX_FIELD_SECTION_SIZE advertised), header blocks
  * buffered across streams over 64 KiB and a capsule over 64 KiB close the connection with
  * H3_EXCESSIVE_LOAD; a Wisp packet longer than max_packet closes it with H3_MESSAGE_ERROR (a
  * framing error leaves nothing to resynchronise on, so the session cannot go on); the reassembly
  * of one Wisp packet never holds more than max_packet bytes; at most 64 peer streams are tracked
- * at once. Received Wisp stream bytes are held only while paused, and then QUIC's stream window
- * bounds them. The send queue is reported (hw_wt_queued) for the caller's backpressure, which is
- * the same high-water rule as a WebSocket client's wbuf.
+ * at once. Received Wisp stream bytes are held only while paused or while their lane may not
+ * deliver yet (before hw_wt_release), and then each lane's QUIC stream window bounds them; a
+ * stream whose first packet is still to be read holds at most 64 bytes. The send queue is reported (hw_wt_queued) for
+ * the caller's backpressure, which is the same high-water rule as a WebSocket client's wbuf.
  *
  * Callbacks run synchronously from inside the hw_wt_* calls (and so from inside the QUIC
  * callbacks that forward to them). A callback may call any function here on the same hw_wt
@@ -70,6 +75,19 @@
 #define HW_WT_SESSION_GONE             0x170d7b68 // our Wisp stream reset after the client closed
 #define HW_QPACK_DECOMPRESSION_FAILED  0x200      // a header block that is malformed or uses a dynamic table
 
+// Lanes and the server-opened Wisp stream (docs/webtransport.md). A session has at most
+// HW_WT_LANES_MAX lanes, lane 0 included.
+#define HW_WT_LANES_MAX 16
+// The subprotocol a client offers (after "wisp-v2") to have the server open lane 0.
+#define HW_WT_SERVER_STREAM "wisp-v2-server-stream"
+// WebTransport application error codes on a refused stream, before hw_wt_error_code.
+#define HW_WT_LANE_REFUSED    0x01 // a LANE whose index is not one the session may have, or a repeat
+#define HW_WT_STREAM_UNWANTED 0x02 // a stream that is not a lane: its first packet was not LANE
+
+// The HTTP/3 code a WebTransport application error code is sent as on RESET_STREAM and
+// STOP_SENDING (draft-02: 0x52e4a40fa8db + n + floor(n / 0x1e), skipping the reserved codes).
+uint64_t hw_wt_error_code(uint32_t code);
+
 typedef struct {
 	const char *authority; // :authority
 	const char *path;      // :path, with its query
@@ -103,6 +121,9 @@ typedef struct {
 	// carries one session, and Chrome sends no CONNECTION_CLOSE after it and goes silent, so the
 	// caller closes the connection itself once its queue has drained (as wt_listener.c does).
 	void (*session_closed)(void *ud, uint32_t code, const char *reason);
+	// A lane ended while the session is open: the peer's FIN on it (after its last packet), its
+	// reset, or its STOP_SENDING. Once per lane; may be NULL.
+	void (*lane_ended)(void *ud, int lane);
 } hw_wt_callbacks;
 
 typedef struct {
@@ -132,9 +153,32 @@ void hw_wt_on_datagram(hw_wt *w, const uint8_t *data, size_t len);
 // every later call a no-op that touches the connection no more.
 void hw_wt_on_closed(hw_wt *w);
 
-// 1 once the session is open (server: answered 200 and saw the Wisp stream; client: got 200
-// and opened it).
+// 1 once the session is open (server: answered 200 and saw or opened the Wisp stream; client:
+// got 200 and opened it, or with HW_WT_SERVER_STREAM took the server's).
 int hw_wt_ready(const hw_wt *w);
+
+// 1 when lane 0 is the server's (it answered HW_WT_SERVER_STREAM).
+int hw_wt_server_stream(const hw_wt *w);
+
+// Server: take lanes, lanes in all with lane 0 (2..HW_WT_LANES_MAX; anything else takes none).
+// Call it from session_request, before the client can open one.
+void hw_wt_accept_lanes(hw_wt *w, int lanes);
+
+// The lanes open now, as a bit mask (bit 0 is lane 0).
+uint32_t hw_wt_lanes(const hw_wt *w);
+
+// The lane the packet being delivered came on, inside the packet callback; -1 for a datagram.
+int hw_wt_packet_lane(const hw_wt *w);
+
+// Server: let packets of every lane through. Until then a session that opened lane 0 itself
+// delivers one packet of lane 0 (the client's INFO, which the caller checks) and holds
+// everything after it, and a client-opened one delivers lane 0 alone. Held lanes are not read
+// (their credit is withheld), so nothing is dropped and nothing grows. Not from a callback.
+void hw_wt_release(hw_wt *w);
+
+// Client: open lane index (1..HW_WT_LANES_MAX - 1) with its LANE packet. 0, or -1 when the
+// session is not open, the index is taken or out of range, or the server's MAX_STREAMS forbids it.
+int hw_wt_open_lane(hw_wt *w, int index);
 
 // Send one whole Wisp packet. unreliable = 1 sends it as a datagram when it fits
 // (hw_wt_datagram_max) and on the Wisp stream otherwise (a datagram QUIC drops for a full queue
@@ -142,6 +186,8 @@ int hw_wt_ready(const hw_wt *w);
 // whole, 1 when this module's own queue (the bytes QUIC has not taken yet) holds send_max or
 // more (nothing taken: wait for writable), -1 when the session is not open or has ended.
 int hw_wt_send(hw_wt *w, const uint8_t *pkt, size_t len, int unreliable);
+// The same on a lane (hw_wt_send is lane 0); -1 also for a lane that is not open.
+int hw_wt_send_lane(hw_wt *w, int lane, const uint8_t *pkt, size_t len, int unreliable);
 
 // Bytes of Wisp stream data queued and not yet sent, here and in QUIC (hw_quic_unsent): what a
 // WebSocket's wbuf would hold. What is in flight is not counted: a window of BBR's two BDPs is
@@ -150,6 +196,8 @@ int hw_wt_send(hw_wt *w, const uint8_t *pkt, size_t len, int unreliable);
 // conn_send_max bounds what it holds, in flight or not. The QUIC part falls as packets go out,
 // with no callback: re-check it after hw_quic_input and hw_quic_output.
 size_t hw_wt_queued(const hw_wt *w);
+// The same for one lane: its queue here and its stream's unsent bytes in QUIC. 0 for no lane.
+size_t hw_wt_lane_queued(const hw_wt *w, int lane);
 
 // The largest Wisp packet that fits one datagram on the session now, 0 when there are none.
 size_t hw_wt_datagram_max(const hw_wt *w);
@@ -181,6 +229,10 @@ const char *hw_wt_protocol(const hw_wt *w);
 // member does not fit. session_request may hand back that member as protocol_out, quoted or not:
 // it is sent as a structured-field string.
 int hw_wt_protocol_first(const char *list, char *out, size_t cap);
+
+// 1 when a structured-field list of strings or tokens has name among its members (compared
+// unquoted and exactly), 0 when not or when the list is malformed before it is found.
+int hw_wt_protocol_offered(const char *list, const char *name);
 
 // Whether a session request's :authority and :path are what a webtransport-path rule names. The
 // rule's host (NULL, "" or "*" for any) is compared with the authority's host whole and without

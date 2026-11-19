@@ -64,6 +64,14 @@ typedef struct hw_client_opts {
 	// is then only where to connect (an address, or another name), as curl's --connect-to.
 	// NULL: host.
 	const char *server_name;
+	// WebTransport v2 (docs/webtransport.md): offer "wisp-v2-server-stream" after "wisp-v2", so a
+	// server that knows it opens the Wisp stream itself and sends its CONTINUE without waiting for
+	// the client's INFO. Off by default.
+	int wt_server_stream;
+	// WebTransport v2: ride up to this many lanes (QUIC streams), lane 0 included, when the
+	// server's INFO offers lanes; at most 16. Each CONNECT goes on the lane with the fewest open
+	// streams, the lowest first. 0 or 1 (the default): lane 0 alone.
+	int wt_lanes;
 } hw_client_opts;
 
 enum hw_client_event_type {
@@ -99,6 +107,11 @@ int hw_client_authenticated(const hw_client *c);
 // "" when none. The server's bytes, cut to 511: they can hold terminal escape sequences.
 const char *hw_client_motd(const hw_client *c);
 int hw_client_server_has_udp(const hw_client *c);
+// WebTransport: the lanes open, lane 0 included (1 on a WebSocket), the lane a stream rides (-1
+// for none), and whether the server opened lane 0 (opts.wt_server_stream answered).
+int hw_client_lanes(const hw_client *c);
+int hw_client_stream_lane(const hw_client *c, uint32_t stream_id);
+int hw_client_server_stream(const hw_client *c);
 uint32_t hw_client_buffer_size(const hw_client *c); // the server's initial CONTINUE
 int hw_client_fd(const hw_client *c);               // for poll(2) alongside other fds
 // The longest a caller that polls hw_client_fd may wait before it calls hw_client_poll, in

@@ -319,8 +319,14 @@ typedef struct hw_conn {
 	int conn_slot;    // holds one of server->connections
 	int ip_slot;      // holds one of server->conns_per_ip for c->ip
 	uint32_t wt_code; // WebTransport: the session close code conn_close sends (ws_fail's code)
-	int heard;        // a read from the client since the worker's last sweep
-	int stream_cap;   // effective max streams (reputation THROTTLE tier lowers it)
+	// WebTransport lanes: the lane of the packet being handled, which a stream it opens rides, and
+	// the lanes whose streams' remotes are paused for their own queue (conn_backpressure).
+	int rx_lane;
+	uint32_t lane_paused;
+	int wt_info_first; // the server opened lane 0: the client's next packet must be its INFO
+	int continue_sent; // ... and the stream-0 CONTINUE went out with the server's INFO
+	int heard;         // a read from the client since the worker's last sweep
+	int stream_cap;    // effective max streams (reputation THROTTLE tier lowers it)
 	enum hw_rep_tier tier;
 	char peer[HW_ADDR_STR_LEN];                  // socket peer, with port, for logs
 	char ip[HW_IP_STR_LEN];                      // client IP after trusted-proxy headers, for policy
@@ -379,7 +385,14 @@ typedef struct hw_stream {
 	hw_buf pin;
 	// Twisp.
 	pid_t pid;
+	int lane; // WebTransport: the lane its CONNECT came on, which every packet of it goes on
 } hw_stream;
+
+// Whether a stream reads from its remote: not while the connection's send queue or bandwidth
+// holds every stream (c->paused), nor while its own lane's queue holds its lane (WebTransport).
+static inline int conn_stream_paused(const hw_conn *c, const hw_stream *s) {
+	return c->paused || (c->lane_paused >> s->lane & 1u);
+}
 
 // conn.c
 void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer);
@@ -395,9 +408,10 @@ hw_conn *conn_wt_new(hw_worker *w, wt_session *s, const struct sockaddr *peer);
 int conn_wt_admit(hw_conn *c, const char *origin, const char *protocols);
 // The session is open (the client's Wisp stream exists): the v1 or v2 opening, as after a 101.
 void conn_wt_open(hw_conn *c);
-// One whole Wisp packet from the Wisp stream, or from a datagram (only DATA for a UDP stream is
-// acted on there). The bytes are only valid during the call. May close the connection.
-void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int datagram);
+// One whole Wisp packet from a lane (0 is the Wisp stream), or from a datagram (lane -1: only DATA
+// for a UDP stream is acted on there). The bytes are only valid during the call. May close the
+// connection.
+void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int lane);
 // Something may have left the send queue (an ACK, a flush): re-evaluate backpressure.
 void conn_wt_progress(hw_conn *c);
 
@@ -416,8 +430,16 @@ void wt_cert_free(wt_cert *c);
 // does not fit.
 size_t wt_json(const hw_worker *w, char *out, size_t cap);
 // For conn.c on a WebTransport connection.
-int wt_conn_send(wt_session *s, const uint8_t *pkt, size_t len, int unreliable);
+int wt_conn_send(wt_session *s, int lane, const uint8_t *pkt, size_t len, int unreliable);
 size_t wt_conn_queued(const wt_session *s);
+// One lane's share of that queue, and the lanes open now (a bit mask, lane 0 in bit 0).
+size_t wt_conn_lane_queued(const wt_session *s, int lane);
+uint32_t wt_conn_lanes(const wt_session *s);
+// The lanes the server's INFO offers (0 for none), and whether the server opened lane 0.
+int wt_conn_lanes_offered(const wt_session *s);
+int wt_conn_server_stream(const wt_session *s);
+// The client's INFO is done: let every lane's packets through (deferred to the session's settle).
+void wt_conn_release(wt_session *s);
 size_t wt_conn_datagram_max(const wt_session *s);
 void wt_conn_pause(wt_session *s, int paused);
 void wt_conn_flush(wt_session *s);
@@ -444,6 +466,9 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s);
 void conn_pipe_drop(hw_stream *s);
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining);
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason);
+// The same for a stream that is gone already, on the lane it rode (WebTransport; a WebSocket has
+// one): stream_close's CLOSE.
+int conn_send_close_lane(hw_conn *c, uint32_t stream_id, uint8_t reason, int lane);
 // Flush what can be written now; arms HW_EV_WRITE for the rest. Closes the conn on error.
 void conn_flush(hw_conn *c);
 // The loop's batch-end hook (ud is the hw_worker): write every connection's deferred frames.

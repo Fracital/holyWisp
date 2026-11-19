@@ -66,6 +66,10 @@ int hw_wisp_parse_info(const hw_wisp_packet *p, hw_wisp_info *out) {
 				out->pass_len = meta_len - 1 - ulen;
 			}
 			break;
+		case HW_EXT_LANES:
+			// The count is the first byte; a longer meta is for later and its rest is skipped.
+			if (meta_len >= 1) out->lanes = meta[0];
+			break;
 		default:
 			// Unknown extensions are skipped by design (spec: "ignore extensions you don't know").
 			break;
@@ -120,6 +124,18 @@ size_t hw_wisp_build_extension(uint8_t *out, size_t cap, uint8_t id, const void 
 	return need;
 }
 
+size_t hw_wisp_build_lane(uint8_t out[HW_WISP_HEADER_LEN + 1], uint8_t index) {
+	hw_wisp_write_header(out, HW_WISP_LANE, 0);
+	out[5] = index;
+	return HW_WISP_HEADER_LEN + 1;
+}
+
+int hw_wisp_parse_lane(const hw_wisp_packet *p, uint8_t *index) {
+	if (p->type != HW_WISP_LANE || p->stream_id != 0 || p->payload_len < 1) return HW_ERR_INVALID;
+	*index = p->payload[0];
+	return HW_OK;
+}
+
 const char *hw_wisp_type_str(uint8_t type) {
 	switch (type) {
 	case HW_WISP_CONNECT:
@@ -132,6 +148,8 @@ const char *hw_wisp_type_str(uint8_t type) {
 		return "CLOSE";
 	case HW_WISP_INFO:
 		return "INFO";
+	case HW_WISP_LANE:
+		return "LANE";
 	default:
 		return "UNKNOWN";
 	}

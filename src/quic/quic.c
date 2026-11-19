@@ -2820,6 +2820,12 @@ size_t hw_quic_unsent(const hw_quic_conn *q) {
 	return q->tx_unsent;
 }
 
+size_t hw_quic_stream_unsent(const hw_quic_conn *q, uint64_t id) {
+	const hw_qc_stream *s = hw_qc_smap_get(&q->streams, id);
+	if (!s || s->freed || !s->has_send || s->tx_reset) return 0;
+	return (size_t)(s->sb.end - s->sb.sent);
+}
+
 int hw_quic_output_alone(const hw_quic_conn *q) {
 	return q->out_alone;
 }

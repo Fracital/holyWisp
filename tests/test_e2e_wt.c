@@ -172,6 +172,8 @@ typedef struct {
 	size_t max_queue;
 	const char *name; // SNI and :authority, the server still reached at 127.0.0.1
 	const char *path;
+	int server_stream; // offer "wisp-v2-server-stream" (with v2)
+	int lanes;         // ride up to this many lanes (with v2)
 } wt_opts;
 
 static hw_client *wt_try(hw_server *s, const wt_opts *w, char *err, size_t err_cap) {
@@ -186,6 +188,8 @@ static hw_client *wt_try(hw_server *s, const wt_opts *w, char *err, size_t err_c
 	if (w && w->max_queue) o.max_queue_bytes = w->max_queue;
 	if (w && w->name) o.server_name = w->name;
 	if (w && w->path) o.path = w->path;
+	o.wt_server_stream = w ? w->server_stream : 0;
+	o.wt_lanes = w ? w->lanes : 0;
 	o.timeout_ms = 5000;
 	return hw_client_connect(&o, err, err_cap);
 }
@@ -667,8 +671,16 @@ typedef struct {
 	int packets;         // Wisp packets from the server
 	uint8_t last_type;
 	uint32_t last_stream;
+	uint8_t last_reason; // the first payload byte of the last packet (a CLOSE's reason)
 	int data_packets;
 	char authority[64];
+	uint8_t types[16]; // the first packets' types and streams, in order
+	uint32_t streams[16];
+	int info_lanes;                       // HW_EXT_LANES in the server's INFO
+	uint64_t lane_bytes[HW_WT_LANES_MAX]; // DATA payload bytes from the server, by lane
+	int stalling;                         // what arrives on stall_id is dropped unread and never credited
+	uint64_t stall_id;
+	uint64_t stalled;
 } raw_wt;
 
 static void raw_q_established(void *ud) {
@@ -681,6 +693,11 @@ static void raw_q_stream_data(void *ud, uint64_t id, const uint8_t *data, size_t
 	// Stream 0 is the CONNECT's: deaf, the client never sees the capsule and never answers it.
 	if (r->deaf && id == 0) {
 		hw_quic_stream_consumed(r->q, id, len);
+		return;
+	}
+	// A lane whose reader has stopped: its stream window runs out at the server.
+	if (r->stalling && id == r->stall_id) {
+		r->stalled += len;
 		return;
 	}
 	hw_wt_on_stream_data(r->wt, id, data, len, fin);
@@ -726,10 +743,21 @@ static void raw_w_packet(void *ud, const uint8_t *data, size_t len, int datagram
 	(void)datagram;
 	hw_wisp_packet p;
 	if (hw_wisp_parse(data, len, &p) != 0) return;
+	if (r->packets < 16) {
+		r->types[r->packets] = p.type;
+		r->streams[r->packets] = p.stream_id;
+	}
 	r->packets++;
 	r->last_type = p.type;
 	r->last_stream = p.stream_id;
-	if (p.type == HW_WISP_DATA) r->data_packets++;
+	r->last_reason = p.payload_len ? p.payload[0] : 0;
+	hw_wisp_info info;
+	if (p.type == HW_WISP_INFO && hw_wisp_parse_info(&p, &info) == 0) r->info_lanes = info.lanes;
+	if (p.type == HW_WISP_DATA) {
+		r->data_packets++;
+		int lane = hw_wt_packet_lane(r->wt);
+		if (lane >= 0) r->lane_bytes[lane] += p.payload_len;
+	}
 }
 
 static void raw_w_session_closed(void *ud, uint32_t code, const char *reason) {
@@ -776,8 +804,9 @@ static void raw_pump(raw_wt *r, int ms, const int *until) {
 	}
 }
 
-// A session with the server, opened (and for v1, its CONTINUE received).
-static void raw_open(raw_wt *r, hw_server *s, int v2) {
+// A session with the server offering protocols (NULL for none: v1), opened, and the server's first
+// packet received. stream_window is the credit each stream gives the server (0: 4 MiB).
+static void raw_open_with(raw_wt *r, hw_server *s, const char *protocols, size_t stream_window) {
 	static const char *const alpn[] = {HW_WT_ALPN};
 	memset(r, 0, sizeof(*r));
 	struct sockaddr_in to = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
@@ -791,7 +820,7 @@ static void raw_open(raw_wt *r, hw_server *s, int v2) {
 	qc.tls.alpn_count = 1;
 	qc.max_idle_ms = 60000;
 	qc.initial_max_data = 4u << 20;
-	qc.initial_max_stream_data = 4u << 20;
+	qc.initial_max_stream_data = stream_window ? stream_window : 4u << 20;
 	qc.initial_max_streams_bidi = 16;
 	qc.initial_max_streams_uni = 16;
 	qc.max_datagram_frame_size = 65535;
@@ -817,7 +846,7 @@ static void raw_open(raw_wt *r, hw_server *s, int v2) {
 	    .is_client = 1,
 	    .authority = r->authority,
 	    .path = "/",
-	    .protocols = v2 ? "\"wisp-v2\"" : NULL,
+	    .protocols = protocols,
 	};
 	hw_wt_callbacks wcb = {.ud = r, .packet = raw_w_packet, .session_closed = raw_w_session_closed};
 	r->wt = hw_wt_new(r->q, &wc, &wcb);
@@ -825,6 +854,11 @@ static void raw_open(raw_wt *r, hw_server *s, int v2) {
 	uint64_t until = hw_now_ms() + 5000;
 	while (r->packets == 0 && !r->quic_closed && hw_now_ms() < until) raw_pump(r, 20, &r->packets);
 	CHECK(r->packets > 0, "the server's opening (ready %d, status %d)", hw_wt_ready(r->wt), hw_wt_status(r->wt));
+}
+
+// A session, v1 or v2 ("wisp-v2" alone), opened (and for v1, its CONTINUE received).
+static void raw_open(raw_wt *r, hw_server *s, int v2) {
+	raw_open_with(r, s, v2 ? "\"wisp-v2\"" : NULL, 0);
 }
 
 static void raw_free(raw_wt *r) {
@@ -888,6 +922,278 @@ static void test_wisp_stream_end(void) {
 	CHECK_EQ(stats(s).streams_active, 0);
 	CHECK(hw_now_ms() - t0 < 2000, "took %llu ms", (unsigned long long)(hw_now_ms() - t0));
 	raw_free(&r);
+	hw_server_free(s);
+}
+
+// ---------------------------------------------------------------------------------- lanes
+
+#define OFFER_SERVER_STREAM "\"wisp-v2\", \"wisp-v2-server-stream\""
+
+static void raw_info(raw_wt *r, const char *user, const char *pass) {
+	uint8_t pkt[128];
+	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, 0);
+	if (user) {
+		char meta[64]; // u8 user length, user, password
+		int len = snprintf(meta, sizeof(meta), "%c%s%s", (char)strlen(user), user, pass);
+		CHECK(len > 0 && (size_t)len < sizeof(meta), "credentials fit");
+		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_PASSWORD, meta, (uint32_t)len);
+	}
+	raw_send(r, pkt, n);
+}
+
+static void raw_connect(raw_wt *r, int lane, uint32_t id, uint16_t port) {
+	uint8_t pkt[64];
+	size_t n = hw_wisp_build_connect(pkt, sizeof(pkt), id, HW_STREAM_TCP, port, "127.0.0.1", 9);
+	CHECK_EQ(hw_wt_send_lane(r->wt, lane, pkt, n, 0), 0);
+	raw_output(r);
+}
+
+static void raw_data(raw_wt *r, int lane, uint32_t id, const char *s) {
+	uint8_t pkt[64];
+	hw_wisp_write_header(pkt, HW_WISP_DATA, id);
+	int n = snprintf((char *)pkt + HW_WISP_HEADER_LEN, sizeof(pkt) - HW_WISP_HEADER_LEN, "%s", s);
+	CHECK(n > 0 && (size_t)n < sizeof(pkt) - HW_WISP_HEADER_LEN, "DATA fits");
+	CHECK_EQ(hw_wt_send_lane(r->wt, lane, pkt, HW_WISP_HEADER_LEN + (size_t)n, 0), 0);
+	raw_output(r);
+}
+
+static void raw_wait_packets(raw_wt *r, int want, int ms) {
+	uint64_t until = hw_now_ms() + (uint64_t)ms;
+	while (r->packets < want && !r->quic_closed && hw_now_ms() < until) raw_pump(r, 10, NULL);
+}
+
+// A client that offers "wisp-v2-server-stream" gets it, and the server's stream brings INFO (with
+// the lanes) and CONTINUE before the client has sent anything on a stream at all: the Wisp
+// handshake costs no round trip. With a password required the CONTINUE waits for the INFO that
+// carries it, as before.
+static void test_server_stream_opening(void) {
+	for (int pass = 0; pass <= 1; pass++) {
+		hw_server_config cfg;
+		base_config(&cfg);
+		cfg.log_level = HW_LOG_NONE;
+		if (pass) {
+			CHECK_EQ(hw_server_config_add_user(&cfg, "alice", "s3cret"), 0);
+			cfg.password_required = 1;
+		}
+		hw_server *s = server_with(&cfg);
+		raw_wt r;
+		raw_open_with(&r, s, OFFER_SERVER_STREAM, 0);
+		CHECK(hw_wt_server_stream(r.wt), "the server opened the Wisp stream");
+		CHECK_STR(hw_wt_protocol(r.wt), HW_WT_SERVER_STREAM);
+		raw_wait_packets(&r, 2, pass ? 500 : 3000);
+		CHECK(r.types[0] == HW_WISP_INFO && r.streams[0] == 0, "INFO first (%d)", r.types[0]);
+		CHECK_EQ(r.info_lanes, 8);
+		if (!pass) {
+			CHECK(r.packets == 2 && r.types[1] == HW_WISP_CONTINUE && r.streams[1] == 0, "and CONTINUE, unasked");
+		} else {
+			CHECK_EQ(r.packets, 1); // no CONTINUE before the password
+		}
+		raw_info(&r, pass ? "alice" : NULL, "s3cret");
+		if (pass) {
+			raw_wait_packets(&r, 2, 3000);
+			CHECK(r.packets == 2 && r.types[1] == HW_WISP_CONTINUE && r.streams[1] == 0, "CONTINUE after the INFO");
+		}
+		raw_connect(&r, 0, 1, g_tcp_echo_port);
+		raw_data(&r, 0, 1, "abc");
+		uint64_t until = hw_now_ms() + 5000;
+		while (r.data_packets == 0 && hw_now_ms() < until) raw_pump(&r, 20, &r.data_packets);
+		CHECK(r.data_packets > 0, "pass %d: echo", pass);
+		raw_free(&r);
+		hw_server_free(s);
+	}
+}
+
+// On a server-opened Wisp stream the client's first packet must be its INFO: anything else is
+// answered with CLOSE 0x04 on stream 0, and the session ends.
+static void test_server_stream_info_first(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open_with(&r, s, OFFER_SERVER_STREAM, 0);
+	raw_wait_packets(&r, 2, 3000);
+	CHECK_EQ(r.packets, 2);
+	raw_connect(&r, 0, 1, g_tcp_echo_port);
+	raw_pump(&r, 3000, &r.session_closed);
+	CHECK(r.last_type == HW_WISP_CLOSE && r.last_stream == 0 && r.last_reason == HW_CLOSE_INCOMPATIBLE,
+	      "CLOSE 0x04 (type %d stream %u reason 0x%02x)", r.last_type, r.last_stream, r.last_reason);
+	CHECK(r.session_closed, "the session ended");
+	CHECK(raw_wait_server(&r, s, 3000, 0, 0), "the session is gone");
+	CHECK_EQ(stats(s).streams_active, 0);
+	raw_free(&r);
+	hw_server_free(s);
+}
+
+// A lane the client opens on the early CONTINUE can reach the server before the INFO does: what is
+// on it waits for the INFO and is then acted on, never dropped.
+static void test_lane_before_info(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open_with(&r, s, OFFER_SERVER_STREAM, 0);
+	raw_wait_packets(&r, 2, 3000);
+	CHECK_EQ(r.packets, 2);
+	CHECK_EQ(hw_wt_open_lane(r.wt, 1), 0);
+	raw_connect(&r, 1, 1, g_tcp_echo_port);
+	raw_data(&r, 1, 1, "early");
+	raw_pump(&r, 200, NULL); // there long before the INFO
+	CHECK_EQ(stats(s).streams_active, 0);
+	raw_info(&r, NULL, NULL);
+	uint64_t until = hw_now_ms() + 5000;
+	while (r.data_packets == 0 && hw_now_ms() < until) raw_pump(&r, 20, &r.data_packets);
+	CHECK(r.data_packets > 0, "the lane's CONNECT was acted on after the INFO");
+	CHECK(r.lane_bytes[1] == 5 && r.lane_bytes[0] == 0, "and its DATA came back on its lane");
+	raw_free(&r);
+	hw_server_free(s);
+}
+
+// The client library on lanes: streams spread over them (the fewest open first), several bulk
+// echoes at once, every byte back on its stream. With and without the server-opened stream, with
+// the server's number below the client's, and with 16 lanes (the server leaves room for them).
+static void test_lanes_echo(void) {
+	for (int round = 0; round < 4; round++) {
+		hw_server *s = g_server;
+		int want = 8;
+		if (round >= 2) {
+			hw_server_config cfg;
+			base_config(&cfg);
+			cfg.log_level = HW_LOG_NONE;
+			want = round == 2 ? 3 : HW_WT_LANES_MAX; // fewer than asked for; the most there may be
+			cfg.webtransport_lanes = want;
+			s = server_with(&cfg);
+		}
+		wt_opts w = {.v2 = 1, .server_stream = round == 1, .lanes = round == 3 ? HW_WT_LANES_MAX : 8};
+		hw_client *c = wt_connect(s, &w);
+		CHECK_EQ(hw_client_lanes(c), want);
+		CHECK_EQ(hw_client_server_stream(c), round == 1);
+		enum {
+			N = 20,
+			SIZE = 256 * 1024,
+			CHUNK = 32 * 1024
+		};
+		uint32_t sid[N];
+		static uint8_t data[N][SIZE], back[N][SIZE];
+		size_t sent[N] = {0}, got[N] = {0};
+		for (int k = 0; k < N; k++) {
+			CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid[k]), 0);
+			CHECK_EQ(hw_client_stream_lane(c, sid[k]), k % want);
+			fill_pattern(data[k], SIZE, (uint32_t)(k + 100 * round));
+		}
+		size_t done = 0;
+		uint64_t until = hw_now_ms() + 20000;
+		while (done < N && hw_now_ms() < until) {
+			for (int k = 0; k < N; k++) {
+				if (sent[k] < SIZE) {
+					CHECK_EQ(hw_client_send(c, sid[k], data[k] + sent[k], CHUNK), 0);
+					sent[k] += CHUNK;
+				}
+			}
+			hw_client_event ev;
+			int r;
+			while ((r = hw_client_poll(c, 0, &ev)) > 0) {
+				CHECK(ev.type != HW_CEV_CLOSE, "closed 0x%02x", ev.reason);
+				if (ev.type != HW_CEV_DATA) continue;
+				int k = 0;
+				while (k < N && sid[k] != ev.stream_id) k++;
+				CHECK(k < N && got[k] + ev.len <= SIZE, "stream %u", ev.stream_id);
+				memcpy(back[k] + got[k], ev.data, ev.len);
+				got[k] += ev.len;
+				if (got[k] == SIZE) done++;
+			}
+			CHECK(r >= 0, "poll %d", r);
+			if (r == 0 && sent[0] >= SIZE) usleep(1000);
+		}
+		for (int k = 0; k < N; k++) {
+			CHECK(got[k] == SIZE && memcmp(data[k], back[k], SIZE) == 0, "round %d: stream %d intact (%zu)", round, k,
+			      got[k]);
+		}
+		hw_client_free(c);
+		wait_sessions_gone(s, 5000);
+		if (s != g_server) hw_server_free(s);
+	}
+}
+
+// Backpressure is per lane: a lane whose client has stopped reading pauses the remotes of its own
+// streams, and a stream on another lane goes on at full speed. Built as test_stalled_reader, with
+// the reader stopped for one lane's QUIC stream only.
+static void test_lane_backpressure(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.workers = 1;
+	cfg.ws_write_high_water = 1024 * 1024;
+	cfg.webtransport_lanes = 4;
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open_with(&r, s, "\"wisp-v2\"", 1024 * 1024);
+	CHECK_EQ(r.info_lanes, 4);
+	raw_info(&r, NULL, NULL);
+	raw_wait_packets(&r, 2, 3000);
+	CHECK(r.types[1] == HW_WISP_CONTINUE, "the handshake");
+	// The client's streams: 0 the CONNECT's, 4 lane 0, then 8 and 12 for lanes 1 and 2.
+	CHECK_EQ(hw_wt_open_lane(r.wt, 1), 0);
+	CHECK_EQ(hw_wt_open_lane(r.wt, 2), 0);
+	r.stall_id = 8;
+	r.stalling = 1;
+	raw_connect(&r, 1, 1, g_source_port);
+	raw_connect(&r, 2, 2, g_source_port);
+	raw_pump(&r, 1500, NULL);
+	CHECK(r.stalled > 0, "lane 1 had bytes");
+	CHECK(r.lane_bytes[2] > 0, "lane 2 has bytes");
+	uint64_t before = r.lane_bytes[2];
+	raw_pump(&r, 1000, NULL);
+	uint64_t moved = r.lane_bytes[2] - before;
+	CHECK(moved >= 4ull * 1024 * 1024, "lane 2 moved %llu bytes in a second behind a stalled lane 1",
+	      (unsigned long long)moved);
+	CHECK(r.stalled <= 1024 * 1024, "lane 1 past its window: %llu", (unsigned long long)r.stalled);
+	CHECK_EQ(stats(s).streams_active, 2);
+	raw_free(&r);
+	hw_server_free(s);
+}
+
+// Clients that ask for neither extension see what they saw before: v1 gets its CONTINUE first and
+// no INFO; v2 with one token (epoxy's random one too) gets it echoed, opens the Wisp stream itself
+// and is sent INFO first (0xE1 among its extensions, which it skips); a server with lanes off
+// sends no 0xE1.
+static void test_old_clients(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *o = server_with(&cfg); // the raw clients leave their sessions to the idle timeout
+	raw_wt r;
+	raw_open_with(&r, o, NULL, 0);
+	CHECK(r.types[0] == HW_WISP_CONTINUE && r.streams[0] == 0, "v1: CONTINUE first");
+	CHECK(!hw_wt_server_stream(r.wt) && hw_wt_protocol(r.wt)[0] == '\0', "v1: no protocol");
+	raw_free(&r);
+	raw_open_with(&r, o, "\"wisp-v2\"", 0);
+	CHECK(r.types[0] == HW_WISP_INFO && r.info_lanes == 8, "v2: INFO first, with the lanes");
+	CHECK(!hw_wt_server_stream(r.wt), "v2: the client's stream");
+	CHECK_STR(hw_wt_protocol(r.wt), "wisp-v2");
+	raw_pump(&r, 200, NULL);
+	CHECK_EQ(r.packets, 1); // no CONTINUE before the client's INFO
+	raw_free(&r);
+	raw_open_with(&r, o, "\"6f9619ff-8b86-d011-b42d-00c04fc964ff\"", 0);
+	CHECK_STR(hw_wt_protocol(r.wt), "6f9619ff-8b86-d011-b42d-00c04fc964ff");
+	CHECK(r.types[0] == HW_WISP_INFO && !hw_wt_server_stream(r.wt), "a random token: v2 as before");
+	raw_free(&r);
+	wt_opts w = {.v2 = 1};
+	hw_client *c = wt_connect(o, &w);
+	CHECK(hw_client_is_v2(c) && hw_client_lanes(c) == 1 && !hw_client_server_stream(c), "the library's default");
+	hw_client_free(c);
+	hw_server_free(o);
+	cfg.webtransport_lanes = 1;
+	hw_server *s = server_with(&cfg);
+	raw_open_with(&r, s, "\"wisp-v2\"", 0);
+	CHECK(r.types[0] == HW_WISP_INFO && r.info_lanes == 0, "lanes off: no 0xE1");
+	raw_free(&r);
+	w.lanes = 8;
+	w.server_stream = 1;
+	c = wt_connect(s, &w);
+	CHECK(hw_client_lanes(c) == 1 && hw_client_server_stream(c), "lanes asked for, none offered");
+	hw_client_free(c);
 	hw_server_free(s);
 }
 
@@ -1323,6 +1629,12 @@ int main(void) {
 	RUN(test_close_unanswered);
 	RUN(test_cert_rotation);
 	RUN(test_operator_reload);
+	RUN(test_server_stream_opening);
+	RUN(test_server_stream_info_first);
+	RUN(test_lane_before_info);
+	RUN(test_lanes_echo);
+	RUN(test_lane_backpressure);
+	RUN(test_old_clients);
 	RUN(test_stats_json);
 
 	hw_server_stop(g_server);

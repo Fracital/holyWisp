@@ -281,7 +281,7 @@ static net *net_new(uint64_t seed, uint64_t stream_window) {
 }
 
 static hw_wt *side_wt(side *e, const hw_wt_config *cfg) {
-	hw_wt_callbacks cb = {e, w_request, w_packet, w_writable, w_closed};
+	hw_wt_callbacks cb = {e, w_request, w_packet, w_writable, w_closed, NULL};
 	hw_wt *w = hw_wt_new(e->q, cfg, &cb);
 	CHECK(w != NULL, "hw_wt_new");
 	return w;

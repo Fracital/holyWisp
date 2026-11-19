@@ -148,6 +148,7 @@ hw_stream *stream_new(hw_conn *c, uint32_t id, uint8_t type, const char *host, s
 	s->fd = -1;
 	s->pid = -1;
 	s->port = port;
+	s->lane = c->rx_lane;
 	s->remaining = c->w->server->window;
 	hw_buf_init(&s->out);
 	hw_buf_init(&s->pin);
@@ -214,8 +215,9 @@ void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	hw_buf_free(&s->out);
 	hw_buf_free(&s->pin);
 	uint32_t id = s->id;
+	int lane = s->lane;
 	free(s);
-	if (send_close) conn_send_close(c, id, reason);
+	if (send_close) conn_send_close_lane(c, id, reason, lane);
 }
 
 void stream_pause(hw_stream *s) {
@@ -241,7 +243,7 @@ void stream_park(hw_stream *s) {
 void stream_unpark(hw_stream *s) {
 	if (!s->parked) return;
 	s->parked = 0;
-	if (!s->conn->paused) stream_resume(s);
+	if (!conn_stream_paused(s->conn, s)) stream_resume(s);
 }
 
 // ---------------------------------------------------------------------------------- SYN signature
@@ -330,7 +332,7 @@ int stream_connected(hw_stream *s) {
 	}
 	s->state = STREAM_OPEN;
 	if (s->type == HW_STREAM_TCP) server_tune_socket(c->w->server, s->fd, 1);
-	s->read_armed = !c->paused;
+	s->read_armed = !conn_stream_paused(c, s);
 	// With client data already queued, stream_flush below sets the event mask once it knows what
 	// is left; setting it here as well would be a second epoll_ctl for every such stream.
 	if (hw_buf_avail(&s->out) == 0 && stream_update_events(s) != 0) {

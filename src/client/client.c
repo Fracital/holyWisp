@@ -8,6 +8,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
 #include "holywisp/sys.h"
+#include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
@@ -35,6 +36,7 @@ typedef struct cstream {
 	uint32_t id;
 	uint8_t type;
 	uint32_t remaining;
+	int lane; // WebTransport: the lane its CONNECT went on, which all its packets take
 } cstream;
 
 typedef struct qevent {
@@ -59,6 +61,8 @@ struct hw_client {
 	int closed;
 	int is_v2;
 	int server_udp;
+	int server_lanes;  // WebTransport: the lanes the server's INFO offers, 0 for none
+	int lanes;         // the lanes open, lane 0 included
 	int authenticated; // the password extension went out and the server completed the handshake
 	int timeout_ms;    // opts.timeout_ms: the longest a send waits for a CONTINUE
 	uint32_t buffer_size;
@@ -206,19 +210,38 @@ static int timer_left(const ctimer *t) {
 	return (int)HW_MIN(t->deadline - now, (uint64_t)INT_MAX);
 }
 
-// One whole packet on the WebTransport session, waiting while its send queue is full for as long
-// as a send waits for a CONTINUE.
-static int wt_send(hw_client *c, const uint8_t *packet, size_t len, int unreliable) {
+// One whole packet on a lane of the WebTransport session, waiting while its send queue is full
+// for as long as a send waits for a CONTINUE.
+static int wt_send(hw_client *c, int lane, const uint8_t *packet, size_t len, int unreliable) {
 	if (c->closed) return HW_ERR_CLOSED;
 	ctimer t = timer_start(c->timeout_ms);
-	int r = hw_wtc_send(c->wt, packet, len, unreliable, t.deadline);
+	int r = hw_wtc_send(c->wt, lane, packet, len, unreliable, t.deadline);
 	if (r == HW_ERR_CLOSED) c->closed = 1;
 	return r;
 }
 
-static int send_packet(hw_client *c, const uint8_t *packet, size_t len) {
-	if (c->wt) return wt_send(c, packet, len, 0);
+// A packet on a lane; a WebSocket has lane 0 alone.
+static int send_packet_lane(hw_client *c, int lane, const uint8_t *packet, size_t len) {
+	if (c->wt) return wt_send(c, lane, packet, len, 0);
 	return send_frame(c, HW_WS_BINARY, packet, len, NULL, 0);
+}
+
+static int send_packet(hw_client *c, const uint8_t *packet, size_t len) {
+	return send_packet_lane(c, 0, packet, len);
+}
+
+// The lane a new stream takes: the one with the fewest open streams, the lowest of those.
+static int lane_pick(const hw_client *c) {
+	if (c->lanes <= 1) return 0;
+	size_t count[16] = {0};
+	for (size_t i = 0; i < c->nstreams; i++) {
+		if (c->streams[i].lane >= 0 && c->streams[i].lane < 16) count[c->streams[i].lane]++;
+	}
+	int best = 0;
+	for (int i = 1; i < c->lanes && i < 16; i++) {
+		if (count[i] < count[best]) best = i;
+	}
+	return best;
 }
 
 // Wait until the socket is readable or the timer runs out. 1 ready, 0 time is up, <0 error.
@@ -548,6 +571,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				return -1;
 			}
 			c->server_udp = info.has_udp;
+			c->server_lanes = info.lanes;
 			if (info.motd) {
 				size_t ml = HW_MIN(info.motd_len, sizeof(c->motd) - 1);
 				memcpy(c->motd, info.motd, ml);
@@ -581,6 +605,11 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 		if (p.type == HW_WISP_CONTINUE && p.payload_len >= 4) {
 			c->buffer_size = hw_le32(p.payload);
 			c->authenticated = sent_password;
+			// The handshake is over on the server's side too: the lanes may open now.
+			if (c->wt && c->is_v2 && o->wt_lanes >= 2 && c->server_lanes >= 2) {
+				int want = HW_MIN(o->wt_lanes, c->server_lanes);
+				c->lanes = hw_wtc_open_lanes(c->wt, HW_MIN(want, 16));
+			}
 			return 0;
 		}
 	}
@@ -595,7 +624,9 @@ static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char 
 	    .port = o->port,
 	    .path = o->path,
 	    .origin = o->origin,
-	    .protocols = o->v2 ? "\"" HW_WISP_V2_PROTOCOL "\"" : NULL,
+	    .protocols = !o->v2                ? NULL
+	                 : o->wt_server_stream ? "\"" HW_WISP_V2_PROTOCOL "\", \"" HW_WT_SERVER_STREAM "\""
+	                                       : "\"" HW_WISP_V2_PROTOCOL "\"",
 	    .pin_sha256 = o->pin_sha256,
 	    .max_packet = c->max_message,
 	    .max_queue = c->max_queue_bytes,
@@ -607,7 +638,8 @@ static int wt_open(hw_client *c, const hw_client_opts *o, const ctimer *t, char 
 		snprintf(err, err_cap, "server chose a subprotocol that was not offered");
 		return -1;
 	}
-	c->is_v2 = o->v2 && strcmp(proto, HW_WISP_V2_PROTOCOL) == 0;
+	c->is_v2 = o->v2 && (strcmp(proto, HW_WISP_V2_PROTOCOL) == 0 ||
+	                     (o->wt_server_stream && strcmp(proto, HW_WT_SERVER_STREAM) == 0));
 	if (o->v2 && !c->is_v2) {
 		snprintf(err, err_cap, "server did not accept %s", HW_WISP_V2_PROTOCOL);
 		return -1;
@@ -636,6 +668,7 @@ hw_client *hw_client_connect(const hw_client_opts *o, char *err, size_t err_cap)
 	c->max_queue_events = o->max_queue_events ? o->max_queue_events : CLIENT_QUEUE_EVENTS;
 	c->timeout_ms = o->timeout_ms;
 	c->next_id = 1;
+	c->lanes = 1;
 	seed_rng(c);
 	// One deadline for the TCP connect, the upgrade and the Wisp handshake together.
 	ctimer t = timer_start(o->timeout_ms);
@@ -695,6 +728,21 @@ int hw_client_server_has_udp(const hw_client *c) {
 	return c->server_udp;
 }
 
+int hw_client_lanes(const hw_client *c) {
+	return c->lanes;
+}
+
+int hw_client_stream_lane(const hw_client *c, uint32_t stream_id) {
+	for (size_t i = 0; i < c->nstreams; i++) {
+		if (c->streams[i].id == stream_id) return c->streams[i].lane;
+	}
+	return -1;
+}
+
+int hw_client_server_stream(const hw_client *c) {
+	return c->wt ? hw_wtc_server_stream(c->wt) : 0;
+}
+
 uint32_t hw_client_buffer_size(const hw_client *c) {
 	return c->buffer_size;
 }
@@ -725,11 +773,13 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	if (n == 0) return HW_ERR_INVALID;
 	uint32_t id = c->next_id++;
 	if (c->next_id == 0) c->next_id = 1;
+	int lane = lane_pick(c);
 	cstream *s = &c->streams[c->nstreams++];
 	s->id = id;
 	s->type = stream_type;
 	s->remaining = c->buffer_size;
-	int r = send_packet(c, pkt, n);
+	s->lane = lane;
+	int r = send_packet_lane(c, lane, pkt, n);
 	if (r != 0) {
 		c->nstreams--;
 		return r;
@@ -766,16 +816,17 @@ int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t le
 		uint8_t *p = hw_buf_tail(&c->sbuf);
 		memcpy(p, hdr, sizeof(hdr));
 		if (len) memcpy(p + sizeof(hdr), data, len);
-		return wt_send(c, p, sizeof(hdr) + len, s->type == HW_STREAM_UDP);
+		return wt_send(c, s->lane, p, sizeof(hdr) + len, s->type == HW_STREAM_UDP);
 	}
 	return send_frame(c, HW_WS_BINARY, hdr, sizeof(hdr), data, len);
 }
 
 int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason) {
 	if (c->closed) return HW_ERR_CLOSED;
+	int lane = hw_client_stream_lane(c, stream_id);
 	stream_forget(c, stream_id);
 	uint8_t pkt[HW_WISP_HEADER_LEN + 1];
-	return send_packet(c, pkt, hw_wisp_build_close(pkt, stream_id, reason));
+	return send_packet_lane(c, lane < 0 ? 0 : lane, pkt, hw_wisp_build_close(pkt, stream_id, reason));
 }
 
 int hw_client_poll(hw_client *c, int timeout_ms, hw_client_event *ev) {

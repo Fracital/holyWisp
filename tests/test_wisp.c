@@ -125,6 +125,59 @@ static void test_info_client_password(void) {
 	CHECK_EQ(hw_wisp_parse_info(&p, &info), HW_ERR_INVALID);
 }
 
+// Lanes: the server's INFO extension 0xE1 (its count, reserved bytes after it skipped), and the
+// LANE packet.
+static void test_lanes(void) {
+	uint8_t pkt[64];
+	size_t n = hw_wisp_build_info(pkt, 2, 1);
+	uint8_t lanes[3] = {8, 0xaa, 0xbb};
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_LANES, lanes, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
+	CHECK_EQ(pkt[7], 0xE1);
+	CHECK_EQ(hw_le32(pkt + 8), 1);
+	CHECK_EQ(pkt[12], 8);
+	hw_wisp_packet p;
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	hw_wisp_info info;
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK_EQ(info.lanes, 8);
+	CHECK(info.has_udp, "the extension after it");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_LANES, lanes, 3);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK_EQ(info.lanes, 8);
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_LANES, NULL, 0); // no count: none
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK_EQ(info.lanes, 0);
+	n = hw_wisp_build_info(pkt, 2, 1);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK_EQ(info.lanes, 0);
+
+	CHECK_EQ(hw_wisp_build_lane(pkt, 3), HW_WISP_HEADER_LEN + 1);
+	static const uint8_t want[] = {0xE1, 0, 0, 0, 0, 3};
+	CHECK(memcmp(pkt, want, sizeof(want)) == 0, "LANE bytes");
+	CHECK_EQ(hw_wisp_parse(pkt, 6, &p), 0);
+	uint8_t idx = 0;
+	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), 0);
+	CHECK_EQ(idx, 3);
+	CHECK_STR(hw_wisp_type_str(HW_WISP_LANE), "LANE");
+	pkt[6] = 0x77; // a reserved byte after the index
+	CHECK_EQ(hw_wisp_parse(pkt, 7, &p), 0);
+	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), 0);
+	CHECK_EQ(hw_wisp_parse(pkt, 5, &p), 0); // no index
+	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), HW_ERR_INVALID);
+	pkt[1] = 1; // not stream 0
+	CHECK_EQ(hw_wisp_parse(pkt, 6, &p), 0);
+	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), HW_ERR_INVALID);
+	hw_wisp_write_header(pkt, HW_WISP_CLOSE, 0); // another type
+	CHECK_EQ(hw_wisp_parse(pkt, 6, &p), 0);
+	CHECK_EQ(hw_wisp_parse_lane(&p, &idx), HW_ERR_INVALID);
+}
+
 int main(void) {
 	RUN(test_le16);
 	RUN(test_header_roundtrip);
@@ -132,5 +185,6 @@ int main(void) {
 	RUN(test_continue_close);
 	RUN(test_info_server);
 	RUN(test_info_client_password);
+	RUN(test_lanes);
 	return 0;
 }

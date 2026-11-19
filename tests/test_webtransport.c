@@ -657,6 +657,23 @@ static void test_protocol_first(void) {
 	CHECK_EQ(hw_wt_protocol_first("\"waytoolongforthisbuffer-waytoolong\"", out, 8), -1);
 }
 
+static void test_protocol_offered(void) {
+	CHECK_EQ(hw_wt_protocol_offered("\"wisp-v2\", \"wisp-v2-server-stream\"", HW_WT_SERVER_STREAM), 1);
+	CHECK_EQ(hw_wt_protocol_offered("\"wisp-v2-server-stream\"", HW_WT_SERVER_STREAM), 1);
+	CHECK_EQ(hw_wt_protocol_offered("tok;a=1 , \t\"wisp-v2-server-stream\";q=2", HW_WT_SERVER_STREAM), 1);
+	CHECK_EQ(hw_wt_protocol_offered("\"wisp-v2\"", HW_WT_SERVER_STREAM), 0);
+	CHECK_EQ(hw_wt_protocol_offered("\"wisp-v2-server-streamX\", \"x-wisp-v2-server-stream\"", HW_WT_SERVER_STREAM), 0);
+	CHECK_EQ(hw_wt_protocol_offered("\"wisp-v2\", 1bad, \"wisp-v2-server-stream\"", HW_WT_SERVER_STREAM), 0);
+	CHECK_EQ(hw_wt_protocol_offered("", HW_WT_SERVER_STREAM), 0);
+	CHECK_EQ(hw_wt_protocol_offered(NULL, HW_WT_SERVER_STREAM), 0);
+	// The draft's mapping of an application code onto HTTP/3's, the reserved codes skipped.
+	CHECK_EQ(hw_wt_error_code(0), 0x52e4a40fa8dbull);
+	CHECK_EQ(hw_wt_error_code(HW_WT_LANE_REFUSED), 0x52e4a40fa8dcull);
+	CHECK_EQ(hw_wt_error_code(HW_WT_STREAM_UNWANTED), 0x52e4a40fa8ddull);
+	CHECK_EQ(hw_wt_error_code(0x1d), 0x52e4a40fa8dbull + 0x1d);
+	CHECK_EQ(hw_wt_error_code(0x1e), 0x52e4a40fa8dbull + 0x1f);
+}
+
 // ---- The Wisp framing -------------------------------------------------------------------------
 
 typedef struct {
@@ -770,6 +787,7 @@ typedef struct {
 	size_t sent;
 	int blocked, fin_sent, reset_sent, stopped;
 	int64_t stop_sent;
+	size_t unsent; // what hw_quic_stream_unsent reports
 } mock_stream;
 
 struct hw_quic_conn {
@@ -1031,6 +1049,10 @@ size_t hw_quic_unsent(const hw_quic_conn *q) {
 	return q->queued;
 }
 
+size_t hw_quic_stream_unsent(const hw_quic_conn *q, uint64_t id) {
+	return mock_st((hw_quic_conn *)q, id)->unsent;
+}
+
 // ---- Endpoints --------------------------------------------------------------------------------
 
 #define EP_PKTS 256
@@ -1053,6 +1075,10 @@ typedef struct {
 	char close_reason[HW_H3_CLOSE_REASON_MAX + 1];
 	int pause_at; // pause once this many packets have arrived
 	int echo;     // send each packet back as it came
+	int pkt_lane[EP_PKTS];
+	int accept_lanes; // hw_wt_accept_lanes at the request
+	int lanes_ended;
+	int lane_last; // the lane that ended last
 } endpoint;
 
 static int ep_request(void *ud, const hw_wt_request *req, const char **protocol_out) {
@@ -1065,7 +1091,14 @@ static int ep_request(void *ud, const hw_wt_request *req, const char **protocol_
 	e->has_protocols = req->protocols != NULL;
 	if (req->protocols) snprintf(e->protocols, sizeof(e->protocols), "%s", req->protocols);
 	*protocol_out = e->answer_protocol;
+	if (e->accept_lanes) hw_wt_accept_lanes(e->w, e->accept_lanes);
 	return e->answer;
+}
+
+static void ep_lane_ended(void *ud, int lane) {
+	endpoint *e = ud;
+	e->lanes_ended++;
+	e->lane_last = lane;
 }
 
 static void ep_packet(void *ud, const uint8_t *data, size_t len, int datagram) {
@@ -1075,6 +1108,7 @@ static void ep_packet(void *ud, const uint8_t *data, size_t len, int datagram) {
 	if (len) memcpy(e->pkt[e->packets], data, len);
 	e->pkt_len[e->packets] = len;
 	e->pkt_dgram[e->packets] = datagram;
+	e->pkt_lane[e->packets] = hw_wt_packet_lane(e->w);
 	e->packets++;
 	if (e->echo) CHECK_EQ(hw_wt_send(e->w, data, len, datagram), 0);
 	if (e->pause_at && e->packets == e->pause_at) hw_wt_pause(e->w, 1);
@@ -1104,7 +1138,7 @@ static void ep_init(endpoint *e, hw_quic_conn *q, int client, size_t max_packet,
 	cfg.path = "/wisp/?v=2";
 	cfg.origin = "https://app.example.com";
 	cfg.protocols = "\"wisp-v2\", \"wisp-v1\"";
-	hw_wt_callbacks cb = {e, ep_request, ep_packet, ep_writable, ep_closed};
+	hw_wt_callbacks cb = {e, ep_request, ep_packet, ep_writable, ep_closed, ep_lane_ended};
 	e->w = hw_wt_new(q, &cfg, &cb);
 	CHECK(e->w != NULL, "hw_wt_new");
 	q->w = e->w;
@@ -1425,7 +1459,7 @@ static void test_chrome_session(void) {
 	CHECK(memcmp(hw_buf_head(&c4->rx) + 4, p, n) == 0, "stream out");
 	// A second session on the same connection, other WebTransport streams, a GREASE stream.
 	raw_headers(&qc, 8, CHROME_BLOCK, 0);
-	raw_write(&qc, 12, "4041 00 aaaa", 0);
+	raw_write(&qc, 12, "4041 00 06000000 01 00000000 aa", 0); // a CONNECT first: not a lane
 	raw_write(&qc, 6, "4054 00 bbbb", 0);
 	raw_write(&qc, 10, "407e cccc", 0);
 	raw_write(&qc, 16, "4041 04 dddd", 0);
@@ -1434,8 +1468,8 @@ static void test_chrome_session(void) {
 	CHECK_EQ(raw_response(&qc, 8, &d), 1);
 	CHECK_STR(d.f[0].value, "429");
 	CHECK(mock_st(&qc, 8)->rx_fin && mock_st(&qc, 8)->stop_got == HW_H3_NO_ERROR, "429, FIN and STOP_SENDING");
-	CHECK(mock_st(&qc, 12)->stop_got == HW_WT_BUFFERED_STREAM_REJECTED, "a second Wisp stream is stopped");
-	CHECK(mock_st(&qc, 12)->rx_reset == HW_WT_BUFFERED_STREAM_REJECTED, "and reset");
+	CHECK(mock_st(&qc, 12)->stop_got == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "a second stream is stopped");
+	CHECK(mock_st(&qc, 12)->rx_reset == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "and reset");
 	CHECK(mock_st(&qc, 16)->stop_got == HW_WT_BUFFERED_STREAM_REJECTED, "another session's stream");
 	CHECK(mock_st(&qc, 6)->stop_got == HW_WT_BUFFERED_STREAM_REJECTED, "a unidirectional WebTransport stream");
 	CHECK(mock_st(&qc, 10)->stop_got == HW_H3_STREAM_CREATION_ERROR, "a GREASE stream");
@@ -1720,6 +1754,264 @@ static void test_client_role(void) {
 	mock_free(&qs);
 }
 
+// ---- The server-opened Wisp stream and lanes ------------------------------------------------------
+
+static void raw_bytes(hw_quic_conn *q, uint64_t id, const uint8_t *d, size_t n);
+
+// The first event of a kind on a stream in a raw end's log, or -1.
+static int log_first(const hw_quic_conn *q, int type, uint64_t id) {
+	for (size_t i = 0; i < q->nlog; i++) {
+		if (q->log[i].type == type && q->log[i].id == id) return (int)i;
+	}
+	return -1;
+}
+
+static int rx_is(hw_quic_conn *q, uint64_t id, const char *hex) {
+	uint8_t want[512];
+	size_t n = unhex(hex, want, sizeof(want));
+	mock_stream *s = mock_st(q, id);
+	return hw_buf_avail(&s->rx) == n && memcmp(hw_buf_head(&s->rx), want, n) == 0;
+}
+
+// A raw server's 200, with wt-protocol when protocol is not NULL.
+static void raw_200(hw_quic_conn *qs, const char *protocol) {
+	uint8_t block[256], f[300];
+	size_t n = hw_qpack_prefix_put(block, sizeof(block));
+	n += hw_qpack_field_put(block + n, sizeof(block) - n, ":status", 7, "200", 3);
+	n += hw_qpack_field_put(block + n, sizeof(block) - n, "sec-webtransport-http3-draft", 28, "draft02", 7);
+	if (protocol) n += hw_qpack_field_put(block + n, sizeof(block) - n, "wt-protocol", 11, protocol, strlen(protocol));
+	size_t h = hw_h3_frame_header_put(f, sizeof(f), HW_H3_FRAME_HEADERS, n);
+	memcpy(f + h, block, n);
+	CHECK_EQ(hw_quic_stream_write(qs, 0, f, h + n, 0), (int64_t)(h + n));
+}
+
+// The server answers the token: it opens lane 0 itself right behind the 200, is ready with no
+// client stream, delivers the client's first packet on it and holds every lane after that until
+// hw_wt_release, uncredited. A client stream that does not start with LANE is unwanted there.
+static void test_server_stream(void) {
+	static hw_quic_conn qc, qs;
+	static endpoint sv;
+	raw_setup(&qc, &qs, &sv, 1);
+	sv.answer_protocol = HW_WT_SERVER_STREAM;
+	sv.accept_lanes = 4;
+	qc.nlog = 0;
+	raw_headers(&qc, 0, CHROME_BLOCK, 0);
+	pump();
+	static decoded d;
+	CHECK_EQ(raw_response(&qc, 0, &d), 3);
+	CHECK_STR(d.f[0].value, "200");
+	CHECK_STR(d.f[2].name, "wt-protocol");
+	CHECK_STR(d.f[2].value, "\"wisp-v2-server-stream\"");
+	CHECK(hw_wt_ready(sv.w) && hw_wt_server_stream(sv.w), "ready with no stream of the client's");
+	CHECK_EQ(sv.writable, 1);
+	CHECK_EQ(hw_wt_lanes(sv.w), 1);
+	CHECK(rx_is(&qc, 1, "4041 00"), "the server's bidirectional stream, on the session");
+	int at200 = log_first(&qc, EV_DATA, 0), atpre = log_first(&qc, EV_DATA, 1);
+	CHECK(at200 >= 0 && atpre > at200, "the 200 first, then the stream (%d, %d)", at200, atpre);
+	// What the caller sends at writable (conn.c: INFO, then CONTINUE) goes behind the preamble.
+	uint8_t p[64];
+	size_t n = make_packet(p, HW_WISP_INFO, 0, 2, 0);
+	size_t m = hw_wisp_build_continue(p + 32, 0, 128);
+	CHECK_EQ(hw_wt_send(sv.w, p, n, 0), 0);
+	CHECK_EQ(hw_wt_send(sv.w, p + 32, m, 0), 0);
+	pump();
+	CHECK(rx_is(&qc, 1, "4041 00 07000000 05 00000000 001f 09000000 03 00000000 80000000"), "INFO and CONTINUE");
+	// The client's INFO is let through, and then nothing until the release: not lane 0's next
+	// packet, not a lane's.
+	raw_write(&qc, 1, "07000000 05 00000000 0200", 0);
+	raw_write(&qc, 1, "06000000 04 05000000 02", 0);
+	raw_write(&qc, 4, "4041 00 06000000 e1 00000000 01 09000000 01 07000000 01 5000 61", 0);
+	pump();
+	CHECK_EQ(sv.packets, 1);
+	CHECK(sv.pkt[0][0] == HW_WISP_INFO && sv.pkt_lane[0] == 0 && !sv.pkt_dgram[0], "the INFO, on lane 0");
+	CHECK_EQ(hw_wt_lanes(sv.w), 3);
+	mock_stream *q1 = mock_st(&qs, 1), *q4 = mock_st(&qs, 4);
+	CHECK_EQ(q1->consumed, 11);     // the INFO alone is credited
+	CHECK_EQ(q4->consumed, 3 + 10); // the prefix and the LANE
+	CHECK(q1->received == 21 && q4->received == 26, "the rest arrived and is held");
+	hw_wt_release(sv.w);
+	CHECK_EQ(sv.packets, 3);
+	CHECK(sv.pkt[1][0] == HW_WISP_CLOSE && sv.pkt_lane[1] == 0, "lane 0's next packet");
+	CHECK(sv.pkt[2][0] == HW_WISP_CONNECT && sv.pkt_lane[2] == 1 && sv.pkt_len[2] == 9, "the lane's CONNECT");
+	CHECK(q1->consumed == q1->received && q4->consumed == q4->received, "credited once delivered");
+	// Packets go out on the lane asked for, and nowhere for a lane that is not open.
+	CHECK_EQ(hw_wt_send_lane(sv.w, 1, p, n, 0), 0);
+	CHECK_EQ(hw_wt_send_lane(sv.w, 2, p, n, 0), -1);
+	CHECK_EQ(hw_wt_send_lane(sv.w, HW_WT_LANES_MAX, p, n, 0), -1);
+	pump();
+	CHECK(rx_is(&qc, 4, "07000000 05 00000000 001f"), "on lane 1");
+	CHECK(hw_wt_lane_queued(sv.w, 1) == 0 && hw_wt_lane_queued(sv.w, 2) == 0, "nothing queued");
+	mock_st(&qs, 4)->unsent = 1234;
+	CHECK_EQ(hw_wt_lane_queued(sv.w, 1), 1234); // QUIC's unsent bytes on the lane's stream
+	mock_st(&qs, 4)->unsent = 0;
+	// A client stream whose first packet is not LANE: lane 0 is the server's, so it is no lane.
+	raw_write(&qc, 8, "4041 00 06000000 04 05000000 02", 0);
+	pump();
+	CHECK(mock_st(&qc, 8)->stop_got == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "unwanted");
+	CHECK(mock_st(&qc, 8)->rx_reset == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "both ways");
+	CHECK_EQ(sv.packets, 3);
+	CHECK(!qs.closed && hw_wt_ready(sv.w), "the session goes on");
+	CHECK_EQ(sv.lanes_ended, 0);
+	raw_free(&qc, &qs, &sv);
+}
+
+// LANE on a client-opened session: what is taken, what is refused (and the connection goes on),
+// and that a lane's packets wait for hw_wt_release while lane 0's do not.
+static void test_lane_claims(void) {
+	static hw_quic_conn qc, qs;
+	static endpoint sv;
+	raw_setup(&qc, &qs, &sv, 1);
+	sv.answer_protocol = "\"wisp-v2\"";
+	sv.accept_lanes = 4;
+	raw_headers(&qc, 0, CHROME_BLOCK, 0);
+	raw_write(&qc, 4, "4041 00", 0);
+	pump();
+	CHECK(hw_wt_ready(sv.w) && !hw_wt_server_stream(sv.w), "a client-opened session");
+	raw_write(&qc, 8, "4041 00 06000000 e1 00000000 01 06000000 04 05000000 02", 0);
+	raw_write(&qc, 4, "06000000 04 07000000 02", 0);
+	pump();
+	CHECK_EQ(sv.packets, 1);
+	CHECK(sv.pkt_lane[0] == 0 && sv.pkt[0][1] == 7, "lane 0 is delivered before the release");
+	hw_wt_release(sv.w);
+	CHECK(sv.packets == 2 && sv.pkt_lane[1] == 1 && sv.pkt[1][1] == 5, "lane 1 after it");
+	const struct {
+		const char *hex;
+		uint32_t code; // 0: taken
+	} cases[] = {
+	    {"4041 00 06000000 e1 00000000 00", HW_WT_LANE_REFUSED},    // lane 0 is not claimed
+	    {"4041 00 06000000 e1 00000000 04", HW_WT_LANE_REFUSED},    // past the lanes taken
+	    {"4041 00 06000000 e1 00000000 01", HW_WT_LANE_REFUSED},    // a repeat
+	    {"4041 00 06000000 e1 01000000 02", HW_WT_LANE_REFUSED},    // not on stream 0
+	    {"4041 00 05000000 e1 00000000", HW_WT_LANE_REFUSED},       // no index
+	    {"4041 00 41000000 e1 00000000 02", HW_WT_LANE_REFUSED},    // longer than a LANE may be
+	    {"4041 00 04000000 e1 000000", HW_WT_STREAM_UNWANTED},      // shorter than a packet
+	    {"4041 00 06000000 03 00000000 02", HW_WT_STREAM_UNWANTED}, // a CONTINUE first
+	    {"4041 00 07000000 e1 00000000 03 ff", 0},                  // reserved bytes after the index
+	};
+	uint64_t id = 12;
+	for (size_t i = 0; i < HW_ARRAY_LEN(cases); i++, id += 4) {
+		raw_write(&qc, id, cases[i].hex, 0);
+		pump();
+		int64_t want = cases[i].code ? (int64_t)hw_wt_error_code(cases[i].code) : -1;
+		CHECK(mock_st(&qc, id)->stop_got == want, "case %zu: %lld", i, (long long)mock_st(&qc, id)->stop_got);
+		CHECK(!qs.closed && hw_wt_ready(sv.w), "case %zu: the session goes on", i);
+	}
+	CHECK_EQ(hw_wt_lanes(sv.w), 0x0b); // lanes 0, 1 and 3
+	// Trickled a byte at a time, and a LANE later on a lane is a packet like any other.
+	uint8_t b[64];
+	size_t n = unhex("4041 00 06000000 e1 00000000 02 06000000 e1 00000000 02", b, sizeof(b));
+	for (size_t i = 0; i < n; i++) raw_bytes(&qc, id, b + i, 1);
+	CHECK_EQ(hw_wt_lanes(sv.w), 0x0f);
+	CHECK(sv.packets == 3 && sv.pkt_lane[2] == 2 && sv.pkt[2][0] == HW_WISP_LANE, "the second LANE is a packet");
+	CHECK_EQ(mock_st(&qs, id)->consumed, n);
+	// A stream that ends before its first packet does is refused, and is forgotten.
+	raw_write(&qc, id + 4, "4041 00 0600", 1);
+	pump();
+	CHECK(mock_st(&qc, id + 4)->rx_reset == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "ended too soon");
+	CHECK(!qs.closed && sv.lanes_ended == 0, "no lane ended");
+	raw_free(&qc, &qs, &sv);
+}
+
+// Any lane's end is reported, once: a FIN (behind its packets), a reset, a STOP_SENDING.
+static void test_lane_end(void) {
+	for (int how = 0; how < 3; how++) {
+		static hw_quic_conn qc, qs;
+		static endpoint sv;
+		raw_setup(&qc, &qs, &sv, 1);
+		sv.answer_protocol = "\"wisp-v2\"";
+		sv.accept_lanes = 3;
+		raw_headers(&qc, 0, CHROME_BLOCK, 0);
+		raw_write(&qc, 4, "4041 00", 0);
+		raw_write(&qc, 8, "4041 00 06000000 e1 00000000 01", 0);
+		raw_write(&qc, 12, "4041 00 06000000 e1 00000000 02", 0);
+		pump();
+		hw_wt_release(sv.w);
+		CHECK_EQ(hw_wt_lanes(sv.w), 7);
+		uint64_t id = how == 0 ? 8 : how == 1 ? 12 : 4;
+		if (how == 0) {
+			raw_write(&qc, 8, "06000000 04 05000000 02", 1);
+		} else if (how == 1) {
+			hw_quic_stream_reset(&qc, 12, 0x10c);
+		} else {
+			hw_quic_stream_stop(&qc, 4, 0x10c);
+		}
+		pump();
+		CHECK_EQ(sv.lanes_ended, 1);
+		CHECK_EQ(sv.lane_last, how == 0 ? 1 : how == 1 ? 2 : 0);
+		if (how == 0) CHECK(sv.packets == 1 && sv.pkt_lane[0] == 1, "the packet before the FIN");
+		if (how == 2) CHECK_EQ(hw_wt_send(sv.w, (const uint8_t *)"\x04\0\0\0\0\x02", 6, 0), -1);
+		CHECK(!qs.closed && sv.closed == 0, "the session itself is the caller's to end (%llu)", (unsigned long long)id);
+		hw_quic_stream_reset(&qc, id, 0x10c); // the rest of that stream's end: still once
+		pump();
+		CHECK_EQ(sv.lanes_ended, 1);
+		raw_free(&qc, &qs, &sv);
+	}
+}
+
+// The client role: the server's stream is lane 0 when the 200 names the token, whether it came
+// before the 200 (held, uncredited) or after; otherwise it is unwanted, and the client opens its
+// own as before. Lanes open with their LANE packet.
+static void test_client_server_stream(void) {
+	for (int early = 0; early <= 1; early++) {
+		for (int token = 0; token <= 1; token++) {
+			static hw_quic_conn qc, qs;
+			static endpoint cl;
+			mock_pair(&qc, &qs, 65536);
+			ep_init(&cl, &qc, 1, 4096, 0);
+			hw_wt_on_established(cl.w);
+			raw_write(&qs, 3, "00 04 07 3301 ab60374201", 0);
+			pump();
+			const char *opening = "4041 00 07000000 05 00000000 0200";
+			if (early) {
+				raw_write(&qs, 1, opening, 0);
+				pump();
+				CHECK(!hw_wt_ready(cl.w) && cl.packets == 0, "held until the 200");
+				CHECK_EQ(mock_st(&qc, 1)->consumed, 3);
+			}
+			raw_200(&qs, token ? "\"wisp-v2-server-stream\"" : "\"wisp-v2\"");
+			if (!early) raw_write(&qs, 1, opening, 0);
+			pump();
+			CHECK(hw_wt_ready(cl.w), "early %d token %d: ready", early, token);
+			CHECK_EQ(hw_wt_server_stream(cl.w), token);
+			if (!token) {
+				int64_t want = (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED);
+				CHECK(mock_st(&qs, 1)->stop_got == want, "early %d: unwanted", early);
+				CHECK_EQ(cl.packets, 0);
+				CHECK(rx_is(&qs, 4, "4041 00"), "early %d: the client's own Wisp stream", early);
+				ep_free(&cl);
+				mock_free(&qc);
+				mock_free(&qs);
+				continue;
+			}
+			CHECK(cl.packets == 1 && cl.pkt[0][0] == HW_WISP_INFO && cl.pkt_lane[0] == 0, "early %d: INFO", early);
+			CHECK_EQ(mock_st(&qc, 1)->consumed, mock_st(&qc, 1)->received);
+			CHECK_EQ(hw_buf_avail(&mock_st(&qs, 4)->rx), 0); // no stream of its own
+			uint8_t p[16];
+			size_t n = make_packet(p, HW_WISP_INFO, 0, 2, 0);
+			CHECK_EQ(hw_wt_send(cl.w, p, n, 0), 0);
+			CHECK_EQ(hw_wt_open_lane(cl.w, 1), 0);
+			CHECK_EQ(hw_wt_open_lane(cl.w, 1), -1);
+			CHECK_EQ(hw_wt_open_lane(cl.w, 0), -1);
+			CHECK_EQ(hw_wt_open_lane(cl.w, HW_WT_LANES_MAX), -1);
+			CHECK_EQ(hw_wt_send_lane(cl.w, 1, p, n, 0), 0);
+			pump();
+			CHECK(rx_is(&qs, 1, "07000000 05 00000000 001f"), "early %d: the INFO on the server's stream", early);
+			CHECK(rx_is(&qs, 4, "4041 00 06000000 e1 00000000 01 07000000 05 00000000 001f"), "early %d: lane 1",
+			      early);
+			CHECK_EQ(hw_wt_lanes(cl.w), 3);
+			raw_write(&qs, 5, "4041 00 07000000", 0); // a second stream of the server's
+			pump();
+			CHECK(mock_st(&qs, 5)->stop_got == (int64_t)hw_wt_error_code(HW_WT_STREAM_UNWANTED), "a second one");
+			hw_quic_stream_reset(&qs, 1, 0x10c);
+			pump();
+			CHECK(cl.lanes_ended == 1 && cl.lane_last == 0, "early %d: lane 0's end", early);
+			ep_free(&cl);
+			mock_free(&qc);
+			mock_free(&qs);
+		}
+	}
+}
+
 // ---- A hostile client --------------------------------------------------------------------------
 
 static void raw_bytes(hw_quic_conn *q, uint64_t id, const uint8_t *d, size_t n) {
@@ -1737,11 +2029,11 @@ static void raw_session(hw_quic_conn *qc, hw_quic_conn *qs, endpoint *sv) {
 }
 
 // Streams the server refuses: unknown and GREASE unidirectional types, WebTransport streams of no
-// session, a second Wisp stream. A peer that answers STOP_SENDING with RESET_STREAM, as QUIC
+// session, a second stream that is not a lane. A peer that answers STOP_SENDING with RESET_STREAM, as QUIC
 // requires, may open them for as long as it likes, since each is forgotten once reset; one that
 // leaves them open is cut off when 64 are tracked, with H3_EXCESSIVE_LOAD.
 static void test_hostile_streams(void) {
-	static const struct {
+	const struct {
 		int bidi;
 		const char *hex;
 		uint64_t code;
@@ -1750,7 +2042,9 @@ static void test_hostile_streams(void) {
 	    {0, "21 00", HW_H3_STREAM_CREATION_ERROR},           // an unknown one
 	    {0, "4054 00 bbbb", HW_WT_BUFFERED_STREAM_REJECTED}, // WebTransport unidirectional
 	    {1, "4041 04 dddd", HW_WT_BUFFERED_STREAM_REJECTED}, // another session's
-	    {1, "4041 00 eeee", HW_WT_BUFFERED_STREAM_REJECTED}, // a second Wisp stream
+	    // A second stream whose first packet is not LANE, and a LANE for a session with no lanes.
+	    {1, "4041 00 06000000 01 00000000 ee", hw_wt_error_code(HW_WT_STREAM_UNWANTED)},
+	    {1, "4041 00 06000000 e1 00000000 01", hw_wt_error_code(HW_WT_LANE_REFUSED)},
 	};
 	for (size_t k = 0; k < HW_ARRAY_LEN(kinds); k++) {
 		for (int hostile = 0; hostile <= 1; hostile++) {
@@ -1990,6 +2284,7 @@ int main(void) {
 	RUN(test_capsule);
 	RUN(test_request_validation);
 	RUN(test_protocol_first);
+	RUN(test_protocol_offered);
 	RUN(test_route_match);
 	RUN(test_lp_splits);
 	RUN(test_session);
@@ -2004,6 +2299,10 @@ int main(void) {
 	RUN(test_chrome_pause);
 	RUN(test_client_role);
 	RUN(test_chrome_server_close);
+	RUN(test_server_stream);
+	RUN(test_lane_claims);
+	RUN(test_lane_end);
+	RUN(test_client_server_stream);
 	RUN(test_hostile_streams);
 	RUN(test_hostile_grease);
 	RUN(test_hostile_wisp_length);

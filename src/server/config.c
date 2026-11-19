@@ -160,6 +160,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	INT_KEY("webtransport-idle-timeout-s", webtransport_idle_timeout_s, 1, 3600)
 	INT_KEY("webtransport-max-handshakes", webtransport_max_handshakes, 1, 1 << 20)
 	INT_KEY("webtransport-retry-threshold", webtransport_retry_threshold, 0, 1 << 20)
+	INT_KEY("webtransport-lanes", webtransport_lanes, 0, 16)
 #undef BOOL_KEY
 #undef INT_KEY
 #undef STR_KEY
@@ -544,6 +545,8 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"
 	       "                                            Retry (64)\n"
 	       "  webtransport-congestion-control           bbr or newreno: how fast QUIC sends to a client (bbr)\n"
+	       "  webtransport-lanes N                      QUIC streams one v2 session's Wisp may ride, the\n"
+	       "                                            first included; 0 or 1 for one, at most 16 (8)\n"
 	       "\n"
 	       "  --version, --help\n");
 }

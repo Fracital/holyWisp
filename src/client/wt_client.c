@@ -127,6 +127,13 @@ static void w_session_closed(void *ud, uint32_t code, const char *reason) {
 	t->closed = 1;
 }
 
+// A lane that ends ends the Wisp connection, whichever it was (a LANE_REFUSED among them).
+static void w_lane_ended(void *ud, int lane) {
+	hw_wtc *t = ud;
+	(void)lane;
+	t->closed = 1;
+}
+
 // ---- I/O
 
 // Send what is batched. A full socket buffer is waited on briefly; what still does not go is
@@ -319,6 +326,7 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	    .packet = w_packet,
 	    .writable = w_writable,
 	    .session_closed = w_session_closed,
+	    .lane_ended = w_lane_ended,
 	};
 	t->wt = hw_wt_new(t->q, &wc, &wcb);
 	if (!t->wt) {
@@ -370,10 +378,10 @@ void hw_wtc_free(hw_wtc *t) {
 	free(t);
 }
 
-int hw_wtc_send(hw_wtc *t, const uint8_t *pkt, size_t len, int unreliable, uint64_t deadline) {
+int hw_wtc_send(hw_wtc *t, int lane, const uint8_t *pkt, size_t len, int unreliable, uint64_t deadline) {
 	for (;;) {
 		if (t->closed) return HW_ERR_CLOSED;
-		int r = hw_wt_send(t->wt, pkt, len, unreliable);
+		int r = hw_wt_send_lane(t->wt, lane, pkt, len, unreliable);
 		if (r == 0) {
 			wtc_output(t);
 			return 0;
@@ -412,6 +420,18 @@ int hw_wtc_next(hw_wtc *t, uint64_t deadline, int *has_read, const uint8_t **pkt
 		*has_read = 1;
 		if (!did && hw_buf_avail(&t->in) < 4 && !t->closed) return 0;
 	}
+}
+
+int hw_wtc_open_lanes(hw_wtc *t, int lanes) {
+	int open = 1;
+	if (lanes > HW_WT_LANES_MAX) lanes = HW_WT_LANES_MAX;
+	while (open < lanes && !t->closed && hw_wt_open_lane(t->wt, open) == 0) open++;
+	wtc_output(t);
+	return open;
+}
+
+int hw_wtc_server_stream(const hw_wtc *t) {
+	return hw_wt_server_stream(t->wt);
 }
 
 const char *hw_wtc_protocol(const hw_wtc *t) {

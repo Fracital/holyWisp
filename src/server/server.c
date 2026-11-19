@@ -12,6 +12,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
 #include "holywisp/sys.h"
+#include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 
 #include "internal.h"
@@ -89,6 +90,7 @@ void hw_server_config_defaults(hw_server_config *cfg) {
 	cfg->webtransport_idle_timeout_s = 30;
 	cfg->webtransport_max_handshakes = 1024;
 	cfg->webtransport_retry_threshold = 64;
+	cfg->webtransport_lanes = 8;
 }
 
 int hw_server_config_add_user(hw_server_config *cfg, const char *user, const char *pass) {
@@ -214,6 +216,10 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 	}
 	if (cfg->webtransport && cfg->webtransport_max_handshakes < 1) {
 		snprintf(err, err_cap, "webtransport-max-handshakes must be at least 1");
+		return -1;
+	}
+	if (cfg->webtransport_lanes < 0 || cfg->webtransport_lanes > HW_WT_LANES_MAX) {
+		snprintf(err, err_cap, "webtransport-lanes must be 0 to %d", HW_WT_LANES_MAX);
 		return -1;
 	}
 	if (cfg->webtransport_url[0]) {

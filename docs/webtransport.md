@@ -197,7 +197,9 @@ skipping them. A header block that refers to the dynamic table is a QPACK_DECOMP
   `handle_packet` dispatch, the same v1/v2 opening (CONTINUE on stream 0, or INFO first for v2).
 - **v2** iff the CONNECT carried `wt-available-protocols` and `enable-v2` is on, mirroring the
   WebSocket rule (presence of the header). The server answers with `wt-protocol` echoing the
-  first offered token, as the WebSocket path echoes the subprotocol.
+  first offered token, as the WebSocket path echoes the subprotocol, except that a v2 session
+  whose list holds `wisp-v2-server-stream` gets that token (see "Lanes and the server-opened
+  stream").
 - **Datagrams.** A Wisp packet that fits one datagram (`hw_wt_datagram_max`) may be sent as one
   QUIC datagram on the session, whole, with no length prefix. Only DATA for a **UDP** Wisp
   stream is ever sent that way, in both directions. The server accepts any Wisp packet in a
@@ -219,9 +221,57 @@ skipping them. A header block that refers to the dynamic table is a QPACK_DECOMP
 - **No zero copy.** Bytes toward a WebTransport client are copied into QUIC packets and
   encrypted; the splice path is the WebSocket listener's alone. A WebTransport `hw_conn` never
   opens a relay pipe.
-- **Phase 2 (not now):** one WebTransport stream per Wisp TCP stream, so that a loss on one
-  stream does not stall the others. It needs a Wisp extension to negotiate. It comes after
-  phase 1 has been measured.
+
+## Lanes and the server-opened stream
+
+Two opt-in extensions, specified in STomp's `wisp-lanes` draft 2; a client that asks for neither
+sees the protocol above, byte for byte.
+
+- **The server-opened Wisp stream.** A v2 client that offers `"wisp-v2", "wisp-v2-server-stream"`
+  is answered `wt-protocol: "wisp-v2-server-stream"` (whatever `webtransport-lanes` says), and
+  the server opens a bidirectional stream right behind the 200 (`server_stream_open` in
+  `webtransport.c`). That stream is lane 0, the Wisp stream; the server writes its INFO on it
+  and, unless `password-required` is on, the stream-0 CONTINUE at once (`conn_wt_open`), so the
+  client can send its first CONNECT with no round trip after `ready`. The client's first packet
+  on it must be its INFO: anything else is CLOSE(0, `0x04`) and the session ends
+  (`wt_info_first` in `conn_wt_packet`). An older server echoes `"wisp-v2"` and the client opens
+  the stream as before. Once the server's stream exists, every client bidi stream must start
+  with LANE; one that does not is reset `STREAM_UNWANTED`.
+- **Lanes.** The server's INFO carries extension `0xE1` (one byte: the most lanes a session may
+  have, lane 0 included) when `webtransport-lanes` is 2 or more and the session is v2. After the
+  stream-0 CONTINUE, a client opens further bidirectional streams, each beginning with a LANE
+  packet (`type 0xE1, stream 0, index u8`, framed like any other); index 1 to lanes - 1, each
+  once. A LANE the server did not advertise, out of range or repeated is reset `LANE_REFUSED`;
+  a stream that has not finished its first packet holds at most 64 bytes
+  (`WT_LANE_FIRST_MAX`). Application codes are mapped as WebTransport's
+  (`hw_wt_error_code`): `LANE_REFUSED` 0x01, `STREAM_UNWANTED` 0x02.
+- **A Wisp stream belongs to the lane its CONNECT came on** (`s->lane`, from `c->rx_lane`), and
+  everything the server sends for it goes there: DATA, CONTINUE, CLOSE, the CLOSE that refuses
+  the CONNECT. Stream 0 is lane 0's. UDP DATA still goes as a datagram when it fits. Lanes never
+  move a stream, so the order of a stream's packets is its lane's.
+- **Nothing is acted on before the INFO, and nothing is dropped.** `hw_wt` gates delivery: a
+  client-opened session delivers lane 0 alone until the handshake is done, a server-opened one
+  delivers exactly one packet of lane 0 (the INFO) and then nothing until `hw_wt_release`
+  (from `handshake_done`, deferred through the session's settle). A lane's bytes meanwhile wait
+  in its own hold buffer, which is never credited, so QUIC's stream window bounds it as it bounds
+  a socket nobody reads.
+- **Any lane ending ends the connection** (FIN, RESET_STREAM or STOP_SENDING, through the
+  `lane_ended` callback), as the Wisp stream's end does.
+- **Backpressure per lane, under a session cap** (`conn_wt_lane_marks`). A lane whose unsent
+  bytes (`hw_wt_lane_queued`: hw_wt's queue plus QUIC's unsent part of that stream) pass
+  `ws-write-high-water` pauses the remotes of its own streams (`c->lane_paused`,
+  `conn_stream_paused`) and resumes them under a quarter of it, so a lane waiting on Chrome's
+  fixed 6 MiB window or a lost packet holds up only its streams. Past lanes x the mark across the
+  session, every remote pauses as before. In flight stays session-wide: QUIC's allowance is
+  lanes x the mark (one mark with no lanes) plus `WT_INFLIGHT_MAX`. Reads from the client pause
+  for the session, never per lane (`hw_wt_pause`).
+- **Room for the lanes.** The server's `initial_max_streams_bidi` is 16 plus the lane count.
+- **The client library** (`hw_client_opts.wt_server_stream`, `.wt_lanes`; the CLI's
+  `--server-stream`, `--lanes N`, and `--streams N` to split a bench over several streams)
+  opens the server's number of lanes within its own and 16, and puts each new stream on the lane
+  with the fewest open streams, the lowest index of those.
+- **What lanes do not fix.** One Wisp stream is still one lane. Spreading one stream over lanes
+  would need sequence numbers; it is not part of this.
 
 ## Security
 
@@ -264,6 +314,7 @@ places in the code. On top of it:
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |
 | `webtransport-congestion-control` | `bbr` | `bbr` or `newreno` (see "Congestion control"). |
+| `webtransport-lanes` | 8 | Lanes a v2 session may have, lane 0 included (INFO extension `0xE1`); 0 or 1: none; at most 16. |
 
 Like every key: `config.c` (parser, `--help`), `README.md`, `holywisp.conf.example`,
 `deploy/holywisp.conf`, the npm wrapper (`node/src/config.ts`, its README, its tests).
@@ -279,7 +330,9 @@ Like every key: `config.c` (parser, `--help`), `README.md`, `holywisp.conf.examp
 - `test_e2e_wt.c`: the real server on an ephemeral UDP port, driven by holyWisp's own
   WebTransport client (the client role of the same layers) over loopback, doing what
   `test_e2e.c` does for WebSocket: TCP echo, UDP echo by datagram, v1 and v2, egress refusals,
-  limits.
+  limits; the server-opened stream (INFO and CONTINUE before the client sends, the password
+  case, INFO first, a lane before the INFO), lanes echo, a stalled lane beside a moving one,
+  and old clients unchanged.
 - Interop, when the tools are on the machine (skipped otherwise, never in CI): `curl --http3-only`
   against the TLS and QUIC layers, and headless Chrome against `GET /webtransport.json` plus a
   WebTransport session with the pinned hash.

@@ -41,6 +41,11 @@ static void usage(const char *argv0) {
 	        "      --confirm        v2: ask for a CONTINUE when the stream connects\n"
 	        "      --idle-ms N      after stdin EOF, exit when nothing arrives for N ms (2000)\n"
 	        "      --bench BYTES    send BYTES to an echo service at HOST:PORT and report throughput\n"
+	        "      --streams N      with --bench: over N streams at once, BYTES split among them (1)\n"
+	        "      --server-stream  WebTransport v2: have the server open the Wisp stream and send its\n"
+	        "                       CONTINUE at once (offers \"wisp-v2-server-stream\")\n"
+	        "      --lanes N        WebTransport v2: ride up to N QUIC streams (lanes) when the server\n"
+	        "                       offers them, the first included; at most 16 (1)\n"
 	        "  -v, --verbose        print events on stderr\n"
 	        "  -h, --help\n",
 	        argv0);
@@ -241,42 +246,74 @@ static int run_pipe(hw_client *c, uint32_t sid, int idle_ms) {
 	}
 }
 
-static int run_bench(hw_client *c, uint32_t sid, size_t total) {
+// The sum of n bytes, the bench's checksum, which is where the client spends its time: eight
+// bytes a step as four 16-bit lanes per half word, folded before a lane can overflow (256 words
+// add at most 255 * 256 to one), so no compiler has to vectorize it for the bench to measure the
+// server rather than this loop.
+static uint64_t byte_sum(const uint8_t *p, size_t n) {
+	const uint64_t lo = 0x00ff00ff00ff00ffull;
+	uint64_t sum = 0;
+	size_t i = 0;
+	while (n - i >= 8) {
+		size_t words = HW_MIN((n - i) / 8, (size_t)256);
+		uint64_t a = 0, b = 0;
+		for (size_t k = 0; k < words; k++, i += 8) {
+			uint64_t w;
+			memcpy(&w, p + i, 8);
+			a += w & lo;
+			b += (w >> 8) & lo;
+		}
+		for (int k = 0; k < 4; k++) sum += ((a >> (16 * k)) & 0xffff) + ((b >> (16 * k)) & 0xffff);
+	}
+	for (; i < n; i++) sum += p[i];
+	return sum;
+}
+
+// The echo benchmark over nsid streams at once, total bytes split among them: each stream sends
+// a chunk in turn, and what has come back is taken between the sends.
+static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t total) {
 	uint8_t *chunk = malloc(PIPE_CHUNK);
-	if (!chunk) return 1;
+	size_t *sent = calloc(nsid, sizeof(*sent));
+	if (!chunk || !sent) {
+		free(chunk);
+		free(sent);
+		return 1;
+	}
 	for (size_t i = 0; i < PIPE_CHUNK; i++) chunk[i] = (uint8_t)(i * 31 + 7);
+	size_t per = total / nsid;
+	total = per * nsid;
 	uint64_t start = hw_now_ms();
-	size_t sent = 0, received = 0;
+	size_t sent_all = 0, received = 0;
 	uint64_t sum_sent = 0, sum_recv = 0;
+	int rc = 1;
 	while (received < total) {
-		if (sent < total) {
-			size_t n = HW_MIN(PIPE_CHUNK, total - sent);
-			int s = hw_client_send(c, sid, chunk, n);
+		for (size_t k = 0; k < nsid; k++) {
+			if (sent[k] >= per) continue;
+			size_t n = HW_MIN(PIPE_CHUNK, per - sent[k]);
+			int s = hw_client_send(c, sid[k], chunk, n);
 			if (s != 0) {
-				fprintf(stderr, "send failed at %zu bytes: %s\n", sent, send_error(s));
-				free(chunk);
-				return 1;
+				fprintf(stderr, "send failed at %zu bytes: %s\n", sent_all, send_error(s));
+				goto done;
 			}
-			for (size_t i = 0; i < n; i++) sum_sent += chunk[i];
-			sent += n;
+			sum_sent += byte_sum(chunk, n);
+			sent[k] += n;
+			sent_all += n;
 		}
 		hw_client_event ev;
 		int r;
-		while ((r = hw_client_poll(c, sent < total ? 0 : 10000, &ev)) > 0) {
-			if (ev.type == HW_CEV_DATA && ev.stream_id == sid) {
-				for (size_t i = 0; i < ev.len; i++) sum_recv += ev.data[i];
+		while ((r = hw_client_poll(c, sent_all < total ? 0 : 10000, &ev)) > 0) {
+			if (ev.type == HW_CEV_DATA) {
+				sum_recv += byte_sum(ev.data, ev.len);
 				received += ev.len;
 			} else if (ev.type == HW_CEV_CLOSE) {
 				fprintf(stderr, "stream closed: %s\n", hw_close_reason_str(ev.reason));
-				free(chunk);
-				return 1;
+				goto done;
 			}
 			if (received >= total) break;
 		}
-		if (r < 0 || (r == 0 && sent >= total)) {
+		if (r < 0 || (r == 0 && sent_all >= total)) {
 			fprintf(stderr, "%s after %zu/%zu bytes\n", r < 0 ? "connection lost" : "timed out", received, total);
-			free(chunk);
-			return 1;
+			goto done;
 		}
 	}
 	uint64_t ms = hw_now_ms() - start;
@@ -284,8 +321,11 @@ static int run_bench(hw_client *c, uint32_t sid, size_t total) {
 	double mb = (double)total / (1024.0 * 1024.0);
 	printf("%zu bytes echoed in %llu ms: %.1f MiB/s each way, checksum %s\n", total, (unsigned long long)ms,
 	       mb / ((double)ms / 1000.0), sum_sent == sum_recv ? "ok" : "MISMATCH");
+	rc = sum_sent == sum_recv ? 0 : 1;
+done:
 	free(chunk);
-	return sum_sent == sum_recv ? 0 : 1;
+	free(sent);
+	return rc;
 }
 
 int main(int argc, char **argv) {
@@ -293,6 +333,7 @@ int main(int argc, char **argv) {
 	int udp = 0;
 	int idle_ms = 2000;
 	size_t bench = 0;
+	long streams = 1;
 	int insecure = 0;
 	const char *pin = NULL;
 	const char *connect_to = NULL;
@@ -324,6 +365,14 @@ int main(int argc, char **argv) {
 			idle_ms = (int)strtol(argv[++i], NULL, 10);
 		} else if (!strcmp(a, "--bench") && i + 1 < argc) {
 			bench = (size_t)strtoull(argv[++i], NULL, 10);
+		} else if (!strcmp(a, "--streams") && i + 1 < argc) {
+			streams = strtol(argv[++i], NULL, 10);
+		} else if (!strcmp(a, "--server-stream")) {
+			o.wt_server_stream = 1;
+			o.v2 = 1;
+		} else if (!strcmp(a, "--lanes") && i + 1 < argc) {
+			o.wt_lanes = (int)strtol(argv[++i], NULL, 10);
+			o.v2 = 1;
 		} else if (!strcmp(a, "--pin") && i + 1 < argc) {
 			pin = argv[++i];
 		} else if (!strcmp(a, "--insecure")) {
@@ -349,6 +398,10 @@ int main(int argc, char **argv) {
 		usage(argv[0]);
 		return 2;
 	}
+	if (streams < 1 || streams > 1024 || o.wt_lanes < 0 || o.wt_lanes > 16) {
+		fprintf(stderr, "--streams is 1 to 1024, --lanes 0 to 16\n");
+		return 2;
+	}
 	char host[256], path[256];
 	uint16_t port;
 	if (parse_url(url, host, sizeof(host), &port, path, sizeof(path), &o.webtransport) != 0) {
@@ -367,8 +420,9 @@ int main(int argc, char **argv) {
 			fprintf(stderr, "an https:// server needs --pin (or --insecure, which takes any certificate)\n");
 			return 2;
 		}
-	} else if (pin || insecure || o.origin || connect_to) {
-		fprintf(stderr, "--pin, --insecure, --origin and --connect-to are for an https:// (WebTransport) server\n");
+	} else if (pin || insecure || o.origin || connect_to || o.wt_lanes || o.wt_server_stream) {
+		fprintf(stderr, "--pin, --insecure, --origin, --connect-to, --lanes and --server-stream are for an https:// "
+		                "(WebTransport) server\n");
 		return 2;
 	}
 	long target_port = strtol(positional[1], NULL, 10);
@@ -383,6 +437,9 @@ int main(int argc, char **argv) {
 	}
 	o.port = port;
 	o.path = path;
+	// A send that waits for one stream's CONTINUE queues what the others' echoes bring meanwhile:
+	// a window each, so the queue a single stream needs, times the streams (up to 16 of them).
+	if (bench && streams > 1) o.max_queue_bytes *= (size_t)HW_MIN(streams, 16);
 
 	char err[512];
 	hw_client *c = hw_client_connect(&o, err, sizeof(err));
@@ -398,18 +455,29 @@ int main(int argc, char **argv) {
 		const char *motd = hw_client_motd(c);
 		char shown[MOTD_SHOWN];
 		hw_client_printable(shown, sizeof(shown), motd, strlen(motd));
-		fprintf(stderr, "connected: wisp-v%d, window %u%s%s\n", hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c),
-		        shown[0] ? ", motd: " : "", shown);
+		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s%s%s\n", hw_client_is_v2(c) ? 2 : 1,
+		        hw_client_buffer_size(c), hw_client_lanes(c), hw_client_lanes(c) == 1 ? "" : "s",
+		        hw_client_server_stream(c) ? ", server-opened" : "", shown[0] ? ", motd: " : "", shown);
 	}
-	uint32_t sid;
-	int opened = hw_client_open(c, udp ? HW_STREAM_UDP : HW_STREAM_TCP, positional[0], (uint16_t)target_port, &sid);
-	if (opened != 0) {
-		fprintf(stderr, "%s\n",
-		        opened == HW_ERR_INVALID ? "bad host: a hostname is 1 to 255 bytes" : "cannot open stream");
+	if (!bench) streams = 1;
+	uint32_t *sid = calloc((size_t)streams, sizeof(*sid));
+	if (!sid) {
 		hw_client_free(c);
 		return 1;
 	}
-	int rc = bench ? run_bench(c, sid, bench) : run_pipe(c, sid, idle_ms);
+	for (long k = 0; k < streams; k++) {
+		int opened = hw_client_open(c, udp ? HW_STREAM_UDP : HW_STREAM_TCP, positional[0], (uint16_t)target_port,
+		                            &sid[k]);
+		if (opened != 0) {
+			fprintf(stderr, "%s\n",
+			        opened == HW_ERR_INVALID ? "bad host: a hostname is 1 to 255 bytes" : "cannot open stream");
+			free(sid);
+			hw_client_free(c);
+			return 1;
+		}
+	}
+	int rc = bench ? run_bench(c, sid, (size_t)streams, bench) : run_pipe(c, sid[0], idle_ms);
+	free(sid);
 	hw_client_free(c);
 	return rc;
 }

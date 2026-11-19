@@ -11,6 +11,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/log.h"
 #include "holywisp/sys.h"
+#include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 #include "holywisp/ws.h"
 
@@ -251,7 +252,8 @@ static int pause_visit(uint32_t key, void *value, void *ud) {
 }
 
 static int resume_visit(uint32_t key, void *value, void *ud) {
-	stream_resume(value);
+	hw_stream *s = value;
+	if (!(s->conn->lane_paused >> s->lane & 1u)) stream_resume(s); // its lane's queue holds it still
 	return 0;
 }
 
@@ -422,9 +424,55 @@ static size_t conn_queued(const hw_conn *c) {
 	return hw_buf_avail(&c->wbuf) + c->pipe_bytes;
 }
 
+typedef struct {
+	uint32_t lanes;
+	int pause;
+} lane_visit_arg;
+
+static int lane_visit(uint32_t key, void *value, void *ud) {
+	hw_stream *s = value;
+	const lane_visit_arg *a = ud;
+	if (!(a->lanes >> s->lane & 1u)) return 0;
+	if (a->pause) {
+		stream_pause(s);
+	} else if (!s->conn->paused) {
+		stream_resume(s);
+	}
+	return 0;
+}
+
+// WebTransport with lanes: each lane's own queue pauses the remotes of the streams on it past the
+// high-water mark and resumes them under a quarter of it, so a lane that waits for the client's
+// credit (or a lost packet) holds up only its own streams. The session's mark, past which every
+// stream pauses as on a WebSocket, is the open lanes' marks together. Lane 0 alone is the
+// WebSocket rule, and nothing pauses per lane. Returns the session's mark.
+static size_t conn_wt_lane_marks(hw_conn *c, size_t high) {
+	uint32_t open = wt_conn_lanes(c->wt);
+	uint32_t want = 0;
+	size_t n = 0;
+	if (open & ~1u) {
+		for (int i = 0; i < HW_WT_LANES_MAX; i++) {
+			uint32_t bit = 1u << i;
+			if (!(open & bit)) continue;
+			n++;
+			size_t q = wt_conn_lane_queued(c->wt, i);
+			if (q > high || ((c->lane_paused & bit) && q >= high / 4)) want |= bit;
+		}
+	}
+	if (want != c->lane_paused) {
+		lane_visit_arg on = {want & ~c->lane_paused, 1};
+		lane_visit_arg off = {c->lane_paused & ~want, 0};
+		c->lane_paused = want;
+		if (on.lanes) hw_map_each(&c->streams, lane_visit, &on);
+		if (off.lanes) hw_map_each(&c->streams, lane_visit, &off);
+	}
+	return n ? n * high : high;
+}
+
 static void conn_backpressure(hw_conn *c) {
 	size_t queued = conn_queued(c);
 	size_t high = c->w->server->cfg.ws_write_high_water;
+	if (c->wt) high = conn_wt_lane_marks(c, high);
 	if (!c->bp_paused && queued > high) {
 		c->bp_paused = 1;
 		conn_sync_streams(c);
@@ -640,16 +688,27 @@ static uint8_t *frame_begin(hw_conn *c, size_t len) {
 	return p + hlen;
 }
 
+// The lane a packet for stream id goes on over WebTransport: stream 0's is lane 0, an open
+// stream's is its own, and one for a stream that is not open (the CLOSE that refuses a CONNECT)
+// goes where the packet that caused it came from.
+static int conn_wt_lane(const hw_conn *c, uint32_t id) {
+	if (id == 0) return 0;
+	const hw_stream *s = hw_map_get(&c->streams, id);
+	return s ? s->lane : c->rx_lane;
+}
+
+static int conn_wt_send_packet(hw_conn *c, const uint8_t *packet, size_t len, int lane) {
+	if (wt_conn_send(c->wt, lane, packet, len, 0) != 0) {
+		conn_close(c);
+		return -1;
+	}
+	conn_kick(c);
+	return 0;
+}
+
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 	if (c->closing) return -1;
-	if (c->wt) {
-		if (wt_conn_send(c->wt, packet, len, 0) != 0) {
-			conn_close(c);
-			return -1;
-		}
-		conn_kick(c);
-		return 0;
-	}
+	if (c->wt) return conn_wt_send_packet(c, packet, len, conn_wt_lane(c, hw_le32(packet + 1)));
 	uint8_t *p = frame_begin(c, len);
 	if (!p) return -1;
 	memcpy(p, packet, len);
@@ -662,6 +721,7 @@ int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 static int conn_wt_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
 	hw_stream *s = hw_map_get(&c->streams, stream_id);
 	int unreliable = s && s->type == HW_STREAM_UDP;
+	int lane = s ? s->lane : c->rx_lane;
 	size_t max = frame_payload_max(c);
 	if (max > HW_WT_SCRATCH_LEN - HW_WISP_HEADER_LEN) max = HW_WT_SCRATCH_LEN - HW_WISP_HEADER_LEN;
 	size_t total = len;
@@ -670,7 +730,7 @@ static int conn_wt_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data
 		uint8_t *p = wt_conn_scratch(c->wt);
 		hw_wisp_write_header(p, HW_WISP_DATA, stream_id);
 		memcpy(p + HW_WISP_HEADER_LEN, data, n);
-		if (wt_conn_send(c->wt, p, HW_WISP_HEADER_LEN + n, unreliable) != 0) {
+		if (wt_conn_send(c->wt, lane, p, HW_WISP_HEADER_LEN + n, unreliable) != 0) {
 			conn_close(c);
 			return -1;
 		}
@@ -718,6 +778,13 @@ int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining) {
 int conn_send_close(hw_conn *c, uint32_t stream_id, uint8_t reason) {
 	uint8_t pkt[HW_WISP_HEADER_LEN + 1];
 	return conn_send_packet(c, pkt, hw_wisp_build_close(pkt, stream_id, reason));
+}
+
+int conn_send_close_lane(hw_conn *c, uint32_t stream_id, uint8_t reason, int lane) {
+	uint8_t pkt[HW_WISP_HEADER_LEN + 1];
+	size_t n = hw_wisp_build_close(pkt, stream_id, reason);
+	if (c->wt && !c->closing) return conn_wt_send_packet(c, pkt, n, lane);
+	return conn_send_packet(c, pkt, n);
 }
 
 // A control frame (a pong) joins the queue behind whatever is already waiting.
@@ -881,7 +948,7 @@ static int apply_reputation(hw_conn *c) {
 
 static void send_server_info(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd)];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 6];
 	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 	if (cfg->allow_udp) n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 	if (cfg->password_user_count > 0) {
@@ -890,6 +957,10 @@ static void send_server_info(hw_conn *c) {
 	}
 	if (cfg->motd[0]) {
 		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_MOTD, cfg->motd, (uint32_t)strlen(cfg->motd));
+	}
+	if (c->wt && wt_conn_lanes_offered(c->wt) >= 2) {
+		uint8_t lanes = (uint8_t)wt_conn_lanes_offered(c->wt);
+		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_LANES, &lanes, 1);
 	}
 	conn_send_packet(c, pkt, n);
 }
@@ -900,7 +971,8 @@ static void handshake_done(hw_conn *c) {
 		hw_loop_cancel_timer(c->w->loop, c->handshake_timer);
 		c->handshake_timer = NULL;
 	}
-	conn_send_continue(c, 0, c->w->server->window);
+	if (!c->continue_sent) conn_send_continue(c, 0, c->w->server->window);
+	if (c->wt && !c->closing) wt_conn_release(c->wt); // the lanes held until now
 }
 
 // Returns 1 to keep parsing rbuf, 0 to wait for more bytes (or because the conn is closing).
@@ -1615,17 +1687,40 @@ int conn_wt_admit(hw_conn *c, const char *origin, const char *protocols) {
 
 void conn_wt_open(hw_conn *c) {
 	if (c->closing) return;
-	if (c->is_v2) {
-		send_server_info(c);
-	} else {
+	if (!c->is_v2) {
 		handshake_done(c);
+		return;
+	}
+	send_server_info(c);
+	if (c->closing || !wt_conn_server_stream(c->wt)) return;
+	// The server opened lane 0, so nothing of the client's can have come first: its first packet
+	// must be its INFO (conn_wt_packet), and hw_wt delivers nothing else until the handshake is
+	// done. So the stream-0 CONTINUE can go now, with the INFO, a round trip before the client's,
+	// unless a password has to be checked before the client may go on.
+	c->wt_info_first = 1;
+	if (!c->w->server->cfg.password_required) {
+		c->continue_sent = 1;
+		conn_send_continue(c, 0, c->w->server->window);
 	}
 }
 
-void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int datagram) {
+void conn_wt_packet(hw_conn *c, const uint8_t *data, size_t len, int lane) {
 	if (c->closing) return;
 	c->heard = 1;
-	if (datagram) {
+	if (lane >= 0) {
+		c->rx_lane = lane;
+		if (c->wt_info_first) {
+			c->wt_info_first = 0;
+			hw_wisp_packet p;
+			if (hw_wisp_parse(data, len, &p) != 0 || p.type != HW_WISP_INFO || p.stream_id != 0) {
+				HW_DEBUG("conn", "%s: the client's first packet is not its INFO", c->peer);
+				conn_send_close(c, 0, HW_CLOSE_INCOMPATIBLE);
+				conn_flush(c);
+				conn_close(c);
+				return;
+			}
+		}
+	} else {
 		// A datagram may be lost or overtake the stream, so only what tolerates that is taken
 		// from one: DATA for a UDP stream. A CLOSE or a CONNECT there would be a race.
 		hw_wisp_packet p;

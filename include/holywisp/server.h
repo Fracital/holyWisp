@@ -192,6 +192,9 @@ typedef struct hw_server_config {
 	int webtransport_max_handshakes;  // handshakes in progress per worker
 	int webtransport_retry_threshold; // handshakes in progress per worker past which an Initial gets a Retry
 	int webtransport_congestion;      // HW_QUIC_CC_BBR (0, the default) or HW_QUIC_CC_NEWRENO
+	// Lanes a v2 session may have, lane 0 included (docs/webtransport.md, "Lanes"): the most
+	// client streams one Wisp connection rides. 0 or 1 offers none; at most HW_WT_LANES_MAX (16).
+	int webtransport_lanes;
 	// For the `holywisp` binary when another program runs it: stop when standard input reaches end
 	// of file, which is what a child holding a pipe from its parent sees when the parent dies, however
 	// it dies. Not for a service manager, whose stdin is /dev/null and at end of file from the start.
