@@ -279,8 +279,8 @@ login; the systemd sandbox still contains whatever it spawns. Leave it off unles
 `holywisp-client` is netcat through a Wisp server:
 
 ```sh
-# UDP, wisp-v2 with a password
-build/release/holywisp-client -s ws://wisp.example:6001/ --udp --user me --pass secret 1.1.1.1 53
+# UDP, wisp-v2 with a password (the first line of the file; or $HOLYWISP_PASSWORD)
+build/release/holywisp-client -s ws://wisp.example:6001/ --udp --user me --pass-file ~/.wisp-pass 1.1.1.1 53
 
 # throughput against a TCP echo service
 build/release/holywisp-client --bench 268435456 echo.example 7
@@ -288,6 +288,9 @@ build/release/holywisp-client --bench 268435456 echo.example 7
 # the same over WebTransport, pinned to the certificate hash /webtransport.json lists
 build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-256> example.org 80
 ```
+
+The password is the first line of `--pass-file`, or `$HOLYWISP_PASSWORD` with `--user`. `--pass`
+still takes it on the command line, where every user of the host can read it in the process list.
 
 `--credit BYTES` asks a v2 server for stream credit with an initial window of `BYTES` per stream:
 the server then sends each TCP stream only what this client has read and one window more, and the

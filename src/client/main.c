@@ -20,6 +20,8 @@
 
 #define PIPE_CHUNK (64 * 1024)
 #define MOTD_SHOWN (4 * 511 + 1) // the longest MOTD the client keeps, every byte of it escaped
+#define PASS_READ  130           // a password file's first 127 bytes and a CRLF, and one more to tell a longer one
+#define PASS_ENV   "HOLYWISP_PASSWORD"
 
 static void usage(const char *argv0) {
 	fprintf(stderr,
@@ -37,8 +39,11 @@ static void usage(const char *argv0) {
 	        "                       the SNI and :authority (as curl's --connect-to)\n"
 	        "  -u, --udp            open a UDP stream instead of TCP\n"
 	        "  -2, --v2             negotiate wisp-v2\n"
-	        "      --user U         v2 password auth username (with --pass)\n"
-	        "      --pass P\n"
+	        "      --user U         v2 password auth username, the password from --pass-file, or\n"
+	        "                       $" PASS_ENV ", or --pass\n"
+	        "      --pass-file F    the password: the first line of file F\n"
+	        "      --pass P         the password itself, which every user of this host can read in\n"
+	        "                       the process list: prefer --pass-file or $" PASS_ENV "\n"
 	        "      --confirm        v2: ask for a CONTINUE when the stream connects\n"
 	        "      --idle-ms N      after stdin EOF, exit when nothing arrives for N ms (2000)\n"
 	        "      --bench BYTES    send BYTES to an echo service at HOST:PORT and report throughput\n"
@@ -136,6 +141,35 @@ static int parse_pin(const char *s, uint8_t out[32]) {
 		}
 	}
 	return got == 32 ? 0 : -1;
+}
+
+// The password in a file: its first line, without the line ending, into out (PASS_READ + 1
+// bytes). 0, or -1 with the reason printed. A first line too long for the password extension is
+// refused here, never cut, and the password itself is never printed.
+static int read_pass_file(const char *path, char *out) {
+	FILE *f = fopen(path, "rb");
+	if (!f) {
+		fprintf(stderr, "--pass-file %s: %s\n", path, strerror(errno));
+		return -1;
+	}
+	size_t n = fread(out, 1, PASS_READ, f);
+	fclose(f);
+	out[n] = '\0';
+	size_t line = strcspn(out, "\r\n");
+	if (line == n && n == PASS_READ) {
+		fprintf(stderr, "--pass-file %s: the first line is over 127 bytes\n", path);
+		return -1;
+	}
+	if (memchr(out, '\0', line)) {
+		fprintf(stderr, "--pass-file %s: the password holds a NUL byte\n", path);
+		return -1;
+	}
+	out[line] = '\0';
+	if (line == 0) {
+		fprintf(stderr, "--pass-file %s: the first line is empty\n", path);
+		return -1;
+	}
+	return 0;
 }
 
 static int g_verbose;
@@ -416,6 +450,8 @@ int main(int argc, char **argv) {
 	int insecure = 0;
 	const char *pin = NULL;
 	const char *connect_to = NULL;
+	const char *pass_file = NULL;
+	char pass_buf[PASS_READ + 1];
 	uint8_t pin_hash[32];
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
@@ -437,6 +473,8 @@ int main(int argc, char **argv) {
 			o.v2 = 1;
 		} else if (!strcmp(a, "--pass") && i + 1 < argc) {
 			o.pass = argv[++i];
+		} else if (!strcmp(a, "--pass-file") && i + 1 < argc) {
+			pass_file = argv[++i];
 		} else if (!strcmp(a, "--confirm")) {
 			o.stream_confirm = 1;
 			o.v2 = 1;
@@ -495,6 +533,21 @@ int main(int argc, char **argv) {
 	if (npos != 2) {
 		usage(argv[0]);
 		return 2;
+	}
+	// The password from the command line is in every process listing; a file or the environment
+	// are not. --pass, then --pass-file, then the environment, which counts only with --user.
+	if (o.pass && pass_file) {
+		fprintf(stderr, "--pass and --pass-file are one password: give one of them\n");
+		return 2;
+	}
+	if (pass_file) {
+		if (read_pass_file(pass_file, pass_buf) != 0) return 2;
+		o.pass = pass_buf;
+	} else if (!o.pass && o.user && getenv(PASS_ENV) && getenv(PASS_ENV)[0]) {
+		o.pass = getenv(PASS_ENV);
+	}
+	if (o.user && !o.pass) {
+		fprintf(stderr, "warning: --user without a password (--pass-file, $" PASS_ENV " or --pass): none is sent\n");
 	}
 	if (streams < 1 || streams > 1024 || o.wt_lanes < 0 || o.wt_lanes > 16) {
 		fprintf(stderr, "--streams is 1 to 1024, --lanes 0 to 16\n");
