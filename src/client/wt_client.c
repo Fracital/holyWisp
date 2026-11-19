@@ -246,6 +246,7 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 		goto fail;
 	}
 	hw_sys_udp_buffers(t->fd, WTC_SOCKET_BUFFER);
+	(void)hw_sys_udp_no_fragment(t->fd); // the datagram size is probed, never left to fragmentation
 	int gro = hw_sys_udp_gro(t->fd);
 	t->rx_slots = gro ? WTC_RX_GRO : HW_SYS_BATCH_MAX;
 	t->rx_cap = gro ? HW_SYS_GRO_SLOT : WTC_RX_SLOT;

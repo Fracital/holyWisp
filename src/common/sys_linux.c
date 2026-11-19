@@ -356,3 +356,19 @@ void hw_sys_pty_end(pid_t pid) {
 		waitpid(pid, NULL, 0);
 	}
 }
+
+int hw_sys_udp_no_fragment(int fd) {
+	// The family decides which option must take; a socket not bound yet has none to tell (Windows
+	// refuses getsockname then), and takes whichever applies. A dual-stack socket's IPv4 datagrams
+	// follow the IPv4 option, so an IPv6 socket gets both.
+	struct sockaddr_storage ss;
+	memset(&ss, 0, sizeof(ss));
+	socklen_t sl = sizeof(ss);
+	int family = getsockname(fd, (struct sockaddr *)&ss, &sl) == 0 ? ss.ss_family : AF_UNSPEC;
+	int v4 = IP_PMTUDISC_PROBE, v6 = IPV6_PMTUDISC_PROBE;
+	int r4 = setsockopt(fd, IPPROTO_IP, IP_MTU_DISCOVER, (const void *)&v4, sizeof(v4));
+	if (family == AF_INET) return r4 == 0 ? 0 : -1;
+	int r6 = setsockopt(fd, IPPROTO_IPV6, IPV6_MTU_DISCOVER, (const void *)&v6, sizeof(v6));
+	if (family == AF_INET6) return r6 == 0 ? 0 : -1;
+	return r4 == 0 || r6 == 0 ? 0 : -1;
+}

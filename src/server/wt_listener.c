@@ -298,6 +298,16 @@ static void session_free(wt_session *s) {
 	hw_server *srv = ww->w->server;
 	dirty_unlink(s);
 	if (s->timer) hw_loop_cancel_timer(ww->w->loop, s->timer);
+	if (s->q && s->counted) {
+		hw_quic_stats st;
+		hw_quic_get_stats(s->q, &st);
+		HW_DEBUG("wt",
+		         "%s: session over: %llu packets sent, %llu lost, %llu received; srtt %llu us, cwnd %llu, "
+		         "datagrams of %llu",
+		         s->ip, (unsigned long long)st.packets_sent, (unsigned long long)st.packets_lost,
+		         (unsigned long long)st.packets_received, (unsigned long long)st.srtt_us, (unsigned long long)st.cwnd,
+		         (unsigned long long)st.mds);
+	}
 	session_hs_done(s);
 	for (size_t i = 0; i < s->ncids; i++) {
 		char key[WT_KEY_HEX];
@@ -1607,6 +1617,11 @@ int wt_listener_init(hw_server *s) {
 			HW_ERROR("wt", "cannot bind UDP %s:%u for WebTransport: %s", host[0] ? host : "*", port, strerror(errno));
 			for (int j = 0; j < i; j++) close(fds[j]);
 			return -1;
+		}
+		// QUIC probes for its datagram size: a probe the path cannot carry must be lost, never
+		// sent in fragments that every later packet would then be sent in too.
+		if (hw_sys_udp_no_fragment(fds[i]) != 0 && i == 0) {
+			HW_WARN("wt", "cannot set don't-fragment on the UDP socket: %s", strerror(errno));
 		}
 		int want = cfg->socket_buffer_size > 0 ? (int)cfg->socket_buffer_size : WT_SOCKET_BUFFER;
 		size_t got = hw_sys_udp_buffers(fds[i], want);

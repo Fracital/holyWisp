@@ -789,6 +789,43 @@ static void test_udp_buffers(void) {
 	close(fd);
 }
 
+// Don't-fragment takes on an IPv4 and an IPv6 socket, and a datagram the path carries still
+// arrives whole: the loopback's MTU holds 9000 bytes, so nothing here is lost or cut.
+static void test_udp_no_fragment(void) {
+	uint16_t port = 0;
+	int rx = udp_bound(&port, 0);
+	int tx = socket(AF_INET, SOCK_DGRAM, 0);
+	CHECK(tx >= 0, "socket: errno %d", errno);
+	CHECK_EQ(hw_sys_udp_no_fragment(tx), 0);
+	struct sockaddr_in to;
+	memset(&to, 0, sizeof(to));
+	to.sin_family = AF_INET;
+	to.sin_port = htons(port);
+	to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	static uint8_t buf[9000], got[9100];
+	const size_t sizes[] = {1200, 1452, 9000};
+	for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+		memset(buf, (int)i + 1, sizes[i]);
+		CHECK_EQ(sendto(tx, (const char *)buf, sizes[i], 0, (struct sockaddr *)&to, sizeof(to)), (ssize_t)sizes[i]);
+		struct pollfd pfd = {.fd = rx, .events = POLLIN};
+		CHECK_EQ(poll(&pfd, 1, 2000), 1);
+		ssize_t n = recv(rx, (char *)got, sizeof(got), 0);
+		CHECK(n == (ssize_t)sizes[i] && got[0] == (uint8_t)(i + 1), "%zu bytes: got %zd", sizes[i], n);
+	}
+	close(tx);
+	close(rx);
+	int six = socket(AF_INET6, SOCK_DGRAM, 0);
+	if (six >= 0) {
+		struct sockaddr_in6 any;
+		memset(&any, 0, sizeof(any));
+		any.sin6_family = AF_INET6;
+		any.sin6_addr = in6addr_loopback;
+		if (bind(six, (struct sockaddr *)&any, sizeof(any)) == 0) CHECK_EQ(hw_sys_udp_no_fragment(six), 0);
+		close(six);
+	}
+	CHECK(hw_sys_udp_no_fragment(-1) != 0, "a descriptor that is none");
+}
+
 // A mark is set or refused, and a refused one leaves the socket as it was: with the capability the
 // mark takes; without it (the usual case here, an unprivileged test) the call says EPERM. Either
 // way the socket still sends. Without marks at all the answer is ENOTSUP.
@@ -886,6 +923,7 @@ int main(void) {
 	RUN(test_udp_batch);
 	RUN(test_udp_coalesce);
 	RUN(test_udp_buffers);
+	RUN(test_udp_no_fragment);
 	RUN(test_mark);
 	RUN(test_pty);
 	return 0;

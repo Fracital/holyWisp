@@ -127,6 +127,14 @@ int hw_sys_udp_gro(int fd);
 // it cannot say.
 size_t hw_sys_udp_buffers(int fd, int bytes);
 
+// Every datagram of a UDP socket leaves whole with the don't-fragment bit set, whatever the path
+// MTU the system has learnt (Linux IP_PMTUDISC_PROBE, macOS IP_DONTFRAG, Windows
+// IP_DONTFRAGMENT; their IPv6 twins). One the path cannot carry is lost on the way, never sent in
+// fragments. QUIC finds its own datagram size by probing (RFC 8899) and needs a probe that does not
+// fit to be lost: a probe that got through fragmented made every packet after it two fragments,
+// and the loss of either cost the packet. 0, or -1 with errno.
+int hw_sys_udp_no_fragment(int fd);
+
 // Whether hw_sys_set_mark can work at all here.
 int hw_sys_has_mark(void);
 // Give a socket a firewall mark (Linux SO_MARK), which policy routing can send out another way:
