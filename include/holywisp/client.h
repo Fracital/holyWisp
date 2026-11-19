@@ -9,7 +9,8 @@
  * (max_message, max_queue_bytes, max_queue_events), every wait for it to send something runs
  * against one deadline per call that nothing it sends can restart, and credentials go to it only
  * when it asked for them. Writing is the exception: the socket is blocking, so a server that stops
- * reading it can hold a call that sends for as long as it keeps the connection open.
+ * reading it can hold a call that sends for as long as it keeps the connection open, except
+hw_client_try_send, which never waits.
  * What the server says about itself (the MOTD, the text quoted in a connect error) is still its
  * own bytes: see hw_client_printable before writing any of it to a terminal or a log.
  *
@@ -188,6 +189,27 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 // (HW_ERR_TIMEOUT, nothing sent), and a UDP stream's DATA is a datagram that may be lost, as UDP's
 // would be.
 int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t len);
+// hw_client_send for a caller with its own event loop: it never waits, for a CONTINUE or for the
+// socket. 0 when the packet is on its way; HW_ERR_AGAIN with nothing sent when the stream's window
+// is spent (a CONTINUE arrives through hw_client_poll, which reads it into the window, so poll
+// hw_client_fd for reading and call hw_client_poll), when the WebTransport session's send queue is
+// full, or when the rest of an earlier frame is still waiting for the socket (hw_client_unsent);
+// HW_ERR_CLOSED as for hw_client_send. On a WebSocket the frame goes as far as the socket takes it
+// now and the client keeps the rest, never more than that one frame: hw_client_unsent says how
+// much, and while it is not 0 the caller polls hw_client_fd for writing and calls
+// hw_client_flush (or this again). Every other call that writes (a blocking send, a CLOSE, the
+// pong to a ping that hw_client_poll reads) first writes that rest, blocking.
+int hw_client_try_send(hw_client *c, uint32_t stream_id, const void *data, size_t len);
+// The DATA packets a stream may send before the server's next CONTINUE, as the client counts them
+// from the CONTINUEs it has read: 0 and *packets (UINT32_MAX for a UDP stream, which is never
+// counted), or HW_ERR_CLOSED when the stream is not open or the client is closed.
+int hw_client_window(const hw_client *c, uint32_t stream_id, uint32_t *packets);
+// Bytes of a frame hw_client_try_send began that the socket has not taken yet; 0 over WebTransport,
+// whose session queues whole packets itself.
+size_t hw_client_unsent(const hw_client *c);
+// Write what the socket takes now of those bytes. 0 when none is left, HW_ERR_AGAIN when some
+// still is, HW_ERR_CLOSED.
+int hw_client_flush(hw_client *c);
 int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason);
 // Send CREDIT for stream_id: the server may have sent it `limit` DATA payload bytes in all,
 // counted from its start. On the stream's lane (lane 0 for an id the client does not have open).

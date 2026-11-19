@@ -309,7 +309,10 @@ with `webtransport-cert-dir`, reached by its address. `--udp-buffer N` sets the 
 which is how a server's bursts are tested against a receive buffer that small.
 
 The library behind it is `include/holywisp/client.h`: connect, open streams, send, poll events
-(`hw_client_opts.webtransport` for WebTransport). `tests/test_e2e.c`, `tests/test_e2e_wt.c` and
+(`hw_client_opts.webtransport` for WebTransport). `hw_client_send` waits for the server's CONTINUE
+when a stream's window is spent; a caller with its own event loop uses `hw_client_try_send`, which
+never waits (`HW_ERR_AGAIN`), with `hw_client_window` for the packets a stream has left and
+`hw_client_unsent` / `hw_client_flush` for a frame the socket took only in part. `tests/test_e2e.c`, `tests/test_e2e_wt.c` and
 `tests/test_security.c` are the reference for using it.
 
 ## Browser demo

@@ -89,6 +89,7 @@ struct hw_client {
 	size_t pending_consume; // bytes of rbuf handed out by the last read, consumed on the next
 	hw_buf frag;
 	hw_buf sbuf; // scratch for masked frames
+	hw_buf wq;   // the rest of a frame hw_client_try_send wrote in part: at most one frame
 
 	cstream *streams;
 	size_t nstreams;
@@ -164,24 +165,46 @@ static void seed_rng(hw_client *c) {
 	c->rng = seed ? seed : 0x9E3779B97F4A7C15ull;
 }
 
-static int send_all(hw_client *c, const uint8_t *data, size_t len) {
-	while (len > 0) {
-		ssize_t n = send(c->fd, data, len, HW_MSG_NOSIGNAL);
+// Write what the socket takes of data. With nonblock, as much as it takes now: the bytes written,
+// which may be fewer than len. Without, all of it, waiting for room (len). HW_ERR_CLOSED when the
+// socket failed.
+static long long write_some(hw_client *c, const uint8_t *data, size_t len, int nonblock) {
+	size_t done = 0;
+	while (done < len) {
+		ssize_t n = send(c->fd, data + done, len - done, HW_MSG_NOSIGNAL | (nonblock ? MSG_DONTWAIT : 0));
 		if (n < 0) {
 			if (errno == EINTR) continue;
+			if (nonblock && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
 			c->closed = 1;
 			return HW_ERR_CLOSED;
 		}
-		data += n;
-		len -= (size_t)n;
+		done += (size_t)n;
 	}
+	return (long long)done;
+}
+
+// Write the rest of the frame hw_client_try_send left unsent. 0 when none is left, HW_ERR_AGAIN
+// (nonblock only) when some still is, HW_ERR_CLOSED.
+static int wq_flush(hw_client *c, int nonblock) {
+	size_t avail = hw_buf_avail(&c->wq);
+	if (avail == 0) return 0;
+	long long n = write_some(c, hw_buf_head(&c->wq), avail, nonblock);
+	if (n < 0) return (int)n;
+	hw_buf_consume(&c->wq, (size_t)n);
+	if (hw_buf_avail(&c->wq)) return HW_ERR_AGAIN;
+	hw_buf_clear(&c->wq);
 	return 0;
 }
 
-// Send one masked binary frame: the Wisp packet header followed by payload.
-static int send_frame(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t hdr_len, const uint8_t *payload,
-                      size_t len) {
-	if (c->closed) return HW_ERR_CLOSED;
+// Write all of data, blocking, behind what is left of an earlier frame: frames never interleave.
+static int send_all(hw_client *c, const uint8_t *data, size_t len) {
+	if (wq_flush(c, 0) != 0) return HW_ERR_CLOSED;
+	return write_some(c, data, len, 0) < 0 ? HW_ERR_CLOSED : 0;
+}
+
+// One masked frame in sbuf: the Wisp packet header followed by payload. Its length in *out_len.
+static int frame_build(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t hdr_len, const uint8_t *payload,
+                       size_t len, size_t *out_len) {
 	size_t total = hdr_len + len;
 	uint8_t mask[4];
 	uint32_t m = rng_next(c);
@@ -193,7 +216,18 @@ static int send_frame(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t h
 	memcpy(p + hl, hdr, hdr_len);
 	if (len) memcpy(p + hl + hdr_len, payload, len);
 	hw_ws_mask(p + hl, total, mask, 0);
-	return send_all(c, p, hl + total);
+	*out_len = hl + total;
+	return 0;
+}
+
+// Send one masked frame, blocking.
+static int send_frame(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t hdr_len, const uint8_t *payload,
+                      size_t len) {
+	if (c->closed) return HW_ERR_CLOSED;
+	size_t n;
+	int r = frame_build(c, opcode, hdr, hdr_len, payload, len, &n);
+	if (r != 0) return r;
+	return send_all(c, hw_buf_tail(&c->sbuf), n);
 }
 
 static cstream *stream_find(hw_client *c, uint32_t id) {
@@ -765,6 +799,7 @@ hw_client *hw_client_connect(const hw_client_opts *o, char *err, size_t err_cap)
 	hw_buf_init(&c->rbuf);
 	hw_buf_init(&c->frag);
 	hw_buf_init(&c->sbuf);
+	hw_buf_init(&c->wq);
 	c->max_message = o->max_message ? o->max_message : 1024 * 1024 + HW_WISP_HEADER_LEN;
 	c->max_queue_bytes = o->max_queue_bytes ? o->max_queue_bytes : CLIENT_QUEUE_BYTES;
 	c->max_queue_events = o->max_queue_events ? o->max_queue_events : CLIENT_QUEUE_EVENTS;
@@ -807,6 +842,7 @@ void hw_client_free(hw_client *c) {
 	hw_buf_free(&c->rbuf);
 	hw_buf_free(&c->frag);
 	hw_buf_free(&c->sbuf);
+	hw_buf_free(&c->wq);
 	free(c->streams);
 	qevent *q;
 	while ((q = queue_pop(c))) qevent_free(c, q);
@@ -919,6 +955,49 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	return 0;
 }
 
+// Put one DATA packet on its way once the window allows it. Over WebTransport the session takes
+// the whole packet or none of it, waiting for room until the client's timeout (nonblock: not at
+// all, HW_ERR_AGAIN). On a WebSocket a blocking send writes the frame whole; a non-blocking one
+// writes what the socket takes now and keeps the rest in wq, which every later write empties first.
+// The window is charged only for a packet that went.
+static int data_send(hw_client *c, cstream *s, const void *data, size_t len, int nonblock) {
+	uint32_t id = s->id;
+	int counted = s->type != HW_STREAM_UDP;
+	uint8_t hdr[HW_WISP_HEADER_LEN];
+	hw_wisp_write_header(hdr, HW_WISP_DATA, id);
+	if (c->wt) {
+		// The session takes whole packets: header and payload in one piece.
+		hw_buf_clear(&c->sbuf);
+		if (hw_buf_reserve(&c->sbuf, sizeof(hdr) + len) != 0) return HW_ERR_NOMEM;
+		uint8_t *p = hw_buf_tail(&c->sbuf);
+		memcpy(p, hdr, sizeof(hdr));
+		if (len) memcpy(p + sizeof(hdr), data, len);
+		int unreliable = s->type == HW_STREAM_UDP;
+		int r = c->closed ? HW_ERR_CLOSED
+		                  : hw_wtc_send(c->wt, s->lane, p, sizeof(hdr) + len, unreliable,
+		                                nonblock ? 0 : timer_start(c->timeout_ms).deadline);
+		if (r == HW_ERR_CLOSED) c->closed = 1;
+		// The wait may have received, and a CLOSE among it forgets the stream: look it up again.
+		if (r == 0 && counted && (s = stream_find(c, id)) && s->remaining) s->remaining--;
+		if (r == HW_ERR_TIMEOUT && nonblock) r = HW_ERR_AGAIN;
+		return r;
+	}
+	size_t n;
+	int r = frame_build(c, HW_WS_BINARY, hdr, sizeof(hdr), data, len, &n);
+	if (r != 0) return r;
+	if (counted) s->remaining--;
+	const uint8_t *frame = hw_buf_tail(&c->sbuf);
+	if (!nonblock) return send_all(c, frame, n);
+	long long w = write_some(c, frame, n, 1);
+	if (w < 0) return (int)w;
+	// Started, so it is sent: the rest goes before any other frame.
+	if ((size_t)w < n && hw_buf_append(&c->wq, frame + w, n - (size_t)w) != 0) {
+		c->closed = 1; // half a frame on the wire and no way to finish it
+		return HW_ERR_CLOSED;
+	}
+	return 0;
+}
+
 int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t len) {
 	if (c->closed) return HW_ERR_CLOSED;
 	credit_flush(c);
@@ -951,20 +1030,39 @@ int hw_client_send(hw_client *c, uint32_t stream_id, const void *data, size_t le
 			s = stream_find(c, stream_id);
 			if (!s) return HW_ERR_CLOSED;
 		}
-		s->remaining--;
 	}
-	uint8_t hdr[HW_WISP_HEADER_LEN];
-	hw_wisp_write_header(hdr, HW_WISP_DATA, stream_id);
-	if (c->wt) {
-		// The session takes whole packets: header and payload in one piece.
-		hw_buf_clear(&c->sbuf);
-		if (hw_buf_reserve(&c->sbuf, sizeof(hdr) + len) != 0) return HW_ERR_NOMEM;
-		uint8_t *p = hw_buf_tail(&c->sbuf);
-		memcpy(p, hdr, sizeof(hdr));
-		if (len) memcpy(p + sizeof(hdr), data, len);
-		return wt_send(c, s->lane, p, sizeof(hdr) + len, s->type == HW_STREAM_UDP);
+	return data_send(c, s, data, len, 0);
+}
+
+int hw_client_try_send(hw_client *c, uint32_t stream_id, const void *data, size_t len) {
+	if (c->closed) return HW_ERR_CLOSED;
+	cstream *s = stream_find(c, stream_id);
+	if (!s) return HW_ERR_CLOSED;
+	if (!c->wt) {
+		int r = wq_flush(c, 1);
+		if (r != 0) return r;
 	}
-	return send_frame(c, HW_WS_BINARY, hdr, sizeof(hdr), data, len);
+	if (s->type != HW_STREAM_UDP && s->remaining == 0) return HW_ERR_AGAIN;
+	return data_send(c, s, data, len, 1);
+}
+
+int hw_client_window(const hw_client *c, uint32_t stream_id, uint32_t *packets) {
+	if (c->closed) return HW_ERR_CLOSED;
+	for (size_t i = 0; i < c->nstreams; i++) {
+		if (c->streams[i].id != stream_id) continue;
+		*packets = c->streams[i].type == HW_STREAM_UDP ? UINT32_MAX : c->streams[i].remaining;
+		return 0;
+	}
+	return HW_ERR_CLOSED;
+}
+
+size_t hw_client_unsent(const hw_client *c) {
+	return hw_buf_avail(&c->wq);
+}
+
+int hw_client_flush(hw_client *c) {
+	if (c->closed) return HW_ERR_CLOSED;
+	return wq_flush(c, 1);
 }
 
 int hw_client_close_stream(hw_client *c, uint32_t stream_id, uint8_t reason) {

@@ -9,6 +9,7 @@
  * A script never outlives FAKE_LIFE_MS, so a client that waits without bound fails its case
  * (the server hangs up and the result is wrong) instead of hanging the suite.
  */
+#include "holywisp/buf.h"
 #include "holywisp/client.h"
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
@@ -64,7 +65,8 @@ struct fake {
 	char pass[64];
 	int connects; // CONNECT packets the client sent
 	size_t connect_host_len;
-	int data_packets; // DATA packets the client sent
+	int data_packets;  // DATA packets the client sent
+	size_t data_bytes; // script_sink: their payload bytes, from frames that parsed whole
 
 	int lfd;
 	uint16_t port;
@@ -328,6 +330,44 @@ static void script_pong_flood(fake *f, int fd) {
 	free(blob);
 }
 
+// Read nothing until the test says go, so the client's socket fills; then read every frame, of any
+// size, until the client hangs up, counting the DATA packets and their bytes. A frame that does
+// not parse (two frames interleaved, half of one lost) ends the count there.
+static void script_sink(fake *f, int fd) {
+	if (fake_continue(f, fd, 0, f->window) != 0) return;
+	while (!atomic_load(&f->go) && !fake_over(f)) {
+		struct pollfd none;
+		poll(&none, 0, FAKE_SLICE_MS);
+	}
+	hw_buf in;
+	hw_buf_init(&in);
+	while (hw_now_ms() < f->deadline) { // to the client's EOF, past fake_join's stop: it all counts
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, FAKE_SLICE_MS) <= 0) continue;
+		CHECK_EQ(hw_buf_reserve(&in, FLOOD_BLOB), 0);
+		ssize_t r = recv(fd, hw_buf_tail(&in), hw_buf_room(&in), 0);
+		if (r == 0 || (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR)) break;
+		if (r < 0) continue;
+		hw_buf_commit(&in, (size_t)r);
+		hw_ws_frame fr;
+		int h;
+		while ((h = hw_ws_parse_header(hw_buf_head(&in), hw_buf_avail(&in), &fr)) > 0 &&
+		       hw_buf_avail(&in) >= fr.header_len + fr.payload_len) {
+			uint8_t *payload = (uint8_t *)hw_buf_head(&in) + fr.header_len;
+			size_t len = (size_t)fr.payload_len;
+			hw_ws_mask(payload, len, fr.mask, 0);
+			hw_wisp_packet p;
+			if (fr.opcode == HW_WS_BINARY && hw_wisp_parse(payload, len, &p) == 0 && p.type == HW_WISP_DATA) {
+				f->data_packets++;
+				f->data_bytes += p.payload_len;
+			}
+			hw_buf_consume(&in, fr.header_len + len);
+		}
+		if (h < 0 && h != HW_ERR_AGAIN) break;
+	}
+	hw_buf_free(&in);
+}
+
 // Two packets for stream 1 with one for another stream between them, then the CLOSE.
 static void script_pieces(fake *f, int fd) {
 	uint8_t reason = HW_CLOSE_VOLUNTARY;
@@ -420,6 +460,97 @@ static void test_send_counts_the_window_on_terminal_streams(void) {
 	hw_client_free(c);
 	fake_join(&f);
 	CHECK(f.data_packets == 5, "%d DATA packets on the wire, 5 sent", f.data_packets);
+}
+
+// hw_client_try_send never waits for a CONTINUE: a spent window is HW_ERR_AGAIN at once, with
+// nothing sent, and hw_client_window says what is left, from the CONTINUEs hw_client_poll read.
+static void test_try_send_never_waits_for_a_continue(void) {
+	fake f = {.script = script_withhold, .window = 2};
+	fake_start(&f);
+	hw_client_opts o;
+	client_opts(&o, &f, 3000);
+	hw_client *c = client_connect(&o);
+	uint32_t sid, udp, w = 0;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "example.com", 80, &sid), 0);
+	CHECK_EQ(hw_client_open(c, HW_STREAM_UDP, "example.com", 53, &udp), 0);
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 2);
+	CHECK_EQ(hw_client_window(c, udp, &w), 0);
+	CHECK_EQ(w, UINT32_MAX);
+	CHECK_EQ(hw_client_window(c, OTHER_STREAM, &w), HW_ERR_CLOSED);
+	CHECK_EQ(hw_client_try_send(c, sid, "a", 1), 0);
+	CHECK_EQ(hw_client_try_send(c, sid, "b", 1), 0);
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 0);
+	uint64_t t0 = hw_now_ms();
+	int r = hw_client_try_send(c, sid, "c", 1);
+	uint64_t took = hw_now_ms() - t0;
+	CHECK(r == HW_ERR_AGAIN, "try_send with a spent window returned %d", r);
+	CHECK(took < 100, "try_send with a spent window took %llu ms", (unsigned long long)took);
+	CHECK_EQ(hw_client_try_send(c, udp, "u", 1), 0); // UDP is never held
+	CHECK_EQ(hw_client_try_send(c, OTHER_STREAM, "x", 1), HW_ERR_CLOSED);
+
+	atomic_store(&f.go, 1);
+	hw_client_event ev;
+	do {
+		CHECK_EQ(hw_client_poll(c, 3000, &ev), 1);
+	} while (ev.type != HW_CEV_CONTINUE);
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 4);
+	CHECK_EQ(hw_client_try_send(c, sid, "c", 1), 0);
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 3);
+	CHECK_EQ(hw_client_unsent(c), 0);
+	hw_client_free(c);
+	fake_join(&f);
+	CHECK(f.data_packets == 4, "%d DATA packets on the wire, 4 sent", f.data_packets);
+}
+
+#define SINK_PAYLOAD (200 * 1000)
+
+// Nor for the socket: toward a server that does not read, hw_client_try_send writes what the
+// socket takes and keeps the rest of that one frame, and refuses the next packet until it is out.
+// Every frame arrives whole and in order once the server reads.
+static void test_try_send_never_waits_for_the_socket(void) {
+	fake f = {.script = script_sink, .window = 1000000};
+	fake_start(&f);
+	hw_client_opts o;
+	client_opts(&o, &f, 3000);
+	hw_client *c = client_connect(&o);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "example.com", 80, &sid), 0);
+	uint8_t *payload = calloc(1, SINK_PAYLOAD);
+	CHECK(payload != NULL, "out of memory");
+	size_t frame = 14 + HW_WISP_HEADER_LEN + SINK_PAYLOAD; // 64-bit length and the mask
+	int sent = 0, r = 0;
+	uint64_t t0 = hw_now_ms();
+	while (sent < 1000 && (r = hw_client_try_send(c, sid, payload, SINK_PAYLOAD)) == 0) sent++;
+	uint64_t took = hw_now_ms() - t0;
+	CHECK(r == HW_ERR_AGAIN, "%d frames into a socket nobody reads, then %d", sent, r);
+	CHECK(took < 2000, "%d frames took %llu ms", sent, (unsigned long long)took);
+	size_t unsent = hw_client_unsent(c);
+	CHECK(unsent > 0 && unsent <= frame, "%zu bytes held of a %zu-byte frame", unsent, frame);
+	uint32_t w = 0;
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 1000000 - (uint32_t)sent); // the refused packet is not charged
+	CHECK_EQ(hw_client_try_send(c, sid, payload, SINK_PAYLOAD), HW_ERR_AGAIN);
+	CHECK(hw_client_unsent(c) <= unsent, "the held bytes grew");
+	CHECK_EQ(hw_client_flush(c), HW_ERR_AGAIN);
+
+	atomic_store(&f.go, 1);
+	uint64_t until = hw_now_ms() + 5000;
+	while ((r = hw_client_flush(c)) == HW_ERR_AGAIN && hw_now_ms() < until) {
+		struct pollfd pfd = {.fd = hw_client_fd(c), .events = POLLOUT};
+		poll(&pfd, 1, 100);
+	}
+	CHECK(r == 0, "flush returned %d with %zu bytes left", r, hw_client_unsent(c));
+	CHECK_EQ(hw_client_unsent(c), 0);
+	CHECK_EQ(hw_client_send(c, sid, "end", 3), 0);
+	hw_client_free(c);
+	fake_join(&f);
+	free(payload);
+	CHECK(f.data_packets == sent + 1, "%d DATA packets parsed of %d", f.data_packets, sent + 1);
+	CHECK_EQ(f.data_bytes, (size_t)sent * SINK_PAYLOAD + 3);
 }
 
 // A window of one, never refilled, and a flood behind it. The second send has to wait for a
@@ -731,6 +862,8 @@ static void test_read_exact_counts_and_keeps_the_rest(void) {
 int main(void) {
 	RUN(test_send_waits_no_longer_than_the_timeout);
 	RUN(test_send_counts_the_window_on_terminal_streams);
+	RUN(test_try_send_never_waits_for_a_continue);
+	RUN(test_try_send_never_waits_for_the_socket);
 	RUN(test_send_queue_is_bounded_in_bytes);
 	RUN(test_send_queue_is_bounded_in_events);
 	RUN(test_read_exact_queue_is_bounded);

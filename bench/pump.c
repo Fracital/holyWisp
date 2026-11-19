@@ -45,7 +45,6 @@ __attribute__((noreturn)) static void die(const char *what, const char *detail) 
 
 typedef struct {
 	uint32_t id;
-	uint32_t credits;
 	uint64_t sent;
 	uint64_t recv;
 } pstream;
@@ -58,6 +57,13 @@ static int find_stream(pstream *st, int n, uint32_t id) {
 
 static int g_settle_ms;
 
+// The packets a stream may send before the next CONTINUE, as the library counts them.
+static uint32_t window_of(const hw_client *c, uint32_t sid) {
+	uint32_t w = 0;
+	if (hw_client_window(c, sid, &w) != 0) die("stream gone", NULL);
+	return w;
+}
+
 static int run_tp(hw_client *c, const char *host, uint16_t port, int nstreams, int duration_s, size_t chunk,
                   uint64_t inflight_cap) {
 	pstream st[MAX_STREAMS];
@@ -67,7 +73,6 @@ static int run_tp(hw_client *c, const char *host, uint16_t port, int nstreams, i
 	uint32_t window = hw_client_buffer_size(c);
 	for (int i = 0; i < nstreams; i++) {
 		if (hw_client_open(c, HW_STREAM_TCP, host, port, &st[i].id) != 0) die("open failed", NULL);
-		st[i].credits = window;
 		st[i].sent = st[i].recv = 0;
 	}
 	if (g_settle_ms) usleep((useconds_t)g_settle_ms * 1000);
@@ -79,9 +84,8 @@ static int run_tp(hw_client *c, const char *host, uint16_t port, int nstreams, i
 		int progressed = 0;
 		for (int i = 0; i < nstreams; i++) {
 			pstream *s = &st[i];
-			if (s->credits == 0 || s->sent - s->recv + chunk > inflight_cap) continue;
+			if (window_of(c, s->id) == 0 || s->sent - s->recv + chunk > inflight_cap) continue;
 			if (hw_client_send(c, s->id, buf, chunk) != 0) die("send failed", NULL);
-			s->credits--;
 			s->sent += chunk;
 			total_sent += chunk;
 			progressed = 1;
@@ -94,8 +98,6 @@ static int run_tp(hw_client *c, const char *host, uint16_t port, int nstreams, i
 				total_recv += ev.len;
 				progressed = 1;
 			} else if (ev.type == HW_CEV_CONTINUE) {
-				int i = find_stream(st, nstreams, ev.stream_id);
-				if (i >= 0) st[i].credits = ev.buffer_remaining;
 				progressed = 1;
 			} else if (ev.type == HW_CEV_CLOSE) {
 				fprintf(stderr, "pump: stream %u closed: %s\n", ev.stream_id, hw_close_reason_str(ev.reason));
@@ -133,7 +135,6 @@ static int cmp_u64(const void *a, const void *b) {
 static int run_rtt(hw_client *c, const char *host, uint16_t port, int duration_s, size_t chunk) {
 	uint32_t sid;
 	if (hw_client_open(c, HW_STREAM_TCP, host, port, &sid) != 0) die("open failed", NULL);
-	uint32_t credits = hw_client_buffer_size(c);
 	if (g_settle_ms) usleep((useconds_t)g_settle_ms * 1000);
 	size_t cap = 4u << 20, n = 0;
 	uint64_t *samples = malloc(cap * sizeof *samples);
@@ -144,34 +145,32 @@ static int run_rtt(hw_client *c, const char *host, uint16_t port, int duration_s
 	uint64_t start = now_us(), deadline = start + (uint64_t)duration_s * 1000000ull;
 	hw_client_event ev;
 	while (now_us() < deadline && n < cap) {
-		if (credits == 0) {
+		if (window_of(c, sid) == 0) {
 			// Wait up to 1 s for the server's CONTINUE. A server that never sends it after exactly
 			// one window has a flow-control bug; measure on a fresh stream and count the stall.
 			uint64_t until = now_us() + 1000000ull;
-			while (credits == 0 && now_us() < until) {
+			while (window_of(c, sid) == 0 && now_us() < until) {
 				int r = hw_client_poll(c, 100, &ev);
 				if (r < 0) die("connection lost", NULL);
-				if (r > 0 && ev.type == HW_CEV_CONTINUE && ev.stream_id == sid) credits = ev.buffer_remaining;
 				if (r > 0 && ev.type == HW_CEV_CLOSE) die("stream closed", hw_close_reason_str(ev.reason));
 			}
-			if (credits == 0) {
+			if (window_of(c, sid) == 0) {
 				stalls++;
 				hw_client_close_stream(c, sid, HW_CLOSE_VOLUNTARY);
 				if (hw_client_open(c, HW_STREAM_TCP, host, port, &sid) != 0) die("open failed", NULL);
-				credits = hw_client_buffer_size(c);
 				if (g_settle_ms) usleep((useconds_t)g_settle_ms * 1000);
 			}
 		}
 		uint64_t t0 = now_us();
 		if (hw_client_send(c, sid, buf, chunk) != 0) die("send failed", NULL);
-		credits--;
 		long long got = hw_client_read_exact(c, sid, in, chunk, 5000);
 		if (got != (long)chunk) die("echo failed", NULL);
 		samples[n++] = now_us() - t0;
-		// read_exact queues CONTINUE events it skipped past; drain them without blocking.
+		// read_exact queues the CONTINUE events it skipped past (the library has counted them);
+		// drain them without blocking.
 		int r;
-		while ((r = hw_client_poll(c, 0, &ev)) > 0)
-			if (ev.type == HW_CEV_CONTINUE && ev.stream_id == sid) credits = ev.buffer_remaining;
+		while ((r = hw_client_poll(c, 0, &ev)) > 0) {
+		}
 		if (r < 0) die("connection lost", NULL);
 	}
 	uint64_t el = now_us() - start;

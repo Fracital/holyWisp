@@ -326,7 +326,14 @@ static void test_every_address(void) {
 	CHECK(took < 3000, "connected after %llu ms of 5000 (::1 first: %d)", (unsigned long long)took, v6_first);
 	uint32_t sid;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
-	CHECK_EQ(hw_client_send(c, sid, "ok", 2), 0);
+	// The session queues whole packets: a try_send that went holds nothing back.
+	uint32_t w = 0;
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 16);
+	CHECK_EQ(hw_client_try_send(c, sid, "ok", 2), 0);
+	CHECK_EQ(hw_client_unsent(c), 0);
+	CHECK_EQ(hw_client_window(c, sid, &w), 0);
+	CHECK_EQ(w, 15);
 	uint8_t buf[2];
 	CHECK_EQ(hw_client_read_exact(c, sid, buf, 2, 5000), 2);
 	hw_client_free(c);
