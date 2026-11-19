@@ -304,6 +304,13 @@ static void bbr_update_min_rtt(hw_qc_cc *c, uint64_t rtt_us, uint64_t now) {
 		c->b.probe_rtt_done = 0;
 	}
 	if (c->b.mode == HW_QC_BBR_PROBE_RTT) {
+		// Its samples measure four packets, not the path, and so do those that span its end: the
+		// connection counts as app-limited until what is in flight now is delivered, as in Linux.
+		// They may raise the estimate, never replace it: after an app-limited stretch longer than
+		// the filter's window one of them did, whole, and the window after the probe was twice the
+		// BDP of four packets.
+		uint64_t mark = c->delivered + c->in_flight;
+		c->app_limited = mark ? mark : 1;
 		if (!c->b.probe_rtt_done && c->in_flight <= bbr_min_cwnd(c)) {
 			c->b.probe_rtt_done = now + BBR_PROBE_RTT_US;
 			c->b.probe_rtt_round_done = 0;

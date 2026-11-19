@@ -616,7 +616,12 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   the fallback; `quic_recovery.c`), because the edge path loses about 0.3% at random and NewReno
   halved its window at each loss: 4 Mbit/s where the same path's TCP, BBR in the kernel, did 30.
   A loss never moves BBR's window; delivery rate samples do, and those taken while the sender had
-  nothing to send (`hw_qc_cc_app_limited` in `output`) only ever raise the estimate. The RTT BBR
+  nothing to send (`hw_qc_cc_app_limited` in `output`) only ever raise the estimate. A stream
+  waiting for room (`blk_head`: the send buffer or the peer's credit) is not "nothing to send":
+  marked so, a bulk download behind a full buffer never left startup and paced at 2.89 times the
+  path (`test_bbr_buffer_limited`). PROBE_RTT counts as app-limited until what was in flight is
+  delivered, as in Linux, or its four-packet sample replaced a stale estimate whole and the rate
+  fell to nothing for seconds (`test_bbr_probe_rtt_stale`). The RTT BBR
   sees is never under 1 ms, the clock's tick: at 0 a loopback window was 4 packets and a 400 MiB/s
   bench ran at 5. `test_bbr_*` in `test_quic` run it on a simulated lossy path, beside NewReno.
   Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be

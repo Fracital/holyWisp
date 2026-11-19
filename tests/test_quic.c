@@ -559,6 +559,21 @@ static void test_bbr_model(void) {
 
 // Sending a tenth of the path's rate for 3 s does not lower the estimate: those samples say
 // what the application had, not what the path can do.
+// The min RTT expires (10 s) while the application sends a tenth of the path: those samples are
+// app-limited and skipped, so the filter's samples are all older than its window when PROBE_RTT
+// cuts the window to four packets, which the application then outpaces. That probe's sample is
+// not app-limited, and it replaced the estimate whole: after the probe the window was twice the
+// BDP of four packets, and the rate took many seconds to come back. Now a sample in PROBE_RTT
+// can only raise the estimate.
+static void test_bbr_probe_rtt_stale(void) {
+	ccsim_result b;
+	ccsim_run(1, 0, 12000000, 0, 1000000, 11000000, &b);
+	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
+	CHECK(b.saw_probe_rtt, "no PROBE_RTT");
+	CHECK(b.bw_after_app_limited > rate * 85 / 100, "bw %llu of %llu after the probe",
+	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+}
+
 static void test_bbr_app_limited(void) {
 	ccsim_result b;
 	ccsim_run(1, 0, 6000000, 0, 2000000, 5000000, &b);
@@ -1168,6 +1183,31 @@ static void bulk(sim *s, uint64_t c2s, uint64_t s2c, uint64_t max_ms) {
 	CHECK(sim_run(s, cond_xfer, &x, max_ms), "transfer: c2s %llu/%llu s2c %llu/%llu at %llu ms",
 	      (unsigned long long)s->sv.st[id].received, (unsigned long long)c2s, (unsigned long long)s->c.st[id].received,
 	      (unsigned long long)s2c, (unsigned long long)s->now);
+}
+
+// A sender that waits for room in its send buffer (or for the peer's credit) is not app-limited:
+// the buffer is a limit of the path's kind, as a full socket buffer is to TCP. Marked
+// app-limited, every sample of a bulk download behind a full buffer was dropped, and BBR never
+// left startup: it paced at 2.89 times the path, and a third of what it sent was lost (the edge,
+// 2026-11-19). A buffer of 4 KB under a first window of ten datagrams: the window and the pacer
+// have room, the stream has none.
+static void test_bbr_buffer_limited(void) {
+	sim *s = sim_new(23);
+	s->ccfg.stream_send_max = s->ccfg.conn_send_max = 4096;
+	sim_handshake(s);
+	int64_t id = hw_quic_stream_open(s->c.q, 1);
+	CHECK(id >= 0, "open");
+	app_send(&s->c, (uint64_t)id, 1u << 20);
+	CHECK(s->c.q->blk_head != NULL, "the writer waits for room");
+	uint64_t mark = s->c.q->cc.app_limited; // the idle handshake's, if any
+	uint8_t out[HW_QUIC_MAX_DGRAM];
+	struct sockaddr_storage to;
+	socklen_t to_len;
+	size_t sent = 0, n;
+	while ((n = hw_quic_output(s->c.q, out, sizeof(out), &to, &to_len, s->now)) > 0) sent += n;
+	CHECK(sent > 0 && hw_qc_cc_can_send(&s->c.q->cc), "the window has room after %zu bytes", sent);
+	CHECK_EQ(s->c.q->cc.app_limited, mark); // no new mark: the buffer, not the application
+	sim_free(s);
 }
 
 static void test_bulk_64m(void) {
@@ -1914,6 +1954,8 @@ int main(int argc, char **argv) {
 	RUN(test_rtt_cc);
 	RUN(test_bbr_random_loss);
 	RUN(test_bbr_model);
+	RUN(test_bbr_buffer_limited);
+	RUN(test_bbr_probe_rtt_stale);
 	RUN(test_bbr_app_limited);
 	RUN(test_smap);
 	RUN(test_handshake);

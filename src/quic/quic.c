@@ -2341,9 +2341,13 @@ size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr
 			for (int spi = 0; spi < HW_QC_SPACES; spi++) pending |= space_can_send(q, spi) && space_ae_pending(q, spi);
 			if (!pending) q->pacer_wait = 0;
 		} else {
-			// Room in the window and the pacer, and nothing to send: the application is the limit.
+			// Room in the window and the pacer, and nothing to send: the application is the limit,
+			// unless a stream is waiting for room (blk_head), which is this send buffer or the
+			// peer's credit, a limit of the path's kind. Marked app-limited, every sample of a bulk
+			// download behind a full buffer was thrown away: BBR never left startup (paced at 2.89x
+			// the path, a third of it lost) and its filter went stale.
 			q->pacer_wait = 0;
-			hw_qc_cc_app_limited(&q->cc);
+			if (!q->blk_head) hw_qc_cc_app_limited(&q->cc);
 		}
 		return 0;
 	}

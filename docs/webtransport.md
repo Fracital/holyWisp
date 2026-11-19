@@ -131,7 +131,13 @@ was sent (draft-cheng-iccrg-delivery-rate-estimation), each ACK makes a delivery
 the model is the highest rate of the last 10 rounds and the lowest RTT of the last 10 s. The
 pacer sends at a gain over that rate (2.89 in startup, then a cycle of 1.25, 0.75 and six of 1),
 the window is twice the estimated BDP, and a loss changes neither. Samples taken while the sender
-had nothing to send (`hw_qc_cc_app_limited`) only ever raise the estimate. The RTT the model sees
+had nothing to send (`hw_qc_cc_app_limited`) only ever raise the estimate. A sender whose
+stream waits for room in the send buffer or for the peer's credit has something to send, and its
+samples count: marked app-limited, a bulk download behind a full buffer stayed in startup,
+pacing at 2.89 times the path. PROBE_RTT counts as app-limited until what was in flight is
+delivered (as Linux does), so its four-packet samples cannot replace an estimate that an
+app-limited stretch left stale: one did, on the edge, and the rate fell to 1 Mbit/s for seconds
+about 10 s into every download. The RTT the model sees
 is never under 1 ms, the clock's tick: below it a loopback path measured 0 and the window was 4
 packets. NewReno (RFC 9002 7, appendix B) remains selectable, and is what the window was until
 2026-11-19: on the edge path, 45 ms and about 0.3% random loss, it halved its window 13 times in
