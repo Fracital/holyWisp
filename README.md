@@ -268,8 +268,24 @@ server's URL in a browser; the page defaults its Wisp field to that same origin.
 the file directly. It confirms a server works interactively: it does the Wisp handshake, opens
 one TCP stream to a destination, sends a plain HTTP request, and prints the response plus a
 per-packet trace. The **Wisp server URL** field is front-and-center so you can point it at a local
-`ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain; there are toggles for Wisp
-v2, the protocol log, and a light/dark theme. The default target is `http://api.ipify.org/`.
+`ws://127.0.0.1:6001/` or an external `wss://wisp.example.com/` domain.
+
+Everything current is on by default:
+
+- **Transport: Automatic.** The page reads the relay's `/webtransport.json` (pinned hashes, or none
+  for a Web PKI certificate, and the URL to dial, `""` meaning the relay's own host and port) and
+  races WebTransport against a WebSocket. WebTransport gets a 1 s head start, and the WebSocket
+  starts at once if WebTransport fails. The first to finish the Wisp handshake wins, and the page
+  remembers it per relay: a WebSocket win keeps WebTransport off for that relay for an hour. A
+  browser without WebTransport, or a relay without the JSON, goes straight to the WebSocket. The
+  choice can be pinned to either transport.
+- **Wisp v2.** The page shows the server's extensions and MOTD, and asks for UDP and stream
+  confirmation.
+- **UDP.** The page resolves the target's host with a DNS query over a Wisp UDP stream (default
+  resolver `one.one.one.one:53`). Over WebTransport the answer arrives as a QUIC datagram, and the
+  page retries as datagrams.
+
+The default target is `http://api.ipify.org/`.
 
 ## Node.js
 

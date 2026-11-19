@@ -10,7 +10,9 @@
   response and log from Google Fonts (Holo already loads Roboto from there; offline, both fall back
   to the system stacks below), and the only local code is the WispClient class below. Laid out like
   an Android settings screen, Holo dark.
-  Set the Wisp server field to a local ws:// server or an external wss:// domain.
+  Set the Wisp server field to a local ws:// server or an external wss:// domain. With the transport
+  on Automatic, the page reads that relay's /webtransport.json and races WebTransport (Wisp over
+  HTTP/3, UDP stream data as QUIC datagrams) against a WebSocket, and remembers the winner per relay.
 -->
 		<link
 			rel="stylesheet"
@@ -35,9 +37,11 @@
 		<style>
 			/* Layout and type only. Colours, borders and controls are Holo's. */
 			:root {
-				--sans: Roboto, ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
+				--sans:
+					Roboto, ui-sans-serif, system-ui, -apple-system, 'Segoe UI',
 					'Helvetica Neue', Arial, sans-serif;
-				--mono: 'Roboto Mono', ui-monospace, 'SF Mono', 'Cascadia Code',
+				--mono:
+					'Roboto Mono', ui-monospace, 'SF Mono', 'Cascadia Code',
 					'JetBrains Mono', Menlo, Consolas, 'DejaVu Sans Mono', monospace;
 			}
 			/* Hiding the log can drop the scrollbar; keep its gutter so the centred column (and
@@ -111,7 +115,8 @@
 				opacity: 0.7;
 				margin-bottom: 6px;
 			}
-			.holo-list li input[type='text'] {
+			.holo-list li input[type='text'],
+			.holo-list li select {
 				width: 100%;
 				box-sizing: border-box;
 				padding: 7px 10px;
@@ -120,6 +125,10 @@
 				font-size: 15px;
 				line-height: 1.4;
 				letter-spacing: 0.01em;
+			}
+			/* Holo gives a select a margin of its own; line it up with the text fields. */
+			.holo-list li select {
+				margin: 0;
 			}
 			.hint {
 				font-size: 11px;
@@ -222,6 +231,21 @@
 					</div>
 				</li>
 				<li>
+					<label class="lbl" for="transport">Transport</label>
+					<select id="transport">
+						<option value="auto" selected>
+							Automatic: WebTransport, else WebSocket
+						</option>
+						<option value="webtransport">WebTransport only</option>
+						<option value="websocket">WebSocket only</option>
+					</select>
+					<div class="hint">
+						Automatic reads the relay's <code>/webtransport.json</code>, races
+						WebTransport against a WebSocket, and remembers the winner for this
+						relay.
+					</div>
+				</li>
+				<li>
 					<label class="lbl" for="target">Target URL</label>
 					<input
 						id="target"
@@ -233,13 +257,39 @@
 						The server relays a plain GET to this host and port.
 					</div>
 				</li>
+				<li>
+					<label class="lbl" for="dns">DNS server (UDP)</label>
+					<input
+						id="dns"
+						type="text"
+						value="one.one.one.one:53"
+						spellcheck="false"
+					/>
+					<div class="hint">
+						With UDP on, the target's host is also resolved here, over a Wisp
+						UDP stream.
+					</div>
+				</li>
 				<li class="row">
 					<label>
 						<span class="grow">
 							<span class="title">Wisp v2</span>
-							<span class="summary">Negotiate the wisp-v2 subprotocol</span>
+							<span class="summary"
+								>Negotiate v2: INFO, extensions, stream confirmation</span
+							>
 						</span>
-						<input id="v2" type="checkbox" />
+						<input id="v2" type="checkbox" checked />
+					</label>
+				</li>
+				<li class="row">
+					<label>
+						<span class="grow">
+							<span class="title">UDP</span>
+							<span class="summary"
+								>Resolve the target's host over a Wisp UDP stream (DNS)</span
+							>
+						</span>
+						<input id="udp" type="checkbox" checked />
 					</label>
 				</li>
 				<li class="row">
@@ -260,9 +310,11 @@
 			</div>
 			<div class="status">
 				<span><span id="dot" class="dot"></span><b id="state">idle</b></span>
+				<span>transport <b id="tr">-</b></span>
 				<span>version <b id="ver">-</b></span>
 				<span>window <b id="win">-</b></span>
 				<span>bytes in/out <b id="bytes">0 / 0</b></span>
+				<span>udp <b id="udp-out">-</b></span>
 			</div>
 
 			<h2>Response <span id="respcount"></span></h2>
@@ -294,6 +346,14 @@
 				INFO: 0x05,
 			};
 			const STREAM_TCP = 0x01;
+			const STREAM_UDP = 0x02;
+			// Wisp v2 extensions (INFO: id u8, length u32 LE, metadata).
+			const EXT = {
+				UDP: 0x01,
+				PASSWORD: 0x02,
+				MOTD: 0x04,
+				STREAM_CONFIRM: 0x05,
+			};
 			const CLOSE_REASONS = {
 				0x01: 'unknown',
 				0x02: 'voluntary (remote closed)',
@@ -318,10 +378,160 @@
 			const enc = new TextEncoder();
 			const dec = new TextDecoder();
 
-			class WispClient {
-				constructor(url, { v2 = false, onLog, onState, onData, onClose } = {}) {
+			const packet = (type, streamId, payload = new Uint8Array(0)) => {
+				const buf = new Uint8Array(5 + payload.length);
+				buf[0] = type;
+				new DataView(buf.buffer).setUint32(1, streamId, true);
+				buf.set(payload, 5);
+				return buf;
+			};
+
+			// ---- Transports: each carries whole Wisp packets, in order. ------------------------
+
+			// One WebSocket message per packet. Offering any subprotocol is the v2 opt-in.
+			class WsTransport {
+				constructor(url, v2) {
+					this.name = 'websocket';
 					this.url = url;
 					this.v2 = v2;
+				}
+				open(onPacket, onClose, onLog) {
+					this.ws = this.v2
+						? new WebSocket(this.url, 'wisp-v2')
+						: new WebSocket(this.url);
+					this.ws.binaryType = 'arraybuffer';
+					this.ws.onopen = () => onLog('info', 'websocket open');
+					this.ws.onmessage = (ev) =>
+						onPacket(new Uint8Array(ev.data), 'message');
+					this.ws.onerror = () =>
+						onLog('err', 'websocket error (is the Wisp server reachable?)');
+					this.ws.onclose = (ev) =>
+						onClose(`websocket closed (code ${ev.code})`);
+				}
+				send(buf) {
+					if (this.ws && this.ws.readyState === 1) this.ws.send(buf);
+				}
+				close() {
+					if (this.ws && this.ws.readyState <= 1) this.ws.close();
+				}
+			}
+
+			// One bidirectional stream of packets, each behind a u32 LE length. UDP DATA may also
+			// travel as a QUIC datagram (one packet, no length), both ways.
+			class WtTransport {
+				constructor(cfg, v2) {
+					this.name = 'webtransport';
+					this.cfg = cfg; // the relay's /webtransport.json
+					this.v2 = v2;
+					this.closed = false;
+				}
+				open(onPacket, onClose, onLog) {
+					const opts = {};
+					const hashes = this.cfg.hashes || [];
+					if (hashes.length) {
+						opts.serverCertificateHashes = hashes.map((h) => ({
+							algorithm: h.algorithm,
+							value: Uint8Array.from(atob(h.value), (c) => c.charCodeAt(0)),
+						}));
+					}
+					if (this.v2) opts.protocols = ['wisp-v2'];
+					const end = (why) => {
+						if (this.closed) return;
+						this.closed = true;
+						onClose(why);
+					};
+					onLog(
+						'info',
+						`webtransport to ${this.cfg.url} (${hashes.length ? `pinned to ${hashes.length} certificate hash${hashes.length > 1 ? 'es' : ''}` : 'Web PKI certificate'})`,
+					);
+					try {
+						this.wt = new WebTransport(this.cfg.url, opts);
+					} catch (e) {
+						setTimeout(() => end(`webtransport refused: ${e.message}`));
+						return;
+					}
+					this.wt.closed.then(
+						(i) => end(`webtransport closed (code ${i.closeCode || 0})`),
+						(e) => end(`webtransport failed: ${e.message || e}`),
+					);
+					(async () => {
+						await this.wt.ready;
+						onLog('info', 'webtransport session ready');
+						const bidi = await this.wt.createBidirectionalStream();
+						this.writer = bidi.writable.getWriter();
+						this.dgWriter = this.wt.datagrams.writable.getWriter();
+						this._readDatagrams(onPacket);
+						const reader = bidi.readable.getReader();
+						let buf = new Uint8Array(0);
+						for (;;) {
+							const { value, done } = await reader.read();
+							if (done) break;
+							const m = new Uint8Array(buf.length + value.length);
+							m.set(buf);
+							m.set(value, buf.length);
+							buf = m;
+							while (buf.length >= 4) {
+								const n = new DataView(buf.buffer, buf.byteOffset).getUint32(
+									0,
+									true,
+								);
+								if (buf.length < 4 + n) break;
+								onPacket(buf.slice(4, 4 + n), 'stream');
+								buf = buf.subarray(4 + n);
+							}
+						}
+						end('webtransport: the Wisp stream ended');
+					})().catch((e) => end(`webtransport failed: ${e.message || e}`));
+				}
+				async _readDatagrams(onPacket) {
+					const r = this.wt.datagrams.readable.getReader();
+					try {
+						for (;;) {
+							const { value, done } = await r.read();
+							if (done) return;
+							onPacket(value, 'datagram');
+						}
+					} catch {
+						// the session ended
+					}
+				}
+				send(buf) {
+					if (!this.writer) return;
+					const f = new Uint8Array(4 + buf.length);
+					new DataView(f.buffer).setUint32(0, buf.length, true);
+					f.set(buf, 4);
+					this.writer.write(f).catch(() => {});
+				}
+				// 1 when it went as a datagram, 0 when it did not fit and went on the stream.
+				sendDatagram(buf) {
+					const max = this.wt && this.wt.datagrams.maxDatagramSize;
+					if (!this.dgWriter || !max || buf.length > max) {
+						this.send(buf);
+						return 0;
+					}
+					this.dgWriter.write(buf).catch(() => {});
+					return 1;
+				}
+				close() {
+					this.closed = true;
+					try {
+						if (this.wt) this.wt.close({ closeCode: 0, reason: 'bye' });
+					} catch {
+						// already closed
+					}
+				}
+			}
+
+			// ---- Wisp over either transport. --------------------------------------------------
+
+			class WispClient {
+				constructor(
+					transport,
+					{ v2 = true, udp = true, onLog, onState, onData, onClose } = {},
+				) {
+					this.t = transport;
+					this.v2 = v2;
+					this.udp = udp;
 					this.onLog = onLog || (() => {});
 					this.onState = onState || (() => {});
 					this.onData = onData || (() => {});
@@ -329,49 +539,68 @@
 					this.ready = false;
 					this.nextId = 1;
 					this.sentInfo = false;
+					this.server = { version: null, udp: null, motd: '', password: false };
+					this.confirm = false;
 				}
 
 				connect() {
 					this.onLog(
 						'info',
-						`connecting to ${this.url} (${this.v2 ? 'wisp-v2' : 'wisp-v1'})`,
+						`connecting over ${this.t.name} (${this.v2 ? 'wisp-v2 offered' : 'wisp-v1'})`,
 					);
-					this.ws = this.v2
-						? new WebSocket(this.url, 'wisp-v2')
-						: new WebSocket(this.url);
-					this.ws.binaryType = 'arraybuffer';
-					this.ws.onopen = () => this.onLog('info', 'websocket open');
-					this.ws.onmessage = (ev) => this._onFrame(new Uint8Array(ev.data));
-					this.ws.onerror = () =>
-						this.onLog(
-							'err',
-							'websocket error (is the Wisp server reachable?)',
-						);
-					this.ws.onclose = (ev) => {
-						this.ready = false;
-						this.onState('closed');
-						this.onLog('info', `websocket closed (code ${ev.code})`);
-					};
+					this.t.open(
+						(buf, via) => this._onPacket(buf, via),
+						(why) => {
+							this.ready = false;
+							this.onLog('info', why);
+							this.onState('closed');
+						},
+						this.onLog,
+					);
 				}
 
 				close() {
-					if (this.ws && this.ws.readyState <= 1) this.ws.close();
+					this.t.close();
 				}
 
-				_send(type, streamId, payload = new Uint8Array(0)) {
-					const buf = new Uint8Array(5 + payload.length);
-					const dv = new DataView(buf.buffer);
-					buf[0] = type;
-					dv.setUint32(1, streamId, true);
-					buf.set(payload, 5);
-					this.ws.send(buf);
+				_send(type, streamId, payload, { datagram = false } = {}) {
+					const buf = packet(type, streamId, payload);
+					let via = this.t.name === 'webtransport' ? 'stream' : 'message';
+					if (datagram && this.t.sendDatagram) {
+						via = this.t.sendDatagram(buf) ? 'datagram' : 'stream';
+					} else {
+						this.t.send(buf);
+					}
 					this.onLog(
 						'tx',
-						`${typeName(type)} stream=${streamId} len=${payload.length}`,
+						`${typeName(type)} stream=${streamId} len=${payload ? payload.length : 0}` +
+							(via === 'datagram' ? ' (datagram)' : ''),
 					);
 				}
 
-				_onFrame(buf) {
+				_parseInfo(payload) {
+					const exts = [];
+					const dv = new DataView(
+						payload.buffer,
+						payload.byteOffset,
+						payload.byteLength,
+					);
+					let o = 2;
+					while (o + 5 <= payload.length) {
+						const id = payload[o];
+						const len = dv.getUint32(o + 1, true);
+						const meta = payload.subarray(o + 5, o + 5 + len);
+						o += 5 + len;
+						exts.push(id);
+						if (id === EXT.UDP) this.server.udp = true;
+						if (id === EXT.MOTD) this.server.motd = dec.decode(meta);
+						if (id === EXT.PASSWORD) this.server.password = !!meta[0];
+					}
+					if (this.server.udp === null) this.server.udp = false;
+					return exts;
+				}
+
+				_onPacket(buf, via) {
 					if (buf.length < 5) return;
 					const type = buf[0];
 					const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
@@ -383,18 +612,52 @@
 							(type === PKT.CLOSE
 								? ` reason=${CLOSE_REASONS[payload[0]] || payload[0]}`
 								: '') +
-							(type === PKT.CONTINUE ? ` window=${dv.getUint32(5, true)}` : ''),
+							(type === PKT.CONTINUE
+								? ` window=${dv.getUint32(5, true)}`
+								: '') +
+							(via === 'datagram' ? ' (datagram)' : ''),
 					);
 
 					if (type === PKT.INFO && streamId === 0) {
-						const major = payload[0];
-						const minor = payload[1];
+						this.server.version = `${payload[0]}.${payload[1]}`;
+						const exts = this._parseInfo(payload);
+						const names = exts.map(
+							(e) =>
+								({
+									1: 'udp',
+									2: 'password',
+									3: 'key',
+									4: 'motd',
+									5: 'stream-confirm',
+								})[e] || '0x' + e.toString(16),
+						);
+						this.onLog(
+							'info',
+							`server extensions: ${names.join(', ') || 'none'}`,
+						);
+						if (this.server.motd)
+							this.onLog('info', `motd: ${this.server.motd}`);
+						if (this.server.password) {
+							this.onLog(
+								'err',
+								'the server wants a password, and this page has none',
+							);
+						}
 						this.onState('handshaking', {
-							ver: `v2 (server ${major}.${minor})`,
+							ver: `v2 (server ${this.server.version})`,
 						});
 						if (!this.sentInfo) {
 							this.sentInfo = true;
-							this._send(PKT.INFO, 0, new Uint8Array([2, 1]));
+							// Ours: UDP when we want it and the server has it, and stream confirmation.
+							const want = [];
+							if (this.udp && this.server.udp) want.push(EXT.UDP);
+							want.push(EXT.STREAM_CONFIRM);
+							const p = new Uint8Array(2 + 5 * want.length);
+							p[0] = 2;
+							p[1] = 0;
+							want.forEach((id, i) => (p[2 + 5 * i] = id)); // each with empty metadata
+							this._send(PKT.INFO, 0, p);
+							this.confirm = true;
 						}
 						return;
 					}
@@ -403,37 +666,276 @@
 						if (!this.ready) {
 							this.ready = true;
 							this.onState('ready', {
-								ver: this.v2 ? 'v2' : 'v1',
+								ver: this.server.version
+									? `v2 (server ${this.server.version})`
+									: 'v1',
 								window: this.window,
 							});
 						}
 						return;
 					}
-					if (type === PKT.DATA) this.onData(streamId, payload);
+					if (
+						type === PKT.CONTINUE &&
+						this.confirm &&
+						this.confirmed &&
+						!this.confirmed.has(streamId)
+					) {
+						this.confirmed.add(streamId);
+						this.onLog(
+							'info',
+							`stream ${streamId} connected (stream confirmation)`,
+						);
+					}
+					if (type === PKT.DATA) this.onData(streamId, payload, via);
 					if (type === PKT.CLOSE) this.onClose(streamId, payload[0]);
 				}
 
-				openTCP(host, port) {
+				_open(kind, host, port) {
 					const id = this.nextId++;
 					const hostBytes = enc.encode(host);
 					const payload = new Uint8Array(3 + hostBytes.length);
-					const dv = new DataView(payload.buffer);
-					payload[0] = STREAM_TCP;
-					dv.setUint16(1, port, true);
+					payload[0] = kind;
+					new DataView(payload.buffer).setUint16(1, port, true);
 					payload.set(hostBytes, 3);
 					this._send(PKT.CONNECT, id, payload);
+					if (kind === STREAM_TCP)
+						(this.confirmed = this.confirmed || new Set()).delete(id);
 					return id;
 				}
 
-				sendData(streamId, bytes) {
-					this._send(PKT.DATA, streamId, bytes);
+				openTCP(host, port) {
+					return this._open(STREAM_TCP, host, port);
+				}
+
+				openUDP(host, port) {
+					return this._open(STREAM_UDP, host, port);
+				}
+
+				sendData(streamId, bytes, opts) {
+					this._send(PKT.DATA, streamId, bytes, opts);
+				}
+
+				closeStream(streamId) {
+					this._send(PKT.CLOSE, streamId, new Uint8Array([0x02]));
 				}
 			}
+
+			// ---- Picking a transport, as STomp does. ------------------------------------------
+
+			// The relay's /webtransport.json lives at the root of the origin that serves its
+			// WebSocket: ws(s)://host/... -> http(s)://host/webtransport.json.
+			function wtConfigUrl(wsUrl) {
+				const u = new URL(wsUrl);
+				if (u.protocol !== 'ws:' && u.protocol !== 'wss:') return null;
+				return `${u.protocol === 'wss:' ? 'https:' : 'http:'}//${u.host}/webtransport.json`;
+			}
+
+			async function fetchWtConfig(wsUrl, ms) {
+				const url = wtConfigUrl(wsUrl);
+				if (!url) throw new Error('not a ws:// or wss:// URL');
+				const ctl = new AbortController();
+				const timer = setTimeout(() => ctl.abort(), ms);
+				try {
+					const r = await fetch(url, { signal: ctl.signal, cache: 'no-store' });
+					if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+					let j;
+					try {
+						j = await r.json();
+					} catch {
+						throw new Error(
+							`${url}: not JSON (this relay has no WebTransport)`,
+						);
+					}
+					if (!j || typeof j.url !== 'string' || !Array.isArray(j.hashes)) {
+						throw new Error(`${url}: not a WebTransport description`);
+					}
+					// "" is the server's default (no webtransport-url): the same host and port
+					// number as the relay, over HTTPS.
+					if (j.url === '') j.url = `https://${new URL(wsUrl).host}/`;
+					if (!/^https:\/\//.test(j.url))
+						throw new Error(`${url}: no https:// url`);
+					return j;
+				} finally {
+					clearTimeout(timer);
+				}
+			}
+
+			// What won last time, per relay: a WebSocket win keeps WebTransport off for an hour, a
+			// WebTransport win gives it a longer head start. Storage may be off: then every connect
+			// detects afresh.
+			const MEMO_KEY = 'holywisp.transport:';
+			const MEMO_WS_MS = 60 * 60 * 1000;
+			function memoGet(relay) {
+				try {
+					return JSON.parse(localStorage.getItem(MEMO_KEY + relay) || 'null');
+				} catch {
+					return null;
+				}
+			}
+			function memoSet(relay, transport) {
+				try {
+					localStorage.setItem(
+						MEMO_KEY + relay,
+						JSON.stringify({ transport, at: Date.now() }),
+					);
+				} catch {
+					// storage is off
+				}
+			}
+
+			// Resolves to the first WispClient whose handshake finishes (stream-0 CONTINUE); every
+			// other attempt is closed. WebTransport goes first, the WebSocket after a head start or
+			// as soon as WebTransport fails. Rejects when every attempt failed.
+			async function connectBest(wsUrl, mode, opts, log) {
+				const relay = wsUrl;
+				const attempts = [];
+				let winner = null;
+				const memo = memoGet(relay);
+				let wtCfg = null;
+				if (mode !== 'websocket') {
+					if (typeof WebTransport === 'undefined') {
+						log('info', 'this browser has no WebTransport');
+					} else if (
+						mode === 'auto' &&
+						memo &&
+						memo.transport === 'websocket' &&
+						Date.now() - memo.at < MEMO_WS_MS
+					) {
+						log(
+							'info',
+							`WebTransport skipped: a WebSocket won here at ${new Date(memo.at).toLocaleTimeString('en-GB', { hour12: false })}`,
+						);
+					} else {
+						try {
+							wtCfg = await fetchWtConfig(wsUrl, 2500);
+						} catch (e) {
+							log('info', `no WebTransport for this relay (${e.message || e})`);
+						}
+					}
+					if (mode === 'webtransport' && !wtCfg)
+						throw new Error('WebTransport is not available');
+				}
+				return new Promise((resolve, reject) => {
+					let wsTimer = null;
+					const settle = () => {
+						if (!winner && attempts.length && attempts.every((a) => a.dead)) {
+							if (
+								mode === 'auto' &&
+								wtCfg &&
+								!attempts.some((a) => a.kind === 'websocket')
+							) {
+								startWs();
+								return;
+							}
+							reject(new Error('no transport reached the server'));
+						}
+					};
+					const start = (transport) => {
+						const a = { kind: transport.name, dead: false };
+						const tag = transport.name === 'webtransport' ? 'wt' : 'ws';
+						const c = new WispClient(transport, {
+							...opts,
+							onLog: (k, m) => {
+								if (!winner || winner === c) log(k, `[${tag}] ${m}`);
+							},
+							onState: (s, extra) => {
+								if (winner === c) return opts.onState(s, extra);
+								if (winner) return;
+								if (s === 'closed') {
+									a.dead = true;
+									if (transport.name === 'webtransport' && !wsStarted)
+										startWs();
+									settle();
+									return;
+								}
+								if (s !== 'ready') return;
+								winner = c;
+								clearTimeout(wsTimer);
+								for (const o of attempts) if (o.client !== c) o.client.close();
+								if (mode === 'auto' && wtCfg) memoSet(relay, transport.name);
+								log('info', `using ${transport.name}`);
+								resolve({ client: c, extra });
+							},
+							onData: (...args) => winner === c && opts.onData(...args),
+							onClose: (...args) => winner === c && opts.onClose(...args),
+						});
+						a.client = c;
+						attempts.push(a);
+						c.connect();
+					};
+					let wsStarted = false;
+					const startWs = () => {
+						if (wsStarted || winner || mode === 'webtransport') return;
+						wsStarted = true;
+						start(new WsTransport(wsUrl, opts.v2));
+					};
+					if (wtCfg) {
+						start(new WtTransport(wtCfg, opts.v2));
+						if (mode === 'auto') {
+							const head =
+								memo && memo.transport === 'webtransport' ? 3000 : 1000;
+							wsTimer = setTimeout(startWs, head);
+						}
+					} else {
+						startWs();
+					}
+				});
+			}
+
+			// ---- DNS over the UDP stream: one A query for the target's host. ------------------
+
+			function dnsQuery(name) {
+				const labels = name.replace(/\.$/, '').split('.');
+				const q = [];
+				const id = (Math.random() * 65536) | 0;
+				q.push(id >> 8, id & 255, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0);
+				for (const l of labels) {
+					const b = enc.encode(l);
+					q.push(b.length, ...b);
+				}
+				q.push(0, 0, 1, 0, 1); // root, type A, class IN
+				return { id, bytes: new Uint8Array(q) };
+			}
+
+			function dnsAnswers(msg, id) {
+				const dv = new DataView(msg.buffer, msg.byteOffset, msg.byteLength);
+				if (msg.length < 12 || dv.getUint16(0) !== id) return null;
+				const rcode = msg[3] & 15;
+				const qd = dv.getUint16(4);
+				const an = dv.getUint16(6);
+				let o = 12;
+				const skipName = () => {
+					while (o < msg.length) {
+						const l = msg[o];
+						if (l === 0) return void o++;
+						if ((l & 0xc0) === 0xc0) return void (o += 2);
+						o += 1 + l;
+					}
+				};
+				for (let i = 0; i < qd; i++) {
+					skipName();
+					o += 4;
+				}
+				const ips = [];
+				for (let i = 0; i < an && o + 10 <= msg.length; i++) {
+					skipName();
+					const type = dv.getUint16(o);
+					const len = dv.getUint16(o + 8);
+					o += 10;
+					if (type === 1 && len === 4)
+						ips.push(Array.from(msg.subarray(o, o + 4)).join('.'));
+					o += len;
+				}
+				return { rcode, ips };
+			}
+
+			// ---- The page. ---------------------------------------------------------------------
 
 			const $ = (id) => document.getElementById(id);
 			const resp = $('resp');
 			const log = $('log');
 			let client = null;
+			let run = 0;
 			let inBytes = 0;
 			let outBytes = 0;
 			let respBytes = 0;
@@ -455,7 +957,7 @@
 			function setState(state, extra = {}) {
 				$('dot').className =
 					'dot' +
-					(state === 'ready'
+					(state === 'ready' || state === 'done'
 						? ' on'
 						: state === 'error' || state === 'closed'
 							? ' err'
@@ -490,19 +992,80 @@
 				};
 			}
 
-			function start() {
+			function parseHostPort(s, defPort) {
+				const m = /^\[?([^\]]+?)\]?(?::(\d+))?$/.exec(s);
+				if (!m) throw new Error(`not host:port: ${s}`);
+				return { host: m[1], port: m[2] ? parseInt(m[2], 10) : defPort };
+			}
+
+			const isIpLiteral = (h) =>
+				/^\d+\.\d+\.\d+\.\d+$/.test(h) || h.includes(':');
+
+			// The DNS lookup: the query goes on the reliable path first (a datagram could overtake the
+			// CONNECT), then again every second, as a datagram where the transport has them.
+			function resolveOverUdp(c, sid, target, dnsSrv) {
+				const q = dnsQuery(target.host);
+				const t0 = performance.now();
+				let tries = 0;
+				let timer = null;
+				let udpDone = false;
+				$('udp-out').textContent = 'asking…';
+				const finish = (text) => {
+					clearTimeout(timer);
+					$('udp-out').textContent = text;
+					c.closeStream(sid);
+					udpDone = true;
+				};
+				const ask = () => {
+					if (udpDone) return;
+					if (tries++ >= 4) return finish('no answer');
+					c.sendData(sid, q.bytes, { datagram: tries > 1 });
+					bump(0, q.bytes.length);
+					timer = setTimeout(ask, 1000);
+				};
+				ask();
+				return {
+					onData(payload, via) {
+						if (udpDone) return;
+						bump(payload.length, 0);
+						const a = dnsAnswers(payload, q.id);
+						if (!a) return;
+						const ms = Math.round(performance.now() - t0);
+						const what = a.ips.length
+							? a.ips.join(', ')
+							: `rcode ${a.rcode}, no A record`;
+						logLine(
+							'info',
+							`udp: ${target.host} is ${what} (from ${dnsSrv.host}:${dnsSrv.port}, ${ms} ms, ${via})`,
+						);
+						finish(`${a.ips[0] || 'none'} (${ms} ms, ${via})`);
+					},
+					closed() {
+						clearTimeout(timer);
+						udpDone = true;
+					},
+				};
+			}
+
+			async function start() {
 				stop();
+				const me = ++run;
 				resp.value = '';
 				respBytes = 0;
 				$('respcount').textContent = '';
 				inBytes = 0;
 				outBytes = 0;
 				bump(0, 0);
+				$('tr').textContent = '-';
+				$('udp-out').textContent = '-';
 				setState('connecting', { ver: '-', window: '-' });
 
 				let target;
+				let dnsSrv = null;
+				const wantUdp = $('udp').checked;
 				try {
 					target = parseTarget($('target').value.trim());
+					if (wantUdp) dnsSrv = parseHostPort($('dns').value.trim(), 53);
 				} catch (e) {
 					logLine('err', e.message);
 					setState('error');
@@ -511,28 +1074,16 @@
 
 				$('go').disabled = true;
 				$('stop').disabled = false;
-				let streamId = null;
-				client = new WispClient($('wisp').value.trim(), {
+				let tcpId = null;
+				let udpId = null;
+				let udp = null;
+				const opts = {
 					v2: $('v2').checked,
-					onLog: logLine,
-					onState: (s, extra) => {
-						setState(s, extra);
-						if (s === 'ready' && streamId === null) {
-							streamId = client.openTCP(target.host, target.port);
-							const req =
-								`GET ${target.path} HTTP/1.1\r\nHost: ${target.host}\r\n` +
-								`User-Agent: holywisp-webclient\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
-							const bytes = enc.encode(req);
-							client.sendData(streamId, bytes);
-							bump(0, bytes.length);
-							logLine(
-								'info',
-								`sent HTTP request to ${target.host}:${target.port} on stream ${streamId}`,
-							);
-						}
-					},
-					onData: (sid, payload) => {
-						if (sid !== streamId) return;
+					udp: wantUdp,
+					onState: (s, extra) => setState(s, extra),
+					onData: (sid, payload, via) => {
+						if (sid === udpId && udp) return udp.onData(payload, via);
+						if (sid !== tcpId) return;
 						bump(payload.length, 0);
 						respBytes += payload.length;
 						resp.value += dec.decode(payload, { stream: true });
@@ -540,20 +1091,70 @@
 						$('respcount').textContent = `(${respBytes} bytes)`;
 					},
 					onClose: (sid, reason) => {
-						if (sid !== streamId) return;
-						logLine(
-							'info',
-							`stream ${sid} closed: ${CLOSE_REASONS[reason] || reason}`,
-						);
+						const why = CLOSE_REASONS[reason] || reason;
+						if (sid === udpId) {
+							if (udp) udp.closed();
+							$('udp-out').textContent = `closed: ${why}`;
+							logLine('info', `udp stream ${sid} closed: ${why}`);
+							return;
+						}
+						if (sid !== tcpId) return;
+						logLine('info', `stream ${sid} closed: ${why}`);
 						setState('done', {});
 						$('go').disabled = false;
 						$('stop').disabled = true;
 					},
-				});
-				client.connect();
+				};
+				let got;
+				try {
+					got = await connectBest(
+						$('wisp').value.trim(),
+						$('transport').value,
+						opts,
+						logLine,
+					);
+				} catch (e) {
+					if (me !== run) return;
+					logLine('err', e.message || String(e));
+					setState('error');
+					$('go').disabled = false;
+					$('stop').disabled = true;
+					return;
+				}
+				if (me !== run) {
+					got.client.close();
+					return;
+				}
+				client = got.client;
+				$('tr').textContent = client.t.name;
+				setState('ready', got.extra);
+
+				tcpId = client.openTCP(target.host, target.port);
+				const req =
+					`GET ${target.path} HTTP/1.1\r\nHost: ${target.host}\r\n` +
+					`User-Agent: holywisp-webclient\r\nAccept: */*\r\nConnection: close\r\n\r\n`;
+				const bytes = enc.encode(req);
+				client.sendData(tcpId, bytes);
+				bump(0, bytes.length);
+				logLine(
+					'info',
+					`sent HTTP request to ${target.host}:${target.port} on stream ${tcpId}`,
+				);
+
+				if (!wantUdp) return;
+				if (client.server.udp === false) {
+					$('udp-out').textContent = 'not offered';
+					logLine('info', 'udp: the server does not offer UDP streams');
+				} else if (isIpLiteral(target.host)) {
+					$('udp-out').textContent = 'target is an address';
+				} else {
+					udpId = client.openUDP(dnsSrv.host, dnsSrv.port);
+					udp = resolveOverUdp(client, udpId, target, dnsSrv);
+				}
 			}
 
 			function stop() {
+				run++;
 				if (client) {
 					client.close();
 					client = null;
