@@ -466,12 +466,70 @@ static void test_chacha20_pieces(void) {
 	}
 }
 
-// The cases that reach the ChaCha20 and Poly1305 kernels, on the base kernels. Where the CPU has
-// others (AVX2 on x86-64) the cases above ran only those, and the base ones are what a CPU
+// The AES-NI kernel and the bitsliced code give the same bytes and open each other's, at every
+// length around one and eight blocks of AAD and of text, in place and not, and a table made while
+// the base kernels were forced works for the AES-NI kernel once they are not.
+static void test_gcm_kernels(void) {
+	static const size_t lens[] = {0,   1,   15,  16,  17,  112,  127,  128,  129,
+	                              143, 144, 255, 256, 257, 1000, 1199, 1200, 1472};
+	static const size_t aads[] = {0, 1, 13, 16, 21, 127, 128, 129, 300};
+	enum {
+		MAX = 1472
+	};
+	int hw = hw_aes128gcm_hw();
+	printf("# AES-GCM on %s\n", hw ? "AES-NI and PCLMULQDQ" : "the bitsliced code alone (no other on this CPU)");
+	static uint8_t m[MAX], aad[300], base[MAX + HW_AEAD_TAG], fast[MAX + HW_AEAD_TAG], back[MAX];
+	for (size_t a = 0; a < HW_ARRAY_LEN(aads); a++) {
+		for (size_t i = 0; i < HW_ARRAY_LEN(lens); i++) {
+			size_t len = lens[i], aad_len = aads[a];
+			uint8_t key[16], nonce[12];
+			pattern(key, 16, 3, (unsigned)(len + aad_len));
+			pattern(nonce, 12, 7, (unsigned)len);
+			pattern(aad, aad_len, 5, (unsigned)aad_len);
+			pattern(m, len, 11, (unsigned)len);
+			hw_aes128gcm made_base, made_cpu;
+			hw_aead_force_base_kernels(1);
+			CHECK_EQ(hw_aes128gcm_hw(), 0);
+			hw_aes128gcm_init(&made_base, key);
+			hw_aes128gcm_seal(&made_base, nonce, aad, aad_len, m, len, base);
+			hw_aead_force_base_kernels(0);
+			CHECK_EQ(hw_aes128gcm_hw(), hw);
+			hw_aes128gcm_init(&made_cpu, key);
+			CHECK(memcmp(&made_base, &made_cpu, sizeof made_cpu) == 0, "the table does not depend on forcing");
+			hw_aes128gcm_seal(&made_base, nonce, aad, aad_len, m, len, fast);
+			CHECK(memcmp(base, fast, len + HW_AEAD_TAG) == 0, "seal differs at aad %zu len %zu", aad_len, len);
+			memcpy(fast, m, len);
+			hw_aes128gcm_seal(&made_cpu, nonce, aad, aad_len, fast, len, fast);
+			CHECK(memcmp(base, fast, len + HW_AEAD_TAG) == 0, "in-place seal differs at aad %zu len %zu", aad_len, len);
+			CHECK_EQ(hw_aes128gcm_open(&made_cpu, nonce, aad, aad_len, base, len + HW_AEAD_TAG, back), 0);
+			CHECK(memcmp(back, m, len) == 0, "open differs at aad %zu len %zu", aad_len, len);
+			hw_aead_force_base_kernels(1);
+			CHECK_EQ(hw_aes128gcm_open(&made_cpu, nonce, aad, aad_len, fast, len + HW_AEAD_TAG, fast), 0);
+			CHECK(memcmp(fast, m, len) == 0, "base open differs at aad %zu len %zu", aad_len, len);
+			hw_aead_force_base_kernels(0);
+		}
+	}
+	// One block of header protection either way.
+	uint8_t key[16], in[16], a[16], b[16];
+	pattern(key, 16, 9, 2);
+	pattern(in, 16, 4, 8);
+	hw_aes128 k;
+	hw_aes128_init(&k, key);
+	hw_aes128_encrypt(&k, in, a);
+	hw_aead_force_base_kernels(1);
+	hw_aes128_encrypt(&k, in, b);
+	hw_aead_force_base_kernels(0);
+	CHECK(memcmp(a, b, 16) == 0, "one block differs");
+}
+
+// The cases that reach the ChaCha20, Poly1305 and AES-GCM kernels, on the base kernels. Where the
+// CPU has others (AVX2 and AES-NI on x86-64) the cases above ran only those, and the base ones are what a CPU
 // without them runs; elsewhere this repeats the same kernels.
 static void test_base_kernels(void) {
 	int other = hw_aead_force_base_kernels(1);
 	printf("# base kernels%s\n", other ? "" : " (the only ones on this CPU)");
+	test_aes128();
+	test_gcm_vectors();
 	test_aead_rejects();
 	test_chacha20_block();
 	test_chacha20_encrypt();
@@ -497,6 +555,7 @@ int main(void) {
 	RUN(test_quic_chacha20);
 	RUN(test_length_sweeps);
 	RUN(test_chacha20_pieces);
+	RUN(test_gcm_kernels);
 	RUN(test_base_kernels);
 	return 0;
 }

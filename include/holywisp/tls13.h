@@ -9,9 +9,12 @@
  *
  * Deliberately narrow (docs/webtransport.md, "Cryptography"):
  * - Only TLS 1.3, only (EC)DHE: key exchange X25519 (a ClientHello without an X25519 key share
- *   but listing it gets a HelloRetryRequest), signatures ecdsa_secp256r1_sha256, cipher suite
- *   TLS_CHACHA20_POLY1305_SHA256 for the server's choice. A client that does not offer all three
- *   is refused with handshake_failure.
+ *   but listing it gets a HelloRetryRequest), signatures ecdsa_secp256r1_sha256, and cipher suite
+ *   TLS_AES_128_GCM_SHA256 where AES runs on this CPU's instructions (hw_aes128gcm_hw) and the
+ *   client offers it without listing ChaCha20 first, TLS_CHACHA20_POLY1305_SHA256 otherwise. A
+ *   client that does not offer X25519, the signature and a suite the server may choose is refused
+ *   with handshake_failure. The client offers AES-128-GCM, first, only where hw_aes128gcm_hw
+ *   says so, and ChaCha20-Poly1305 always.
  * - No PSK, no resumption tickets, no 0-RTT (early data is never accepted), no client
  *   certificates, no post-handshake messages other than an ignored NewSessionTicket on the
  *   client side and KeyUpdate, which QUIC forbids (unexpected_message).
@@ -41,7 +44,7 @@ typedef enum {
 
 #define HW_TLS_KEY_PINS_MAX 4 // key pins a client may hold at once (the key in use and its successors)
 
-#define HW_TLS_CIPHER_AES128GCM 0x1301 // only ever the Initial level's, which TLS does not choose
+#define HW_TLS_CIPHER_AES128GCM 0x1301 // the Initial level's always; chosen only on AES instructions
 #define HW_TLS_CIPHER_CHACHA20  0x1303
 
 // TLS alerts the module raises (QUIC sends them as CRYPTO_ERROR 0x100 + alert).
@@ -129,5 +132,10 @@ uint8_t hw_tls_alert(const hw_tls *t);
 const char *hw_tls_alpn(const hw_tls *t);
 const uint8_t *hw_tls_peer_transport_params(const hw_tls *t, size_t *len);
 const char *hw_tls_server_name(const hw_tls *t);
+
+// After the ServerHello: the cipher suite of the Handshake and 1-RTT keys
+// (HW_TLS_CIPHER_AES128GCM or HW_TLS_CIPHER_CHACHA20), the one the secret callback is given.
+// 0 before it is chosen.
+uint16_t hw_tls_cipher(const hw_tls *t);
 
 #endif

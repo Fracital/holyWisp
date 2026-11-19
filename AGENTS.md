@@ -108,8 +108,9 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   themselves: `src/compat/win32/` supplies them over Winsock under their POSIX names (headers in
   `include/`, all of the code in `posix.c`), so no other file knows it is not on POSIX. The one
   platform `#if` in the tree is the pair of `send` flags in `sys.h` (the architecture `#if`s are
-  `__x86_64__` around the AVX2 unmask in `ws.c` and around the AVX2 ChaCha20 and Poly1305 kernels
-  in `aead.c`, which are about the CPU, not the OS; see "The unmask"). Do not add another, do not
+  `__x86_64__` around the AVX2 unmask in `ws.c` and around the AVX2 ChaCha20 and Poly1305 and
+  the AES-NI AES-128-GCM kernels in `aead.c`, which are about the CPU, not the OS; see "The
+  unmask"). Do not add another, do not
   write `_WIN32` or a Winsock call outside the three Windows files, and do not call a
   kernel-specific function (`accept4`, `splice`, `pipe2`, `crypt_r`, `forkpty`, `MSG_NOSIGNAL`,
   ...) outside the platform files: add it to `sys.h`, implement it three times, and test the

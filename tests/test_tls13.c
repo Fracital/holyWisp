@@ -6,12 +6,14 @@
  * whose handshake the test finishes itself from its own key schedule, and truncated and mutated
  * ClientHellos and server flights from a fixed seed, which must only ever be refused.
  */
+#include "holywisp/aead.h"
 #include "holywisp/cert.h"
 #include "holywisp/ecc.h"
 #include "holywisp/hw.h"
 #include "holywisp/sha256.h"
 #include "holywisp/tls13.h"
 
+#include "common/aead_internal.h"
 #include "quic/tls13_internal.h"
 #include "test.h"
 
@@ -195,7 +197,8 @@ static int secret_cb(void *ud, hw_tls_level level, int write, uint16_t cipher, c
 	side *s = ud;
 	CHECK(level == HW_TLS_HANDSHAKE || level == HW_TLS_APP, "secret at level %d", (int)level);
 	CHECK(write == 0 || write == 1, "write %d", write);
-	CHECK_EQ(cipher, HW_TLS_CIPHER_CHACHA20);
+	CHECK(cipher == HW_TLS_CIPHER_CHACHA20 || cipher == HW_TLS_CIPHER_AES128GCM, "cipher %#x", (unsigned)cipher);
+	CHECK_EQ(cipher, hw_tls_cipher(s->t));
 	CHECK(!s->have[level][write], "secret %d/%d installed twice", (int)level, write);
 	memcpy(s->sec[level][write], secret, 32);
 	s->have[level][write] = 1;
@@ -620,6 +623,8 @@ enum {
 	F_COMP_ONE = 1 << 26,        // {1}
 	F_COMP_EMPTY = 1 << 27,      // {}
 	F_ECH_ALT = 1 << 28,         // the ECH payload sealed anew, as a real ECH client does on a retry
+	F_CHACHA_FIRST = 1u << 29,   // ChaCha20 listed first, as BoringSSL does without AES instructions
+	F_NO_AES = 1u << 30,         // TLS_AES_128_GCM_SHA256 not offered
 };
 
 static unsigned grease(void) {
@@ -648,9 +653,10 @@ static size_t chrome_hello(uint8_t *out, unsigned flags, const uint8_t x25519_pu
 	b_close(&b);
 	b_open(&b, 2);
 	b_u16(&b, grease());
-	b_u16(&b, 0x1301);
+	if (flags & F_CHACHA_FIRST) b_u16(&b, 0x1303);
+	if (!(flags & F_NO_AES)) b_u16(&b, 0x1301);
 	if (!(flags & F_SUITES_ALT)) b_u16(&b, 0x1302);
-	if (!(flags & F_NO_CHACHA)) b_u16(&b, 0x1303);
+	if (!(flags & (F_NO_CHACHA | F_CHACHA_FIRST))) b_u16(&b, 0x1303);
 	b_close(&b);
 	if (flags & F_COMP_EMPTY) {
 		b_u8(&b, 0);
@@ -840,7 +846,8 @@ static void chrome_complete(side *s, const uint8_t *transcript_head, size_t head
 	CHECK(ks && n == 36 && ks[0] == 0 && ks[1] == 0x1d && ks[2] == 0 && ks[3] == 32, "server share x25519");
 	const uint8_t *sv = sh_ext(sh, sh_len, 43, &n);
 	CHECK(sv && n == 2 && sv[0] == 3 && sv[1] == 4, "TLS 1.3 selected");
-	CHECK(sh[4 + 2 + 32 + 1 + sh[4 + 2 + 32]] == 0x13 && sh[4 + 2 + 32 + 2 + sh[4 + 2 + 32]] == 0x03, "chacha20");
+	size_t suite = 4 + 2 + 32 + 1 + sh[4 + 2 + 32];
+	CHECK_EQ((unsigned)(sh[suite] << 8 | sh[suite + 1]), (unsigned)hw_tls_cipher(s->t));
 	CHECK(sh_ext(sh, sh_len, 41, &n) == NULL, "no PSK selected");
 
 	uint8_t ecdhe[32], th[32], hs[32], c_hs[32], s_hs[32];
@@ -918,6 +925,8 @@ static void test_chrome_hello(void) {
 		side s;
 		server_init(&s, H3, 1);
 		feed_server(&s, g_hello, n, 0, 0);
+		// Chrome lists AES-128-GCM first: taken where this CPU has AES instructions.
+		CHECK_EQ(hw_tls_cipher(s.t), hw_aes128gcm_hw() ? HW_TLS_CIPHER_AES128GCM : HW_TLS_CIPHER_CHACHA20);
 		// legacy_session_id is echoed, whatever it is.
 		size_t sid = g_hello[4 + 2 + 32];
 		CHECK(s.q[0][4 + 2 + 32] == sid && memcmp(s.q[0] + 4 + 2 + 32 + 1, g_hello + 4 + 2 + 32 + 1, sid) == 0,
@@ -950,10 +959,17 @@ static size_t retry_feed(side *s, const uint8_t *first, size_t n1, const uint8_t
 		memcpy(head + 36 + hrr_len, second, n2);
 		*head_len = 36 + hrr_len + n2;
 	}
+	size_t suite = 4 + 2 + 32 + 1 + s->q[0][4 + 2 + 32];
+	unsigned hrr_suite = (unsigned)(s->q[0][suite] << 8 | s->q[0][suite + 1]);
+	CHECK_EQ(hrr_suite, (unsigned)hw_tls_cipher(s->t));
 	free(s->q[0]);
 	s->q[0] = NULL;
 	s->qn[0] = 0;
 	feed_server(s, second, n2, want_rc, want_alert);
+	if (want_rc == 0) {
+		CHECK(s->q[0] != NULL && s->qn[0] > suite + 1, "ServerHello");
+		CHECK_EQ((unsigned)(s->q[0][suite] << 8 | s->q[0][suite + 1]), hrr_suite);
+	}
 	return hrr_len;
 }
 
@@ -1032,7 +1048,7 @@ static void test_server_refusals(void) {
 		unsigned flags;
 		uint8_t alert;
 	} cases[] = {
-	    {F_NO_CHACHA, HW_TLS_ALERT_HANDSHAKE_FAILURE},
+	    {F_NO_CHACHA | F_NO_AES, HW_TLS_ALERT_HANDSHAKE_FAILURE},
 	    {F_NO_X25519, HW_TLS_ALERT_HANDSHAKE_FAILURE},
 	    {F_NO_ECDSA, HW_TLS_ALERT_HANDSHAKE_FAILURE},
 	    {F_NO_ALPN, HW_TLS_ALERT_NO_APP_PROTOCOL},
@@ -1288,6 +1304,84 @@ static void test_client_refusals(void) {
 	CHECK(hw_tls_done(c.t), "done without a pin");
 	side_clear(&c);
 	side_clear(&s);
+}
+
+static void tamper_sh_suite_aes(side *s) {
+	size_t suite = 4 + 2 + 32 + 1 + s->q[0][4 + 2 + 32];
+	CHECK(s->q[0][suite] == 0x13 && s->q[0][suite + 1] == 0x03, "ChaCha20 chosen");
+	s->q[0][suite + 1] = 0x01;
+}
+
+// The suite of the secret keys: AES-128-GCM where this CPU runs it on AES instructions and the
+// client offers it without putting ChaCha20 first, ChaCha20-Poly1305 otherwise, and never AES in
+// software; both ends of a handshake agree, and a client that did not offer AES refuses it.
+// Run as the CPU chooses and again on the base kernels, where AES is the bitsliced code.
+static void cipher_choice(void) {
+	int hw = hw_aes128gcm_hw();
+	uint16_t pref = hw ? HW_TLS_CIPHER_AES128GCM : HW_TLS_CIPHER_CHACHA20;
+	side c, s;
+	server_init(&s, H3, 1);
+	client_init(&c, H3, 1, "wt.example", g_pin);
+	CHECK_EQ(hw_tls_cipher(c.t), 0);
+	CHECK_EQ(hw_tls_start(c.t), 0);
+	CHECK_EQ(pump(&c, &s, 0), 0);
+	check_negotiated(&c, &s, "h3", "wt.example");
+	CHECK_EQ(hw_tls_cipher(s.t), pref);
+	CHECK_EQ(hw_tls_cipher(c.t), pref);
+	side_clear(&c);
+	side_clear(&s);
+
+	uint8_t priv[32], pub[32];
+	CHECK(hw_x25519_keygen(priv, pub) == 0, "x25519 keygen");
+	static const struct {
+		unsigned flags;
+		int aes_on_hw; // the server takes AES-128-GCM when it has AES instructions
+	} cases[] = {
+	    {0, 1},
+	    {F_CHACHA_FIRST, 0},
+	    {F_NO_AES, 0},
+	    {F_NO_CHACHA, 1},
+	};
+	for (size_t i = 0; i < HW_ARRAY_LEN(cases); i++) {
+		size_t n = chrome_hello(g_hello, cases[i].flags, pub, 0x5eed);
+		server_init(&s, H3, 1);
+		if (!hw && (cases[i].flags & F_NO_CHACHA)) {
+			feed_server(&s, g_hello, n, -1, HW_TLS_ALERT_HANDSHAKE_FAILURE);
+		} else {
+			feed_server(&s, g_hello, n, 0, 0);
+			CHECK_EQ(hw_tls_cipher(s.t), hw && cases[i].aes_on_hw ? HW_TLS_CIPHER_AES128GCM : HW_TLS_CIPHER_CHACHA20);
+			chrome_complete(&s, g_hello, n, priv);
+		}
+		side_clear(&s);
+	}
+
+	// A HelloRetryRequest names the suite the ServerHello then takes (retry_feed checks both).
+	static uint8_t ch1[8192], ch2[8192], head[8192 * 2];
+	size_t n1 = chrome_hello(ch1, F_NO_X25519_SHARE, pub, 91);
+	size_t n2 = chrome_hello(ch2, F_RETRY, pub, 91);
+	size_t head_len;
+	retry_feed(&s, ch1, n1, ch2, n2, 0, 0, head, &head_len);
+	CHECK_EQ(hw_tls_cipher(s.t), pref);
+	chrome_complete(&s, head, head_len, priv);
+	side_clear(&s);
+
+	if (!hw) {
+		// The client offered ChaCha20 alone: a ServerHello naming AES is refused.
+		CHECK_EQ(client_flight(&c, &s, g_pin, tamper_sh_suite_aes), -1);
+		CHECK_EQ(hw_tls_alert(c.t), HW_TLS_ALERT_ILLEGAL_PARAMETER);
+		CHECK(!c.have[HW_TLS_HANDSHAKE][0], "no keys from a refused ServerHello");
+		side_clear(&c);
+		side_clear(&s);
+	}
+}
+
+static void test_cipher_choice(void) {
+	printf("# %s\n", hw_aes128gcm_hw() ? "AES instructions: AES-128-GCM preferred" : "no AES instructions here");
+	cipher_choice();
+	int other = hw_aead_force_base_kernels(1);
+	CHECK_EQ(hw_aes128gcm_hw(), 0);
+	cipher_choice();
+	CHECK_EQ(hw_aead_force_base_kernels(0), other);
 }
 
 // The server holds the client's Finished to the transcript too.
@@ -1782,6 +1876,7 @@ int main(void) {
 	RUN(test_alpn_mismatch);
 	RUN(test_client_refusals);
 	RUN(test_key_pins);
+	RUN(test_cipher_choice);
 	RUN(test_tampered_client_finished);
 	RUN(test_post_handshake);
 	RUN(test_callback_failure);

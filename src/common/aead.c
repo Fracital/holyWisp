@@ -8,7 +8,9 @@
  * whose operands have holes between their bits, so that carries never reach a bit that is kept.
  * ChaCha20 runs four or eight blocks at once in the compiler's generic vectors, one block per
  * lane, and Poly1305 four blocks at once over 26-bit limbs, so that every product is a 32x32->64
- * multiply on any target. On x86-64 both kernels are also built for AVX2 and picked at run time.
+ * multiply on any target. On x86-64 both kernels are also built for AVX2 and picked at run time,
+ * and AES-128-GCM for AES-NI and PCLMULQDQ: the same blocks and the same GHASH, on the CPU's
+ * instructions, which are constant-time too.
  */
 #include "holywisp/aead.h"
 
@@ -75,6 +77,20 @@ static void *(*const volatile WIPE_FN)(void *, int, size_t) = memset;
 static void wipe(void *p, size_t n) {
 	WIPE_FN(p, 0, n);
 }
+
+// AES-128 and GCM on the CPU's instructions where it has them (x86-64's AES-NI and PCLMULQDQ),
+// defined with the vector kernels below. aes_hw_cpu: the CPU has them; aes_hw: they are to be
+// used (not when a test forces the base kernels). gcm_hw_init fills the table's hardware part,
+// which the CPU decides alone, so that a table made while the base kernels were forced still
+// works once they are not.
+static int aes_hw_cpu(void);
+static int aes_hw(void);
+static void aes_hw_encrypt(const hw_aes128 *k, const uint8_t in[16], uint8_t out[16]);
+static void gcm_hw_init(hw_aes128gcm *g);
+static void gcm_hw_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                        const uint8_t *in, size_t len, uint8_t *out);
+static int gcm_hw_open(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                       const uint8_t *in, size_t len, uint8_t *out);
 
 // ---- AES-128, bitsliced -------------------------------------------------------------------
 // Up to four blocks in q[0..7]: bit i of byte p of block b is bit 16 * b + p of q[i]. A byte's
@@ -250,6 +266,10 @@ void hw_aes128_init(hw_aes128 *k, const uint8_t key[16]) {
 }
 
 void hw_aes128_encrypt(const hw_aes128 *k, const uint8_t in[16], uint8_t out[16]) {
+	if (aes_hw()) {
+		aes_hw_encrypt(k, in, out);
+		return;
+	}
 	aes_bs_keys bk;
 	aes_bs_expand(k, &bk);
 	uint64_t q[8] = {0};
@@ -260,7 +280,9 @@ void hw_aes128_encrypt(const hw_aes128 *k, const uint8_t in[16], uint8_t out[16]
 
 // ---- GCM ----------------------------------------------------------------------------------
 // htable[0] and htable[1] hold H as two big-endian halves, htable[2] their XOR (Karatsuba's
-// middle operand); the rest is zero. There is no table: the multiply below is constant-time.
+// middle operand). There is no table: the multiply below is constant-time. Where the CPU has
+// AES-NI, htable[4..19] hold H^1 to H^8 for its kernel (GCM_HW_POWERS); the rest is zero.
+#define GCM_HW_POWERS 4
 
 // The carry-less product of two 32-bit words. Each operand is split into four with three-bit
 // holes, so a column of any partial product sums at most eight bits and its carries stay in the
@@ -328,6 +350,7 @@ void hw_aes128gcm_init(hw_aes128gcm *g, const uint8_t key[16]) {
 	g->htable[0] = be64(h);
 	g->htable[1] = be64(h + 8);
 	g->htable[2] = g->htable[0] ^ g->htable[1];
+	if (aes_hw_cpu()) gcm_hw_init(g);
 }
 
 // CTR from J0 = nonce || 1: the first keystream block (E(J0), which masks the tag) goes to
@@ -378,6 +401,10 @@ static void gcm_tag(const hw_aes128gcm *g, const uint8_t *aad, size_t aad_len, c
 
 void hw_aes128gcm_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
                        const uint8_t *in, size_t len, uint8_t *out) {
+	if (aes_hw()) {
+		gcm_hw_seal(g, nonce, aad, aad_len, in, len, out);
+		return;
+	}
 	uint8_t mask[16];
 	gcm_ctr(g, nonce, in, len, out, mask);
 	gcm_tag(g, aad, aad_len, out, len, mask, out + len);
@@ -386,6 +413,7 @@ void hw_aes128gcm_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE]
 int hw_aes128gcm_open(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
                       const uint8_t *in, size_t len, uint8_t *out) {
 	if (len < HW_AEAD_TAG) return -1;
+	if (aes_hw()) return gcm_hw_open(g, nonce, aad, aad_len, in, len - HW_AEAD_TAG, out);
 	len -= HW_AEAD_TAG;
 	uint8_t want[16], mask[16];
 	memcpy(want, in + len, 16); // in place, out may be in; the tag is past what is decrypted
@@ -713,9 +741,223 @@ static void poly_v4(poly1305 *p, const uint8_t *m, size_t n) {
 	}
 }
 
+// ---- AES-128-GCM on AES-NI and PCLMULQDQ
+// The blocks are FIPS 197's bytes in an XMM register, the round keys hw_aes128's words with each
+// one's bytes reversed (rk[] holds them as big-endian words). GHASH works on byte-reversed
+// blocks, where the reflected field element is an ordinary 128-bit carry-less product shifted
+// left by one; the product of eight blocks with H^8 down to H^1 is summed before it is reduced
+// once (Gueron and Kounavis, Intel's "Carry-Less Multiplication and Its Usage for Computing the
+// GCM Mode", 2014), which is linear and so the same as reducing each.
+#include <immintrin.h>
+
+#define AESNI_FN     __attribute__((target("aes,pclmul,ssse3,sse4.1"))) static
+#define AESNI_INLINE __attribute__((target("aes,pclmul,ssse3,sse4.1"), always_inline)) static inline
+#define GCM_HW_WIDE  8 // blocks per step: AES-NI's latency is hidden by eight independent blocks
+
+AESNI_INLINE __m128i xmm_load(const uint8_t *p) {
+	return _mm_loadu_si128((const __m128i *)p);
+}
+
+AESNI_INLINE void xmm_store(uint8_t *p, __m128i x) {
+	_mm_storeu_si128((__m128i *)p, x);
+}
+
+AESNI_INLINE __m128i xmm_bswap(__m128i x) {
+	return _mm_shuffle_epi8(x, _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15));
+}
+
+AESNI_INLINE void aesni_keys(const hw_aes128 *k, __m128i rk[11]) {
+	const __m128i words = _mm_set_epi8(12, 13, 14, 15, 8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3);
+	for (int r = 0; r < 11; r++) {
+		rk[r] = _mm_shuffle_epi8(_mm_loadu_si128((const __m128i *)(k->rk + 4 * r)), words);
+	}
+}
+
+AESNI_INLINE __m128i aesni_block(const __m128i rk[11], __m128i x) {
+	x = _mm_xor_si128(x, rk[0]);
+	for (int r = 1; r < 10; r++) x = _mm_aesenc_si128(x, rk[r]);
+	return _mm_aesenclast_si128(x, rk[10]);
+}
+
+// The counter block nonce || n, from j (the nonce with a zero counter).
+AESNI_INLINE __m128i gcm_counter(__m128i j, uint32_t n) {
+	return _mm_insert_epi32(j, (int)__builtin_bswap32(n), 3);
+}
+
+// A carry-less product before its reduction: the low, middle and high 128 bits of 256.
+typedef struct {
+	__m128i lo, mid, hi;
+} clmul_sum;
+
+AESNI_INLINE void clmul_add(clmul_sum *a, __m128i x, __m128i h) {
+	a->lo = _mm_xor_si128(a->lo, _mm_clmulepi64_si128(x, h, 0x00));
+	a->hi = _mm_xor_si128(a->hi, _mm_clmulepi64_si128(x, h, 0x11));
+	a->mid = _mm_xor_si128(a->mid, _mm_xor_si128(_mm_clmulepi64_si128(x, h, 0x10), _mm_clmulepi64_si128(x, h, 0x01)));
+}
+
+// The 256-bit sum shifted left by one (the reflection), then folded by x^128 = x^7 + x^2 + x + 1.
+AESNI_INLINE __m128i clmul_reduce(const clmul_sum *a) {
+	__m128i lo = _mm_xor_si128(a->lo, _mm_slli_si128(a->mid, 8));
+	__m128i hi = _mm_xor_si128(a->hi, _mm_srli_si128(a->mid, 8));
+	__m128i lo_c = _mm_srli_epi32(lo, 31), hi_c = _mm_srli_epi32(hi, 31);
+	lo = _mm_slli_epi32(lo, 1);
+	hi = _mm_slli_epi32(hi, 1);
+	hi = _mm_or_si128(hi, _mm_srli_si128(lo_c, 12));
+	hi = _mm_or_si128(hi, _mm_slli_si128(hi_c, 4));
+	lo = _mm_or_si128(lo, _mm_slli_si128(lo_c, 4));
+	__m128i f = _mm_xor_si128(_mm_xor_si128(_mm_slli_epi32(lo, 31), _mm_slli_epi32(lo, 30)), _mm_slli_epi32(lo, 25));
+	__m128i f_hi = _mm_srli_si128(f, 4);
+	lo = _mm_xor_si128(lo, _mm_slli_si128(f, 12));
+	__m128i g = _mm_xor_si128(_mm_xor_si128(_mm_srli_epi32(lo, 1), _mm_srli_epi32(lo, 2)), _mm_srli_epi32(lo, 7));
+	g = _mm_xor_si128(g, f_hi);
+	return _mm_xor_si128(hi, _mm_xor_si128(lo, g));
+}
+
+AESNI_INLINE __m128i gf_mul(__m128i x, __m128i h) {
+	clmul_sum a = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128()};
+	clmul_add(&a, x, h);
+	return clmul_reduce(&a);
+}
+
+// y absorbs len bytes, the last block padded with zeros; hp[i] is H^(i + 1).
+AESNI_INLINE __m128i ghash_hw(__m128i y, const __m128i hp[GCM_HW_WIDE], const uint8_t *p, size_t len) {
+	for (; len >= 16 * GCM_HW_WIDE; p += 16 * GCM_HW_WIDE, len -= 16 * GCM_HW_WIDE) {
+		clmul_sum a = {_mm_setzero_si128(), _mm_setzero_si128(), _mm_setzero_si128()};
+		clmul_add(&a, _mm_xor_si128(y, xmm_bswap(xmm_load(p))), hp[GCM_HW_WIDE - 1]);
+		for (int i = 1; i < GCM_HW_WIDE; i++) clmul_add(&a, xmm_bswap(xmm_load(p + 16 * i)), hp[GCM_HW_WIDE - 1 - i]);
+		y = clmul_reduce(&a);
+	}
+	for (; len >= 16; p += 16, len -= 16) y = gf_mul(_mm_xor_si128(y, xmm_bswap(xmm_load(p))), hp[0]);
+	if (len) {
+		uint8_t b[16] = {0};
+		memcpy(b, p, len);
+		y = gf_mul(_mm_xor_si128(y, xmm_bswap(xmm_load(b))), hp[0]);
+	}
+	return y;
+}
+
+AESNI_INLINE void gcm_hw_powers(const hw_aes128gcm *g, __m128i hp[GCM_HW_WIDE]) {
+	for (int i = 0; i < GCM_HW_WIDE; i++) {
+		hp[i] = _mm_loadu_si128((const __m128i *)(g->htable + GCM_HW_POWERS + 2 * i));
+	}
+}
+
+// The tag before E(J0) masks it: GHASH of aad, ct and their lengths in bits, bytes in GCM's order.
+AESNI_INLINE __m128i gcm_hw_hash(const __m128i hp[GCM_HW_WIDE], const uint8_t *aad, size_t aad_len, const uint8_t *ct,
+                                 size_t len) {
+	__m128i y = ghash_hw(_mm_setzero_si128(), hp, aad, aad_len);
+	y = ghash_hw(y, hp, ct, len);
+	uint64_t aad_bits = (uint64_t)aad_len * 8, ct_bits = (uint64_t)len * 8;
+	y = _mm_xor_si128(y, _mm_set_epi64x((long long)aad_bits, (long long)ct_bits));
+	return xmm_bswap(gf_mul(y, hp[0]));
+}
+
+// CTR from nonce || 2 over len bytes, eight blocks at a time; out may equal in.
+AESNI_INLINE void gcm_hw_ctr(const __m128i rk[11], __m128i j, const uint8_t *in, size_t len, uint8_t *out) {
+	uint32_t n = 2;
+	for (; len >= 16 * GCM_HW_WIDE; in += 16 * GCM_HW_WIDE, out += 16 * GCM_HW_WIDE, len -= 16 * GCM_HW_WIDE) {
+		__m128i b[GCM_HW_WIDE];
+		for (int i = 0; i < GCM_HW_WIDE; i++) b[i] = _mm_xor_si128(gcm_counter(j, n + (uint32_t)i), rk[0]);
+		for (int r = 1; r < 10; r++) {
+			for (int i = 0; i < GCM_HW_WIDE; i++) b[i] = _mm_aesenc_si128(b[i], rk[r]);
+		}
+		for (int i = 0; i < GCM_HW_WIDE; i++) {
+			b[i] = _mm_aesenclast_si128(b[i], rk[10]);
+			xmm_store(out + 16 * i, _mm_xor_si128(xmm_load(in + 16 * i), b[i]));
+		}
+		n += GCM_HW_WIDE;
+	}
+	for (; len >= 16; in += 16, out += 16, len -= 16) {
+		xmm_store(out, _mm_xor_si128(xmm_load(in), aesni_block(rk, gcm_counter(j, n++))));
+	}
+	if (len) {
+		uint8_t ks[16];
+		xmm_store(ks, aesni_block(rk, gcm_counter(j, n)));
+		for (size_t i = 0; i < len; i++) out[i] = in[i] ^ ks[i];
+		wipe(ks, sizeof ks);
+	}
+}
+
+AESNI_INLINE __m128i gcm_hw_nonce(const uint8_t nonce[HW_AEAD_NONCE]) {
+	uint8_t b[16] = {0};
+	memcpy(b, nonce, HW_AEAD_NONCE);
+	return xmm_load(b);
+}
+
+AESNI_FN void aes_hw_encrypt(const hw_aes128 *k, const uint8_t in[16], uint8_t out[16]) {
+	__m128i rk[11];
+	aesni_keys(k, rk);
+	xmm_store(out, aesni_block(rk, xmm_load(in)));
+}
+
+AESNI_FN void gcm_hw_init(hw_aes128gcm *g) {
+	__m128i rk[11];
+	aesni_keys(&g->aes, rk);
+	__m128i h = xmm_bswap(aesni_block(rk, _mm_setzero_si128())), p = h;
+	for (int i = 0; i < GCM_HW_WIDE; i++) {
+		_mm_storeu_si128((__m128i *)(g->htable + GCM_HW_POWERS + 2 * i), p);
+		p = gf_mul(p, h);
+	}
+}
+
+AESNI_FN void gcm_hw_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                          const uint8_t *in, size_t len, uint8_t *out) {
+	__m128i rk[11], hp[GCM_HW_WIDE];
+	aesni_keys(&g->aes, rk);
+	gcm_hw_powers(g, hp);
+	__m128i j = gcm_hw_nonce(nonce);
+	gcm_hw_ctr(rk, j, in, len, out);
+	__m128i tag = _mm_xor_si128(gcm_hw_hash(hp, aad, aad_len, out, len), aesni_block(rk, gcm_counter(j, 1)));
+	xmm_store(out + len, tag);
+}
+
+// len excludes the tag, which follows the ciphertext in in. Nothing is decrypted unless the tag
+// verifies.
+AESNI_FN int gcm_hw_open(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                         const uint8_t *in, size_t len, uint8_t *out) {
+	__m128i rk[11], hp[GCM_HW_WIDE];
+	aesni_keys(&g->aes, rk);
+	gcm_hw_powers(g, hp);
+	__m128i j = gcm_hw_nonce(nonce);
+	uint8_t tag[16];
+	xmm_store(tag, _mm_xor_si128(gcm_hw_hash(hp, aad, aad_len, in, len), aesni_block(rk, gcm_counter(j, 1))));
+	if (!hw_ct_equal(tag, in + len, 16)) {
+		if (len) memset(out, 0, len);
+		return -1;
+	}
+	gcm_hw_ctr(rk, j, in, len, out);
+	return 0;
+}
+
+// AES-NI, PCLMULQDQ and the SSSE3 and SSE4.1 the kernel's shuffles and inserts are: XMM state is
+// x86-64's baseline, which every OS saves.
+static int cpu_has_aesni(void) {
+	unsigned a, b, c, d;
+	if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
+	return (c & bit_AES) && (c & bit_PCLMUL) && (c & bit_SSSE3) && (c & bit_SSE4_1);
+}
+
+// -1 until the first look; g_aes_hw_off is set while a test forces the base kernels.
+static _Atomic int g_aes_hw_cpu = -1;
+static _Atomic int g_aes_hw_off = 0;
+
+static int aes_hw_cpu(void) {
+	int has = atomic_load_explicit(&g_aes_hw_cpu, memory_order_relaxed);
+	if (has < 0) {
+		has = cpu_has_aesni();
+		atomic_store_explicit(&g_aes_hw_cpu, has, memory_order_relaxed);
+	}
+	return has;
+}
+
+static int aes_hw(void) {
+	return !atomic_load_explicit(&g_aes_hw_off, memory_order_relaxed) && aes_hw_cpu();
+}
+
 int hw_aead_force_base_kernels(int on) {
 	atomic_store_explicit(&g_aead_avx2, on ? 0 : -1, memory_order_relaxed);
-	return cpu_has_avx2();
+	atomic_store_explicit(&g_aes_hw_off, on ? 1 : 0, memory_order_relaxed);
+	return cpu_has_avx2() || cpu_has_aesni();
 }
 #else
 static void chacha_v8(const uint32_t st[16], const uint8_t *in, uint8_t *out) {
@@ -726,11 +968,38 @@ static void poly_v4(poly1305 *p, const uint8_t *m, size_t n) {
 	poly_v4_base(p, m, n);
 }
 
+static int aes_hw_cpu(void) {
+	return 0;
+}
+
+static int aes_hw(void) {
+	return 0;
+}
+
+static void aes_hw_encrypt(const hw_aes128 *k, const uint8_t in[16], uint8_t out[16]) {
+}
+
+static void gcm_hw_init(hw_aes128gcm *g) {
+}
+
+static void gcm_hw_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                        const uint8_t *in, size_t len, uint8_t *out) {
+}
+
+static int gcm_hw_open(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
+                       const uint8_t *in, size_t len, uint8_t *out) {
+	return -1;
+}
+
 int hw_aead_force_base_kernels(int on) {
 	(void)on;
 	return 0;
 }
 #endif
+
+int hw_aes128gcm_hw(void) {
+	return aes_hw();
+}
 
 // ---- ChaCha20 -----------------------------------------------------------------------------
 // The keystream from st's counter XORed into len bytes; st's counter is advanced past it.

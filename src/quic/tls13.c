@@ -11,6 +11,7 @@
  */
 #include "holywisp/tls13.h"
 
+#include "holywisp/aead.h"
 #include "holywisp/ecc.h"
 #include "holywisp/hw.h"
 #include "holywisp/sha256.h"
@@ -97,10 +98,12 @@ struct hw_tls {
 	int has_pin;
 	uint8_t key_pins[HW_TLS_KEY_PINS_MAX][TLS_HASH];
 	size_t key_pin_count;
-	int omit_share; // tests: the first ClientHello carries no key share
+	int omit_share;  // tests: the first ClientHello carries no key share
+	int offered_aes; // client: the first ClientHello offered AES-128-GCM (a second repeats it)
 	// What was negotiated or learnt from the peer.
 	char alpn_sel[256];
 	int has_alpn;
+	uint16_t cipher; // the suite of the Handshake and 1-RTT keys, from the (first) ServerHello
 	uint8_t *peer_tp;
 	size_t peer_tp_len;
 	char *server_name; // the client's configured SNI, or the one the server received
@@ -375,7 +378,7 @@ static int tls_send(hw_tls *t, hw_tls_level level, const tbuf *msg) {
 
 static int tls_install(hw_tls *t, hw_tls_level level, int write, const uint8_t secret[TLS_HASH]) {
 	if (!t->cb.secret) return 0;
-	if (t->cb.secret(t->cb.ud, level, write, HW_TLS_CIPHER_CHACHA20, secret) != 0) {
+	if (t->cb.secret(t->cb.ud, level, write, t->cipher, secret) != 0) {
 		return tls_fail(t, HW_TLS_ALERT_INTERNAL_ERROR);
 	}
 	return 0;
@@ -440,7 +443,9 @@ static void msg_open(tbuf *b, unsigned type) {
 typedef struct {
 	rd session_id;
 	int chacha;
-	int bad_comp; // legacy_compression_methods other than one null method: refused once it is TLS 1.3
+	int aes;          // TLS_AES_128_GCM_SHA256 offered
+	int chacha_first; // and ChaCha20 before it: the client has no AES instructions of its own
+	int bad_comp;     // legacy_compression_methods other than one null method: refused once it is TLS 1.3
 	int has_versions;
 	int tls13;
 	int has_groups;
@@ -575,7 +580,11 @@ static uint8_t ch_parse(const uint8_t *p, size_t len, client_hello *ch) {
 	if (rd_u16(&r, &x) || rd_take(&r, 32, &v)) return HW_TLS_ALERT_DECODE_ERROR; // legacy_version, random
 	if (rd_vec(&r, 1, &ch->session_id) || ch->session_id.n > 32) return HW_TLS_ALERT_DECODE_ERROR;
 	if (rd_vec(&r, 2, &cs) || cs.n < 2 || cs.n % 2) return HW_TLS_ALERT_DECODE_ERROR;
-	while (!rd_u16(&cs, &x)) ch->chacha |= x == HW_TLS_CIPHER_CHACHA20;
+	while (!rd_u16(&cs, &x)) {
+		if (x == HW_TLS_CIPHER_AES128GCM) ch->aes = 1;
+		if (x == HW_TLS_CIPHER_CHACHA20 && !ch->aes) ch->chacha_first = 1;
+		ch->chacha |= x == HW_TLS_CIPHER_CHACHA20;
+	}
 	if (rd_vec(&r, 1, &comp) || comp.n == 0) return HW_TLS_ALERT_DECODE_ERROR;
 	ch->bad_comp = comp.n != 1 || comp.p[0] != 0;
 	if (r.n == 0) return 0; // no extensions: a TLS 1.2 hello, refused for its version
@@ -612,7 +621,7 @@ static void server_hello_build(hw_tls *t, const client_hello *ch, int hrr, tbuf 
 	size_t at = tbuf_open(b, 1);
 	tbuf_put(b, ch->session_id.p, ch->session_id.n);
 	tbuf_close(b, at, 1);
-	tbuf_u16(b, HW_TLS_CIPHER_CHACHA20);
+	tbuf_u16(b, t->cipher);
 	tbuf_u8(b, 0);
 	size_t exts = tbuf_open(b, 2);
 	tbuf_u16(b, EXT_SUPPORTED_VERSIONS);
@@ -730,7 +739,19 @@ static int server_on_client_hello(hw_tls *t, const uint8_t *msg, size_t len) {
 	}
 	if (!ch.tls13) return tls_fail(t, HW_TLS_ALERT_PROTOCOL_VERSION);
 	if (ch.bad_comp) return tls_fail(t, HW_TLS_ALERT_ILLEGAL_PARAMETER);
-	if (!ch.chacha) return tls_fail(t, HW_TLS_ALERT_HANDSHAKE_FAILURE);
+	// AES-128-GCM where this CPU runs it on its own instructions and the client offers it, unless
+	// the client lists ChaCha20 first (BoringSSL and NSS do on a CPU without AES instructions, and
+	// the cost is the client's too); ChaCha20-Poly1305 otherwise. Never AES in software for secret
+	// keys. A second hello repeats the suites of the first, so the HelloRetryRequest's choice holds.
+	if (t->state != ST_SERVER_WAIT_CH2) {
+		if (ch.aes && (!ch.chacha || !ch.chacha_first) && hw_aes128gcm_hw()) {
+			t->cipher = HW_TLS_CIPHER_AES128GCM;
+		} else if (ch.chacha) {
+			t->cipher = HW_TLS_CIPHER_CHACHA20;
+		} else {
+			return tls_fail(t, HW_TLS_ALERT_HANDSHAKE_FAILURE);
+		}
+	}
 	if (!ch.has_sigalgs || !ch.has_groups || !ch.has_shares) return tls_fail(t, HW_TLS_ALERT_MISSING_EXTENSION);
 	// A share for a group the client does not list (RFC 8446 section 4.2.8).
 	if (ch.x25519_share && !ch.x25519_listed) return tls_fail(t, HW_TLS_ALERT_ILLEGAL_PARAMETER);
@@ -828,7 +849,16 @@ static int client_send_hello(hw_tls *t) {
 	tbuf_u16(&b, LEGACY_VERSION);
 	tbuf_put(&b, t->random, 32);
 	tbuf_u8(&b, 0); // legacy_session_id: empty in QUIC
-	tbuf_u16(&b, 2);
+	// AES-128-GCM first only where it runs on this CPU's instructions: a server may take the
+	// first suite offered, and AES in software is never used for secret keys. A second hello
+	// (after a HelloRetryRequest) offers what the first did.
+	if (!t->hrr) t->offered_aes = hw_aes128gcm_hw();
+	if (t->offered_aes) {
+		tbuf_u16(&b, 4);
+		tbuf_u16(&b, HW_TLS_CIPHER_AES128GCM);
+	} else {
+		tbuf_u16(&b, 2);
+	}
 	tbuf_u16(&b, HW_TLS_CIPHER_CHACHA20);
 	tbuf_u8(&b, 1);
 	tbuf_u8(&b, 0); // legacy_compression_methods: null
@@ -899,9 +929,13 @@ static int client_on_server_hello(hw_tls *t, const uint8_t *msg, size_t len) {
 	}
 	int hrr = memcmp(random.p, HRR_RANDOM, 32) == 0;
 	if (version != LEGACY_VERSION) return tls_fail(t, HW_TLS_ALERT_PROTOCOL_VERSION);
-	if (sid.n != 0 || cipher != HW_TLS_CIPHER_CHACHA20 || comp != 0) {
+	// The suite must be one offered (AES-128-GCM only when it was), and after a HelloRetryRequest
+	// the one it named (RFC 8446 section 4.1.4).
+	int offered = cipher == HW_TLS_CIPHER_CHACHA20 || (cipher == HW_TLS_CIPHER_AES128GCM && t->offered_aes);
+	if (sid.n != 0 || !offered || (t->hrr && cipher != t->cipher) || comp != 0) {
 		return tls_fail(t, HW_TLS_ALERT_ILLEGAL_PARAMETER);
 	}
+	t->cipher = cipher;
 	ext_seen *seen = calloc(1, sizeof *seen);
 	if (!seen) return tls_fail(t, HW_TLS_ALERT_INTERNAL_ERROR);
 	int has_version = 0, has_share = 0;
@@ -1319,4 +1353,8 @@ const uint8_t *hw_tls_peer_transport_params(const hw_tls *t, size_t *len) {
 
 const char *hw_tls_server_name(const hw_tls *t) {
 	return t->server_name;
+}
+
+uint16_t hw_tls_cipher(const hw_tls *t) {
+	return t->cipher;
 }

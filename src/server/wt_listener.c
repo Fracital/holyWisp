@@ -35,6 +35,7 @@
 #include "holywisp/quic.h"
 #include "holywisp/sha256.h"
 #include "holywisp/sys.h"
+#include "holywisp/tls13.h"
 #include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 
@@ -333,13 +334,14 @@ static void session_free(wt_session *s) {
 		HW_DEBUG("wt",
 		         "%s: session over: %llu packets sent, %llu lost (%llu spurious), %llu received; srtt %llu us, "
 		         "cwnd %llu, ssthresh %lld, %llu congestion events, %llu PTOs, %llu bytes acknowledged app-limited, "
-		         "bandwidth %llu B/s, datagrams of %llu (%llu black holes)",
+		         "bandwidth %llu B/s, datagrams of %llu (%llu black holes), %s",
 		         s->ip, (unsigned long long)st.packets_sent, (unsigned long long)st.packets_lost,
 		         (unsigned long long)st.spurious_lost, (unsigned long long)st.packets_received,
 		         (unsigned long long)st.srtt_us, (unsigned long long)st.cwnd,
 		         st.ssthresh == UINT64_MAX ? -1LL : (long long)st.ssthresh, (unsigned long long)st.congestion_events,
 		         (unsigned long long)st.ptos, (unsigned long long)st.acked_limited, (unsigned long long)st.bandwidth,
-		         (unsigned long long)st.mds, (unsigned long long)st.pmtu_black_holes);
+		         (unsigned long long)st.mds, (unsigned long long)st.pmtu_black_holes,
+		         st.cipher == HW_TLS_CIPHER_AES128GCM ? "AES-128-GCM" : "ChaCha20-Poly1305");
 		// The session's whole life, into this worker's sums for /stats.
 		hw_worker_stats *ws = &ww->w->st;
 		HW_WSTAT_ADD(ws->quic_sessions, 1);

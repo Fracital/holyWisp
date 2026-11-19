@@ -49,8 +49,12 @@
 #define HW_QC_PMTU_BH_PTOS      2u      // from this PTO in a row on, probes go at the base size
 #define HW_QC_SENT_RING_MAX     65536u  // packets tracked per space before ACK-only ones are forgotten
 // RFC 9001 6.6: packets that may fail authentication in a connection, across all keys, under
-// ChaCha20-Poly1305 (the AEAD TLS selects; AES-128-GCM, Initial packets only, allows 2^52).
+// ChaCha20-Poly1305 (AES-128-GCM allows 2^52; the lower bound is kept for both).
 #define HW_QC_AEAD_INTEGRITY_LIMIT (1ull << 36)
+// RFC 9001 6.6: AES-128-GCM may protect 2^23 packets under one key. A key update starts at half
+// of that (it may start once a packet of the current phase is acknowledged, a round trip later),
+// and no packet is sent under a key past twice that point, the limit.
+#define HW_QC_AES_KEY_UPDATE_AT (1ull << 22)
 
 #define HW_QC_APPLICATION_ERROR   0x0c // CONNECTION_CLOSE 0x1c code for an application close before 1-RTT
 #define HW_QC_CONNECTION_ID_LIMIT 0x09
@@ -653,7 +657,11 @@ struct hw_quic_conn {
 	uint64_t rx_phase_first_pn; // first packet number received in the current rx phase
 	uint64_t rx_prev_discard;   // when rx_prev is forgotten
 	uint64_t tx_phase_first_pn; // first packet number sent in the current tx phase
-	uint64_t key_updates;       // phases entered, either side's doing
+	// Packets of one tx phase before a key update starts: HW_QC_AES_KEY_UPDATE_AT under
+	// AES-128-GCM, UINT64_MAX under ChaCha20-Poly1305 (whose limit no connection reaches).
+	// Tests lower it.
+	uint64_t key_update_at;
+	uint64_t key_updates; // phases entered, either side's doing
 
 	// Handshake.
 	uint8_t *token; // client: Retry token for later Initials

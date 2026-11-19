@@ -6,10 +6,12 @@
  * Which is used for what (docs/webtransport.md, "Cryptography"):
  * - AES-128-GCM and AES-128 header protection protect QUIC Initial packets, which RFC 9001
  *   requires. Their keys are derived from the client's Destination Connection ID, which is on
- *   the wire, so they protect nothing secret; the table-free but not hardware-accelerated AES
- *   here is acceptable for them only.
- * - ChaCha20-Poly1305 (TLS_CHACHA20_POLY1305_SHA256) is the only suite the server selects for
- *   the Handshake and 1-RTT keys, where the keys are secret. Its code must be constant-time.
+ *   the wire, so they protect nothing secret.
+ * - For the Handshake and 1-RTT keys, where the keys are secret, TLS selects
+ *   TLS_AES_128_GCM_SHA256 only where AES runs on the CPU's instructions (hw_aes128gcm_hw), and
+ *   TLS_CHACHA20_POLY1305_SHA256 otherwise: the portable AES here is table-free and
+ *   constant-time, but several times slower than ChaCha20, and is never chosen for bulk data.
+ *   Every code path for secret keys must be constant-time.
  *
  * Every function is pure and thread-safe. Lengths are bytes. Seal writes len bytes of ciphertext
  * followed by the HW_AEAD_TAG-byte tag; open takes ciphertext with its tag and fails (-1, output
@@ -47,6 +49,12 @@ void hw_aes128gcm_seal(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE]
                        const uint8_t *in, size_t len, uint8_t *out);
 int hw_aes128gcm_open(const hw_aes128gcm *g, const uint8_t nonce[HW_AEAD_NONCE], const uint8_t *aad, size_t aad_len,
                       const uint8_t *in, size_t len, uint8_t *out);
+
+// 1 when AES-128 and AES-128-GCM here run on the CPU's AES and carry-less multiply instructions
+// (AES-NI and PCLMULQDQ on x86-64), so that AES-128-GCM is fit for bulk data; 0 when they run the
+// portable bitsliced code, as on every other architecture. The same answer on every thread for
+// the life of the process (but for a test that forces the base kernels, aead_internal.h).
+int hw_aes128gcm_hw(void);
 
 // ---- ChaCha20-Poly1305 --------------------------------------------------------------------
 // The ChaCha20 keystream XORed into len bytes, starting at block counter (RFC 8439 2.4).

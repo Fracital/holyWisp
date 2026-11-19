@@ -36,12 +36,19 @@ from `hw_sys_random` (key generation, connection IDs, the Retry token key).
   X25519 only: a ClientHello that lists X25519 in supported_groups without a key share for it gets
   a HelloRetryRequest. Signatures ecdsa_secp256r1_sha256 only. No PSK, no tickets, no 0-RTT,
   no client certificates. ALPN `h3` required.
-- **Cipher suites.** The server selects TLS_CHACHA20_POLY1305_SHA256 for the Handshake and
-  1-RTT keys. Chrome offers it. It is constant-time in portable C, and AES-GCM is not without
-  hardware support, which no-dependency C cannot reach portably. AES-128-GCM exists only because
-  RFC 9001 mandates it for Initial packets, whose keys derive from a connection ID on the wire
-  and protect nothing secret. A client that does not offer ChaCha20 is refused
-  (handshake_failure).
+- **Cipher suites.** For the Handshake and 1-RTT keys the server selects TLS_AES_128_GCM_SHA256
+  when its CPU has AES-NI and PCLMULQDQ (`hw_aes128gcm_hw`) and the client offers it without
+  listing ChaCha20 before it (BoringSSL and NSS put ChaCha20 first on a CPU without AES
+  instructions, where AES costs the client too), and TLS_CHACHA20_POLY1305_SHA256 otherwise.
+  Chrome offers both. The AES-NI kernel is in `aead.c`, compiled for those instructions and
+  picked at the first call by `cpuid`, as the AVX2 ChaCha20 kernels are; elsewhere AES-128-GCM
+  is the portable bitsliced code, constant-time but several times slower than ChaCha20, and is
+  never chosen for secret keys (it still protects Initial packets, which RFC 9001 mandates and
+  whose keys derive from a connection ID on the wire). A client that offers neither suite the
+  server may choose is refused (handshake_failure). holyWisp's own client offers AES-128-GCM,
+  first, only on AES instructions. Under AES-128-GCM a sender updates its 1-RTT key after 2^22
+  packets of a phase and sends nothing under a key past 2^23 (RFC 9001 6.6's confidentiality
+  limit; `key_update_at` in `quic.c`).
 - **Constant time** for everything keyed by a secret: X25519 (Montgomery ladder, constant-time
   field arithmetic), P-256 signing (constant-time scalar multiplication, RFC 6979 nonces),
   ChaCha20-Poly1305, and tag comparisons (`hw_ct_equal`). Verification of public data

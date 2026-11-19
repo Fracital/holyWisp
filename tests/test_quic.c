@@ -8,12 +8,14 @@
  * `test_quic --bench [MiB]` runs only the single-stream throughput measurement, and
  * `test_quic --loss-table` only the goodput under loss and reordering, as a fraction of the link.
  */
+#include "holywisp/aead.h"
 #include "holywisp/cert.h"
 #include "holywisp/ecc.h"
 #include "holywisp/quic.h"
 #include "holywisp/sha256.h"
 #include "holywisp/sys.h"
 
+#include "common/aead_internal.h"
 #include "quic/quic_internal.h"
 #include "quic/tls13_internal.h"
 #include "test.h"
@@ -2845,6 +2847,43 @@ static void test_key_update(void) {
 	sim_free(s);
 }
 
+// The 1-RTT suite is TLS's choice (AES-128-GCM on AES instructions, ChaCha20-Poly1305 otherwise),
+// and under AES-128-GCM a key may protect only so many packets (RFC 9001 6.6): the sender updates
+// its key on its own once a phase has sent key_update_at packets, here lowered to 64 so that a
+// bulk transfer crosses it many times, and the bytes arrive whole through every update.
+static void key_limit_run(void) {
+	sim *s = sim_new(31);
+	sim_handshake(s);
+	uint64_t want = hw_aes128gcm_hw() ? HW_TLS_CIPHER_AES128GCM : HW_TLS_CIPHER_CHACHA20;
+	hw_quic_stats st;
+	hw_quic_get_stats(s->sv.q, &st);
+	CHECK_EQ(st.cipher, want);
+	hw_quic_get_stats(s->c.q, &st);
+	CHECK_EQ(st.cipher, want);
+	CHECK_EQ(s->sv.q->key_update_at, want == HW_TLS_CIPHER_AES128GCM ? HW_QC_AES_KEY_UPDATE_AT : UINT64_MAX);
+	if (want == HW_TLS_CIPHER_AES128GCM) {
+		s->sv.q->key_update_at = 64;
+		s->c.q->key_update_at = 64;
+	}
+	bulk(s, 1u << 20, 1u << 20, 30000);
+	if (want == HW_TLS_CIPHER_AES128GCM) {
+		CHECK(s->sv.q->key_updates >= 4, "server key updates: %llu", (unsigned long long)s->sv.q->key_updates);
+		CHECK(s->c.q->key_updates >= 4, "client key updates: %llu", (unsigned long long)s->c.q->key_updates);
+	} else {
+		CHECK_EQ(s->sv.q->key_updates, 0);
+	}
+	CHECK(!s->c.closed && !s->sv.closed, "still up");
+	sim_free(s);
+}
+
+static void test_key_limit(void) {
+	printf("# 1-RTT under %s\n", hw_aes128gcm_hw() ? "AES-128-GCM" : "ChaCha20-Poly1305");
+	key_limit_run();
+	(void)hw_aead_force_base_kernels(1);
+	key_limit_run();
+	(void)hw_aead_force_base_kernels(0);
+}
+
 static void test_stream_reset_stop(void) {
 	sim *s = sim_new(22);
 	sim_handshake(s);
@@ -2960,6 +2999,7 @@ int main(int argc, char **argv) {
 	RUN(test_datagrams);
 	RUN(test_many_streams);
 	RUN(test_key_update);
+	RUN(test_key_limit);
 	RUN(test_migration);
 	RUN(test_loss);
 	RUN(test_reassembly_refused);

@@ -21,9 +21,11 @@
  *
  * AEAD limits (RFC 9001 6.6): packets that fail authentication are counted per connection,
  * across every key, and past HW_QC_AEAD_INTEGRITY_LIMIT (ChaCha20-Poly1305's 2^36) the
- * connection closes with AEAD_LIMIT_REACHED. There is no key update for the confidentiality
- * limit and none is needed: ChaCha20-Poly1305's is past 2^62 packets, more than a packet number
- * space holds, and AES-128-GCM (2^23) protects only Initial packets, a handful per connection.
+ * connection closes with AEAD_LIMIT_REACHED. ChaCha20-Poly1305's confidentiality limit is past
+ * 2^62 packets, more than a packet number space holds. AES-128-GCM's is 2^23 packets per key,
+ * 12 GB of full datagrams: where TLS chose it for 1-RTT, a key update starts after
+ * HW_QC_AES_KEY_UPDATE_AT packets of a phase (pkt_header), and a phase that reaches the limit
+ * sends nothing more until the update can start. Initial packets are a handful per connection.
  *
  * Datagram size (RFC 9000 14): every connection starts at HW_QUIC_MIN_DGRAM, which every QUIC
  * path carries, and probes for more once the handshake is confirmed (DPLPMTUD, RFC 8899): a PING
@@ -428,6 +430,9 @@ static int tls_secret(void *ud, hw_tls_level level, int write, uint16_t cipher, 
 	if (write) {
 		hw_qw_keys_from_secret(&sp->tx, cipher, secret);
 		sp->has_tx = 1;
+		if (level == HW_TLS_APP) {
+			q->key_update_at = cipher == HW_TLS_CIPHER_AES128GCM ? HW_QC_AES_KEY_UPDATE_AT : UINT64_MAX;
+		}
 	} else {
 		hw_qw_keys_from_secret(&sp->rx, cipher, secret);
 		sp->has_rx = 1;
@@ -1934,6 +1939,11 @@ static size_t pkt_header(hw_quic_conn *q, int spi, uint8_t *p, size_t room, pkt_
 		if (spi == HW_QC_SP_INITIAL) need += hw_qc_vlen(q->token_len) + q->token_len;
 	}
 	if (need + HW_AEAD_TAG + 8 > room) return 0;
+	if (spi == HW_QC_SP_APP && pn - q->tx_phase_first_pn >= q->key_update_at) {
+		// The key has protected its share (AES-128-GCM's confidentiality limit): a new one, and
+		// none past the limit while the update waits for this phase's acknowledgement.
+		if (hw_qc_key_update(q) != 0 && pn - q->tx_phase_first_pn >= 2 * q->key_update_at) return 0;
+	}
 	uint8_t *h = p;
 	if (spi == HW_QC_SP_APP) {
 		*h++ = (uint8_t)(0x40 | (q->tx_phase << 2));
@@ -2703,6 +2713,7 @@ static hw_quic_conn *conn_new(const hw_quic_config *cfg, const hw_quic_callbacks
 	if (!q->cfg.datagram_queue_max) q->cfg.datagram_queue_max = DEFAULT_DGRAM_QUEUE;
 	if (cb) q->cb = *cb;
 	q->is_server = is_server;
+	q->key_update_at = UINT64_MAX; // until TLS names the 1-RTT suite
 	q->now = now_ms * 1000;
 	for (int i = 0; i < HW_QC_SPACES; i++) space_init(&q->sp[i]);
 	hw_qw_tp_defaults(&q->peer_tp);
@@ -3013,4 +3024,5 @@ void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out) {
 	out->spurious_lost = q->spurious_lost;
 	out->bandwidth = q->cc.bbr ? q->cc.b.bw : 0;
 	out->pmtu_black_holes = q->pmtu_black_holes;
+	out->cipher = q->tls ? hw_tls_cipher(q->tls) : 0;
 }
