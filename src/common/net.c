@@ -9,6 +9,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,6 +90,96 @@ int hw_listen_tcp(const char *host, uint16_t port, int reuseport, int backlog, u
 	return fd;
 }
 
+// Happy Eyeballs (RFC 8305) in its simple form: a new attempt starts CONNECT_STAGGER_MS after the
+// last one (its Connection Attempt Delay) or as soon as the last one failed, the earlier ones stay
+// in flight, and the first to connect wins. At most CONNECT_LIVE_MAX attempts at once, and
+// hw_connect_tcp considers the first CONNECT_ADDRS_MAX addresses a name has.
+#define CONNECT_STAGGER_MS 250
+#define CONNECT_LIVE_MAX   8
+#define CONNECT_ADDRS_MAX  32
+
+int hw_connect_tcp_list(const struct addrinfo *list, int timeout_ms) {
+	struct pollfd live[CONNECT_LIVE_MAX];
+	size_t nlive = 0;
+	const struct addrinfo *next = list;
+	uint64_t now = hw_now_ms();
+	uint64_t deadline = timeout_ms < 0 ? UINT64_MAX : now + (uint64_t)timeout_ms;
+	uint64_t next_at = now;
+	int saved = ECONNREFUSED;
+	int fd = -1;
+	while (fd < 0) {
+		now = hw_now_ms();
+		if (now >= deadline) {
+			if (nlive || next) saved = ETIMEDOUT;
+			break;
+		}
+		// Start the next attempt when it is due, or at once when none is in flight.
+		while (next && nlive < CONNECT_LIVE_MAX && (nlive == 0 || now >= next_at)) {
+			const struct addrinfo *ai = next;
+			next = next->ai_next;
+			int s = hw_socket_nb(ai->ai_family, SOCK_STREAM, ai->ai_protocol);
+			if (s < 0) {
+				saved = errno;
+				continue;
+			}
+			if (connect(s, ai->ai_addr, ai->ai_addrlen) == 0) {
+				fd = s;
+				break;
+			}
+			if (errno != EINPROGRESS) {
+				saved = errno; // refused or unreachable at once: the next one goes now
+				close(s);
+				continue;
+			}
+			live[nlive].fd = s;
+			live[nlive].events = POLLOUT;
+			live[nlive].revents = 0;
+			nlive++;
+			next_at = now + CONNECT_STAGGER_MS;
+			break;
+		}
+		if (fd >= 0) break;
+		if (nlive == 0) {
+			if (!next) break; // every address failed
+			continue;
+		}
+		uint64_t until = next && nlive < CONNECT_LIVE_MAX ? HW_MIN(next_at, deadline) : deadline;
+		int wait = until == UINT64_MAX ? -1 : (int)HW_MIN(until > now ? until - now : 0, (uint64_t)INT_MAX);
+		int r = poll(live, (nfds_t)nlive, wait);
+		if (r < 0 && errno == EINTR) continue;
+		if (r < 0) {
+			saved = errno;
+			break;
+		}
+		for (size_t i = 0; i < nlive && fd < 0;) {
+			if (!live[i].revents) {
+				i++;
+				continue;
+			}
+			int err = 0;
+			socklen_t el = sizeof(err);
+			if (getsockopt(live[i].fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
+			if (err == 0 && !(live[i].revents & (POLLERR | POLLHUP))) {
+				fd = live[i].fd;
+			} else {
+				saved = err ? err : ECONNREFUSED;
+				close(live[i].fd);
+				next_at = now; // a failure starts the next attempt at once
+			}
+			live[i] = live[--nlive];
+		}
+	}
+	for (size_t i = 0; i < nlive; i++) close(live[i].fd);
+	if (fd < 0) {
+		errno = saved;
+		return -1;
+	}
+	// The client is blocking by design; the socket came back non-blocking from hw_socket_nb.
+	int fl = fcntl(fd, F_GETFL, 0);
+	fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+	return fd;
+}
+
 int hw_connect_tcp(const char *host, uint16_t port, int timeout_ms) {
 	struct addrinfo hints;
 	memset(&hints, 0, sizeof(hints));
@@ -102,45 +193,37 @@ int hw_connect_tcp(const char *host, uint16_t port, int timeout_ms) {
 		errno = EHOSTUNREACH;
 		return -1;
 	}
-	int fd = -1;
-	int saved = ECONNREFUSED;
-	for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
-		fd = hw_socket_nb(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-		if (fd < 0) {
-			saved = errno;
-			continue;
+	// The resolver's order, with the families taking turns (RFC 8305 section 4), so a family that
+	// is broken here costs one stagger and not every address it has. Copies, relinked: the
+	// resolver's own list is freed as it was made.
+	struct addrinfo order[CONNECT_ADDRS_MAX];
+	size_t n = 0;
+	const struct addrinfo *v6 = res, *other = res;
+	for (;;) {
+		while (v6 && v6->ai_family != AF_INET6) v6 = v6->ai_next;
+		while (other && other->ai_family == AF_INET6) other = other->ai_next;
+		if (!v6 && !other) break;
+		// Whichever family the resolver put first goes first in each pair.
+		const struct addrinfo *pair[2] = {v6, other};
+		if (res->ai_family != AF_INET6) {
+			pair[0] = other;
+			pair[1] = v6;
 		}
-		int r = connect(fd, ai->ai_addr, ai->ai_addrlen);
-		if (r != 0 && errno == EINPROGRESS) {
-			struct pollfd pfd = {.fd = fd, .events = POLLOUT};
-			r = poll(&pfd, 1, timeout_ms);
-			if (r == 0) {
-				saved = ETIMEDOUT;
-				r = -1;
-			} else if (r > 0) {
-				int err = 0;
-				socklen_t el = sizeof(err);
-				getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
-				r = err ? -1 : 0;
-				if (err) saved = err;
-			} else {
-				saved = errno;
+		for (int k = 0; k < 2; k++) {
+			if (pair[k] && n < CONNECT_ADDRS_MAX) {
+				order[n] = *pair[k];
+				order[n].ai_next = NULL;
+				if (n) order[n - 1].ai_next = &order[n];
+				n++;
 			}
-		} else if (r != 0) {
-			saved = errno;
 		}
-		if (r == 0) break;
-		close(fd);
-		fd = -1;
+		if (v6) v6 = v6->ai_next;
+		if (other) other = other->ai_next;
 	}
+	int fd = hw_connect_tcp_list(n ? order : NULL, timeout_ms);
+	int saved = errno;
 	freeaddrinfo(res);
-	if (fd < 0) {
-		errno = saved;
-		return -1;
-	}
-	// The client is blocking by design; the socket came back non-blocking from hw_socket_nb.
-	int fl = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+	errno = saved;
 	return fd;
 }
 

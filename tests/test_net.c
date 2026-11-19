@@ -1,8 +1,12 @@
+#include "holywisp/hw.h"
 #include "holywisp/net.h"
 
 #include "test.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <string.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -224,6 +228,107 @@ static void test_listen_and_connect(void) {
 	CHECK_EQ(errno, ECONNREFUSED);
 }
 
+#define HOLE_FILL 4
+
+// A listener whose accept queue is full and never read. Linux drops the SYNs that reach it, so a
+// connect to it hangs as one to an address without a route does; another system may refuse them,
+// which the cases below allow. fill[] holds the connections that filled the queue.
+static int black_hole(struct sockaddr_in *addr, int fill[HOLE_FILL]) {
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 0, &port);
+	CHECK(lfd >= 0, "listen");
+	memset(addr, 0, sizeof(*addr));
+	addr->sin_family = AF_INET;
+	addr->sin_port = htons(port);
+	addr->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+	for (int i = 0; i < HOLE_FILL; i++) {
+		fill[i] = hw_socket_nb(AF_INET, SOCK_STREAM, 0);
+		CHECK(fill[i] >= 0, "socket");
+		(void)connect(fill[i], (struct sockaddr *)addr, sizeof(*addr));
+	}
+	struct pollfd none;
+	poll(&none, 0, 50); // the handshakes that will complete have completed
+	return lfd;
+}
+
+static struct addrinfo ai_of(struct sockaddr_in *addr, struct addrinfo *next) {
+	struct addrinfo ai;
+	memset(&ai, 0, sizeof(ai));
+	ai.ai_family = AF_INET;
+	ai.ai_socktype = SOCK_STREAM;
+	ai.ai_addr = (struct sockaddr *)addr;
+	ai.ai_addrlen = sizeof(*addr);
+	ai.ai_next = next;
+	return ai;
+}
+
+static uint16_t peer_port(int fd) {
+	struct sockaddr_storage ss;
+	socklen_t sl = sizeof(ss);
+	CHECK(getpeername(fd, (struct sockaddr *)&ss, &sl) == 0, "getpeername: %s", strerror(errno));
+	return hw_addr_port((struct sockaddr *)&ss);
+}
+
+// An address that never answers costs the next one a stagger, not the whole timeout: with one
+// timeout for each address in turn, a host whose IPv6 has no route waited it out on every name
+// before its IPv4 was tried. The socket that wins is blocking, and the timeout bounds the list.
+static void test_connect_moves_past_a_silent_address(void) {
+	int fill[HOLE_FILL];
+	struct sockaddr_in hole, good, refused;
+	int hfd = black_hole(&hole, fill);
+	uint16_t port = 0;
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 16, &port);
+	CHECK(lfd >= 0, "listen");
+	good = hole;
+	good.sin_port = htons(port);
+	int rfd = hw_listen_tcp("127.0.0.1", 0, 0, 16, &port);
+	CHECK(rfd >= 0, "listen");
+	close(rfd); // nothing listens here: refused
+	refused = good;
+	refused.sin_port = htons(port);
+
+	struct addrinfo second = ai_of(&good, NULL);
+	struct addrinfo first = ai_of(&hole, &second);
+	uint64_t t0 = hw_now_ms();
+	int fd = hw_connect_tcp_list(&first, 5000);
+	uint64_t took = hw_now_ms() - t0;
+	CHECK(fd >= 0, "connect past a silent address: %s", strerror(errno));
+	CHECK(took < 2000, "the second address connected after %llu ms of a 5000 ms timeout", (unsigned long long)took);
+	CHECK_EQ(peer_port(fd), ntohs(good.sin_port));
+	CHECK_EQ(fcntl(fd, F_GETFL, 0) & O_NONBLOCK, 0);
+	close(fd);
+
+	// A refused address hands over at once, or after a stagger where the refusal is slow (Windows).
+	first = ai_of(&refused, &second);
+	fd = hw_connect_tcp_list(&first, 5000);
+	CHECK(fd >= 0, "connect past a refused address: %s", strerror(errno));
+	CHECK_EQ(peer_port(fd), ntohs(good.sin_port));
+	close(fd);
+
+	// Silence alone: the timeout is the bound, and it says so.
+	first = ai_of(&hole, NULL);
+	t0 = hw_now_ms();
+	fd = hw_connect_tcp_list(&first, 300);
+	took = hw_now_ms() - t0;
+	CHECK(fd < 0, "connected to a full accept queue");
+	if (errno == ETIMEDOUT) {
+		CHECK(took >= 250 && took < 1500, "a 300 ms connect took %llu ms", (unsigned long long)took);
+	}
+	first = ai_of(&hole, &second);
+	second = ai_of(&hole, NULL);
+	t0 = hw_now_ms();
+	fd = hw_connect_tcp_list(&first, 400);
+	took = hw_now_ms() - t0;
+	CHECK(fd < 0, "connected to a full accept queue");
+	if (errno == ETIMEDOUT) {
+		CHECK(took >= 350 && took < 1500, "a 400 ms connect over two addresses took %llu ms", (unsigned long long)took);
+	}
+	CHECK(hw_connect_tcp_list(NULL, 300) < 0, "an empty list");
+	for (int i = 0; i < HOLE_FILL; i++) close(fill[i]);
+	close(hfd);
+	close(lfd);
+}
+
 int main(void) {
 	RUN(test_parse_literals);
 	RUN(test_parse_numeric_names);
@@ -232,5 +337,6 @@ int main(void) {
 	RUN(test_classify_v6_wrapped);
 	RUN(test_classify_v6_reserved);
 	RUN(test_listen_and_connect);
+	RUN(test_connect_moves_past_a_silent_address);
 	return 0;
 }

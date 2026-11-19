@@ -30,7 +30,8 @@
 #define WTC_SEND_MAX       (8u * 1024 * 1024)  // queued in hw_wt before a send waits
 #define WTC_IDLE_MS        30000
 #define WTC_KEEPALIVE      15000
-#define WTC_PACING_TICK_US 100 // how late a wait for QUIC's timer ends: the listener's (wt_listener.c)
+#define WTC_ATTEMPT_MS     5000 // with no deadline, how long an address that gives no answer is waited for
+#define WTC_PACING_TICK_US 100  // how late a wait for QUIC's timer ends: the listener's (wt_listener.c)
 #define WTC_FOREVER        UINT64_MAX
 
 struct hw_wtc {
@@ -40,7 +41,9 @@ struct hw_wtc {
 	int closed;           // the session or the connection is over
 	uint64_t close_error; // QUIC's error code when the connection closed, and whether it was the application's
 	int close_app;
-	int writable; // hw_wt said its queue went down since the last look
+	int heard;     // a datagram came from the server (hw_wtc_connect: this address answers)
+	int net_error; // the last error the socket reported (an ICMP unreachable), 0 for none
+	int writable;  // hw_wt said its queue went down since the last look
 	int paused;
 	size_t max_queue;
 	hw_buf in;      // packets not handed out yet: [u32 LE length][packet] each
@@ -149,6 +152,7 @@ static void wtc_tx_flush(hw_wtc *t, size_t n) {
 			continue;
 		}
 		if ((errno != EAGAIN && errno != EWOULDBLOCK) || ++tries > 2) {
+			if (errno != EAGAIN && errno != EWOULDBLOCK) t->net_error = errno;
 			off++; // refused (no route, say) or still full: dropped, as the network would
 			tries = 0;
 			continue;
@@ -213,8 +217,10 @@ static int wtc_pump(hw_wtc *t, uint64_t deadline) {
 			int n = hw_sys_recv_batch(t->fd, t->rxd, t->rx_slots);
 			if (n < 0) {
 				if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+				t->net_error = errno;
 				continue; // an ICMP error taken off the socket; the next receive goes on
 			}
+			if (n > 0) t->heard = 1;
 			uint64_t now_us = hw_now_us();
 			for (int i = 0; i < n; i++) {
 				// A coalesced read is the server's datagrams back to back, each taken on its own.
@@ -238,32 +244,38 @@ static int wtc_pump(hw_wtc *t, uint64_t deadline) {
 	return did || now_us / 1000 < deadline;
 }
 
-hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_t err_cap) {
-	static const char *const alpn[] = {HW_WT_ALPN};
-	hw_wtc *t = calloc(1, sizeof(*t));
-	if (!t) {
-		snprintf(err, err_cap, "out of memory");
-		return NULL;
-	}
+// Let go of one address's attempt: the session, the connection, the socket and what they held.
+static void wtc_reset(hw_wtc *t) {
+	if (t->wt) hw_wt_free(t->wt);
+	if (t->q) hw_quic_free(t->q);
+	if (t->fd >= 0) close(t->fd);
+	free(t->rx);
+	t->wt = NULL;
+	t->q = NULL;
 	t->fd = -1;
-	t->max_queue = o->max_queue ? o->max_queue : 32u * 1024 * 1024;
-	hw_buf_init(&t->in);
-	struct addrinfo hints, *res = NULL;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_DGRAM;
-	hints.ai_flags = AI_NUMERICSERV;
-	char service[8];
-	snprintf(service, sizeof(service), "%u", o->port);
-	if (getaddrinfo(o->host, service, &hints, &res) != 0 || !res) {
-		snprintf(err, err_cap, "cannot resolve %s", o->host);
-		goto fail;
-	}
-	t->fd = hw_sys_socket(res->ai_family, SOCK_DGRAM, 0, 1);
-	if (t->fd < 0 || connect(t->fd, res->ai_addr, res->ai_addrlen) != 0) {
+	t->rx = NULL;
+	t->closed = 0;
+	t->close_error = 0;
+	t->close_app = 0;
+	t->heard = 0;
+	t->net_error = 0;
+	t->writable = 0;
+	t->paused = 0;
+	t->pending = 0;
+	hw_buf_clear(&t->in);
+}
+
+// One address: the socket, QUIC and the session, until the session is open (0), the address has
+// given no answer by give_up (1: the caller tries the next one), or the attempt has failed for
+// good (-1: the server answered and refused, or the deadline came). err says why unless 0.
+static int wtc_attempt(hw_wtc *t, const hw_wtc_opts *o, const struct addrinfo *ai, const char *sni, uint64_t give_up,
+                       uint64_t deadline, char *err, size_t err_cap) {
+	static const char *const alpn[] = {HW_WT_ALPN};
+	t->fd = hw_sys_socket(ai->ai_family, SOCK_DGRAM, 0, 1);
+	if (t->fd < 0 || connect(t->fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+		// No route for this family, say: the next address may have one.
 		snprintf(err, err_cap, "udp %s:%u: %s", o->host, o->port, strerror(errno));
-		freeaddrinfo(res);
-		goto fail;
+		return 1;
 	}
 	hw_sys_udp_buffers(t->fd, (int)HW_MIN(o->udp_buffer ? o->udp_buffer : WTC_SOCKET_BUFFER, (size_t)INT_MAX));
 	(void)hw_sys_udp_no_fragment(t->fd); // the datagram size is probed, never left to fragmentation
@@ -273,24 +285,13 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	t->rx = malloc(t->rx_slots * t->rx_cap);
 	if (!t->rx) {
 		snprintf(err, err_cap, "out of memory");
-		freeaddrinfo(res);
-		goto fail;
+		return -1;
 	}
-	struct sockaddr_storage literal;
-	socklen_t literal_len;
-	int is_literal = hw_addr_parse(o->host, o->port, &literal, &literal_len) == 1;
-
 	hw_quic_config qc;
 	memset(&qc, 0, sizeof(qc));
 	qc.tls.alpn = alpn;
 	qc.tls.alpn_count = 1;
-	const char *name = o->server_name && o->server_name[0] ? o->server_name : o->host;
-	if (name != o->host) {
-		struct sockaddr_storage ns;
-		socklen_t nl;
-		is_literal = hw_addr_parse(name, o->port, &ns, &nl) == 1;
-	}
-	qc.tls.server_name = is_literal ? NULL : name; // SNI never carries an address (RFC 6066)
+	qc.tls.server_name = sni;
 	qc.tls.pin_sha256 = o->pin_sha256;
 	qc.max_idle_ms = WTC_IDLE_MS;
 	qc.initial_max_data = WTC_WINDOW;
@@ -315,16 +316,10 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	    .cid = q_cid,
 	    .closed = q_closed,
 	};
-	t->q = hw_quic_connect(&qc, &cb, res->ai_addr, res->ai_addrlen, hw_now_ms());
-	freeaddrinfo(res);
+	t->q = hw_quic_connect(&qc, &cb, ai->ai_addr, ai->ai_addrlen, hw_now_ms());
 	if (!t->q) {
 		snprintf(err, err_cap, "cannot start a QUIC connection");
-		goto fail;
-	}
-	if (strchr(name, ':')) {
-		snprintf(t->authority, sizeof(t->authority), "[%s]:%u", name, o->port);
-	} else {
-		snprintf(t->authority, sizeof(t->authority), "%s:%u", name, o->port);
+		return -1;
 	}
 	hw_wt_config wc = {
 	    .max_packet = o->max_packet ? o->max_packet : 1024 * 1024 + HW_WISP_HEADER_LEN,
@@ -345,14 +340,14 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 	t->wt = hw_wt_new(t->q, &wc, &wcb);
 	if (!t->wt) {
 		snprintf(err, err_cap, "out of memory");
-		goto fail;
+		return -1;
 	}
 	wtc_output(t);
 	while (!hw_wt_ready(t->wt)) {
 		int status = hw_wt_status(t->wt);
 		if (status != 0 && status != 200) {
 			snprintf(err, err_cap, "server answered %d", status);
-			goto fail;
+			return -1;
 		}
 		if (t->closed) {
 			if (!t->close_app && t->close_error >= HW_QUIC_CRYPTO_ERROR(0) &&
@@ -364,13 +359,76 @@ hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_
 				snprintf(err, err_cap, "the connection closed during the handshake (error 0x%llx)",
 				         (unsigned long long)t->close_error);
 			}
-			goto fail;
+			return -1;
 		}
-		if (hw_now_ms() >= deadline || !wtc_pump(t, deadline)) {
+		if (!t->heard && t->net_error) {
+			// Port or host unreachable, and nothing has come back from there.
+			snprintf(err, err_cap, "udp %s:%u: %s", o->host, o->port, strerror(t->net_error));
+			return 1;
+		}
+		// Until the address answers it has its share of the time; once it has, all of it.
+		uint64_t until = t->heard ? deadline : HW_MIN(give_up, deadline);
+		if (hw_now_ms() >= until || !wtc_pump(t, until)) {
+			if (!t->heard && hw_now_ms() < deadline) {
+				snprintf(err, err_cap, "no answer from %s:%u", o->host, o->port);
+				return 1;
+			}
 			snprintf(err, err_cap, "webtransport handshake timed out");
-			goto fail;
+			return -1;
 		}
 	}
+	return 0;
+}
+
+hw_wtc *hw_wtc_connect(const hw_wtc_opts *o, uint64_t deadline, char *err, size_t err_cap) {
+	hw_wtc *t = calloc(1, sizeof(*t));
+	if (!t) {
+		snprintf(err, err_cap, "out of memory");
+		return NULL;
+	}
+	t->fd = -1;
+	t->max_queue = o->max_queue ? o->max_queue : 32u * 1024 * 1024;
+	hw_buf_init(&t->in);
+	struct addrinfo hints, *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_DGRAM;
+	hints.ai_flags = AI_NUMERICSERV;
+	char service[8];
+	snprintf(service, sizeof(service), "%u", o->port);
+	if (getaddrinfo(o->host, service, &hints, &res) != 0 || !res) {
+		snprintf(err, err_cap, "cannot resolve %s", o->host);
+		goto fail;
+	}
+	const char *name = o->server_name && o->server_name[0] ? o->server_name : o->host;
+	struct sockaddr_storage literal;
+	socklen_t literal_len;
+	const char *sni = hw_addr_parse(name, o->port, &literal, &literal_len) == 1 ? NULL
+	                                                                            : name; // never an address (RFC 6066)
+	if (strchr(name, ':')) {
+		snprintf(t->authority, sizeof(t->authority), "[%s]:%u", name, o->port);
+	} else {
+		snprintf(t->authority, sizeof(t->authority), "%s:%u", name, o->port);
+	}
+	// Every address, in the resolver's order. One that gives no answer has its share of the time
+	// that is left (the last one all of it), so a family without a route here costs a share and
+	// not the whole handshake, and the next address still has time. An address that answers keeps
+	// the rest: its server's refusal, or a TLS handshake that fails, is final.
+	size_t left = 0;
+	for (const struct addrinfo *ai = res; ai; ai = ai->ai_next) left++;
+	int r = 1;
+	for (const struct addrinfo *ai = res; ai && r == 1; ai = ai->ai_next, left--) {
+		uint64_t now = hw_now_ms();
+		if (ai != res) {
+			if (now >= deadline) break;
+			wtc_reset(t);
+		}
+		uint64_t share = deadline == WTC_FOREVER ? WTC_ATTEMPT_MS : (deadline > now ? deadline - now : 0) / left;
+		uint64_t give_up = left == 1 ? deadline : now + share;
+		r = wtc_attempt(t, o, ai, sni, give_up, deadline, err, err_cap);
+	}
+	freeaddrinfo(res);
+	if (r != 0) goto fail;
 	return t;
 fail:
 	hw_wtc_free(t);

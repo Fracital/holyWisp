@@ -782,7 +782,7 @@ hw_client *hw_client_connect(const hw_client_opts *o, char *err, size_t err_cap)
 		}
 		return c;
 	}
-	c->fd = hw_connect_tcp(o->host, o->port, o->timeout_ms);
+	c->fd = hw_connect_tcp(o->host, o->port, timer_left(&t)); // within the deadline, which the upgrade shares
 	if (c->fd < 0) {
 		snprintf(err, err_cap, "connect %s:%u: %s", o->host, o->port, strerror(errno));
 		free(c);

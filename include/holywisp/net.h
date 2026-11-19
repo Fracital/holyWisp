@@ -22,8 +22,18 @@ int hw_accept_nb(int listen_fd, struct sockaddr_storage *addr, socklen_t *addr_l
 // port 0 picks one; the chosen port is written to bound_port when non-NULL.
 int hw_listen_tcp(const char *host, uint16_t port, int reuseport, int backlog, uint16_t *bound_port);
 
-// Blocking connect with a timeout, for the client. Resolves host synchronously.
+// Blocking connect, for the client and the tests: resolves host synchronously and connects to the
+// first of its addresses that answers (hw_connect_tcp_list), within timeout_ms for the whole call
+// (negative: no bound). The address families take turns in the resolver's order, so one that is
+// broken on this host (IPv6 without a route, say) costs a quarter of a second, not the timeout.
+// The socket returned is blocking. -1 with errno on failure: ETIMEDOUT when the time ran out,
+// otherwise the last address's error (EHOSTUNREACH when the name does not resolve).
 int hw_connect_tcp(const char *host, uint16_t port, int timeout_ms);
+// The same over a list of addresses as getaddrinfo gives them (ai_family, ai_protocol, ai_addr,
+// ai_addrlen and ai_next are read), in order: each attempt starts a quarter of a second after the
+// last, or as soon as the last one failed, earlier ones stay in flight, and the first to connect
+// wins; the others are closed. timeout_ms bounds the whole list.
+int hw_connect_tcp_list(const struct addrinfo *list, int timeout_ms);
 
 // Literal IPv4/IPv6 address ("1.2.3.4", "::1", "[::1]") into a sockaddr. 1 when host was a literal,
 // 0 when it is a name (out untouched), -1 when it looks like a literal but is malformed. A name

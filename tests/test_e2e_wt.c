@@ -298,6 +298,41 @@ static int json_hashes(hw_server *s, uint8_t out[][32], int max, char *json, siz
 
 // ---------------------------------------------------------------------------------- cases
 
+// A name with an address that does not answer and one that does: the client goes on to the next,
+// with time left. The server is on 127.0.0.1 alone, so "localhost", which most systems resolve to
+// ::1 first, has a first address whose port is closed. The client used to try the first address
+// and nothing else, for the whole timeout.
+static void test_every_address(void) {
+	struct addrinfo hints, *res = NULL;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_socktype = SOCK_DGRAM;
+	if (getaddrinfo("localhost", "443", &hints, &res) != 0) {
+		printf("  (skipped: localhost does not resolve)\n");
+		return;
+	}
+	int v6_first = res->ai_family == AF_INET6;
+	freeaddrinfo(res);
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "localhost";
+	o.port = hw_server_wt_port(g_server);
+	o.webtransport = 1;
+	o.timeout_ms = 5000;
+	char err[256];
+	uint64_t t0 = hw_now_ms();
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	uint64_t took = hw_now_ms() - t0;
+	CHECK(c != NULL, "connect to localhost (::1 first: %d): %s", v6_first, err);
+	CHECK(took < 3000, "connected after %llu ms of 5000 (::1 first: %d)", (unsigned long long)took, v6_first);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
+	CHECK_EQ(hw_client_send(c, sid, "ok", 2), 0);
+	uint8_t buf[2];
+	CHECK_EQ(hw_client_read_exact(c, sid, buf, 2, 5000), 2);
+	hw_client_free(c);
+	if (!v6_first) printf("  (localhost resolves to 127.0.0.1 first here: only the plain case ran)\n");
+}
+
 static void test_v1_tcp_echo(void) {
 	hw_client *c = wt_connect(g_server, NULL);
 	CHECK(!hw_client_is_v2(c), "v1");
@@ -1842,6 +1877,7 @@ int main(void) {
 	g_server = server_with(&cfg);
 
 	RUN(test_v1_tcp_echo);
+	RUN(test_every_address);
 	RUN(test_v2_handshake);
 	RUN(test_udp_datagram_echo);
 	RUN(test_egress_blocked);
