@@ -36,6 +36,7 @@
 #include "holywisp/sha256.h"
 #include "holywisp/sys.h"
 #include "holywisp/webtransport.h"
+#include "holywisp/wisp.h"
 
 #include "internal.h"
 
@@ -100,8 +101,13 @@ struct wt_session {
 	int opened;       // conn_wt_open has run
 	int refused;      // the CONNECT was answered with an error: close once that is delivered
 	uint64_t refuse_at;
-	int quic_closing; // hw_quic_close has been called, or the connection closed by itself
+	const char *refuse_reason; // what QUIC's close says then: "refused", or "" after the client's close
+	int quic_closing;          // hw_quic_close has been called, or the connection closed by itself
 	int close_pending;
+	// close_pending waits for what is queued (the Wisp CLOSE that explains it, above all) to be
+	// acknowledged, at most until this: Chrome drops what a stream holds unread once the capsule is
+	// in, so a capsule in the same flight as the CLOSE took the reason away from the page.
+	uint64_t capsule_at;
 	uint32_t close_code;
 	// After hw_wt_close the client answers with its FIN, and hw_wt closes QUIC then. One that never
 	// answers and keeps the connection busy (the idle timeout never comes) is closed at this time.
@@ -367,6 +373,7 @@ static void session_arm(wt_session *s) {
 	if (!s->established && s->created_ms + WT_HS_EXPIRY_MS < at) at = s->created_ms + WT_HS_EXPIRY_MS;
 	if (s->refused && !s->quic_closing && s->refuse_at < at) at = s->refuse_at;
 	if (s->close_by && !s->quic_closing && s->close_by < at) at = s->close_by;
+	if (s->close_pending && !s->quic_closing && s->capsule_at < at) at = s->capsule_at;
 	if (at == UINT64_MAX) return;
 	if (s->timer && s->timer_at <= at) return;
 	hw_loop *loop = s->ww->w->loop;
@@ -418,10 +425,12 @@ static void session_settle(wt_session *s) {
 		HW_DEBUG("wt", "%s: the client ended a lane", s->ip);
 		conn_close(s->c); // wt_conn_detach: close_pending, just below
 	}
-	if (s->close_pending) {
+	if (s->close_pending && (s->quic_closing || hw_quic_queued(s->q) == 0 || now >= s->capsule_at)) {
 		s->close_pending = 0;
 		if (!s->quic_closing) {
-			hw_wt_close(s->wt, s->close_code, "");
+			// A Wisp close reason (conn.c records the stream-0 CLOSE's) is named in the capsule too.
+			const char *why = s->close_code && s->close_code < 0x100 ? hw_close_reason_str((uint8_t)s->close_code) : "";
+			hw_wt_close(s->wt, s->close_code, why);
 			s->close_by = now + WT_CLOSE_MS;
 		}
 	}
@@ -430,7 +439,7 @@ static void session_settle(wt_session *s) {
 		session_quic_close(s, HW_H3_NO_ERROR, "");
 	}
 	if (s->refused && !s->quic_closing && (hw_quic_queued(s->q) == 0 || now >= s->refuse_at)) {
-		session_quic_close(s, HW_H3_NO_ERROR, "refused");
+		session_quic_close(s, HW_H3_NO_ERROR, s->refuse_reason ? s->refuse_reason : "refused");
 	}
 	s->busy--;
 	if (s->busy) return; // settled from inside a callback after all: the outer call finishes
@@ -634,9 +643,11 @@ static void w_session_closed(void *ud, uint32_t code, const char *reason) {
 		c->wt = NULL;
 		conn_close(c);
 	}
-	// The session was all this connection was for.
+	// The session was all this connection was for. QUIC closes once our FIN on the CONNECT stream
+	// (peer_closed) is acknowledged: closed before it, Chrome logs the session as failed.
 	s->refused = 1;
-	s->refuse_at = hw_now_ms();
+	s->refuse_at = hw_now_ms() + WT_REFUSE_MS;
+	s->refuse_reason = "";
 	session_touch(s);
 }
 
@@ -708,6 +719,7 @@ void wt_conn_detach(wt_session *s, uint32_t code) {
 	s->c = NULL;
 	s->close_pending = 1;
 	s->close_code = code;
+	s->capsule_at = hw_now_ms() + WT_REFUSE_MS;
 	session_defer(s);
 }
 

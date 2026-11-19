@@ -6,7 +6,7 @@
 //
 // Starts the server on loopback (an ephemeral port, its own TCP and UDP echo services), then:
 // - curl --http3-only -k GET / (curl's ngtcp2 and nghttp3): a request that is not a WebTransport
-//   CONNECT is answered 404;
+//   CONNECT is answered 421 (alt-svc: clear, so a page sent here goes back to TCP);
 // - headless Chrome: a page on 127.0.0.1 fetches /webtransport.json, opens new WebTransport() with
 //   the pinned hashes and speaks Wisp v1 over the session (the stream-0 CONTINUE, a TCP stream
 //   echoed on the Wisp stream, a UDP stream echoed by datagram), then a second session offering
@@ -84,7 +84,7 @@ if (/HTTP3/.test(curlVersion)) {
   } catch (e) {
     code = String(e.stdout || e.message);
   }
-  results.curl = { status: code, ok: code === "404" };
+  results.curl = { status: code, ok: code === "421" };
 } else {
   results.curl = "skipped: no curl with HTTP/3";
 }

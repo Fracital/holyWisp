@@ -184,7 +184,10 @@ sends no request. The request is HEADERS on stream 0 (`:method CONNECT`, `:proto
 `wt-available-protocols`), static QPACK table and literals only. A DATA frame with a GREASE
 capsule follows. The answer `:status 200` opens the session. Datagrams are prefixed with the
 quarter stream id of the session (`00`). Client bidi streams start `40 41 <session id>`, uni
-streams `40 54 <session id>`. A close is capsule 0x2843 (code u32, reason) then FIN. The server
+streams `40 54 <session id>`. A close is capsule 0x2843 (code u32, reason) then FIN. The server's
+capsule waits until what it queued before it is acknowledged (2 s at most), because Chrome drops
+unread stream data once it has the capsule; a session ended by a stream-0 CLOSE carries that
+Wisp reason as its code (0x04 incompatible, 0x06 auth required, ...). The server
 advertises a QPACK dynamic table of 0 and never reads the encoder stream's instructions beyond
 skipping them. A header block that refers to the dynamic table is a QPACK_DECOMPRESSION_FAILED.
 

@@ -667,8 +667,12 @@ typedef struct {
 	int session_closed;  // hw_wt's session_closed has run (the server's capsule, or its FIN)
 	int heard_close;     // ... and before the connection closed, so not because it did
 	uint32_t close_code; // ... with this code
-	int deaf;            // the session is open: what arrives on the CONNECT stream is dropped unread
-	int packets;         // Wisp packets from the server
+	int dgrams;          // datagrams taken in
+	int packet_dgram;    // the datagram the last Wisp packet came in, and the one that closed the session
+	int close_dgram;
+	char quic_reason[32]; // the reason in the server's CONNECTION_CLOSE
+	int deaf;             // the session is open: what arrives on the CONNECT stream is dropped unread
+	int packets;          // Wisp packets from the server
 	uint8_t last_type;
 	uint32_t last_stream;
 	uint8_t last_reason; // the first payload byte of the last packet (a CLOSE's reason)
@@ -733,7 +737,7 @@ static void raw_q_closed(void *ud, uint64_t error, int app, const char *reason) 
 	raw_wt *r = ud;
 	(void)error;
 	(void)app;
-	(void)reason;
+	snprintf(r->quic_reason, sizeof(r->quic_reason), "%s", reason ? reason : "");
 	r->quic_closed = 1;
 	hw_wt_on_closed(r->wt);
 }
@@ -743,6 +747,7 @@ static void raw_w_packet(void *ud, const uint8_t *data, size_t len, int datagram
 	(void)datagram;
 	hw_wisp_packet p;
 	if (hw_wisp_parse(data, len, &p) != 0) return;
+	r->packet_dgram = r->dgrams;
 	if (r->packets < 16) {
 		r->types[r->packets] = p.type;
 		r->streams[r->packets] = p.stream_id;
@@ -764,6 +769,7 @@ static void raw_w_session_closed(void *ud, uint32_t code, const char *reason) {
 	raw_wt *r = ud;
 	(void)reason;
 	r->session_closed = 1;
+	r->close_dgram = r->dgrams;
 	r->heard_close = !r->quic_closed;
 	r->close_code = code;
 }
@@ -798,6 +804,7 @@ static void raw_pump(raw_wt *r, int ms, const int *until) {
 			struct sockaddr_in from;
 			socklen_t fl = sizeof(from);
 			getpeername(r->fd, (struct sockaddr *)&from, &fl);
+			r->dgrams++;
 			hw_quic_input(r->q, buf, (size_t)n, (struct sockaddr *)&from, fl, hw_now_ms());
 		}
 		if (hw_now_ms() >= hw_quic_timeout(r->q)) hw_quic_on_timeout(r->q, hw_now_ms());
@@ -1004,7 +1011,8 @@ static void test_server_stream_opening(void) {
 }
 
 // On a server-opened Wisp stream the client's first packet must be its INFO: anything else is
-// answered with CLOSE 0x04 on stream 0, and the session ends.
+// answered with CLOSE 0x04 on stream 0, and the session ends. The capsule waits for the CLOSE to be
+// acknowledged (Chrome drops what a stream holds unread once it has the capsule) and carries 0x04.
 static void test_server_stream_info_first(void) {
 	hw_server_config cfg;
 	base_config(&cfg);
@@ -1019,6 +1027,10 @@ static void test_server_stream_info_first(void) {
 	CHECK(r.last_type == HW_WISP_CLOSE && r.last_stream == 0 && r.last_reason == HW_CLOSE_INCOMPATIBLE,
 	      "CLOSE 0x04 (type %d stream %u reason 0x%02x)", r.last_type, r.last_stream, r.last_reason);
 	CHECK(r.session_closed, "the session ended");
+	CHECK_EQ(r.close_code, HW_CLOSE_INCOMPATIBLE);
+	CHECK(r.close_dgram > r.packet_dgram,
+	      "the capsule came after the CLOSE was acknowledged (datagram %d, CLOSE in %d)", r.close_dgram,
+	      r.packet_dgram);
 	CHECK(raw_wait_server(&r, s, 3000, 0, 0), "the session is gone");
 	CHECK_EQ(stats(s).streams_active, 0);
 	raw_free(&r);
@@ -1214,6 +1226,25 @@ static void test_client_close_then_silent(void) {
 	uint64_t t0 = hw_now_ms();
 	CHECK(raw_wait_server(NULL, s, 3000, 0, 0), "a silent closed session is still held");
 	CHECK(hw_now_ms() - t0 < 3000, "took %llu ms", (unsigned long long)(hw_now_ms() - t0));
+	raw_free(&r);
+	hw_server_free(s);
+}
+
+// A client that ends its session and goes on answering gets a CONNECTION_CLOSE that says nothing
+// went wrong, once the server's FIN on the CONNECT stream is acknowledged (Chrome logged the
+// session as failed on "refused", sent with that FIN still in flight).
+static void test_client_close_answered(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open(&r, s, 0);
+	hw_wt_close(r.wt, 7, "bye");
+	raw_pump(&r, 3000, &r.quic_closed);
+	CHECK(r.quic_closed, "QUIC was not closed in 3 s");
+	CHECK_STR(r.quic_reason, "");
+	CHECK(raw_wait_server(&r, s, 3000, 0, 0), "the session is gone");
 	raw_free(&r);
 	hw_server_free(s);
 }
@@ -1631,6 +1662,7 @@ int main(void) {
 	RUN(test_operator_reload);
 	RUN(test_server_stream_opening);
 	RUN(test_server_stream_info_first);
+	RUN(test_client_close_answered);
 	RUN(test_lane_before_info);
 	RUN(test_lanes_echo);
 	RUN(test_lane_backpressure);

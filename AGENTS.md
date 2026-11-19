@@ -651,7 +651,13 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   is handed over). After the server's own capsule, `WT_CLOSE_MS` (3 s) bounds a client that never
   answers, even one that keeps sending. The close goes capsule, then FIN, then nothing that could
   overtake it: Chrome reads a reset or STOP_SENDING before the capsule as "Connection lost.".
-  `test_wisp_stream_end`, `test_close_unanswered` and `test_client_close_then_silent` hold it.
+  The server's capsule waits for what is queued to be acknowledged (at most `WT_REFUSE_MS`):
+  Chrome drops what a stream holds unread once it has the capsule, so a stream-0 CLOSE sent in
+  the same flight never reached the page. That CLOSE's reason is also the capsule's code, with
+  `hw_close_reason_str` as its reason. After the client's close, QUIC's CONNECTION_CLOSE (reason
+  empty) waits likewise for the FIN on the CONNECT stream, or Chrome logs the session as failed.
+  `test_wisp_stream_end`, `test_close_unanswered`, `test_client_close_then_silent`,
+  `test_client_close_answered` and `test_server_stream_info_first` hold it.
 
 ## Verification before you hand work off
 
@@ -675,7 +681,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 - If you touched `wt_listener.c`, the WebTransport branches of `conn.c`, `wt_client.c` or any
   layer of the stack, run `test_e2e_wt` several times
   (`for i in 1 2 3 4 5; do build/debug/test_e2e_wt || break; done`), and once by hand
-  `node tests/wt_interop.mjs build/release/holywisp`: `curl --http3-only` gets its 404, and
+  `node tests/wt_interop.mjs build/release/holywisp`: `curl --http3-only` gets its 421, and
   headless Chrome goes through `/webtransport.json` to a pinned session, a TCP echo, a UDP echo
   by datagram and a v2 session (each skipped when the tool is missing; nothing in CI runs it).
   A WebTransport throughput figure is

@@ -708,7 +708,14 @@ static int conn_wt_send_packet(hw_conn *c, const uint8_t *packet, size_t len, in
 
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len) {
 	if (c->closing) return -1;
-	if (c->wt) return conn_wt_send_packet(c, packet, len, conn_wt_lane(c, hw_le32(packet + 1)));
+	if (c->wt) {
+		// A CLOSE on stream 0 ends the connection: the session's close carries its reason as the code,
+		// as it carries ws_fail's, so a page that missed the packet still learns why.
+		if (!c->wt_code && len > HW_WISP_HEADER_LEN && packet[0] == HW_WISP_CLOSE && hw_le32(packet + 1) == 0) {
+			c->wt_code = packet[HW_WISP_HEADER_LEN];
+		}
+		return conn_wt_send_packet(c, packet, len, conn_wt_lane(c, hw_le32(packet + 1)));
+	}
 	uint8_t *p = frame_begin(c, len);
 	if (!p) return -1;
 	memcpy(p, packet, len);
