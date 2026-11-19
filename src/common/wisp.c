@@ -78,6 +78,14 @@ int hw_wisp_parse_info(const hw_wisp_packet *p, hw_wisp_info *out) {
 				out->credit_window = hw_le32(meta);
 			}
 			break;
+		case HW_EXT_STREAM_LIMIT:
+			// The client's is empty; the server's starts with the limit, and the rest is for later.
+			out->has_stream_limit = 1;
+			if (meta_len >= 4) {
+				out->has_max_streams = 1;
+				out->max_streams = hw_le32(meta);
+			}
+			break;
 		default:
 			// Unknown extensions are skipped by design (spec: "ignore extensions you don't know").
 			break;

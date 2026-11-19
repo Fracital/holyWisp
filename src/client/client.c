@@ -66,11 +66,12 @@ struct hw_client {
 	int closed;
 	int is_v2;
 	int server_udp;
-	int server_confirm; // the server's INFO offers stream-open confirmation
-	int server_lanes;   // WebTransport: the lanes the server's INFO offers, 0 for none
-	int lanes;          // the lanes open, lane 0 included
-	int authenticated;  // the password extension went out and the server completed the handshake
-	int timeout_ms;     // opts.timeout_ms: the longest a send waits for a CONTINUE
+	int server_confirm;   // the server's INFO offers stream-open confirmation
+	uint32_t max_streams; // the server's stream limit (0xE3), 0 for none or none known
+	int server_lanes;     // WebTransport: the lanes the server's INFO offers, 0 for none
+	int lanes;            // the lanes open, lane 0 included
+	int authenticated;    // the password extension went out and the server completed the handshake
+	int timeout_ms;       // opts.timeout_ms: the longest a send waits for a CONTINUE
 	uint32_t buffer_size;
 	uint32_t credit;   // stream credit's window, 0 when off
 	int credit_manual; // opts.credit_manual: no grants but the caller's
@@ -626,6 +627,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 			}
 			c->server_udp = info.has_udp;
 			c->server_confirm = info.has_stream_confirm;
+			c->max_streams = info.has_max_streams ? info.max_streams : 0;
 			c->server_lanes = info.lanes;
 			if (info.motd) {
 				size_t ml = HW_MIN(info.motd_len, sizeof(c->motd) - 1);
@@ -633,7 +635,7 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				c->motd[ml] = '\0';
 			}
 			uint8_t meta[1 + CLIENT_USER_MAX + CLIENT_PASS_MAX];
-			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 4 * 5 + 4 + sizeof(meta)];
+			uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 * 5 + 4 + sizeof(meta)];
 			size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 			n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 			if (o->stream_confirm) {
@@ -647,6 +649,10 @@ static int do_wisp_handshake(hw_client *c, const hw_client_opts *o, ctimer *t, c
 				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, window, sizeof(window));
 				c->credit = o->credit_window > HW_WISP_CREDIT_MIN ? o->credit_window : HW_WISP_CREDIT_MIN;
 				c->credit_manual = o->credit_manual;
+			}
+			// The stream limit is kept to (hw_client_open), and naming it says so.
+			if (info.has_stream_limit) {
+				n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, NULL, 0);
 			}
 			// Credentials go only to a server that asked for them. One that did not advertise the
 			// extension has no use for a password, and would get it in clear all the same.
@@ -797,6 +803,10 @@ int hw_client_server_has_stream_confirm(const hw_client *c) {
 	return c->server_confirm;
 }
 
+uint32_t hw_client_max_streams(const hw_client *c) {
+	return c->max_streams;
+}
+
 int hw_client_lanes(const hw_client *c) {
 	return c->lanes;
 }
@@ -839,6 +849,9 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	// passed (its suffix, say), and a prefix of it is a different name.
 	size_t hl = strlen(host);
 	if (hl == 0 || hl > CLIENT_HOST_MAX) return HW_ERR_INVALID;
+	// The server would refuse it 0x49: every stream the client has not closed or seen closed is
+	// still one of the server's, so this count is never under the server's.
+	if (c->max_streams && c->nstreams >= c->max_streams) return HW_ERR_TOOBIG;
 	if (c->nstreams == c->streams_cap) {
 		size_t cap = c->streams_cap ? c->streams_cap * 2 : 16;
 		cstream *p = realloc(c->streams, cap * sizeof(*p));

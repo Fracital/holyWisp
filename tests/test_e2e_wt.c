@@ -19,6 +19,7 @@
 #include "holywisp/wisp.h"
 
 #include "credit_cases.h"
+#include "ext_cases.h"
 #include "test.h"
 
 #include <errno.h>
@@ -1821,6 +1822,17 @@ static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manu
 	return c;
 }
 
+// ext_cases.h's client: WebTransport v2, on two lanes unless the case says otherwise.
+static void ext_client_opts(hw_server *s, hw_client_opts *o) {
+	hw_client_opts_defaults(o);
+	o->host = "127.0.0.1";
+	o->port = hw_server_wt_port(s);
+	o->webtransport = 1;
+	o->v2 = 1;
+	o->wt_lanes = 2;
+	o->timeout_ms = 5000;
+}
+
 int main(void) {
 	start_services();
 	hw_server_config cfg;
@@ -1868,6 +1880,9 @@ int main(void) {
 	credit_cases_run(&credit);
 	RUN(test_credit_not_by_datagram); // after credit_cases_run, which starts its source
 	hw_server_free(off);
+	ext_env ext = {
+	    .config = base_config, .start = server_with, .client_opts = ext_client_opts, .echo_port = g_tcp_echo_port};
+	ext_cases_run(&ext);
 
 	hw_server_stop(g_server);
 	hw_server_free(g_server);

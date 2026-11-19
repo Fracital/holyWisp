@@ -551,10 +551,10 @@ int main(int argc, char **argv) {
 		const char *motd = hw_client_motd(c);
 		char shown[MOTD_SHOWN];
 		hw_client_printable(shown, sizeof(shown), motd, strlen(motd));
-		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s, stream credit %u%s%s\n",
+		fprintf(stderr, "connected: wisp-v%d, window %u, %d lane%s%s, stream credit %u, stream limit %u%s%s\n",
 		        hw_client_is_v2(c) ? 2 : 1, hw_client_buffer_size(c), hw_client_lanes(c),
 		        hw_client_lanes(c) == 1 ? "" : "s", hw_client_server_stream(c) ? ", server-opened" : "",
-		        hw_client_credit_window(c), shown[0] ? ", motd: " : "", shown);
+		        hw_client_credit_window(c), hw_client_max_streams(c), shown[0] ? ", motd: " : "", shown);
 	}
 	if (!bench) streams = 1;
 	uint32_t *sid = calloc((size_t)streams, sizeof(*sid));

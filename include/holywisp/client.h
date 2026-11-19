@@ -128,6 +128,10 @@ int hw_client_server_has_udp(const hw_client *c);
 // confirmed TCP stream's first event is the CONTINUE, or its CLOSE. A UDP stream is never
 // confirmed. 0 on v1.
 int hw_client_server_has_stream_confirm(const hw_client *c);
+// The most streams the server lets this connection have open at once, from its v2 INFO
+// (extension 0xE3, docs/extensions.md), which the client names back. 0 when the server has no
+// limit or did not say (v1, or a server without the extension). hw_client_open keeps to it.
+uint32_t hw_client_max_streams(const hw_client *c);
 // WebTransport: the lanes open, lane 0 included (1 on a WebSocket), the lane a stream rides (-1
 // for none), and whether the server opened lane 0 (opts.wt_server_stream answered).
 int hw_client_lanes(const hw_client *c);
@@ -155,7 +159,11 @@ int64_t hw_client_wait_us(const hw_client *c);
 size_t hw_client_printable(char *out, size_t cap, const void *data, size_t len);
 
 // Open a stream; the id is chosen by the client and returned. 0 on success, HW_ERR_INVALID when
-// host is empty or longer than 255 bytes, the most a CONNECT carries (it is never cut to fit).
+// host is empty or longer than 255 bytes, the most a CONNECT carries (it is never cut to fit),
+// HW_ERR_TOOBIG with hw_client_max_streams streams open already (counting each until the client
+// closed it or saw it closed): nothing is sent, and the server would have refused it 0x49. Over
+// WebTransport lanes a CONNECT can still overtake the CLOSE that made room for it on another lane
+// and be refused 0x49; on one lane, or a WebSocket, it never is.
 int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t port, uint32_t *stream_id);
 // Send one DATA packet. For TCP streams this waits (pumping events into the queue) while the
 // server's window is exhausted, for at most opts.timeout_ms. 0 on success, HW_ERR_CLOSED when the

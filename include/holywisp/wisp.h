@@ -73,7 +73,12 @@ enum hw_wisp_extension {
 	// Stream credit. Server -> client: meta empty (any bytes are reserved). Client -> server, only
 	// when the server's INFO had it: meta initial_window(u32 LE), further bytes reserved; a meta
 	// under 4 bytes is as if the extension were absent.
-	HW_EXT_CREDIT = 0xE2
+	HW_EXT_CREDIT = 0xE2,
+	// Stream limit (docs/extensions.md). Server -> client: meta max_streams(u32 LE), the most
+	// streams the connection may have open at once, 0 for no limit; further bytes are reserved, and
+	// a meta under 4 bytes is as if the extension were absent. Client -> server: meta empty (any
+	// bytes are reserved).
+	HW_EXT_STREAM_LIMIT = 0xE3
 };
 
 typedef struct hw_wisp_packet {
@@ -108,6 +113,9 @@ typedef struct hw_wisp_info {
 	int has_credit;         // HW_EXT_CREDIT present, whatever its meta
 	int has_credit_window;  // ... with an initial window (client->server: a meta of 4 bytes or more)
 	uint32_t credit_window; // that window as sent, 0 without one
+	int has_stream_limit;   // HW_EXT_STREAM_LIMIT present, whatever its meta
+	int has_max_streams;    // ... with a limit (server->client: a meta of 4 bytes or more)
+	uint32_t max_streams;   // that limit as sent (0: none), 0 without one
 } hw_wisp_info;
 
 static inline uint32_t hw_le32(const uint8_t *p) {

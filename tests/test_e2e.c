@@ -11,6 +11,7 @@
 #include "holywisp/ws.h"
 
 #include "credit_cases.h"
+#include "ext_cases.h"
 #include "test.h"
 
 #include <errno.h>
@@ -1283,19 +1284,39 @@ static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manu
 	return c;
 }
 
+// ext_cases.h's server and client over a WebSocket.
+static void ext_config(hw_server_config *cfg) {
+	hw_server_config_defaults(cfg);
+	strcpy(cfg->host, "127.0.0.1");
+	cfg->port = 0;
+	cfg->workers = 2;
+	cfg->allow_direct_ip = 1;
+	cfg->allow_loopback = 1;
+	cfg->buffer_remaining = 16;
+	cfg->stream_queue_max = 32u * 1024 * 1024; // 16 max-size packets fit, so the window stays 16
+	cfg->log_level = HW_LOG_WARN;
+}
+
+static hw_server *ext_start(const hw_server_config *cfg) {
+	hw_server *s = hw_server_new(cfg);
+	CHECK(s != NULL, "server: %s", strerror(errno));
+	CHECK_EQ(hw_server_start(s), 0);
+	return s;
+}
+
+static void ext_client_opts(hw_server *s, hw_client_opts *o) {
+	hw_client_opts_defaults(o);
+	o->host = "127.0.0.1";
+	o->port = hw_server_port(s);
+	o->v2 = 1;
+	o->timeout_ms = 5000;
+}
+
 int main(void) {
 	start_echo_services();
 	hw_server_config cfg;
-	hw_server_config_defaults(&cfg);
-	strcpy(cfg.host, "127.0.0.1");
-	cfg.port = 0;
-	cfg.workers = 2;
-	cfg.allow_direct_ip = 1;
-	cfg.allow_loopback = 1;
-	cfg.buffer_remaining = 16;
-	cfg.stream_queue_max = 32u * 1024 * 1024; // 16 max-size packets fit, so the window stays 16
+	ext_config(&cfg);
 	strcpy(cfg.motd, "welcome to the test server");
-	cfg.log_level = HW_LOG_WARN;
 	g_server = hw_server_new(&cfg);
 	CHECK(g_server != NULL, "server: %s", strerror(errno));
 	CHECK_EQ(hw_server_start(g_server), 0);
@@ -1342,6 +1363,9 @@ int main(void) {
 	                     .open_client = credit_connect};
 	credit_cases_run(&credit);
 	hw_server_free(off);
+	ext_env ext = {
+	    .config = ext_config, .start = ext_start, .client_opts = ext_client_opts, .echo_port = g_tcp_echo_port};
+	ext_cases_run(&ext);
 
 	hw_server_stop(g_server);
 	hw_server_free(g_server);

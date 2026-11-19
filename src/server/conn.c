@@ -1211,7 +1211,7 @@ static int apply_reputation(hw_conn *c) {
 
 static void send_server_info(hw_conn *c) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 5 + 6 + 5];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 2 + 5 + 6 + 5 + sizeof(cfg->motd) + 5 + 6 + 5 + 9];
 	size_t n = hw_wisp_build_info(pkt, HW_WISP_MAJOR, HW_WISP_MINOR);
 	if (cfg->allow_udp) n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
 	// Stream-open confirmation is always honoured (stream_connected), so it is always offered: a
@@ -1232,6 +1232,11 @@ static void send_server_info(hw_conn *c) {
 		n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_CREDIT, NULL, 0);
 		c->credit_offered = 1;
 	}
+	// The stream cap as admission left it (apply_reputation runs before this on both transports),
+	// so a client need not find it by being refused 0x49 (docs/extensions.md).
+	uint8_t cap[4];
+	hw_put_le32(cap, c->stream_cap > 0 ? (uint32_t)c->stream_cap : 0);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, cap, sizeof(cap));
 	conn_send_packet(c, pkt, n);
 }
 

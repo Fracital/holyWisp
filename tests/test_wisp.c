@@ -235,6 +235,44 @@ static void test_credit(void) {
 	CHECK(hw_le64(pkt) == UINT64_MAX, "le64 round trip");
 }
 
+// Stream limit: INFO extension 0xE3 (a u32 limit from the server, empty from the client, a
+// shorter meta as no limit, reserved bytes after it skipped).
+static void test_stream_limit(void) {
+	uint8_t pkt[64];
+	hw_wisp_packet p;
+	hw_wisp_info info;
+	uint8_t meta[6] = {0x00, 0x08, 0x00, 0x00, 0xaa, 0xbb}; // 2048, then two reserved bytes
+	size_t n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, meta, 6);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_UDP, NULL, 0);
+	CHECK_EQ(pkt[7], 0xE3);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_stream_limit && info.has_max_streams, "server's 0xE3");
+	CHECK_EQ(info.max_streams, 2048);
+	CHECK(info.has_udp, "the extension after it");
+	meta[0] = meta[1] = 0; // 0: no limit, which is still a limit sent
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, meta, 4);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_max_streams && info.max_streams == 0, "no limit");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, NULL, 0);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_stream_limit && !info.has_max_streams, "client's 0xE3");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	n += hw_wisp_build_extension(pkt + n, sizeof(pkt) - n, HW_EXT_STREAM_LIMIT, meta, 3);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(info.has_stream_limit && !info.has_max_streams, "3 bytes are no limit");
+	n = hw_wisp_build_info(pkt, 2, 1);
+	CHECK_EQ(hw_wisp_parse(pkt, n, &p), 0);
+	CHECK_EQ(hw_wisp_parse_info(&p, &info), 0);
+	CHECK(!info.has_stream_limit && !info.has_max_streams, "absent");
+}
+
 int main(void) {
 	RUN(test_le16);
 	RUN(test_header_roundtrip);
@@ -244,5 +282,6 @@ int main(void) {
 	RUN(test_info_client_password);
 	RUN(test_lanes);
 	RUN(test_credit);
+	RUN(test_stream_limit);
 	return 0;
 }
