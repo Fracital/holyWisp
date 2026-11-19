@@ -1015,6 +1015,140 @@ static void test_cert_rotation(void) {
 	hw_server_free(s);
 }
 
+// A new P-256 key and a certificate for it, as PEM files at fresh temporary paths.
+static void operator_pair(char cert_path[512], char key_path[512], uint8_t hash[32]) {
+	uint8_t priv[HW_P256_PRIV_LEN], pub[HW_P256_PUB_LEN];
+	CHECK_EQ(hw_p256_keygen(priv, pub), 0);
+	hw_der cert = {0};
+	int64_t now = (int64_t)time(NULL);
+	CHECK_EQ(hw_cert_selfsigned(priv, pub, "wt.example", now - 3600, now + 7 * 86400, &cert), 0);
+	hw_sha256(cert.der, cert.len, hash);
+	uint8_t key[128];
+	size_t key_len = sec1_key(priv, pub, key);
+	write_pem(cert_path, 512, "CERTIFICATE", cert.der, cert.len);
+	write_pem(key_path, 512, "EC PRIVATE KEY", key, key_len);
+	hw_der_free(&cert);
+}
+
+// Puts from in place of to, in one step, as certbot's symlink swap or an atomic writer does.
+static void file_replace(const char *from, const char *to) {
+	CHECK(rename(from, to) == 0, "rename %s: %s", from, strerror(errno));
+}
+
+// Until the wall clock's second turns. The server tells files apart by stat's inode, size and
+// mtime in seconds, and Windows has no inode: a key of the same size written in the second the
+// last one was would look like the same file there. A real renewal comes weeks after the last.
+static void second_turn(void) {
+	time_t t = time(NULL);
+	while (time(NULL) == t) usleep(20000);
+}
+
+// Whether a new session pinned to hash connects, and then whether every worker serves it: the
+// workers get their copies by posted tasks, and each new client may land on another one.
+static int pin_served(hw_server *s, const uint8_t hash[32]) {
+	wt_opts w = {.pin = hash};
+	char err[256];
+	for (int i = 0; i < 8; i++) {
+		hw_client *c = wt_try(s, &w, err, sizeof(err));
+		if (!c) return 0;
+		hw_client_free(c);
+	}
+	return 1;
+}
+
+static int pin_refused(hw_server *s, const uint8_t hash[32]) {
+	wt_opts w = {.pin = hash};
+	char err[256];
+	for (int i = 0; i < 8; i++) {
+		hw_client *c = wt_try(s, &w, err, sizeof(err));
+		if (c) {
+			hw_client_free(c);
+			return 0;
+		}
+	}
+	return 1;
+}
+
+// Until a new session pinned to hash connects, at most timeout_ms.
+static int pin_wait(hw_server *s, const uint8_t hash[32], int timeout_ms) {
+	wt_opts w = {.pin = hash};
+	char err[256];
+	uint64_t until = hw_now_ms() + (uint64_t)timeout_ms;
+	while (hw_now_ms() < until) {
+		hw_client *c = wt_try(s, &w, err, sizeof(err));
+		if (c) {
+			hw_client_free(c);
+			usleep(100000); // the other workers' posted copies
+			return 1;
+		}
+		usleep(100000);
+	}
+	return 0;
+}
+
+// The operator's files renewed in place (certbot, lego): the server reads them again within a
+// couple of seconds, new sessions get the new certificate and a session from before goes on with
+// the old one. A file that does not load, and a certificate whose key has not arrived yet, change
+// nothing; the pair is tried again when the files change again.
+static void test_operator_reload(void) {
+	char cert_path[512], key_path[512], cert_new[512], key_new[512];
+	uint8_t ha[32], hb[32], hc[32];
+	operator_pair(cert_path, key_path, ha);
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	snprintf(cfg.webtransport_cert, sizeof(cfg.webtransport_cert), "%s", cert_path);
+	snprintf(cfg.webtransport_key, sizeof(cfg.webtransport_key), "%s", key_path);
+	hw_server *s = server_with(&cfg);
+	wt_opts pin_a = {.pin = ha};
+	hw_client *a = wt_connect(s, &pin_a);
+	uint32_t sa;
+	CHECK_EQ(hw_client_open(a, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sa), 0);
+	echo_check(a, sa, "before");
+
+	second_turn();
+	operator_pair(cert_new, key_new, hb);
+	file_replace(cert_new, cert_path);
+	file_replace(key_new, key_path);
+	CHECK(pin_wait(s, hb, 5000), "the renewed certificate is not served");
+	CHECK(pin_served(s, hb), "a worker still serves the old certificate");
+	CHECK(pin_refused(s, ha), "a new session still gets the old certificate");
+	echo_check(a, sa, "across the reload");
+	uint32_t sa2;
+	CHECK_EQ(hw_client_open(a, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sa2), 0);
+	echo_check(a, sa2, "a new stream after the reload");
+	char json[2048];
+	uint8_t hashes[2][32];
+	CHECK_EQ(json_hashes(s, hashes, 2, json, sizeof(json)), 0);
+
+	// Not a certificate at all: B stays.
+	char junk[512];
+	second_turn();
+	hw_test_tmp(junk, sizeof(junk), "hw-wt-junk");
+	int fd = mkstemp(junk);
+	CHECK(fd >= 0, "mkstemp: %s", strerror(errno));
+	CHECK_EQ(write(fd, "-----BEGIN CERTIFICATE-----\nnot base64\n", 39), 39);
+	close(fd);
+	file_replace(junk, cert_path);
+	usleep(3000000); // two looks: the change, then the read
+	CHECK(pin_served(s, hb), "a file that is not a certificate replaced the one served");
+
+	// The renewer's first half: C's certificate beside B's key. Still B, until C's key is there.
+	operator_pair(cert_new, key_new, hc);
+	file_replace(cert_new, cert_path);
+	usleep(3000000);
+	CHECK(pin_served(s, hb), "a certificate without its key replaced the one served");
+	file_replace(key_new, key_path);
+	CHECK(pin_wait(s, hc, 5000), "the pair was not tried again once the key arrived");
+	CHECK(pin_served(s, hc), "a worker still serves B");
+	CHECK(pin_refused(s, hb), "a new session still gets B");
+	echo_check(a, sa, "after the second reload");
+	hw_client_free(a);
+	hw_server_free(s);
+	unlink(cert_path);
+	unlink(key_path);
+}
+
 static void test_stats_json(void) {
 	char buf[8192];
 	http_get(g_server, "/stats", buf, sizeof(buf));
@@ -1048,6 +1182,7 @@ int main(void) {
 	RUN(test_client_close_then_silent);
 	RUN(test_close_unanswered);
 	RUN(test_cert_rotation);
+	RUN(test_operator_reload);
 	RUN(test_stats_json);
 
 	hw_server_stop(g_server);

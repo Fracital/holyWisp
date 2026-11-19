@@ -69,6 +69,14 @@ typedef struct wt_cert {
 	int nhashes;
 } wt_cert;
 
+// What stat(2) says of an operator's certificate or key file. Any field that differs is another
+// file, or the same file rewritten.
+typedef struct {
+	int ok; // stat succeeded; the rest is zero when it did not
+	uint64_t dev, ino, size;
+	int64_t mtime;
+} wt_file_id;
+
 // auth.c: hashed-password checks on threads of their own.
 typedef struct hw_auth hw_auth;
 typedef struct hw_auth_req hw_auth_req;
@@ -191,13 +199,17 @@ struct hw_server {
 	// WebTransport. The keys are drawn once and never change: Retry tokens are sealed with the
 	// first and stateless reset tokens derived from the second, and any worker must be able to
 	// answer for any other's connection IDs. The certificate is the maintenance thread's
-	// (wt_cert_rotate); workers have their copies.
+	// (wt_cert_tick); workers have their copies.
 	uint16_t wt_port; // bound UDP port, 0 when off
 	uint8_t wt_token_key[32];
 	uint8_t wt_reset_key[32];
 	wt_cert *wt_cert_cur;  // maintenance thread only
 	_Atomic int wt_renew;  // hw_server_wt_renew asked for a new certificate before its time
 	uint64_t wt_cert_made; // wall-clock seconds the self-signed one was made, 0 for the operator's
+	// webtransport-cert and -key (maintenance thread only): as the last look found them, and as
+	// they were when the pair was last read, whether it loaded or not.
+	wt_file_id wt_files_seen[2];
+	wt_file_id wt_files_tried[2];
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
@@ -381,8 +393,9 @@ void conn_wt_progress(hw_conn *c);
 int wt_listener_init(hw_server *s);
 // Every session of the worker, freed in place (shutdown, loops stopped), and the worker's state.
 void wt_worker_free(hw_worker *w);
-// The maintenance thread's look at the self-signed certificate: a new one every 6 days, or at once
-// after hw_server_wt_renew.
+// The maintenance thread's look at the certificate, once a second. Self-signed: a new one every 6
+// days, or at once after hw_server_wt_renew. The operator's: read again once either file has
+// changed and then stayed as it is for one look, and published only when it loads as at start.
 void wt_cert_tick(hw_server *s, int running);
 void wt_cert_free(wt_cert *c);
 // The body of GET /webtransport.json from this worker's copy, into out. Its length, 0 when it

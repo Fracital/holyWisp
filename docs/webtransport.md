@@ -70,6 +70,18 @@ P-256 key and a validity of at most 14 days. So by default the server makes its 
 - With `webtransport-cert` and `webtransport-key` (PEM files, ECDSA P-256 only: the TLS layer
   signs with P-256 only), that chain is used instead, nothing rotates, and `/webtransport.json`
   lists no hashes. The browser then verifies it through the Web PKI.
+- Those files are renewed in place (certbot, lego) without a restart. The maintenance thread
+  stats both once a second (device, inode, size, mtime; `stat` follows certbot's symlinks).
+  When either has changed it waits until neither changes for one more look, because a renewer
+  writes the certificate and then the key and the new certificate must not be tried with the
+  old key. Then it reads the pair with exactly the checks made at start (a chain of at most
+  `HW_CERT_CHAIN_MAX` blocks, a P-256 key, the key of the leaf) and, only if they pass, posts
+  each worker its copy as the self-signed rotation does, and logs the leaf's notAfter and
+  SHA-256 at INFO. New handshakes take the new certificate; a connection under way keeps the
+  one it started with, because `hw_tls_new` copies the chain and the key. A pair that does not
+  load is one ERROR (paths and the reason, never the key) and changes nothing: the current
+  certificate stays until the files change again. There is no SIGHUP; the unit has no
+  `ExecReload` on purpose.
 
 ## QUIC
 
@@ -202,7 +214,7 @@ places in the code. On top of it:
 | `webtransport-host` | `host` | UDP address to bind. |
 | `webtransport-port` | `port` | UDP port to bind (the same number as the TCP port by default). |
 | `webtransport-url` | empty | The URL `/webtransport.json` names, for when the client should not derive it from the page's origin. |
-| `webtransport-cert`, `webtransport-key` | empty | PEM files (ECDSA P-256) to use instead of the rotating self-signed certificate. |
+| `webtransport-cert`, `webtransport-key` | empty | PEM files (ECDSA P-256) to use instead of the rotating self-signed certificate. Read again when they change, for new sessions. |
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout. |
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |

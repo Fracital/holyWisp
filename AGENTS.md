@@ -597,7 +597,9 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   `warp_publish` does. `GET /webtransport.json` on the TCP port lists the current and previous
   hashes (`Access-Control-Allow-Origin: *`, `no-store`), so a page that fetched it just before a
   rotation still connects. With operator files nothing rotates and no hash is listed; the key
-  must be P-256 and match the leaf, or the server does not start.
+  must be P-256 and match the leaf, or the server does not start. Operator files are re-read when
+  they change (`wt_cert_watch`: once neither has changed for one look, with the checks made at
+  start, kept only if they pass), for new sessions only.
 - **The idle timeout is mandatory** (`webtransport-idle-timeout-s`, 1 to 3600), and the server
   sends a keepalive after 20 s without sending (divide's conntrack forgets a UDP flow at 30 s).
 - **A session ends promptly, whoever ends it.** Chrome never sends CONNECTION_CLOSE and goes

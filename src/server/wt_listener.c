@@ -7,8 +7,9 @@
  *
  * Threads: everything here runs on the loop of the worker that owns the socket, except
  * wt_listener_init (hw_server_new, before the loops run), wt_cert_tick (the maintenance thread,
- * which gives each worker its own copy of a new certificate by a posted task, as warp_publish
- * does) and wt_worker_free (shutdown, after the loops stopped). A worker's sessions, its tables
+ * which makes a new self-signed certificate or reads the operator's files again when they have
+ * changed, and gives each worker its own copy by a posted task, as warp_publish does) and
+ * wt_worker_free (shutdown, after the loops stopped). A worker's sessions, its tables
  * and its sockets are touched by that worker alone; steering is what makes every datagram of a
  * connection arrive there.
  *
@@ -49,6 +50,7 @@
 
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 
 #define WT_RX_SLOT      4096  // receive room per datagram; a longer one is dropped (QUIC's are 1200 to 1500)
 #define WT_RX_GRO_SLOTS 16    // receive slots with GRO, HW_SYS_GRO_SLOT each: a slot is up to 45 datagrams
@@ -64,7 +66,8 @@
 #define WT_CERT_EARLY_S 3600 // valid from an hour ago, for clocks that are a little behind
 #define WT_CERT_CN      "holywisp"
 #define WT_PEM_MAX      (256 * 1024)
-#define WT_KEY_HEX      41 // hex of a CID of up to 20 bytes, NUL included
+#define WT_WHY_LEN      1200 // why a pair did not load: both paths (512 each) and what is wrong
+#define WT_KEY_HEX      41   // hex of a CID of up to 20 bytes, NUL included
 // The UDP socket buffers unless socket-buffer-size says otherwise. A QUIC flight is many datagrams
 // at once, and with GRO one queued read is up to 64 KiB: measured on loopback, the kernel's
 // default (net.core.rmem_max 212992) dropped bursts and held one session at 230 MiB/s, 4 MiB
@@ -916,12 +919,17 @@ static void cert_swap_task(hw_loop *loop, void *ud) {
 }
 
 // Every worker its own copy: in place before the loops run, by a posted task after. New
-// handshakes take the copy they find; one under way has its own (hw_tls copies the config).
-static void wt_cert_publish(hw_server *s, int running) {
+// handshakes take the copy they find; one under way has its own (hw_tls copies the config), so the
+// copy a swap frees is never in use. 0, or -1 when a worker kept the previous one (no memory).
+static int wt_cert_publish(hw_server *s, int running) {
+	int rc = 0;
 	for (int i = 0; i < s->nworkers; i++) {
 		wt_worker *ww = s->workers[i].wt;
 		wt_cert *copy = wt_cert_copy(s->wt_cert_cur);
-		if (!copy) continue; // this worker keeps the previous one until the next rotation
+		if (!copy) {
+			rc = -1; // this worker keeps the previous one until the next rotation or reload
+			continue;
+		}
 		if (!running) {
 			wt_cert_free(ww->cert);
 			ww->cert = copy;
@@ -935,8 +943,10 @@ static void wt_cert_publish(hw_server *s, int running) {
 		if (!m || hw_loop_post(s->workers[i].loop, cert_swap_task, m) != 0) {
 			free(m);
 			wt_cert_free(copy);
+			rc = -1;
 		}
 	}
+	return rc;
 }
 
 // A new self-signed P-256 certificate, valid from an hour ago for 13 days, with the previous one's
@@ -991,47 +1001,52 @@ static char *read_file(const char *path, size_t *len) {
 	return buf;
 }
 
-// webtransport-cert and webtransport-key, once. The key must be the leaf's and on P-256: that is
-// the only signature the TLS layer makes.
-static int wt_cert_load(hw_server *s) {
-	const hw_server_config *cfg = &s->cfg;
+// webtransport-cert and webtransport-key, into *out. The key must be the leaf's and on P-256: that
+// is the only signature the TLS layer makes. The same checks at start and on every reload. 0, or
+// -1 and the reason in why (file names and what is wrong, never the key's bytes).
+static int wt_cert_load(const hw_server_config *cfg, wt_cert **out, char *why, size_t why_cap) {
+	*out = NULL;
 	size_t clen = 0, klen = 0;
 	char *cpem = read_file(cfg->webtransport_cert, &clen);
 	if (!cpem) {
-		HW_ERROR("wt", "webtransport-cert %s: %s", cfg->webtransport_cert, strerror(errno));
+		snprintf(why, why_cap, "webtransport-cert %s: %s", cfg->webtransport_cert, strerror(errno));
 		return -1;
 	}
 	char *kpem = read_file(cfg->webtransport_key, &klen);
 	if (!kpem) {
-		HW_ERROR("wt", "webtransport-key %s: %s", cfg->webtransport_key, strerror(errno));
+		snprintf(why, why_cap, "webtransport-key %s: %s", cfg->webtransport_key, strerror(errno));
 		free(cpem);
 		return -1;
 	}
 	wt_cert *c = calloc(1, sizeof(*c));
 	int rc = -1;
 	uint8_t pub[HW_P256_PUB_LEN], want[HW_P256_PUB_LEN];
-	if (!c) goto done;
+	if (!c) {
+		snprintf(why, why_cap, "webtransport-cert %s: %s", cfg->webtransport_cert, strerror(ENOMEM));
+		goto done;
+	}
 	if (hw_cert_load_chain(cpem, clen, c->chain, HW_CERT_CHAIN_MAX, &c->chain_len) != 0) {
-		HW_ERROR("wt", "webtransport-cert %s: no certificate chain of at most %d PEM blocks", cfg->webtransport_cert,
-		         HW_CERT_CHAIN_MAX);
+		snprintf(why, why_cap, "webtransport-cert %s: no certificate chain of at most %d PEM blocks",
+		         cfg->webtransport_cert, HW_CERT_CHAIN_MAX);
 		goto done;
 	}
 	// Never the key's bytes in a message: only that it is not what is needed.
 	if (hw_cert_load_p256_key(kpem, klen, c->key) != 0) {
-		HW_ERROR("wt", "webtransport-key %s: not an ECDSA P-256 private key", cfg->webtransport_key);
+		snprintf(why, why_cap, "webtransport-key %s: not an ECDSA P-256 private key", cfg->webtransport_key);
 		goto done;
 	}
 	if (hw_cert_p256_pubkey(c->chain[0].der, c->chain[0].len, want) != 0) {
-		HW_ERROR("wt", "webtransport-cert %s: the first certificate has no ECDSA P-256 key", cfg->webtransport_cert);
-		goto done;
-	}
-	if (hw_p256_public(c->key, pub) != 0 || memcmp(pub, want, sizeof(pub)) != 0) {
-		HW_ERROR("wt", "webtransport-key %s is not the key of the first certificate in %s", cfg->webtransport_key,
+		snprintf(why, why_cap, "webtransport-cert %s: the first certificate has no ECDSA P-256 key",
 		         cfg->webtransport_cert);
 		goto done;
 	}
+	if (hw_p256_public(c->key, pub) != 0 || memcmp(pub, want, sizeof(pub)) != 0) {
+		snprintf(why, why_cap, "webtransport-key %s is not the key of the first certificate in %s",
+		         cfg->webtransport_key, cfg->webtransport_cert);
+		goto done;
+	}
 	c->nhashes = 0; // a certificate of the Web PKI is verified, not pinned
-	s->wt_cert_cur = c;
+	*out = c;
 	c = NULL;
 	rc = 0;
 done:
@@ -1042,8 +1057,84 @@ done:
 	return rc;
 }
 
+// Whole seconds of mtime are enough: a renewal comes weeks after the last, and a file replaced by
+// rename is another inode (except on Windows, which has none).
+static wt_file_id file_id(const char *path) {
+	wt_file_id id;
+	memset(&id, 0, sizeof(id));
+	struct stat sb;
+	if (stat(path, &sb) != 0) return id;
+	id.ok = 1;
+	id.dev = (uint64_t)sb.st_dev;
+	id.ino = (uint64_t)sb.st_ino;
+	id.size = (uint64_t)sb.st_size;
+	id.mtime = (int64_t)sb.st_mtime;
+	return id;
+}
+
+static int file_ids_same(const wt_file_id a[2], const wt_file_id b[2]) {
+	for (int i = 0; i < 2; i++) {
+		if (a[i].ok != b[i].ok || a[i].dev != b[i].dev || a[i].ino != b[i].ino || a[i].size != b[i].size ||
+		    a[i].mtime != b[i].mtime) {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+// The operator's pair as it is on disk now. Taken before the files are read, so a change after
+// the stat is seen by the next look, never missed. stat follows a symlink: certbot's live/ names
+// point at a new file on every renewal.
+static void wt_files_stat(const hw_server *s, wt_file_id ids[2]) {
+	ids[0] = file_id(s->cfg.webtransport_cert);
+	ids[1] = file_id(s->cfg.webtransport_key);
+}
+
+// A renewer (certbot, lego) replaces the certificate and then the key, so a pair is read only
+// once neither file has changed for one look: a new certificate is not tried with the old key
+// while the new one is on its way. A pair that does not load is logged once and changes nothing:
+// new sessions keep the certificate they had until the files change again. Sessions under way
+// keep theirs in any case (hw_tls copied it at the first Initial).
+static void wt_cert_watch(hw_server *s, int running) {
+	wt_file_id now[2];
+	wt_files_stat(s, now);
+	if (!file_ids_same(now, s->wt_files_seen)) {
+		memcpy(s->wt_files_seen, now, sizeof(now));
+		return;
+	}
+	if (file_ids_same(now, s->wt_files_tried)) return;
+	memcpy(s->wt_files_tried, now, sizeof(now));
+	wt_cert *c = NULL;
+	char why[WT_WHY_LEN];
+	if (wt_cert_load(&s->cfg, &c, why, sizeof(why)) != 0) {
+		HW_ERROR("wt", "%s; new sessions keep the certificate loaded before", why);
+		return;
+	}
+	wt_cert_free(s->wt_cert_cur);
+	s->wt_cert_cur = c;
+	// A worker that missed its copy (no memory) gets the pair read again at the next look.
+	if (wt_cert_publish(s, running) != 0) memset(s->wt_files_tried, 0, sizeof(s->wt_files_tried));
+	uint8_t hash[HW_SHA256_LEN];
+	hw_sha256(c->chain[0].der, c->chain[0].len, hash);
+	char b64[HW_BASE64_LEN(HW_SHA256_LEN)];
+	hw_base64_encode(hash, sizeof(hash), b64, sizeof(b64));
+	char until[32] = "an unreadable date";
+	int64_t not_after = 0;
+	if (hw_cert_not_after(c->chain[0].der, c->chain[0].len, &not_after) == 0) {
+		time_t t = (time_t)not_after;
+		struct tm tm;
+		if (gmtime_r(&t, &tm)) strftime(until, sizeof(until), "%Y-%m-%d %H:%M:%S UTC", &tm);
+	}
+	HW_INFO("wt", "webtransport-cert %s reloaded: new sessions get the certificate valid until %s, sha-256 %s",
+	        s->cfg.webtransport_cert, until, b64);
+}
+
 void wt_cert_tick(hw_server *s, int running) {
-	if (!s->cfg.webtransport || s->cfg.webtransport_cert[0]) return;
+	if (!s->cfg.webtransport) return;
+	if (s->cfg.webtransport_cert[0]) {
+		wt_cert_watch(s, running);
+		return;
+	}
 	uint64_t now = (uint64_t)time(NULL);
 	int asked = atomic_exchange(&s->wt_renew, 0);
 	if (!asked && s->wt_cert_cur && now - s->wt_cert_made < WT_CERT_RENEW_S && now >= s->wt_cert_made) return;
@@ -1169,8 +1260,14 @@ int wt_listener_init(hw_server *s) {
 		if (!s->workers[i].wt) return -1;
 	}
 	if (cfg->webtransport_cert[0]) {
-		if (wt_cert_load(s) != 0) return -1;
-		wt_cert_publish(s, 0);
+		char why[WT_WHY_LEN];
+		wt_files_stat(s, s->wt_files_seen);
+		memcpy(s->wt_files_tried, s->wt_files_seen, sizeof(s->wt_files_tried));
+		if (wt_cert_load(cfg, &s->wt_cert_cur, why, sizeof(why)) != 0) {
+			HW_ERROR("wt", "%s", why);
+			return -1;
+		}
+		if (wt_cert_publish(s, 0) != 0) return -1;
 	} else {
 		wt_cert_tick(s, 0);
 		if (!s->wt_cert_cur) return -1;
