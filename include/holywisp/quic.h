@@ -239,7 +239,12 @@ const struct sockaddr *hw_quic_peer(const hw_quic_conn *q, socklen_t *len);
 typedef struct {
 	uint64_t packets_sent, packets_received, packets_lost, bytes_sent, bytes_received;
 	uint64_t srtt_us, cwnd;
-	uint64_t mds; // the datagram size in use: HW_QUIC_MIN_DGRAM until a larger one is probed
+	uint64_t mds;               // the datagram size in use: HW_QUIC_MIN_DGRAM until a larger one is probed
+	uint64_t ssthresh;          // UINT64_MAX while still in slow start
+	uint64_t congestion_events; // recovery periods entered (mod 2^16)
+	uint64_t spurious_lost;     // packets declared lost and acknowledged after all
+	uint64_t acked_limited;     // bytes acknowledged that the window did not grow by (sent app-limited)
+	uint64_t ptos;              // probe timeouts
 } hw_quic_stats;
 void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out);
 

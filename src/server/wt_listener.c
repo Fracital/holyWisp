@@ -302,11 +302,14 @@ static void session_free(wt_session *s) {
 		hw_quic_stats st;
 		hw_quic_get_stats(s->q, &st);
 		HW_DEBUG("wt",
-		         "%s: session over: %llu packets sent, %llu lost, %llu received; srtt %llu us, cwnd %llu, "
+		         "%s: session over: %llu packets sent, %llu lost (%llu spurious), %llu received; srtt %llu us, "
+		         "cwnd %llu, ssthresh %lld, %llu congestion events, %llu PTOs, %llu bytes acknowledged app-limited, "
 		         "datagrams of %llu",
 		         s->ip, (unsigned long long)st.packets_sent, (unsigned long long)st.packets_lost,
-		         (unsigned long long)st.packets_received, (unsigned long long)st.srtt_us, (unsigned long long)st.cwnd,
-		         (unsigned long long)st.mds);
+		         (unsigned long long)st.spurious_lost, (unsigned long long)st.packets_received,
+		         (unsigned long long)st.srtt_us, (unsigned long long)st.cwnd,
+		         st.ssthresh == UINT64_MAX ? -1LL : (long long)st.ssthresh, (unsigned long long)st.congestion_events,
+		         (unsigned long long)st.ptos, (unsigned long long)st.acked_limited, (unsigned long long)st.mds);
 	}
 	session_hs_done(s);
 	for (size_t i = 0; i < s->ncids; i++) {

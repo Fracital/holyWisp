@@ -779,6 +779,7 @@ static void packet_resolve(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, int 
 	if (s->flags & HW_QC_SENT_ACK_ELICITING) sp->ae_in_flight--;
 	if (acked) {
 		if (s->flags & HW_QC_SENT_IN_FLIGHT) {
+			if (s->flags & HW_QC_SENT_LIMITED) q->stats.acked_limited += s->size;
 			hw_qc_cc_on_acked(&q->cc, s->size, s->time, (s->flags & HW_QC_SENT_LIMITED) != 0);
 		}
 		s->flags |= HW_QC_SENT_ACKED;
@@ -1016,6 +1017,7 @@ static void on_loss_timeout(hw_quic_conn *q) {
 		pto_fire(q, spi);
 	}
 	q->pto_count++;
+	q->stats.ptos++;
 }
 
 // ---- Receiving: frames -----------------------------------------------------------------------
@@ -2785,4 +2787,7 @@ void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out) {
 	out->srtt_us = q->rtt.smoothed;
 	out->cwnd = q->cc.cwnd;
 	out->mds = q->mds;
+	out->ssthresh = q->cc.ssthresh;
+	out->congestion_events = q->cc.epoch;
+	out->spurious_lost = q->spurious_lost;
 }
