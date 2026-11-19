@@ -136,9 +136,14 @@ every test still passes, so each item has a test and a change to it needs a reas
   `enable-v2` is on. The spec names no subprotocol; wispurr treats a non-empty header as the v2
   opt-in and epoxy (scramjet, STomp) sends a random UUID, so the rule is presence, not the string
   `wisp-v2`. The server echoes the offered token *verbatim* (a browser fails the handshake if the
-  token it asked for does not come back), sends INFO first, waits for the client's INFO, then
-  sends the stream-0 CONTINUE. Until that CONTINUE, the only packets honoured are
-  INFO and CLOSE on stream 0. Major version mismatch closes with `0x04`. Over WebTransport the
+  token it asked for does not come back), sends INFO first and, with no `password-user`
+  configured, the stream-0 CONTINUE right behind it, so v2 opens in no more round trips than v1
+  (stream credit needs v2; `test_v2_any_subprotocol`). With a password user the CONTINUE waits
+  for the client's INFO, because a hashed password is checked on an auth thread and what the
+  client sent meanwhile would be dropped (`test_v2_continue_waits_for_password`). Either way,
+  until the client's INFO is handled the only packets honoured are INFO and CLOSE on stream 0.
+  A client in the wild reads INFO, sends its own and then reads the CONTINUE, which is there by
+  then. Major version mismatch closes with `0x04`. Over WebTransport the
   token rule is the same (`wt-available-protocols`, the first member echoed), with one opt-in
   exception: a list holding `wisp-v2-server-stream` is answered with it, and the server opens
   the Wisp stream and sends INFO and, without a required password, the CONTINUE at once (see

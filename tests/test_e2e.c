@@ -613,53 +613,89 @@ static void test_v2_handshake_and_confirm(void) {
 	wait_streams_idle(g_server);
 }
 
-// epoxy (the client behind scramjet and STomp) offers a random UUID as the subprotocol, not
-// "wisp-v2". Any offered token must negotiate v2 and come back verbatim: a browser fails the
-// WebSocket when the token it asked for is not echoed, which is how the whole relay went dark.
-static void test_v2_any_subprotocol(void) {
-	const char *uuid = "4f73350d-99e4-43d6-8986-5e8be4687c24";
+// A raw v2 upgrade to port with uuid as the subprotocol (which must come back verbatim), then the
+// Wisp packets the server sends of its own accord within wait_ms, before the client says anything:
+// their types into types (at most max). Returns how many there were.
+static int v2_first_packets(uint16_t port, const char *uuid, uint8_t *types, int max, int wait_ms) {
 	int fd = socket(AF_INET, SOCK_STREAM, 0);
 	CHECK(fd >= 0, "socket");
 	struct sockaddr_in sin = {
-	    .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(hw_server_port(g_server))};
+	    .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK), .sin_port = htons(port)};
 	CHECK_EQ(connect(fd, (struct sockaddr *)&sin, sizeof(sin)), 0);
 	char req[1024];
-	size_t n = hw_http_write_upgrade(req, sizeof(req), "127.0.0.1", hw_server_port(g_server), "/",
-	                                 "dGhlIHNhbXBsZSBub25jZQ==", uuid, NULL);
+	size_t n = hw_http_write_upgrade(req, sizeof(req), "127.0.0.1", port, "/", "dGhlIHNhbXBsZSBub25jZQ==", uuid, NULL);
 	CHECK(n > 0 && write(fd, req, n) == (ssize_t)n, "send upgrade");
 	char accept[HW_WS_ACCEPT_LEN + 1];
 	hw_ws_accept_key("dGhlIHNhbXBsZSBub25jZQ==", accept);
-	uint8_t buf[2048];
+	uint8_t buf[4096];
 	size_t have = 0;
 	char proto[64] = "";
 	int head = HW_ERR_AGAIN;
+	int got = 0;
 	uint64_t deadline = hw_now_ms() + 5000;
-	while (hw_now_ms() < deadline) {
+	uint64_t quiet_until = 0;
+	size_t off = 0;
+	for (;;) {
+		uint64_t now = hw_now_ms();
+		if (now >= deadline || (quiet_until && now >= quiet_until) || got >= max) break;
 		struct pollfd pfd = {.fd = fd, .events = POLLIN};
-		if (poll(&pfd, 1, 200) <= 0) continue;
+		if (poll(&pfd, 1, 20) <= 0) continue;
 		ssize_t r = read(fd, buf + have, sizeof(buf) - have);
-		CHECK(r > 0, "read upgrade response");
+		if (r <= 0) break;
 		have += (size_t)r;
-		head = hw_http_parse_upgrade_response(buf, have, accept, proto, sizeof(proto));
-		if (head != HW_ERR_AGAIN) break;
+		if (head == HW_ERR_AGAIN) {
+			head = hw_http_parse_upgrade_response(buf, have, accept, proto, sizeof(proto));
+			if (head == HW_ERR_AGAIN) continue;
+			CHECK(head > 0, "101 with a valid accept key (%d)", head);
+			off = (size_t)head;
+			quiet_until = hw_now_ms() + (uint64_t)wait_ms;
+		}
+		for (;;) {
+			hw_ws_frame f;
+			int hl = hw_ws_parse_header(buf + off, have - off, &f);
+			if (hl <= 0 || have - off < (size_t)hl + f.payload_len) break;
+			CHECK_EQ(f.opcode, HW_WS_BINARY);
+			CHECK(!f.masked, "server frames are never masked");
+			if (got < max) types[got] = buf[off + (size_t)hl];
+			got++;
+			off += (size_t)hl + f.payload_len;
+		}
 	}
-	CHECK(head > 0, "101 with a valid accept key (%d)", head);
 	CHECK_STR(proto, uuid);
-	// v2 was negotiated: the first packet after the 101 is INFO, not the v1 CONTINUE.
-	while (have < (size_t)head + 7 && hw_now_ms() < deadline) {
-		struct pollfd pfd = {.fd = fd, .events = POLLIN};
-		if (poll(&pfd, 1, 200) <= 0) continue;
-		ssize_t r = read(fd, buf + have, sizeof(buf) - have);
-		CHECK(r > 0, "read first frame");
-		have += (size_t)r;
-	}
-	hw_ws_frame f;
-	int hl = hw_ws_parse_header(buf + head, have - (size_t)head, &f);
-	CHECK(hl > 0, "frame header");
-	CHECK_EQ(f.opcode, HW_WS_BINARY);
-	CHECK(!f.masked, "server frames are never masked");
-	CHECK_EQ(buf[head + hl], HW_WISP_INFO);
 	close(fd);
+	return got;
+}
+
+// epoxy (the client behind scramjet and STomp) offers a random UUID as the subprotocol, not
+// "wisp-v2". Any offered token must negotiate v2 and come back verbatim: a browser fails the
+// WebSocket when the token it asked for is not echoed, which is how the whole relay went dark.
+// v2 was negotiated, so the first packet after the 101 is INFO, not the v1 CONTINUE; with no
+// password users the stream-0 CONTINUE follows it at once, before the client's INFO, so that v2
+// costs no round trip over v1 (what is sent before the INFO is handled is held, not acted on).
+static void test_v2_any_subprotocol(void) {
+	uint8_t types[4];
+	int n = v2_first_packets(hw_server_port(g_server), "4f73350d-99e4-43d6-8986-5e8be4687c24", types, 4, 300);
+	CHECK(n >= 1 && types[0] == HW_WISP_INFO, "INFO first (%d packets)", n);
+	CHECK(n == 2 && types[1] == HW_WISP_CONTINUE, "the early CONTINUE (%d packets)", n);
+}
+
+// With a password user, the INFO's password may take an auth thread a while, and what the client
+// sends meanwhile is not held: the CONTINUE waits for the client's INFO, as it always did.
+static void test_v2_continue_waits_for_password(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.log_level = HW_LOG_NONE;
+	CHECK_EQ(hw_server_config_add_user(&cfg, "alice", "s3cret"), 0);
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	uint8_t types[4];
+	int n = v2_first_packets(hw_server_port(s), "wisp-v2", types, 4, 300);
+	CHECK(n == 1 && types[0] == HW_WISP_INFO, "INFO alone (%d packets)", n);
+	hw_server_free(s);
 }
 
 static void test_v2_password_auth(void) {
@@ -909,6 +945,7 @@ int main(void) {
 	RUN(test_egress_blocked);
 	RUN(test_v2_handshake_and_confirm);
 	RUN(test_v2_any_subprotocol);
+	RUN(test_v2_continue_waits_for_password);
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
 	RUN(test_webclient_wisp_url);

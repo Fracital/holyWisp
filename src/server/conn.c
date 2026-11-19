@@ -1170,6 +1170,15 @@ static int http_process(hw_conn *c) {
 	HW_DEBUG("conn", "%s (%s): websocket %s", c->peer, c->ip, v2 ? "wisp-v2" : "wisp-v1");
 	if (v2) {
 		send_server_info(c);
+		// The stream-0 CONTINUE goes with the INFO, a round trip before the client's, so v2 costs
+		// no more to open than v1 (stream credit needs v2). The client's INFO is still handled
+		// before anything else it sends (handle_message), and with no password users that is
+		// done at once, in order, behind it. With one, the INFO may wait for an auth thread, and
+		// what follows it would be dropped meanwhile: the CONTINUE then waits for it as before.
+		if (!c->closing && cfg->password_user_count == 0) {
+			c->continue_sent = 1;
+			conn_send_continue(c, 0, srv->window);
+		}
 	} else {
 		handshake_done(c);
 	}
