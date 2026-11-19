@@ -323,7 +323,7 @@ HW_MUST_USE static int signature_record(hw_stream *s, int ok) {
 	if (!d) return 0;
 	hw_sigdet_record(d, ok, hw_now_ms(), (uint64_t)f->syn_signature_window_ms);
 	if (!hw_sigdet_match(d, f->syn_signature_min_samples, f->syn_signature_failed_ratio)) return 0;
-	HW_WARN("flood", "%s: SYN-flood signature matched for %s; closing", c->ip, s->dest);
+	HW_WARN_LIMITED("flood", "%s: SYN-flood signature matched for %s; closing", c->ip, s->dest);
 	HW_STAT_INC(c->w->server, syn_signatures);
 	conn_rep_source(c, HW_REP_SYN_SIGNATURE);
 	conn_rep_dest(c, s->dest, HW_REP_SYN_SIGNATURE);
@@ -489,7 +489,7 @@ static uint8_t dest_policy(hw_stream *s) {
 	if (srv->reputation) {
 		int score = hw_reputation_dest_score(srv->reputation, s->dest);
 		if (hw_reputation_tier(srv->reputation, score) == HW_TIER_STRICT) {
-			HW_WARN("reputation", "%s: destination %s refused (score %d)", c->ip, s->dest, score);
+			HW_WARN_LIMITED("reputation", "%s: destination %s refused (score %d)", c->ip, s->dest, score);
 			return HW_CLOSE_BLOCKED;
 		}
 	}
@@ -768,7 +768,7 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 	}
 	if (s->naddrs == 0) {
 		if (any_blocked) {
-			HW_INFO("egress", "%s: blocked %s:%u (%s)", c->ip, s->host, s->port, hw_addr_class_str(blocked));
+			HW_INFO_LIMITED("egress", "%s: blocked %s:%u (%s)", c->ip, s->host, s->port, hw_addr_class_str(blocked));
 			HW_STAT_INC(c->w->server, blocked_egress);
 			conn_rep_source(c, HW_REP_PRIVATE_EGRESS);
 		}
@@ -806,7 +806,7 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 		return;
 	}
 	if (filter_ok(cfg, host, host_len, port) != 0) {
-		HW_INFO("filter", "%s: blocked %.*s:%u", c->ip, (int)host_len, host, port);
+		HW_INFO_LIMITED("filter", "%s: blocked %.*s:%u", c->ip, (int)host_len, host, port);
 		HW_STAT_INC(c->w->server, blocked_filter);
 		conn_send_close(c, id, HW_CLOSE_BLOCKED);
 		return;
@@ -825,13 +825,13 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 	if (literal) {
 		enum hw_addr_class why;
 		if (!cfg->allow_direct_ip) {
-			HW_INFO("egress", "%s: blocked direct IP %s:%u", c->ip, s->host, port);
+			HW_INFO_LIMITED("egress", "%s: blocked direct IP %s:%u", c->ip, s->host, port);
 			HW_STAT_INC(c->w->server, blocked_egress);
 			stream_close(s, HW_CLOSE_BLOCKED, 1);
 			return;
 		}
 		if (egress_allowed(cfg, (struct sockaddr *)&ss, &why) != 0) {
-			HW_INFO("egress", "%s: blocked %s:%u (%s)", c->ip, s->host, port, hw_addr_class_str(why));
+			HW_INFO_LIMITED("egress", "%s: blocked %s:%u (%s)", c->ip, s->host, port, hw_addr_class_str(why));
 			HW_STAT_INC(c->w->server, blocked_egress);
 			conn_rep_source(c, HW_REP_PRIVATE_EGRESS);
 			stream_close(s, HW_CLOSE_BLOCKED, 1);

@@ -263,7 +263,7 @@ int conn_violation(hw_conn *c, const char *reason) {
 	conn_rep_source(c, HW_REP_PROTOCOL_VIOLATION);
 	if (limit <= 0) return 0;
 	if (++c->violations >= limit) {
-		HW_WARN("flood", "%s: closing after %d violations (last: %s)", c->peer, c->violations, reason);
+		HW_WARN_LIMITED("flood", "%s: closing after %d violations (last: %s)", c->peer, c->violations, reason);
 		HW_STAT_INC(c->w->server, ws_closed_violations);
 		conn_close(c);
 		return 1;
@@ -1197,14 +1197,14 @@ static int apply_reputation(hw_conn *c) {
 	int score = hw_reputation_source_score(rep, c->ip);
 	c->tier = hw_reputation_tier(rep, score);
 	if (c->tier == HW_TIER_STRICT) {
-		HW_WARN("reputation", "%s: refused, score %d (strict)", c->ip, score);
+		HW_WARN_LIMITED("reputation", "%s: refused, score %d (strict)", c->ip, score);
 		HW_STAT_INC(c->w->server, refused_reputation);
 		return -1;
 	}
 	if (c->tier >= HW_TIER_THROTTLE) {
 		int capped = c->w->server->cfg.max_streams_per_conn;
 		c->stream_cap = capped > 0 ? (capped < 16 ? capped : 16) : 16;
-		HW_INFO("reputation", "%s: throttled, score %d, stream cap %d", c->ip, score, c->stream_cap);
+		HW_INFO_LIMITED("reputation", "%s: throttled, score %d, stream cap %d", c->ip, score, c->stream_cap);
 	}
 	return 0;
 }
@@ -1619,7 +1619,8 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 			return;
 		}
 		if (!c->is_v2 || !c->authenticated) {
-			HW_WARN("twisp", "%s: terminal stream refused (v2=%d auth=%d)", c->peer, c->is_v2, c->authenticated);
+			HW_WARN_LIMITED("twisp", "%s: terminal stream refused (v2=%d auth=%d)", c->peer, c->is_v2,
+			                c->authenticated);
 			conn_rep_source(c, HW_REP_TWISP_NO_AUTH);
 			conn_send_close(c, p->stream_id, HW_CLOSE_BLOCKED);
 			return;

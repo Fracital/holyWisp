@@ -419,7 +419,12 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 - **Logs.** `hw_log` writes every control byte of the tag and message as `\xNN`; callers pass
   client strings as they are. A failed login is logged without the user name it tried, and a
   config error never echoes the value of `proxy`, `trusted-proxy-secret`,
-  `proxy-client-key-secret`, a `webtransport-path` or a `password-user`.
+  `proxy-client-key-secret`, a `webtransport-path` or a `password-user`. An `info` or `warn` line
+  that a client can cause as often as it sends (a refused CONNECT, a refused upgrade, a violation
+  close) is `HW_INFO_LIMITED` / `HW_WARN_LIMITED`: `HW_LOG_BURST` (20) lines a second per
+  statement, then a count of the ones not written (`test_refusals_do_not_flood_the_log`). A new
+  such line takes the limited form. Two stay unlimited on purpose: a failed login (one per
+  connection, and a record someone may count) and `log-blocked-dials`, whose point is every dial.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
   lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits

@@ -119,11 +119,60 @@ static void test_levels(void) {
 	CHECK(capture_at(HW_LOG_DEBUG, out, sizeof(out), "conn", "written") > 0, "debug is a level");
 }
 
+// One statement's budget: HW_LOG_BURST lines a second, the rest counted, and the count handed to
+// the first line of a later second. A burst that is spent stays spent until the second turns.
+static void test_limit(void) {
+	hw_log_limit l;
+	memset(&l, 0, sizeof(l));
+	uint32_t held = 99;
+	for (int i = 0; i < HW_LOG_BURST; i++) {
+		CHECK(hw_log_limit_take(&l, 5000 + (uint64_t)i, &held), "line %d of the burst", i);
+		CHECK_EQ(held, 0);
+	}
+	for (int i = 0; i < 30; i++) CHECK(!hw_log_limit_take(&l, 5900, &held), "line %d past the burst", i);
+	CHECK(hw_log_limit_take(&l, 6000, &held), "a new second");
+	CHECK_EQ(held, 30);
+	CHECK(hw_log_limit_take(&l, 6001, &held), "the count was handed over once");
+	CHECK_EQ(held, 0);
+	// A clock that has not moved does not refill it, one far later does.
+	for (int i = 2; i < HW_LOG_BURST; i++) CHECK(hw_log_limit_take(&l, 6500, &held), "line %d", i);
+	CHECK(!hw_log_limit_take(&l, 6999, &held), "spent");
+	CHECK(hw_log_limit_take(&l, 1000000, &held), "much later");
+	CHECK_EQ(held, 1);
+
+	// Through the macro: a statement reached 100 times in one burst writes at most two seconds' worth.
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-log-limit");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	fflush(stderr);
+	int saved = dup(STDERR_FILENO);
+	CHECK(dup2(fd, STDERR_FILENO) >= 0, "dup2");
+	int before = hw_log_get_level();
+	hw_log_set_level(HW_LOG_INFO);
+	for (int i = 0; i < 100; i++) HW_WARN_LIMITED("flood", "line %d", i);
+	hw_log_set_level(before);
+	CHECK(dup2(saved, STDERR_FILENO) >= 0, "restore stderr");
+	close(saved);
+	close(fd);
+	static char out[64 * 1024];
+	FILE *f = fopen(path, "rb");
+	CHECK(f != NULL, "reopen");
+	size_t n = fread(out, 1, sizeof(out) - 1, f);
+	fclose(f);
+	unlink(path);
+	out[n] = '\0';
+	size_t lines = count_byte(out, n, '\n');
+	CHECK(lines >= HW_LOG_BURST && lines <= 2 * HW_LOG_BURST + 1, "%zu lines written", lines);
+	CHECK(strstr(out, "flood: line 0\n") != NULL, "the first line is there");
+}
+
 int main(void) {
 	RUN(test_plain_line);
 	RUN(test_no_forged_line);
 	RUN(test_no_terminal_escapes);
 	RUN(test_long_message);
 	RUN(test_levels);
+	RUN(test_limit);
 	return 0;
 }

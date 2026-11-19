@@ -3,7 +3,7 @@
  * a client that sends and never reads, a remote that goes away while its stream is paused or held
  * by its credit, one address taking every connection, every connect in progress or the resolver,
  * pages of other origins, bytes in a hostname that are not a hostname's, a download past the
- * bandwidth limit, a duplicate CONNECT.
+ * bandwidth limit, a duplicate CONNECT, refusals as fast as a client can earn them.
  * A real server on loopback, driven by the client library and, where the library is too well
  * behaved, by a raw socket.
  */
@@ -1272,6 +1272,74 @@ static void test_passwords(void) {
 	hw_server_free(s);
 }
 
+static size_t count_lines_with(const char *text, const char *needle) {
+	size_t n = 0;
+	for (const char *p = strstr(text, needle); p; p = strstr(p + 1, needle)) n++;
+	return n;
+}
+
+// A client that sends CONNECTs the server refuses, as fast as it can. Each refusal is a log line,
+// and the server used to write every one: a client's CONNECT rate became journald's write rate. A
+// statement a client can reach now writes at most HW_LOG_BURST lines a second and says how many it
+// did not. The CONNECTs are refused for a direct IP, which costs the client no reputation and no
+// violation, so nothing else stops it first.
+static void test_refusals_do_not_flood_the_log(void) {
+	enum {
+		REFUSED = 300
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.allow_direct_ip = 0;
+	cfg.log_level = HW_LOG_INFO;
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-abuse-log");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	fflush(stderr);
+	int saved = dup(STDERR_FILENO);
+	CHECK(saved >= 0 && dup2(fd, STDERR_FILENO) >= 0, "stderr to a file");
+	hw_server *s = start(&cfg);
+	hw_client *c = connect_plain(s);
+	uint64_t t0 = hw_now_ms();
+	for (int i = 0; i < REFUSED; i++) {
+		uint32_t sid;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	}
+	int closed = 0;
+	hw_client_event ev;
+	while (closed < REFUSED && hw_client_poll(c, 5000, &ev) > 0) {
+		if (ev.type == HW_CEV_CLOSE && ev.reason == HW_CLOSE_BLOCKED) closed++;
+	}
+	uint64_t took = hw_now_ms() - t0;
+	// A later refusal is written, behind the count of the ones that were not.
+	sleep_ms(1100);
+	uint32_t sid;
+	uint8_t reason = 0;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	CHECK(wait_close(c, sid, &reason, NULL) && reason == HW_CLOSE_BLOCKED, "refused: 0x%02x", reason);
+	hw_client_free(c);
+	hw_server_free(s);
+	hw_log_set_level(HW_LOG_ERROR);
+	CHECK(dup2(saved, STDERR_FILENO) >= 0, "restore stderr");
+	close(saved);
+	close(fd);
+	CHECK_EQ(closed, REFUSED);
+
+	static char log[256 * 1024];
+	FILE *f = fopen(path, "rb");
+	CHECK(f != NULL, "reopen");
+	size_t n = fread(log, 1, sizeof(log) - 1, f);
+	fclose(f);
+	unlink(path);
+	log[n] = '\0';
+	size_t written = count_lines_with(log, "blocked direct IP");
+	// Each second the burst spanned (and the one after it) may write a budget's worth.
+	size_t bound = (size_t)(took / 1000 + 2) * (HW_LOG_BURST + 1) + 1;
+	CHECK(written >= HW_LOG_BURST && written <= bound, "%zu refusals written of %d in %llu ms (at most %zu)", written,
+	      REFUSED + 1, (unsigned long long)took, bound);
+	CHECK(count_lines_with(log, "lines like the next were not written") >= 1, "the held-back count is written");
+}
+
 int main(void) {
 	g_echo_port = start_service(echo_conn);
 	g_blast_port = start_service(blast_conn);
@@ -1293,6 +1361,7 @@ int main(void) {
 	RUN(test_host_bytes);
 	RUN(test_raw_connects);
 	RUN(test_passwords);
+	RUN(test_refusals_do_not_flood_the_log);
 	printf("ok all abuse cases\n");
 	return 0;
 }

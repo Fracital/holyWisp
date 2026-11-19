@@ -41,6 +41,22 @@ int hw_log_level_parse(const char *name) {
 	return -1;
 }
 
+int hw_log_limit_take(hw_log_limit *l, uint64_t now_ms, uint32_t *held) {
+	uint64_t second = now_ms / 1000;
+	uint64_t seen = atomic_load_explicit(&l->second, memory_order_relaxed);
+	// One thread turns the second over; the others count into whichever second they find.
+	if (seen != second && atomic_compare_exchange_strong_explicit(&l->second, &seen, second, memory_order_relaxed,
+	                                                              memory_order_relaxed)) {
+		atomic_store_explicit(&l->count, 0, memory_order_relaxed);
+	}
+	if (atomic_fetch_add_explicit(&l->count, 1, memory_order_relaxed) >= HW_LOG_BURST) {
+		atomic_fetch_add_explicit(&l->held, 1, memory_order_relaxed);
+		return 0;
+	}
+	*held = atomic_exchange_explicit(&l->held, 0, memory_order_relaxed);
+	return 1;
+}
+
 // Append msg to line (which has room for cap bytes, and for the newline after them) with every
 // control byte written as \xNN. A message carries what clients sent (a CONNECT host, a user
 // name): raw, a line feed in one starts a line the server never wrote, and an escape sequence
