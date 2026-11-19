@@ -83,6 +83,24 @@ typedef struct {
 	int64_t mtime;
 } wt_file_id;
 
+// The lists an operator edits while the server runs: the config's own, plus policy-file's when
+// there is one (server.c, "Policy"). Immutable once made, shared by reference between the
+// workers and freed by its last one, so a new policy costs one copy however many workers read it,
+// and the data path reads it without a lock: a worker swaps its pointer in a posted task, between
+// two callbacks, and nothing keeps it across one.
+typedef struct hw_policy {
+	_Atomic int refs;
+	hw_hostlist allow_hosts; // when non-empty, only these
+	hw_hostlist block_hosts;
+	hw_portset allow_ports; // when non-empty, only these
+	hw_portset block_ports;
+	hw_hostlist warp_bypass_hosts;
+	char allow_origins[HW_MAX_ORIGINS][128];
+	int allow_origin_count;
+} hw_policy;
+
+void policy_unref(hw_policy *p);
+
 // auth.c: hashed-password checks on threads of their own.
 typedef struct hw_auth hw_auth;
 typedef struct hw_auth_req hw_auth_req;
@@ -137,6 +155,7 @@ typedef struct hw_worker {
 	// without a lock. NULL: no usable state, UDP goes out unmarked.
 	struct hw_warp_state *warp;
 	uint64_t warp_warned_ms; // last "no healthy tunnel" warning, at most one a minute per worker
+	hw_policy *policy;       // this worker's reference to the policy in force (never NULL once running)
 	struct hw_conn *conns;   // every live connection on this worker, for shutdown cleanup
 	// Ingress batch (stream_on_data / stream_batch_flush): DATA payloads for one idle TCP stream,
 	// still sitting in the connection's read buffer, waiting to go out in one vectored write. It
@@ -269,6 +288,15 @@ struct hw_server {
 	uint64_t wt_dir_rescan_ms;
 	int wt_dir_failed;
 	int wt_hosts_unpublished;
+	// The policy (maintenance thread only, after hw_server_new): what the workers were last given,
+	// policy-file as the last look found it and as it was when last read, when to read it again
+	// whatever it says, whether that read failed, and whether a worker missed the last one.
+	hw_policy *policy_cur;
+	wt_file_id policy_seen;
+	wt_file_id policy_tried;
+	uint64_t policy_rescan_ms;
+	int policy_failed;
+	int policy_unpublished;
 
 	_Atomic uint64_t connections_total;
 	_Atomic uint64_t connections_active;
@@ -574,6 +602,9 @@ void stream_time_first(hw_stream *s);
 // stats.c: the body of GET /stats, appended to out, for a connection on worker w (whose own copy
 // of the WARP state names the tunnels). 0, or -1 when out could not grow.
 int stats_json(const hw_worker *w, hw_buf *out);
+// Look at policy-file again, and when it holds another policy that loads, give it to the workers
+// (server.c). The maintenance thread's, once a second.
+void server_policy_tick(hw_server *s);
 
 // Look at udp-warp-state again and give the workers what it now means (server.c). The maintenance
 // thread does this every second; running 0 means the workers have not started, so their copies

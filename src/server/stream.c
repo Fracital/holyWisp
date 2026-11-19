@@ -515,7 +515,7 @@ static int stream_warp_mark(hw_stream *s, const struct sockaddr *sa) {
 	int tcp = s->type == HW_STREAM_TCP;
 	// A name kept off WARP goes out unmarked, whatever the state, the capability or the fallback
 	// say: the router dials its TCP the same way. An IP literal is never on the list.
-	if (!s->literal_host && hw_hostlist_allows(&srv->cfg.warp_bypass_hosts, s->host, strlen(s->host))) {
+	if (!s->literal_host && hw_hostlist_allows(&w->policy->warp_bypass_hosts, s->host, strlen(s->host))) {
 		if (tcp) {
 			HW_STAT_INC(srv, tcp_warp_bypassed);
 		} else {
@@ -778,16 +778,16 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 	begin_dial(s);
 }
 
-// Host/port allow and block lists. Returns 0 when the target is permitted.
-static int filter_ok(const hw_server_config *cfg, const char *host, size_t host_len, uint16_t port) {
-	if (cfg->allow_hosts.count > 0) {
-		if (!hw_hostlist_allows(&cfg->allow_hosts, host, host_len)) return -1;
-	} else if (hw_hostlist_blocks(&cfg->block_hosts, host, host_len)) {
+// Host/port allow and block lists (the worker's policy). Returns 0 when the target is permitted.
+static int filter_ok(const hw_policy *p, const char *host, size_t host_len, uint16_t port) {
+	if (p->allow_hosts.count > 0) {
+		if (!hw_hostlist_allows(&p->allow_hosts, host, host_len)) return -1;
+	} else if (hw_hostlist_blocks(&p->block_hosts, host, host_len)) {
 		return -1;
 	}
-	if (cfg->allow_ports.count > 0) {
-		if (!hw_portset_has(&cfg->allow_ports, port)) return -1;
-	} else if (cfg->block_ports.count > 0 && hw_portset_has(&cfg->block_ports, port)) {
+	if (p->allow_ports.count > 0) {
+		if (!hw_portset_has(&p->allow_ports, port)) return -1;
+	} else if (p->block_ports.count > 0 && hw_portset_has(&p->block_ports, port)) {
 		return -1;
 	}
 	return 0;
@@ -805,7 +805,7 @@ void stream_open(hw_conn *c, uint32_t id, uint8_t type, const char *host, size_t
 		conn_send_close(c, id, HW_CLOSE_BLOCKED);
 		return;
 	}
-	if (filter_ok(cfg, host, host_len, port) != 0) {
+	if (filter_ok(c->w->policy, host, host_len, port) != 0) {
 		HW_INFO_LIMITED("filter", "%s: blocked %.*s:%u", c->ip, (int)host_len, host, port);
 		HW_STAT_INC(c->w->server, blocked_filter);
 		conn_send_close(c, id, HW_CLOSE_BLOCKED);

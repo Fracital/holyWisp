@@ -23,6 +23,11 @@ allow-link-local = off
 # allow-port = 443
 # block-port = 25
 # block-port = 6000-6100
+# A file of more allow-host, block-host, allow-port, block-port, warp-bypass-host and allow-origin
+# lines (nothing else), added to the ones here and read again within a few seconds of a change, so
+# a list edit needs no restart. It must load at start; later, one that does not load (or has gone)
+# is logged as an error and the lists in force stay. Replace it by rename, not in place.
+# policy-file = /etc/holywisp/policy.conf
 
 # ---------------------------------------------------------------- protocol
 enable-v2 = on

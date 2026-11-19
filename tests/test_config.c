@@ -184,6 +184,72 @@ static void test_warp_bypass_host_key(void) {
 	CHECK_EQ(cfg.warp_bypass_hosts.count, 4);
 }
 
+// A policy file holds the lists an operator edits, in the config file's syntax, and nothing else.
+// Its entries go on top of the config's own. A key that is not a list, a value the key refuses,
+// a line too long to be read whole and a file that is not there are each an error naming the line.
+static void test_policy_file_keys(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	char err[256];
+	CHECK_EQ(hw_config_set(&cfg, "policy-file", "/etc/holywisp/policy.conf", err, sizeof(err)), 0);
+	CHECK_STR(cfg.policy_file, "/etc/holywisp/policy.conf");
+	CHECK_EQ(hw_config_set(&cfg, "block-host", "config.example", err, sizeof(err)), 0);
+
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-policy");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	write_file(path, "# lists only\n"
+	                 "block-host = *.blocked.example   # and its subdomains\n"
+	                 "allow-port = 443\n"
+	                 "block-port = 6881-6889\n"
+	                 "warp-bypass-host = *.youtube.com\n"
+	                 "allow-origin = https://app.example\n"
+	                 "allow-host = \"only.example\"\n");
+	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) == 0, "load: %s", err);
+	CHECK_EQ(cfg.block_hosts.count, 2);
+	CHECK(hw_hostlist_blocks(&cfg.block_hosts, "config.example", 14), "the config's entry stays");
+	CHECK(hw_hostlist_blocks(&cfg.block_hosts, "a.blocked.example", 17), "the file's entry");
+	CHECK(hw_portset_has(&cfg.allow_ports, 443) && hw_portset_has(&cfg.block_ports, 6885), "ports");
+	CHECK_EQ(cfg.warp_bypass_hosts.count, 1);
+	CHECK_EQ(cfg.allow_origin_count, 1);
+	CHECK_STR(cfg.allow_origins[0], "https://app.example");
+	CHECK_EQ(cfg.allow_hosts.count, 1);
+
+	const struct {
+		const char *content;
+		const char *says;
+	} bad[] = {
+	    {"block-host = a.example\nport = 7000\n", ":2: 'port' is not for a policy file"},
+	    {"policy-file = /tmp/other\n", ":1: 'policy-file' is not for a policy file"},
+	    {"password-user = alice:secret\n", ":1: 'password-user' is not for a policy file"},
+	    {"allow-port = https\n", ":1: bad value"},
+	    {"allow-origin = example.com\n", ":1: allow-origin"},
+	    {"warp-bypass-host = you*tube.com\n", ":1: warp-bypass-host"},
+	    {"block-host\n", ":1: expected key = value"},
+	};
+	hw_server_config *scratch = malloc(sizeof(*scratch)); // a config is 260 KiB: not two on Windows' stack
+	CHECK(scratch != NULL, "malloc");
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		write_file(path, bad[i].content);
+		*scratch = cfg;
+		CHECK(hw_config_load_policy(scratch, path, err, sizeof(err)) != 0, "accepted: %s", bad[i].content);
+		CHECK(strstr(err, bad[i].says) != NULL, "'%s' for %s", err, bad[i].content);
+	}
+	free(scratch);
+	// A line the reader cannot hold whole is refused, never read as two.
+	static char longline[1200];
+	int at = snprintf(longline, sizeof(longline), "block-host = ");
+	memset(longline + at, 'a', sizeof(longline) - 2 - (size_t)at);
+	longline[sizeof(longline) - 2] = '\n';
+	write_file(path, longline);
+	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) != 0, "a long line was accepted");
+	CHECK(strstr(err, ":1: line longer than 1023 bytes") != NULL, "%s", err);
+	unlink(path);
+	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) != 0, "a missing file was accepted");
+}
+
 // The WebTransport keys, their defaults, and what validation refuses.
 static void test_webtransport_keys(void) {
 	hw_server_config cfg;
@@ -346,6 +412,7 @@ int main(void) {
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);
 	RUN(test_config_check);
+	RUN(test_policy_file_keys);
 	RUN(test_shipped_configs);
 	return 0;
 }

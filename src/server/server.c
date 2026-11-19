@@ -15,11 +15,13 @@
 #include "holywisp/webtransport.h"
 #include "holywisp/wisp.h"
 
+#include "config.h"
 #include "internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -526,7 +528,191 @@ static void worker_destroy(hw_worker *w) {
 	hw_loop_free(w->loop); // runs any swap still posted, so the last copy is the one to free
 	free(w->warp);
 	w->warp = NULL;
+	policy_unref(w->policy);
+	w->policy = NULL;
 	free(w->scratch);
+}
+
+// ---------------------------------------------------------------------------------- policy
+//
+// The host and port filters, warp-bypass-host and allow-origin are what an operator changes most
+// often, and each change used to take a restart that dropped every client. With policy-file their
+// lists are the config's plus the file's, and the maintenance thread looks at the file once a
+// second: one that changed is read once it has stayed the same for a look (an editor that writes
+// in place is not read half-way), and every POLICY_RESCAN_MS in any case (a rewrite in place within
+// one second at the same size has the same identity). The reader is the config file's, restricted
+// to those keys, and all or nothing: a file that does not load, with any key that sizes or starts
+// something, a bad value or a list too full, is logged as an ERROR and the policy in force stays,
+// whatever it held. So does a file that has gone. The result is checked as the config is
+// (hw_server_config_validate: warp-bypass-host needs WARP), and only one that differs from the
+// policy in force is given to the workers, a reference each, as webtransport-cert-dir's table is.
+
+#define POLICY_RESCAN_MS 60000
+
+void policy_unref(hw_policy *p) {
+	if (p && atomic_fetch_sub(&p->refs, 1) == 1) free(p);
+}
+
+static hw_policy *policy_from(const hw_server_config *cfg) {
+	hw_policy *p = calloc(1, sizeof(*p));
+	if (!p) return NULL;
+	atomic_init(&p->refs, 1);
+	p->allow_hosts = cfg->allow_hosts;
+	p->block_hosts = cfg->block_hosts;
+	p->allow_ports = cfg->allow_ports;
+	p->block_ports = cfg->block_ports;
+	p->warp_bypass_hosts = cfg->warp_bypass_hosts;
+	memcpy(p->allow_origins, cfg->allow_origins, sizeof(p->allow_origins));
+	p->allow_origin_count = cfg->allow_origin_count;
+	return p;
+}
+
+// Everything but the count of references.
+static int policy_same(const hw_policy *a, const hw_policy *b) {
+	size_t from = offsetof(hw_policy, allow_hosts);
+	return a && b && memcmp((const char *)a + from, (const char *)b + from, sizeof(*a) - from) == 0;
+}
+
+static wt_file_id policy_file_id(const char *path) {
+	wt_file_id id;
+	memset(&id, 0, sizeof(id));
+	struct stat sb;
+	if (stat(path, &sb) != 0) return id;
+	id.ok = 1;
+	id.dev = (uint64_t)sb.st_dev;
+	id.ino = (uint64_t)sb.st_ino;
+	id.size = (uint64_t)sb.st_size;
+	id.mtime = (int64_t)sb.st_mtime;
+	return id;
+}
+
+static int policy_file_id_same(const wt_file_id *a, const wt_file_id *b) {
+	return a->ok == b->ok && a->dev == b->dev && a->ino == b->ino && a->size == b->size && a->mtime == b->mtime;
+}
+
+// The config's lists with policy-file's on top, checked as a config is. 0 with the policy in *out,
+// or -1 with the reason in why. The copy is on the heap: a config is far larger than a stack frame
+// should be, and the maintenance thread's stack is the default.
+static int policy_load(const hw_server *s, hw_policy **out, char *why, size_t why_cap) {
+	hw_server_config *scratch = malloc(sizeof(*scratch));
+	if (!scratch) {
+		snprintf(why, why_cap, "%s", strerror(ENOMEM));
+		return -1;
+	}
+	*scratch = s->cfg;
+	int rc = hw_config_load_policy(scratch, s->cfg.policy_file, why, why_cap);
+	if (rc == 0 && hw_server_config_validate(scratch, why, why_cap) != 0) rc = -1;
+	if (rc == 0) {
+		*out = policy_from(scratch);
+		if (!*out) {
+			snprintf(why, why_cap, "%s", strerror(ENOMEM));
+			rc = -1;
+		}
+	}
+	free(scratch);
+	return rc;
+}
+
+typedef struct {
+	hw_worker *w;
+	hw_policy *p;
+} policy_msg;
+
+static void policy_swap_task(hw_loop *loop, void *ud) {
+	(void)loop;
+	policy_msg *m = ud;
+	policy_unref(m->w->policy);
+	m->w->policy = m->p;
+	free(m);
+}
+
+// s->policy_cur to every worker, a reference each: in place before the loops run, by a posted task
+// after. 0, or -1 when a worker kept the one it had (no memory), and the next look tries again.
+static int policy_publish(hw_server *s, int running) {
+	int rc = 0;
+	for (int i = 0; i < s->nworkers; i++) {
+		hw_worker *w = &s->workers[i];
+		hw_policy *p = s->policy_cur;
+		atomic_fetch_add(&p->refs, 1);
+		if (!running) {
+			policy_unref(w->policy);
+			w->policy = p;
+			continue;
+		}
+		policy_msg *m = malloc(sizeof(*m));
+		if (m) {
+			m->w = w;
+			m->p = p;
+		}
+		if (!m || hw_loop_post(w->loop, policy_swap_task, m) != 0) {
+			free(m);
+			policy_unref(p);
+			rc = -1;
+		}
+	}
+	return rc;
+}
+
+static void policy_log(const hw_server *s, const hw_policy *p) {
+	HW_INFO("policy",
+	        "policy-file %s: %d allow-host, %d block-host, %d allow-port, %d block-port, %d warp-bypass-host and %d "
+	        "allow-origin entries in force, the config's included",
+	        s->cfg.policy_file, p->allow_hosts.count, p->block_hosts.count, p->allow_ports.count, p->block_ports.count,
+	        p->warp_bypass_hosts.count, p->allow_origin_count);
+}
+
+// The policy the workers start with. Without policy-file, the config's; with it, the file must
+// load, since a server that started without the lists it was given would be open where it was
+// told to be shut. The file's identity is taken before it is read, so a change while it is read
+// is seen by the first look.
+static int policy_init(hw_server *s) {
+	if (!s->cfg.policy_file[0]) {
+		s->policy_cur = policy_from(&s->cfg);
+		return s->policy_cur ? 0 : -1;
+	}
+	s->policy_seen = policy_file_id(s->cfg.policy_file);
+	s->policy_tried = s->policy_seen;
+	s->policy_rescan_ms = hw_now_ms() + POLICY_RESCAN_MS;
+	char why[512];
+	if (policy_load(s, &s->policy_cur, why, sizeof(why)) != 0) {
+		HW_ERROR("config", "policy-file: %s", why);
+		errno = EINVAL;
+		return -1;
+	}
+	policy_log(s, s->policy_cur);
+	return 0;
+}
+
+void server_policy_tick(hw_server *s) {
+	if (!s->cfg.policy_file[0]) return;
+	if (s->policy_unpublished) s->policy_unpublished = policy_publish(s, 1) != 0;
+	wt_file_id now = policy_file_id(s->cfg.policy_file);
+	if (!policy_file_id_same(&now, &s->policy_seen)) {
+		s->policy_seen = now; // read once it has stayed so for a look
+		return;
+	}
+	uint64_t ms = hw_now_ms();
+	int changed = !policy_file_id_same(&now, &s->policy_tried);
+	if (!changed && ms < s->policy_rescan_ms) return;
+	s->policy_tried = now;
+	s->policy_rescan_ms = ms + POLICY_RESCAN_MS;
+	hw_policy *p = NULL;
+	char why[512];
+	if (policy_load(s, &p, why, sizeof(why)) != 0) {
+		// Once per file that fails, not once a minute for the same one.
+		if (changed || !s->policy_failed) HW_ERROR("policy", "policy-file: %s; the policy in force stays", why);
+		s->policy_failed = 1;
+		return;
+	}
+	s->policy_failed = 0;
+	if (policy_same(p, s->policy_cur)) {
+		policy_unref(p);
+		return;
+	}
+	policy_unref(s->policy_cur);
+	s->policy_cur = p;
+	s->policy_unpublished = policy_publish(s, 1) != 0;
+	policy_log(s, p);
 }
 
 // ---------------------------------------------------------------------------------- UDP on WARP
@@ -758,6 +944,7 @@ static void *maint_main(void *arg) {
 			}
 		}
 		if (s->warp_on && !stop) server_warp_refresh(s, 1);
+		if (!stop) server_policy_tick(s);
 		if (!stop) wt_cert_tick(s, 1);
 		if (stop) return NULL;
 	}
@@ -857,6 +1044,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		HW_INFO("server", "proxy-client-key: no proxy-client-key-secret, so client keys change with every start");
 	}
 	if (build_limiters(s) != 0) goto fail;
+	if (policy_init(s) != 0) goto fail;
 	if (webclient_page_build(s) != 0) goto fail;
 	s->window = server_ingress_window(cfg);
 	s->client_rcvbuf = server_fixed_buffer(cfg, cfg->client_recv_buffer, "/proc/sys/net/core/rmem_max",
@@ -923,6 +1111,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 			goto fail;
 		}
 	}
+	policy_publish(s, 0); // in place: it cannot fail
 	warp_init(s);
 	if (wt_listener_init(s) != 0) {
 		for (int i = 0; i < s->nworkers; i++) {
@@ -952,6 +1141,7 @@ fail: {
 	hw_gauge_free(s->heads_per_ip);
 	hw_budget_free(s->queue_budget);
 	hw_reputation_free(s->reputation);
+	policy_unref(s->policy_cur);
 	pthread_mutex_destroy(&s->maint_lock);
 	pthread_cond_destroy(&s->maint_cond);
 	free(s->webclient_page);
@@ -1060,6 +1250,7 @@ void hw_server_free(hw_server *s) {
 	free(s->warp_given);
 	wt_cert_free(s->wt_cert_cur);
 	wt_hosts_unref(s->wt_hosts_cur);
+	policy_unref(s->policy_cur);
 	free(s->webclient_page);
 	free(s->workers);
 	free(s);

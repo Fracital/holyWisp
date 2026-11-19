@@ -486,6 +486,124 @@ static void test_host_filter(void) {
 	hw_server_free(s);
 }
 
+// The file replaced as an operator's tool should: written beside it and renamed over it.
+static void policy_write(const char *path, const char *content) {
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.new", path);
+	FILE *f = fopen(tmp, "w");
+	CHECK(f != NULL, "open %s", tmp);
+	fputs(content, f);
+	fclose(f);
+	CHECK_EQ(rename(tmp, path), 0);
+}
+
+// Whether a TCP stream to the echo service is let through now: 1 when it echoes, 0 when it is
+// closed 0x48.
+static int policy_lets_through(hw_server *s) {
+	hw_client *c = connect_plain(s);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+	CHECK_EQ(hw_client_send(c, sid, "x", 1), 0);
+	int verdict = -1;
+	hw_client_event ev;
+	while (verdict < 0 && hw_client_poll(c, 5000, &ev) > 0) {
+		if (ev.stream_id != sid) continue;
+		if (ev.type == HW_CEV_DATA) verdict = 1;
+		if (ev.type == HW_CEV_CLOSE) {
+			CHECK_EQ(ev.reason, HW_CLOSE_BLOCKED);
+			verdict = 0;
+		}
+	}
+	CHECK(verdict >= 0, "neither data nor a CLOSE");
+	hw_client_free(c);
+	return verdict;
+}
+
+// Until the policy lets the echo stream through (want 1) or blocks it (want 0), within 8 s: a
+// change is read once the file has stayed the same for a look, and the looks are a second apart.
+static int policy_wait(hw_server *s, int want) {
+	for (int i = 0; i < 80; i++) {
+		if (policy_lets_through(s) == want) return 1;
+		usleep(100 * 1000);
+	}
+	return 0;
+}
+
+// Whether a WebSocket upgrade with this Origin (NULL: none) is answered 101. The client library
+// sends no Origin over a WebSocket, so this is a raw request.
+static int origin_admitted(hw_server *s, const char *origin) {
+	int fd = hw_connect_tcp("127.0.0.1", hw_server_port(s), 2000);
+	CHECK(fd >= 0, "connect");
+	char req[512];
+	int n = snprintf(req, sizeof(req),
+	                 "GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+	                 "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n%s%s%s\r\n",
+	                 origin ? "Origin: " : "", origin ? origin : "", origin ? "\r\n" : "");
+	CHECK_EQ(send(fd, req, (size_t)n, HW_MSG_NOSIGNAL), (ssize_t)n);
+	char head[13] = {0};
+	size_t got = 0;
+	while (got < 12) {
+		struct pollfd pfd = {.fd = fd, .events = POLLIN};
+		if (poll(&pfd, 1, 5000) <= 0) break;
+		ssize_t r = recv(fd, head + got, 12 - got, 0);
+		if (r <= 0) break;
+		got += (size_t)r;
+	}
+	close(fd);
+	CHECK(got == 12, "no status line");
+	return strcmp(head, "HTTP/1.1 101") == 0;
+}
+
+// policy-file: the filters and allow-origin change while the server runs, without a restart and
+// without dropping anyone. A file that does not load leaves the policy in force as it was, and one
+// that loads later is still taken; at start, one that does not load keeps the server from starting.
+static void test_policy_file(void) {
+	char path[200]; // it goes into policy_file, 256 bytes
+	hw_test_tmp(path, sizeof(path), "hw-policy");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	hw_server_config cfg;
+	base_config(&cfg);
+	snprintf(cfg.policy_file, sizeof(cfg.policy_file), "%s", path);
+
+	policy_write(path, "port = 7000\n"); // not a policy key
+	CHECK(hw_server_new(&cfg) == NULL, "a server started with a policy file that does not load");
+	policy_write(path, "warp-bypass-host = example.com\n"); // checked as a config is: there is no WARP
+	CHECK(hw_server_new(&cfg) == NULL, "a server started with a policy its config refuses");
+
+	policy_write(path, "# the edge's list\nblock-host = 127.0.0.1\n");
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	// One client stays connected across every change.
+	hw_client *stay = connect_plain(s);
+	uint32_t stay_sid;
+	CHECK_EQ(hw_client_open(stay, HW_STREAM_TCP, "localhost", g_echo_port, &stay_sid), 0);
+	CHECK_EQ(policy_lets_through(s), 0);
+
+	policy_write(path, "block-port = 1\n");
+	CHECK(policy_wait(s, 1), "the new file was not taken");
+	policy_write(path, "allow-host = example.com\n"); // an allow list that 127.0.0.1 is not on
+	CHECK(policy_wait(s, 0), "the allow list was not taken");
+	policy_write(path, "allow-host = example.com\nnot-a-key = 1\n");
+	usleep(3500 * 1000);                 // three looks: long enough for it to have been read
+	CHECK_EQ(policy_lets_through(s), 0); // what was in force stays
+	unlink(path);
+	usleep(2500 * 1000);
+	CHECK_EQ(policy_lets_through(s), 0); // and a file that has gone changes nothing either
+	policy_write(path, "allow-origin = https://good.example\n");
+	CHECK(policy_wait(s, 1), "a good file after a bad one was not taken");
+	CHECK(origin_admitted(s, "https://good.example"), "the listed origin");
+	CHECK(!origin_admitted(s, "https://evil.example"), "an origin not on the list");
+	CHECK(origin_admitted(s, NULL), "no origin at all");
+
+	CHECK(echo_once(stay, stay_sid, "still here"), "the client that stayed");
+	hw_client_free(stay);
+	hw_server_free(s);
+	unlink(path);
+}
+
 static void test_per_source_throttle(void) {
 	hw_server_config cfg;
 	base_config(&cfg);
@@ -1213,6 +1331,7 @@ int main(void) {
 
 	RUN(test_port_filter);
 	RUN(test_host_filter);
+	RUN(test_policy_file);
 	RUN(test_per_source_throttle);
 	RUN(test_syn_signature_on_connect_timeout);
 	RUN(test_concurrent_cap);

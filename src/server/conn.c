@@ -1279,10 +1279,10 @@ int webclient_page_build(hw_server *s) {
 // allow-origin set, a page that is not on the list may not use this relay from its visitors'
 // addresses (and so cannot spend their rate limits or their reputation). A client that sends
 // no Origin is not a browser, and is not stopped by this: it speaks for itself.
-static int origin_allowed(const hw_server_config *cfg, const char *origin) {
-	if (cfg->allow_origin_count == 0 || origin == NULL) return 1;
-	for (int i = 0; i < cfg->allow_origin_count; i++) {
-		if (strcasecmp(origin, cfg->allow_origins[i]) == 0) return 1;
+static int origin_allowed(const hw_policy *p, const char *origin) {
+	if (p->allow_origin_count == 0 || origin == NULL) return 1;
+	for (int i = 0; i < p->allow_origin_count; i++) {
+		if (strcasecmp(origin, p->allow_origins[i]) == 0) return 1;
 	}
 	return 0;
 }
@@ -1368,7 +1368,7 @@ static int http_process(hw_conn *c) {
 		return 0;
 	}
 
-	if (!origin_allowed(cfg, hw_http_header_get(&req, "Origin"))) {
+	if (!origin_allowed(c->w->policy, hw_http_header_get(&req, "Origin"))) {
 		http_reply(c, 403, "Forbidden", "text/plain; charset=utf-8", "origin not allowed\n");
 		return 0;
 	}
@@ -1980,7 +1980,7 @@ hw_conn *conn_wt_new(hw_worker *w, wt_session *s, const struct sockaddr *peer) {
 int conn_wt_admit(hw_conn *c, const char *origin, const char *protocols) {
 	const hw_server_config *cfg = &c->w->server->cfg;
 	hw_server *srv = c->w->server;
-	if (!origin_allowed(cfg, origin)) return 403;
+	if (!origin_allowed(c->w->policy, origin)) return 403;
 	switch (conn_admit(c)) {
 	case ADMIT_OK:
 		break;

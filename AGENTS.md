@@ -314,7 +314,8 @@ as before), and holyWisp dials the rest itself, marked by the same pick, spliced
   `*.name` its subdomains, never an IP literal) is unmarked before any state, capability or
   fallback is consulted, for UDP and for TCP dialled here. The router has its own copy of the
   list (`warp_bypass` in edge-router.json, from the same Ansible variable) for the TCP it dials;
-  the two must be equal, or one site's TCP and UDP leave from two addresses.
+  the two must be equal, or one site's TCP and UDP leave from two addresses. In a `policy-file`
+  the list changes without a restart; the router's copy has to change with it.
 
 - **The choice is the router's, to the bit.** `holywisp/warp.h` repeats `edge-router.py`'s
   `site_key` (the last two labels, or three under a two-letter TLD whose second level is on its
@@ -425,6 +426,19 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   statement, then a count of the ones not written (`test_refusals_do_not_flood_the_log`). A new
   such line takes the limited form. Two stay unlimited on purpose: a failed login (one per
   connection, and a record someone may count) and `log-blocked-dials`, whose point is every dial.
+- **The policy file** (`policy-file`). The host and port filters, `warp-bypass-host` and
+  `allow-origin` are read through the worker's `hw_policy` (`w->policy`: `filter_ok`,
+  `stream_warp_mark`, `origin_allowed`), never `srv->cfg`: the config's lists plus the file's,
+  immutable, shared by reference and swapped by a posted task (`policy_publish`), as the
+  certificate table is, so the data path takes no lock and nothing holds a policy across a
+  callback. The maintenance thread reads the file once it has stayed the same for a look, and
+  once a minute in any case (`server_policy_tick`). The reader is the config file's held to those
+  six keys (`hw_config_load_policy`) and all or nothing, and the result passes
+  `hw_server_config_validate`: a file that does not load, or has gone, is an ERROR and the policy
+  in force stays; at start it keeps the server from starting, because a server that came up
+  without the block list it was given would be open where it was told to be shut. A key that
+  sizes or starts something never belongs in it. `test_policy_file` (test_security) and
+  `test_policy_file_keys` hold it.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
   lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits

@@ -166,6 +166,12 @@ export type holyWispConfig = {
 	 * wants. A request with no `Origin` header (anything that is not a browser) is never refused.
 	 */
 	allowedOrigins?: string[];
+	/**
+	 * A file of more `allow-host`, `block-host`, `allow-port`, `block-port`, `warp-bypass-host` and
+	 * `allow-origin` lines, added to the lists above and read again when it changes, without a
+	 * restart. It must load when the server starts.
+	 */
+	policyFile?: string;
 
 	connectionsLimitPerIP?: number;
 	connectionWindowSeconds?: number;
@@ -454,6 +460,7 @@ export function workerArgs(
 	if (config.allowedOrigins !== undefined) {
 		for (const origin of list("allowedOrigins", config.allowedOrigins)) flag("allow-origin", origin);
 	}
+	str("policy-file", "policyFile", config.policyFile);
 
 	int("connections-limit-per-ip", "connectionsLimitPerIP", config.connectionsLimitPerIP);
 	int("connection-window-s", "connectionWindowSeconds", config.connectionWindowSeconds);

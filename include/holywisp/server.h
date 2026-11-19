@@ -89,6 +89,11 @@ typedef struct hw_server_config {
 	// from a browser and is always let through.
 	char allow_origins[HW_MAX_ORIGINS][128];
 	int allow_origin_count;
+	// A file of more allow-host, block-host, allow-port, block-port, warp-bypass-host and
+	// allow-origin lines, added to the ones above and read again while the server runs when it
+	// changes. It must load when the server is made; later, one that does not load is logged and
+	// the lists in force stay. "" = none.
+	char policy_file[256];
 
 	// Per-client limits.
 	int connections_limit_per_ip; // new WebSockets per IP per window; 0 = off

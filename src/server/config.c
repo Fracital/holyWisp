@@ -130,6 +130,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	STR_KEY("udp-warp-state", udp_warp_state)
 	INT_KEY("udp-warp-state-max-age-s", udp_warp_state_max_age_s, 0, 86400)
 	STR_KEY("trusted-proxy-secret", trusted_proxy_secret)
+	STR_KEY("policy-file", policy_file)
 	INT_KEY("buffer-remaining", buffer_remaining, 1, 1 << 24)
 	INT_KEY("max-message-size", max_message_size, 1024, 1LL << 30)
 	INT_KEY("ws-write-high-water", ws_write_high_water, 4096, 1LL << 31)
@@ -410,7 +411,20 @@ static char *trim(char *s) {
 	return s;
 }
 
-int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size_t err_cap) {
+static const char *const POLICY_KEYS[] = {"allow-host", "block-host",       "allow-port",
+                                          "block-port", "warp-bypass-host", "allow-origin"};
+
+static int policy_key(const char *key) {
+	for (size_t i = 0; i < HW_ARRAY_LEN(POLICY_KEYS); i++) {
+		if (!strcmp(key, POLICY_KEYS[i])) return 1;
+	}
+	return 0;
+}
+
+// The config file's reader, and with `policy` set a policy-file's: only POLICY_KEYS, and a line
+// that does not fit the buffer is an error, not two lines (the rest of a long list line would be
+// read as a line of its own).
+static int config_load(hw_server_config *cfg, const char *path, int policy, char *err, size_t err_cap) {
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		snprintf(err, err_cap, "%s: %s", path, strerror(errno));
@@ -420,6 +434,11 @@ int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size
 	int lineno = 0;
 	while (fgets(line, sizeof(line), f)) {
 		lineno++;
+		if (policy && !strchr(line, '\n') && !feof(f)) {
+			snprintf(err, err_cap, "%s:%d: line longer than %zu bytes", path, lineno, sizeof(line) - 1);
+			fclose(f);
+			return -1;
+		}
 		char *s = trim(line);
 		if (!*s || *s == '#') continue;
 		char *eq = strchr(s, '=');
@@ -431,6 +450,14 @@ int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size
 		*eq = '\0';
 		char *key = trim(s);
 		char *value = trim(eq + 1);
+		if (policy && !policy_key(key)) {
+			snprintf(err, err_cap,
+			         "%s:%d: '%s' is not for a policy file (allow-host, block-host, allow-port, block-port, "
+			         "warp-bypass-host and allow-origin are)",
+			         path, lineno, key);
+			fclose(f);
+			return -1;
+		}
 		if (value[0] == '"') {
 			// Quoted value: keep everything up to the closing quote (so it may hold '#' or spaces),
 			// then drop the quotes. Anything after the close quote (e.g. a comment) is ignored.
@@ -456,8 +483,21 @@ int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size
 			return -1;
 		}
 	}
+	int failed = ferror(f);
 	fclose(f);
+	if (policy && failed) {
+		snprintf(err, err_cap, "%s: read error after line %d", path, lineno);
+		return -1;
+	}
 	return 0;
+}
+
+int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size_t err_cap) {
+	return config_load(cfg, path, 0, err, err_cap);
+}
+
+int hw_config_load_policy(hw_server_config *cfg, const char *path, char *err, size_t err_cap) {
+	return config_load(cfg, path, 1, err, err_cap);
 }
 
 void hw_config_usage(const char *argv0) {
@@ -485,6 +525,8 @@ void hw_config_usage(const char *argv0) {
 	    "  trusted-proxy-secret VALUE                a trusted proxy must also send X-HolyWisp-Proxy-Secret: VALUE\n"
 	    "  allow-origin ORIGIN                       only pages of these origins may connect, e.g.\n"
 	    "                                            https://example.com (repeatable; default: any page)\n"
+	    "  policy-file PATH                          more allow/block-host, allow/block-port, warp-bypass-host\n"
+	    "                                            and allow-origin lines, read again when the file changes\n"
 	    "  connections-limit-per-ip, connection-window-s   new WebSockets per IP per window (200 / 10s)\n"
 	    "  bandwidth-limit-kbps                      per-IP bandwidth cap, each direction (0 = off)\n"
 	    "  flood-protection                          master switch for the limits below (on)\n",
