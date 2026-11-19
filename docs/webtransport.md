@@ -102,7 +102,7 @@ P-256 key and a validity of at most 14 days. So by default the server makes its 
 RFC 9000/9001/9002 version 1, plus RFC 9221 datagrams. Implemented: Initial/Handshake/1-RTT
 spaces; coalesced packets; ACK ranges and ACK delay; loss detection by packet and time
 threshold, both adapting to the reordering seen, with a window cut undone when every loss it
-answered proves spurious; PTO with probes; NewReno with pacing; persistent congestion; anti-amplification (3x
+answered proves spurious; PTO with probes; BBR or NewReno, with pacing; persistent congestion; anti-amplification (3x
 the bytes received before the address is validated); flow control at stream and connection
 level, with receive credit granted only when the application consumes (`hw_quic_stream_consumed`),
 which is how backpressure reaches a client; stream limits (MAX_STREAMS); NEW_CONNECTION_ID and
@@ -119,8 +119,24 @@ are never counted in flight, so a lost one is not a congestion signal and arms n
 starts at 1200 again. Until 2026-11-18 every connection started at 1452, and a path under 1480
 bytes that drops instead of answering with ICMP (a VPN, PPPoE, some mobile links) lost every
 full-size packet: the handshake went through and the session then carried nothing
-(`test_pmtu` in `test_quic`). The sockets keep the kernel's default don't-fragment behaviour, so
-where ICMP does come back a probe can pass fragmented.
+(`test_pmtu` in `test_quic`). Every datagram carries DF and is never fragmented on this host
+(`hw_sys_udp_no_fragment`: Linux `IP_PMTUDISC_PROBE`), so a probe the path cannot carry is lost.
+Until 2026-11-19 the sockets kept Linux's default: once an ICMP "fragmentation needed" had put a
+1360 MTU in the route cache, the edge sent every 1452-byte probe, and then every packet, as two
+fragments, and a lost fragment lost the packet.
+
+**Congestion control** is BBR by default (`webtransport-congestion-control`), version 1 as Linux's
+`tcp_bbr` has it, in `quic_recovery.c`. Every packet in flight records the delivery state when it
+was sent (draft-cheng-iccrg-delivery-rate-estimation), each ACK makes a delivery rate sample, and
+the model is the highest rate of the last 10 rounds and the lowest RTT of the last 10 s. The
+pacer sends at a gain over that rate (2.89 in startup, then a cycle of 1.25, 0.75 and six of 1),
+the window is twice the estimated BDP, and a loss changes neither. Samples taken while the sender
+had nothing to send (`hw_qc_cc_app_limited`) only ever raise the estimate. The RTT the model sees
+is never under 1 ms, the clock's tick: below it a loopback path measured 0 and the window was 4
+packets. NewReno (RFC 9002 7, appendix B) remains selectable, and is what the window was until
+2026-11-19: on the edge path, 45 ms and about 0.3% random loss, it halved its window 13 times in
+an 8 s download and ran at 4 Mbit/s where the same path's TCP (BBR) did 30. On a 40 Mbit/s netem
+link with that loss and RTT, NewReno moved 0.8 MiB/s and BBR 4.5.
 
 Every buffer is bounded (`hw_quic_config`). A peer that would push a buffer past its bound is
 closed with the matching transport error, never buffered: CRYPTO data beyond 64 KiB per
@@ -234,6 +250,7 @@ places in the code. On top of it:
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout. |
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |
+| `webtransport-congestion-control` | `bbr` | `bbr` or `newreno` (see "Congestion control"). |
 
 Like every key: `config.c` (parser, `--help`), `README.md`, `holywisp.conf.example`,
 `deploy/holywisp.conf`, the npm wrapper (`node/src/config.ts`, its README, its tests).

@@ -7,6 +7,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/limits.h"
 #include "holywisp/log.h"
+#include "holywisp/quic.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -210,6 +211,16 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 			cfg->udp_warp_fallback_direct = 1;
 		} else if (!strcmp(value, "refuse")) {
 			cfg->udp_warp_fallback_direct = 0;
+		} else {
+			goto bad_value;
+		}
+		return 0;
+	}
+	if (!strcmp(key, "webtransport-congestion-control")) {
+		if (!strcmp(value, "bbr")) {
+			cfg->webtransport_congestion = HW_QUIC_CC_BBR;
+		} else if (!strcmp(value, "newreno")) {
+			cfg->webtransport_congestion = HW_QUIC_CC_NEWRENO;
 		} else {
 			goto bad_value;
 		}
@@ -532,6 +543,7 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-max-handshakes               QUIC handshakes in progress per worker (1024)\n"
 	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"
 	       "                                            Retry (64)\n"
+	       "  webtransport-congestion-control           bbr or newreno: how fast QUIC sends to a client (bbr)\n"
 	       "\n"
 	       "  --version, --help\n");
 }

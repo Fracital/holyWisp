@@ -304,12 +304,13 @@ static void session_free(wt_session *s) {
 		HW_DEBUG("wt",
 		         "%s: session over: %llu packets sent, %llu lost (%llu spurious), %llu received; srtt %llu us, "
 		         "cwnd %llu, ssthresh %lld, %llu congestion events, %llu PTOs, %llu bytes acknowledged app-limited, "
-		         "datagrams of %llu",
+		         "bandwidth %llu B/s, datagrams of %llu",
 		         s->ip, (unsigned long long)st.packets_sent, (unsigned long long)st.packets_lost,
 		         (unsigned long long)st.spurious_lost, (unsigned long long)st.packets_received,
 		         (unsigned long long)st.srtt_us, (unsigned long long)st.cwnd,
 		         st.ssthresh == UINT64_MAX ? -1LL : (long long)st.ssthresh, (unsigned long long)st.congestion_events,
-		         (unsigned long long)st.ptos, (unsigned long long)st.acked_limited, (unsigned long long)st.mds);
+		         (unsigned long long)st.ptos, (unsigned long long)st.acked_limited, (unsigned long long)st.bandwidth,
+		         (unsigned long long)st.mds);
 	}
 	session_hs_done(s);
 	for (size_t i = 0; i < s->ncids; i++) {
@@ -707,6 +708,7 @@ static void session_quic_config(const wt_worker *ww, hw_quic_config *qc) {
 	qc->tls.alpn = alpn;
 	qc->tls.alpn_count = 1;
 	qc->max_idle_ms = (uint64_t)cfg->webtransport_idle_timeout_s * 1000;
+	qc->congestion = cfg->webtransport_congestion;
 	// The client's credit: what it may have in flight toward the server before the server reads
 	// it. The Wisp stream carries every stream's uploads, so it gets the whole connection's.
 	size_t window = cfg->ws_write_high_water;

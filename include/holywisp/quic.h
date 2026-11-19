@@ -56,6 +56,11 @@
 #define HW_QUIC_AEAD_LIMIT_REACHED        0xf
 #define HW_QUIC_CRYPTO_ERROR(alert)       (0x100 + (alert))
 
+// Congestion control: BBR, which a random loss does not slow, or RFC 9002's NewReno, which halves
+// its window at each.
+#define HW_QUIC_CC_BBR     0
+#define HW_QUIC_CC_NEWRENO 1
+
 typedef struct {
 	int is_server;
 	hw_tls_config tls; // certificate, key, ALPN; transport_params is filled in by hw_quic
@@ -71,6 +76,7 @@ typedef struct {
 	size_t conn_send_max;      // the same, across all streams of the connection
 	size_t datagram_queue_max; // datagrams queued for sending before the newest is dropped
 	uint64_t keepalive_ms;     // 0 = none: send a PING after this long without sending anything
+	int congestion;            // HW_QUIC_CC_BBR (the default) or HW_QUIC_CC_NEWRENO
 	// Server: the first byte of every connection ID issued (the owning worker's index), the
 	// listener's stateless reset key (reset tokens are HMAC-SHA-256(key, cid) truncated), and
 	// the original DCID and Retry SCID when the client went through a Retry.
@@ -245,6 +251,7 @@ typedef struct {
 	uint64_t spurious_lost;     // packets declared lost and acknowledged after all
 	uint64_t acked_limited;     // bytes acknowledged that the window did not grow by (sent app-limited)
 	uint64_t ptos;              // probe timeouts
+	uint64_t bandwidth;         // BBR's estimate of the path, bytes per second (0: NewReno, or none yet)
 } hw_quic_stats;
 void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out);
 

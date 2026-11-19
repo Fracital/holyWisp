@@ -607,6 +607,15 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   the paths and hosts they name, 404 otherwise, before `conn_wt_new`; the value may hold a gate
   key and is never logged. A request that is not a CONNECT is 421 with `alt-svc: clear`, so a
   page load sent here by a CDN's cached alternative service goes back to TCP.
+- **Congestion control is BBR** (`webtransport-congestion-control`, `bbr` by default, `newreno`
+  the fallback; `quic_recovery.c`), because the edge path loses about 0.3% at random and NewReno
+  halved its window at each loss: 4 Mbit/s where the same path's TCP, BBR in the kernel, did 30.
+  A loss never moves BBR's window; delivery rate samples do, and those taken while the sender had
+  nothing to send (`hw_qc_cc_app_limited` in `output`) only ever raise the estimate. The RTT BBR
+  sees is never under 1 ms, the clock's tick: at 0 a loopback window was 4 packets and a 400 MiB/s
+  bench ran at 5. `test_bbr_*` in `test_quic` run it on a simulated lossy path, beside NewReno.
+  Every datagram also carries DF (`hw_sys_udp_no_fragment`): a probe the path cannot carry must be
+  lost, never sent in fragments that every later packet is then sent in too.
 - **The idle timeout is mandatory** (`webtransport-idle-timeout-s`, 1 to 3600), and the server
   sends a keepalive after 20 s without sending (divide's conntrack forgets a UDP flow at 30 s).
 - **A session ends promptly, whoever ends it.** Chrome never sends CONNECTION_CLOSE and goes

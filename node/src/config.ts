@@ -82,6 +82,8 @@ export type WebTransportConfig = {
 	idleTimeoutSeconds?: number;
 	maxHandshakes?: number;
 	retryThreshold?: number;
+	/** QUIC congestion control toward the client: `"bbr"` (the server's default) or `"newreno"`. */
+	congestionControl?: "bbr" | "newreno";
 };
 
 export type holyWispConfig = {
@@ -548,6 +550,10 @@ export function workerArgs(
 			int("webtransport-idle-timeout-s", "webTransport.idleTimeoutSeconds", wt.idleTimeoutSeconds);
 			int("webtransport-max-handshakes", "webTransport.maxHandshakes", wt.maxHandshakes);
 			int("webtransport-retry-threshold", "webTransport.retryThreshold", wt.retryThreshold);
+			if (wt.congestionControl !== undefined && wt.congestionControl !== "bbr" && wt.congestionControl !== "newreno") {
+				fail("webTransport.congestionControl must be bbr or newreno");
+			}
+			str("webtransport-congestion-control", "webTransport.congestionControl", wt.congestionControl);
 		}
 	}
 	// `none` still has the server report errors: the wrapper drops them like everything else, but

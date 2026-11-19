@@ -408,6 +408,165 @@ static void test_rtt_cc(void) {
 	CHECK_EQ(hw_qc_pacer_next(&c, &r, t), t);
 }
 
+// A path for the congestion controller alone: a bottleneck of CCSIM_RATE bytes per microsecond with
+// a queue of CCSIM_QUEUE_US, CCSIM_RTT_US of propagation, an ACK for every packet, a loss detected
+// when the packet three after it is acknowledged, and random loss of one packet in loss_in
+// (0: none). Time is in microseconds and the run is deterministic.
+#define CCSIM_RATE     5u // 5 MB/s
+#define CCSIM_RTT_US   40000u
+#define CCSIM_QUEUE_US 40000u
+#define CCSIM_MDS      1200u
+#define CCSIM_MAX      200000u
+
+typedef struct {
+	hw_qc_sent rec;
+	uint64_t ack_at; // 0: lost
+	int done;
+} ccsim_pkt;
+
+typedef struct {
+	uint64_t delivered_after; // bytes acknowledged after t_measure
+	uint64_t max_cwnd, min_cwnd_late;
+	int saw_probe_rtt;
+	uint64_t bw_after_app_limited; // BBR's estimate when the app-limited stretch ended
+} ccsim_result;
+
+static uint64_t ccsim_rand(uint64_t *x) {
+	*x ^= *x << 13;
+	*x ^= *x >> 7;
+	*x ^= *x << 17;
+	return *x;
+}
+
+// Runs for `end` us. Between app_from and app_to the sender has only a tenth of the path's rate
+// to send (it is app-limited); otherwise it always has data.
+static void ccsim_run(int bbr, uint64_t loss_in, uint64_t end, uint64_t t_measure, uint64_t app_from, uint64_t app_to,
+                      ccsim_result *out) {
+	static ccsim_pkt pk[CCSIM_MAX];
+	memset(out, 0, sizeof(*out));
+	out->min_cwnd_late = UINT64_MAX;
+	hw_qc_cc c;
+	hw_qc_rtt r;
+	hw_qc_cc_init(&c, CCSIM_MDS, 0);
+	if (bbr) hw_qc_cc_use_bbr(&c, 0);
+	hw_qc_rtt_init(&r);
+	uint64_t seed = 0x9e3779b97f4a7c15ull, now = 0, link_free = 0, app_credit = 0, app_last = 0;
+	size_t n = 0, next_ack = 0, scan = 0;
+	while (now < end && n < CCSIM_MAX) {
+		// Acknowledgments due by now, in order (the link is FIFO and the RTT constant).
+		// A lost packet is passed over (loss detection declares it below); ACK times grow with the
+		// send order, so the first one still due later ends the pass.
+		while (next_ack < n && (!pk[next_ack].ack_at || pk[next_ack].ack_at <= now)) {
+			ccsim_pkt *p = &pk[next_ack++];
+			if (p->done || !p->ack_at) continue;
+			p->done = 1;
+			hw_qc_rs_on_acked(&c, &p->rec, p->ack_at);
+			hw_qc_cc_on_acked(&c, p->rec.size, p->rec.time, 0);
+			uint64_t rtt = p->ack_at - p->rec.time;
+			hw_qc_rtt_sample(&r, rtt, 0, p->ack_at);
+			if (p->ack_at >= t_measure) out->delivered_after += p->rec.size;
+			// Packet threshold 3: what was sent three or more before this one and not acked is lost.
+			size_t me = (size_t)(p - pk);
+			for (; scan + 3 <= me; scan++) {
+				if (pk[scan].done) continue;
+				if (!pk[scan].ack_at) {
+					pk[scan].done = 1;
+					hw_qc_cc_remove(&c, pk[scan].rec.size);
+					hw_qc_cc_congestion_event(&c, pk[scan].rec.time, 1, p->ack_at);
+				}
+			}
+			hw_qc_cc_on_ack_done(&c, rtt, p->ack_at);
+		}
+		if (bbr && c.b.mode == HW_QC_BBR_PROBE_RTT) out->saw_probe_rtt = 1;
+		if (c.cwnd > out->max_cwnd) out->max_cwnd = c.cwnd;
+		if (now > end / 2 && c.cwnd < out->min_cwnd_late) out->min_cwnd_late = c.cwnd;
+		if (bbr && app_to && now >= app_to && !out->bw_after_app_limited) out->bw_after_app_limited = c.b.bw;
+		// Send what the window, the pacer and the application allow.
+		int app_limited = now >= app_from && now < app_to;
+		if (app_limited) {
+			app_credit += (now - app_last) * CCSIM_RATE / 10;
+			if (app_credit > 4 * CCSIM_MDS) app_credit = 4 * CCSIM_MDS;
+		}
+		app_last = now;
+		uint64_t wake = UINT64_MAX;
+		while (hw_qc_cc_can_send(&c) && n < CCSIM_MAX) {
+			uint64_t t = hw_qc_pacer_next(&c, &r, now);
+			if (t > now) {
+				wake = t;
+				break;
+			}
+			if (app_limited && app_credit < CCSIM_MDS) {
+				hw_qc_cc_app_limited(&c);
+				wake = now + CCSIM_MDS * 10 / CCSIM_RATE;
+				break;
+			}
+			if (app_limited) app_credit -= CCSIM_MDS;
+			ccsim_pkt *p = &pk[n++];
+			memset(p, 0, sizeof(*p));
+			p->rec.time = now;
+			p->rec.size = CCSIM_MDS;
+			hw_qc_rs_on_sent(&c, &p->rec, now);
+			hw_qc_cc_on_sent(&c, CCSIM_MDS);
+			hw_qc_pacer_on_sent(&c, CCSIM_MDS);
+			uint64_t start = HW_MAX(now, link_free);
+			int dropped = start - now > CCSIM_QUEUE_US || (loss_in && ccsim_rand(&seed) % loss_in == 0);
+			if (start - now <= CCSIM_QUEUE_US) link_free = start + CCSIM_MDS / CCSIM_RATE;
+			p->ack_at = dropped ? 0 : link_free + CCSIM_RTT_US;
+		}
+		// On to the next thing that happens.
+		uint64_t t = wake;
+		if (next_ack < n && pk[next_ack].ack_at < t) t = pk[next_ack].ack_at;
+		if (t == UINT64_MAX) t = now + 1000; // stalled: what is in flight is all lost
+		now = t > now ? t : now + 1;
+	}
+}
+
+// BBR on a path that drops one packet in a hundred at random: it fills the bottleneck, where
+// NewReno, halving its window at each loss, does not reach a quarter of it. Its model is the
+// path's: the bandwidth within 10%, the minimum RTT within a millisecond.
+static void test_bbr_random_loss(void) {
+	ccsim_result b, nr;
+	ccsim_run(1, 100, 20000000, 5000000, 0, 0, &b);
+	ccsim_run(0, 100, 20000000, 5000000, 0, 0, &nr);
+	uint64_t full = (uint64_t)CCSIM_RATE * 15000000; // the bottleneck's bytes over the 15 s measured
+	CHECK(b.delivered_after > full * 85 / 100, "bbr delivered %llu of %llu", (unsigned long long)b.delivered_after,
+	      (unsigned long long)full);
+	CHECK(nr.delivered_after < full / 4, "newreno delivered %llu of %llu", (unsigned long long)nr.delivered_after,
+	      (unsigned long long)full);
+	hw_qc_cc c;
+	hw_qc_cc_init(&c, CCSIM_MDS, 0);
+	hw_qc_cc_use_bbr(&c, 0);
+	// And a loss by itself changes nothing.
+	uint64_t w = c.cwnd;
+	hw_qc_cc_congestion_event(&c, 10, 3, 20);
+	CHECK_EQ(c.cwnd, w);
+	CHECK_EQ(c.ssthresh, UINT64_MAX);
+}
+
+// The model: after startup the estimate is the bottleneck's rate, the min RTT the path's, the
+// window about two BDPs; after 10 s it goes to PROBE_RTT (4 packets) and comes back.
+static void test_bbr_model(void) {
+	ccsim_result b;
+	ccsim_run(1, 0, 12000000, 1000000, 0, 0, &b);
+	CHECK(b.saw_probe_rtt, "probe_rtt after 10 s");
+	CHECK(b.min_cwnd_late <= 4 * CCSIM_MDS, "probe_rtt window %llu", (unsigned long long)b.min_cwnd_late);
+	uint64_t bdp = (uint64_t)CCSIM_RATE * CCSIM_RTT_US;
+	CHECK(b.max_cwnd >= 2 * bdp && b.max_cwnd <= 4 * bdp, "window %llu, bdp %llu", (unsigned long long)b.max_cwnd,
+	      (unsigned long long)bdp);
+	CHECK(b.delivered_after > (uint64_t)CCSIM_RATE * 11000000 * 85 / 100, "delivered %llu",
+	      (unsigned long long)b.delivered_after);
+}
+
+// Sending a tenth of the path's rate for 3 s does not lower the estimate: those samples say
+// what the application had, not what the path can do.
+static void test_bbr_app_limited(void) {
+	ccsim_result b;
+	ccsim_run(1, 0, 6000000, 0, 2000000, 5000000, &b);
+	uint64_t rate = (uint64_t)CCSIM_RATE * 1000000;
+	CHECK(b.bw_after_app_limited > rate * 85 / 100 && b.bw_after_app_limited < rate * 115 / 100, "bw %llu of %llu",
+	      (unsigned long long)b.bw_after_app_limited, (unsigned long long)rate);
+}
+
 static void test_smap(void) {
 	hw_qc_smap m;
 	hw_qc_smap_init(&m);
@@ -833,8 +992,11 @@ static void make_cert(void) {
 	for (size_t i = 0; i < HW_CERT_CHAIN_MAX; i++) g_chain[i] = g_cert;
 }
 
+static int g_sim_cc = HW_QUIC_CC_BBR; // the congestion control sim_new's connections get
+
 static void sim_config(hw_quic_config *c, int server) {
 	memset(c, 0, sizeof(*c));
+	c->congestion = g_sim_cc;
 	c->is_server = server;
 	c->tls.is_server = server;
 	c->tls.alpn = ALPN;
@@ -1205,13 +1367,22 @@ static void test_loss(void) {
 	hw_quic_stats a, b, c, d;
 	// Reordering alone: the thresholds adapt and the spurious losses are undone, so the link
 	// stays nearly full (4 MiB at 2 MB/s is 2.1 s; with the fixed threshold of 3 it took 13 s).
+	// BBR takes 2.5 s where NewReno took 2.2: both directions are busy and the path's queues have
+	// no end, so each side's ACKs wait behind the other's data, and BBR's window of two BDPs
+	// runs out where NewReno's fills the queue. One way, both take 2.2 s.
 	uint64_t spurious;
 	uint64_t took = lossy(9, 0, 4u << 20, &a, &b, &spurious);
-	CHECK(took < 2500, "reordering alone: %llu ms", (unsigned long long)took);
+	CHECK(took < 2700, "reordering alone: %llu ms", (unsigned long long)took);
 	CHECK(spurious > 0 && spurious == a.packets_lost + b.packets_lost, "every loss declared came back: %llu of %llu",
 	      (unsigned long long)spurious, (unsigned long long)(a.packets_lost + b.packets_lost));
+	// 1% random loss: BBR does not slow down for it (2.6 s); NewReno halves its window at each
+	// (6.2 s; 14.8 s with the fixed threshold).
 	took = lossy(10, 10000, 4u << 20, &a, &b, NULL);
-	CHECK(took < 8000, "1%% loss: %llu ms", (unsigned long long)took); // 14.8 s with the fixed threshold
+	CHECK(took < 3200, "1%% loss: %llu ms", (unsigned long long)took);
+	g_sim_cc = HW_QUIC_CC_NEWRENO;
+	took = lossy(10, 10000, 4u << 20, &a, &b, NULL);
+	g_sim_cc = HW_QUIC_CC_BBR;
+	CHECK(took < 8000, "1%% loss, NewReno: %llu ms", (unsigned long long)took);
 	lossy(11, 50000, 4u << 20, &a, &b, NULL);
 	lossy(12, 200000, 1u << 20, &a, &b, NULL);
 	// The same seed is the same run.
@@ -1703,6 +1874,9 @@ int main(int argc, char **argv) {
 	RUN(test_sendbuf);
 	RUN(test_recvbuf);
 	RUN(test_rtt_cc);
+	RUN(test_bbr_random_loss);
+	RUN(test_bbr_model);
+	RUN(test_bbr_app_limited);
 	RUN(test_smap);
 	RUN(test_handshake);
 	RUN(test_handshake_hrr);

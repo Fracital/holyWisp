@@ -762,6 +762,11 @@ static void frame_lost(hw_quic_conn *q, hw_qc_space *sp, const hw_qc_frec *r) {
 	}
 }
 
+static void cc_init(hw_quic_conn *q) {
+	hw_qc_cc_init(&q->cc, q->mds, q->now);
+	if (q->cfg.congestion != HW_QUIC_CC_NEWRENO) hw_qc_cc_use_bbr(&q->cc, q->now);
+}
+
 static void pmtu_result(hw_quic_conn *q, int passed);
 
 static void packet_resolve(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, int acked) {
@@ -780,6 +785,7 @@ static void packet_resolve(hw_quic_conn *q, hw_qc_space *sp, hw_qc_sent *s, int 
 	if (acked) {
 		if (s->flags & HW_QC_SENT_IN_FLIGHT) {
 			if (s->flags & HW_QC_SENT_LIMITED) q->stats.acked_limited += s->size;
+			hw_qc_rs_on_acked(&q->cc, s, q->now);
 			hw_qc_cc_on_acked(&q->cc, s->size, s->time, (s->flags & HW_QC_SENT_LIMITED) != 0);
 		}
 		s->flags |= HW_QC_SENT_ACKED;
@@ -916,6 +922,7 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 		}
 	} while (hw_qc_ack_iter_next(&it));
 	if (!newly) return;
+	uint64_t rtt_sample = 0;
 	if (largest_newly && ae_newly) {
 		uint64_t latest = q->now > largest_time ? q->now - largest_time : 0;
 		uint64_t ack_delay = 0;
@@ -925,9 +932,12 @@ static void on_ack(hw_quic_conn *q, int spi, const hw_qc_frame *f) {
 			if (q->handshake_confirmed && ack_delay > q->peer_max_ack_delay) ack_delay = q->peer_max_ack_delay;
 		}
 		hw_qc_rtt_sample(&q->rtt, latest, ack_delay, q->now);
+		// The clock ticks in milliseconds: a sample is never taken for less than one tick.
+		rtt_sample = HW_MAX(latest, (uint64_t)HW_QC_GRANULARITY_US);
 	}
 	if (!q->is_server && spi == HW_QC_SP_HANDSHAKE) q->peer_validated_addr = 1;
 	detect_lost(q, spi);
+	hw_qc_cc_on_ack_done(&q->cc, rtt_sample, q->now);
 	if (peer_validated(q)) q->pto_count = 0;
 	hw_qc_ring_trim(&sp->ring, lost_keep_since(q));
 	q->writable_check = 1;
@@ -1602,7 +1612,7 @@ static void path_migrate(hw_quic_conn *q, const struct sockaddr *from, socklen_t
 		// the old path's periods declared lost are never taken for the new one's.
 		uint16_t epoch = q->cc.epoch;
 		pmtu_restart(q);
-		hw_qc_cc_init(&q->cc, q->mds, q->now);
+		cc_init(q);
 		q->cc.epoch = (uint16_t)(epoch + 1);
 		hw_qc_rtt_init(&q->rtt);
 		q->pkt_threshold = HW_QC_PACKET_THRESHOLD;
@@ -2119,8 +2129,9 @@ static size_t pkt_finish(hw_quic_conn *q, pkt_build *b, size_t pad_to_total) {
 	if (b->spi == HW_QC_SP_APP && q->tx_phase) s.flags |= HW_QC_SENT_PHASE;
 	hw_qc_ring_add_packet(&sp->ring, &s);
 	if (s.flags & HW_QC_SENT_IN_FLIGHT) {
-		hw_qc_cc_on_sent(&q->cc, n);
 		hw_qc_sent *rec = hw_qc_ring_get(&sp->ring, b->pn);
+		hw_qc_rs_on_sent(&q->cc, rec, q->now);
+		hw_qc_cc_on_sent(&q->cc, n);
 		if (q->cc.in_flight * 2 < q->cc.cwnd) rec->flags |= HW_QC_SENT_LIMITED;
 	}
 	if (b->ae) {
@@ -2293,7 +2304,9 @@ size_t hw_quic_output(hw_quic_conn *q, uint8_t *out, size_t cap, struct sockaddr
 			for (int spi = 0; spi < HW_QC_SPACES; spi++) pending |= space_can_send(q, spi) && space_ae_pending(q, spi);
 			if (!pending) q->pacer_wait = 0;
 		} else {
+			// Room in the window and the pacer, and nothing to send: the application is the limit.
 			q->pacer_wait = 0;
+			hw_qc_cc_app_limited(&q->cc);
 		}
 		return 0;
 	}
@@ -2504,7 +2517,7 @@ static hw_quic_conn *conn_new(const hw_quic_config *cfg, const hw_quic_callbacks
 	q->mds = HW_QUIC_MIN_DGRAM;
 	q->pmtu_max = HW_QUIC_MAX_DGRAM;
 	hw_qc_rtt_init(&q->rtt);
-	hw_qc_cc_init(&q->cc, q->mds, q->now);
+	cc_init(q);
 	q->pkt_threshold = HW_QC_PACKET_THRESHOLD;
 	q->time_shift = HW_QC_TIME_SHIFT;
 	hw_qc_smap_init(&q->streams);
@@ -2790,4 +2803,5 @@ void hw_quic_get_stats(const hw_quic_conn *q, hw_quic_stats *out) {
 	out->ssthresh = q->cc.ssthresh;
 	out->congestion_events = q->cc.epoch;
 	out->spurious_lost = q->spurious_lost;
+	out->bandwidth = q->cc.bbr ? q->cc.b.bw : 0;
 }

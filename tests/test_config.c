@@ -2,6 +2,7 @@
  * Config parsing: inline comments, quoted values, flags, and that the shipped default configs
  * actually load (a broken default config would brick a fresh install).
  */
+#include "holywisp/quic.h"
 #include "holywisp/server.h"
 
 #include "server/config.h"
@@ -177,6 +178,13 @@ static void test_webtransport_keys(void) {
 	CHECK_EQ(cfg.webtransport_max_handshakes, 256);
 	CHECK_EQ(cfg.webtransport_retry_threshold, 0);
 	CHECK(hw_server_config_validate(&cfg, err, sizeof(err)) == 0, "valid: %s", err);
+	// Congestion control: BBR unless NewReno is asked for, and nothing else.
+	CHECK_EQ(cfg.webtransport_congestion, HW_QUIC_CC_BBR);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-congestion-control", "newreno", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport_congestion, HW_QUIC_CC_NEWRENO);
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-congestion-control", "bbr", err, sizeof(err)), 0);
+	CHECK_EQ(cfg.webtransport_congestion, HW_QUIC_CC_BBR);
+	CHECK(hw_config_set(&cfg, "webtransport-congestion-control", "cubic", err, sizeof(err)) != 0, "no cubic");
 	// An idle timeout is not optional, and neither is a handshake cap.
 	CHECK(hw_config_set(&cfg, "webtransport-idle-timeout-s", "0", err, sizeof(err)) != 0, "idle timeout 0");
 	CHECK(hw_config_set(&cfg, "webtransport-max-handshakes", "0", err, sizeof(err)) != 0, "no handshakes");

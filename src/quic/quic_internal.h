@@ -299,11 +299,62 @@ typedef struct {
 	uint64_t undo_lost;
 	uint16_t epoch; // recovery periods entered (mod 2^16), stamped on the packets each declared lost
 	int undo_ok;    // the current period may still be undone
-	// Pacer: a token bucket refilled at 5/4 * cwnd / smoothed RTT.
+	// Pacer: a token bucket refilled at 5/4 * cwnd / smoothed RTT (NewReno) or at BBR's
+	// pacing rate.
 	uint64_t tokens, last_refill;
+	// Delivery rate estimation (draft-cheng-iccrg-delivery-rate-estimation), kept by both
+	// algorithms and used by BBR: bytes acknowledged so far and when the latest was, the send
+	// time of the packet that started the current interval, and the app-limited mark (the
+	// delivered count until which samples are app-limited, 0 when none).
+	uint64_t delivered, delivered_time, first_sent_time, app_limited;
+	// The sample this ACK makes, from the newest packet it acknowledges.
+	struct {
+		int has;
+		int is_app_limited;
+		uint64_t prior_delivered, prior_time, send_elapsed, ack_elapsed;
+		uint64_t acked, lost; // bytes acknowledged and declared lost while this ACK is processed
+	} rs;
+	// BBR (draft-cardwell-iccrg-bbr-congestion-control-00, as Linux's tcp_bbr does it); bbr = 0
+	// is NewReno and leaves all of this alone.
+	int bbr;
+	struct {
+		int mode;                  // HW_QC_BBR_*
+		uint64_t bw;               // the max filter's answer, bytes per second
+		uint64_t bw_s[3], bw_t[3]; // the windowed max filter (Linux lib/minmax.c): value, round
+		uint64_t min_rtt, min_rtt_stamp;
+		uint64_t round_count, next_round_delivered;
+		int round_start;
+		uint64_t full_bw;
+		unsigned full_bw_cnt;
+		int full_bw_reached;
+		unsigned cycle_idx;
+		uint64_t cycle_stamp;
+		unsigned pacing_gain, cwnd_gain; // in 1/256
+		uint64_t pacing_rate;            // bytes per second, 0 until the first is set
+		uint64_t prior_cwnd;
+		uint64_t probe_rtt_done;
+		int probe_rtt_round_done;
+		int idle_restart;
+		uint64_t init_cwnd;
+		// ACK aggregation (Linux's extra_acked): how far the bytes acknowledged ran ahead of
+		// the estimated rate since the epoch began, its max over two windows of 5 rounds, added
+		// to the window so that ACKs that come late or in clumps do not stall the sender.
+		uint64_t ack_epoch_start, ack_epoch_acked;
+		uint64_t extra_acked[2];
+		unsigned extra_acked_idx, extra_acked_rounds;
+	} b;
 } hw_qc_cc;
 
+enum {
+	HW_QC_BBR_STARTUP = 0,
+	HW_QC_BBR_DRAIN,
+	HW_QC_BBR_PROBE_BW,
+	HW_QC_BBR_PROBE_RTT,
+};
+
 void hw_qc_cc_init(hw_qc_cc *c, uint64_t mds, uint64_t now);
+// After hw_qc_cc_init: the window is BBR's from then on, not NewReno's.
+void hw_qc_cc_use_bbr(hw_qc_cc *c, uint64_t now);
 void hw_qc_cc_on_sent(hw_qc_cc *c, uint64_t bytes);
 // An in-flight packet sent at time_sent was acknowledged. limited = the sender was not using
 // the window (no growth then).
@@ -347,8 +398,24 @@ typedef struct {
 	uint16_t size;
 	uint16_t nframes;
 	uint8_t flags;
-	uint16_t loss_epoch; // HW_QC_SENT_LOST: the recovery period that declared it (hw_qc_cc.epoch)
+	uint8_t rs_app_limited; // in flight: sent while the sender was app-limited (hw_qc_cc.app_limited)
+	uint16_t loss_epoch;    // HW_QC_SENT_LOST: the recovery period that declared it (hw_qc_cc.epoch)
+	// In flight: the connection's delivery state when it was sent (hw_qc_cc.delivered and the
+	// rest), from which its acknowledgment makes a delivery rate sample.
+	uint64_t delivered, delivered_time, first_sent_time;
 } hw_qc_sent;
+
+// Delivery rate estimation. An in-flight packet is being sent (before hw_qc_cc_on_sent counts
+// it): it takes the connection's delivery state.
+void hw_qc_rs_on_sent(hw_qc_cc *c, hw_qc_sent *s, uint64_t now);
+// An in-flight packet was acknowledged (before hw_qc_cc_on_acked).
+void hw_qc_rs_on_acked(hw_qc_cc *c, const hw_qc_sent *s, uint64_t now);
+// The sender has room in the window and pacer but nothing to send: what goes out until what is
+// in flight now is delivered says nothing about the path's bandwidth.
+void hw_qc_cc_app_limited(hw_qc_cc *c);
+// An ACK frame has been processed (its packets acknowledged, losses detected): BBR updates its
+// model, pacing rate and window from the sample. rtt_us is the RTT sample it made, 0 for none.
+void hw_qc_cc_on_ack_done(hw_qc_cc *c, uint64_t rtt_us, uint64_t now);
 
 // What a sent frame needs to be sent again when it is lost, or forgotten when it is acked.
 enum {

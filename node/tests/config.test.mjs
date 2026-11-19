@@ -40,6 +40,7 @@ test("webTransport maps onto the webtransport keys, and false or absent passes n
 				idleTimeoutSeconds: 45,
 				maxHandshakes: 256,
 				retryThreshold: 16,
+				congestionControl: "newreno",
 			},
 		}),
 		[
@@ -52,8 +53,10 @@ test("webTransport maps onto the webtransport keys, and false or absent passes n
 			"--webtransport-idle-timeout-s=45",
 			"--webtransport-max-handshakes=256",
 			"--webtransport-retry-threshold=16",
+			"--webtransport-congestion-control=newreno",
 		],
 	);
+	assert.throws(() => workerArgs({ webTransport: { congestionControl: "cubic" } }, run), /congestionControl must be bbr or newreno/);
 	assert.throws(() => workerArgs({ webTransport: "yes" }, run), /webTransport must be a boolean or an object/);
 	assert.throws(() => workerArgs({ webTransport: { port: 1.5 } }, run), /webTransport.port must be an integer/);
 });

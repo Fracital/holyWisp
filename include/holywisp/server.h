@@ -191,6 +191,7 @@ typedef struct hw_server_config {
 	int webtransport_idle_timeout_s;  // QUIC idle timeout
 	int webtransport_max_handshakes;  // handshakes in progress per worker
 	int webtransport_retry_threshold; // handshakes in progress per worker past which an Initial gets a Retry
+	int webtransport_congestion;      // HW_QUIC_CC_BBR (0, the default) or HW_QUIC_CC_NEWRENO
 	// For the `holywisp` binary when another program runs it: stop when standard input reaches end
 	// of file, which is what a child holding a pipe from its parent sees when the parent dies, however
 	// it dies. Not for a service manager, whose stdin is /dev/null and at end of file from the start.
