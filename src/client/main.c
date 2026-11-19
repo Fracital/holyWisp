@@ -395,6 +395,7 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 	}
 	size_t ahead = dir == BENCH_ECHO ? hw_client_credit_window(c) / 2 : 0; // 0: no bound
 	for (size_t i = 0; i < PIPE_CHUNK; i++) chunk[i] = (uint8_t)(i * 31 + 7);
+	uint64_t chunk_sum = byte_sum(chunk, PIPE_CHUNK); // every send but a short last one is the whole chunk
 	size_t per = total / nsid;
 	total = per * nsid;
 	uint64_t start = hw_now_us();
@@ -418,7 +419,7 @@ static int run_bench(hw_client *c, const uint32_t *sid, size_t nsid, size_t tota
 				fprintf(stderr, "send failed at %zu bytes: %s\n", sent_all, send_error(s));
 				goto done;
 			}
-			if (dir == BENCH_ECHO) sum_sent += byte_sum(chunk, n);
+			if (dir == BENCH_ECHO) sum_sent += n == PIPE_CHUNK ? chunk_sum : byte_sum(chunk, n);
 			sent[k] += n;
 			sent_all += n;
 		}

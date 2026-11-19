@@ -38,6 +38,9 @@ typedef struct hw_ws_frame {
 int hw_ws_parse_header(const uint8_t *data, size_t len, hw_ws_frame *f);
 // XOR data with the mask, starting at `offset` into the mask cycle (for payloads arriving in parts).
 void hw_ws_mask(uint8_t *data, size_t len, const uint8_t mask[4], size_t offset);
+// The same from src into dst in one pass, as a sender writes a frame: dst[i] = src[i] ^ the mask
+// byte at offset + i. dst and src are the same buffer or do not overlap at all.
+void hw_ws_mask_copy(uint8_t *dst, const uint8_t *src, size_t len, const uint8_t mask[4], size_t offset);
 size_t hw_ws_header_len(uint64_t payload_len, int masked);
 // Write a header for a payload of payload_len bytes; mask NULL = unmasked. Returns bytes written.
 size_t hw_ws_write_header(uint8_t out[HW_WS_MAX_HEADER], int fin, uint8_t opcode, uint64_t payload_len,

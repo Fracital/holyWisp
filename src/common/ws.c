@@ -54,24 +54,30 @@ int hw_ws_parse_header(const uint8_t *data, size_t len, hw_ws_frame *f) {
 // a step with the compiler's generic vectors, which are two SSE2 or NEON registers anywhere and one
 // AVX2 register where the CPU has it: on the bench VM at 16x4 that was 4.8% more bytes per CPU
 // second than 8 bytes a step (2.4% for SSE2 alone). `data` starts on a mask cycle; returns the
-// bytes done, a multiple of 32.
+// bytes done, a multiple of 32. The copying form (dst from src) is the client's, which masks what
+// it sends as it writes the frame instead of copying the payload and masking it again.
 typedef uint8_t mask_v32 __attribute__((vector_size(32)));
 
-static inline __attribute__((always_inline)) size_t mask_v32_run(uint8_t *data, size_t len, const uint8_t mask[4]) {
+static inline __attribute__((always_inline)) size_t mask_v32_run(uint8_t *dst, const uint8_t *src, size_t len,
+                                                                 const uint8_t mask[4]) {
 	mask_v32 key;
 	for (int k = 0; k < 32; k++) key[k] = mask[k & 3];
 	size_t i = 0;
 	for (; len - i >= 32; i += 32) {
 		mask_v32 v;
-		memcpy(&v, data + i, 32);
+		memcpy(&v, src + i, 32);
 		v ^= key;
-		memcpy(data + i, &v, 32);
+		memcpy(dst + i, &v, 32);
 	}
 	return i;
 }
 
 static size_t mask_v32_base(uint8_t *data, size_t len, const uint8_t mask[4]) {
-	return mask_v32_run(data, len, mask);
+	return mask_v32_run(data, data, len, mask);
+}
+
+static size_t mask_copy_v32_base(uint8_t *dst, const uint8_t *src, size_t len, const uint8_t mask[4]) {
+	return mask_v32_run(dst, src, len, mask);
 }
 
 // The one architecture #if in the tree: AVX2 is not in the x86-64 baseline the release builds
@@ -80,7 +86,12 @@ static size_t mask_v32_base(uint8_t *data, size_t len, const uint8_t mask[4]) {
 #include <cpuid.h>
 
 __attribute__((target("avx2"))) static size_t mask_v32_avx2(uint8_t *data, size_t len, const uint8_t mask[4]) {
-	return mask_v32_run(data, len, mask);
+	return mask_v32_run(data, data, len, mask);
+}
+
+__attribute__((target("avx2"))) static size_t mask_copy_v32_avx2(uint8_t *dst, const uint8_t *src, size_t len,
+                                                                 const uint8_t mask[4]) {
+	return mask_v32_run(dst, src, len, mask);
 }
 
 // AVX2 in the CPU (leaf 7) and its registers saved by the OS (OSXSAVE, then XCR0's SSE and AVX
@@ -97,17 +108,29 @@ static int cpu_has_avx2(void) {
 
 static _Atomic int g_mask_avx2 = -1; // unknown until the first large unmask; every thread finds the same
 
-static size_t mask_vec(uint8_t *data, size_t len, const uint8_t mask[4]) {
+static int mask_avx2(void) {
 	int avx2 = atomic_load_explicit(&g_mask_avx2, memory_order_relaxed);
 	if (avx2 < 0) {
 		avx2 = cpu_has_avx2();
 		atomic_store_explicit(&g_mask_avx2, avx2, memory_order_relaxed);
 	}
-	return avx2 ? mask_v32_avx2(data, len, mask) : mask_v32_base(data, len, mask);
+	return avx2;
+}
+
+static size_t mask_vec(uint8_t *data, size_t len, const uint8_t mask[4]) {
+	return mask_avx2() ? mask_v32_avx2(data, len, mask) : mask_v32_base(data, len, mask);
+}
+
+static size_t mask_copy_vec(uint8_t *dst, const uint8_t *src, size_t len, const uint8_t mask[4]) {
+	return mask_avx2() ? mask_copy_v32_avx2(dst, src, len, mask) : mask_copy_v32_base(dst, src, len, mask);
 }
 #else
 static size_t mask_vec(uint8_t *data, size_t len, const uint8_t mask[4]) {
 	return mask_v32_base(data, len, mask);
+}
+
+static size_t mask_copy_vec(uint8_t *dst, const uint8_t *src, size_t len, const uint8_t mask[4]) {
+	return mask_copy_v32_base(dst, src, len, mask);
 }
 #endif
 
@@ -132,6 +155,30 @@ void hw_ws_mask(uint8_t *data, size_t len, const uint8_t mask[4], size_t offset)
 	}
 	while (i < len) {
 		data[i] ^= mask[(offset + i) & 3];
+		i++;
+	}
+}
+
+void hw_ws_mask_copy(uint8_t *dst, const uint8_t *src, size_t len, const uint8_t mask[4], size_t offset) {
+	size_t i = 0;
+	while (i < len && ((offset + i) & 3) != 0) {
+		dst[i] = src[i] ^ mask[(offset + i) & 3];
+		i++;
+	}
+	if (len - i >= 32) i += mask_copy_vec(dst + i, src + i, len - i, mask);
+	if (len - i >= 8) {
+		uint64_t key = 0;
+		for (int k = 7; k >= 0; k--) key = key << 8 | mask[k & 3];
+		while (len - i >= 8) {
+			uint64_t v;
+			memcpy(&v, src + i, 8);
+			v ^= key;
+			memcpy(dst + i, &v, 8);
+			i += 8;
+		}
+	}
+	while (i < len) {
+		dst[i] = src[i] ^ mask[(offset + i) & 3];
 		i++;
 	}
 }

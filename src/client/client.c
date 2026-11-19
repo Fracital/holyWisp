@@ -23,7 +23,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLIENT_READ_CHUNK   (64 * 1024)
+#define CLIENT_READ_CHUNK   (256 * 1024) // the room a read has at least: two of the server's 128 KiB frames
 #define CLIENT_QUEUE_BYTES  ((size_t)32 * 1024 * 1024) // default opts.max_queue_bytes
 #define CLIENT_QUEUE_EVENTS ((size_t)65536)            // default opts.max_queue_events
 #define CLIENT_ERR_EXCERPT  64                         // bytes of a bad upgrade response quoted in the error
@@ -213,9 +213,9 @@ static int frame_build(hw_client *c, uint8_t opcode, const uint8_t *hdr, size_t 
 	if (hw_buf_reserve(&c->sbuf, HW_WS_MAX_HEADER + total) != 0) return HW_ERR_NOMEM;
 	uint8_t *p = hw_buf_tail(&c->sbuf);
 	size_t hl = hw_ws_write_header(p, 1, opcode, total, mask);
-	memcpy(p + hl, hdr, hdr_len);
-	if (len) memcpy(p + hl + hdr_len, payload, len);
-	hw_ws_mask(p + hl, total, mask, 0);
+	// Masked as it is copied: one pass over the payload, not a copy and a second pass to mask it.
+	hw_ws_mask_copy(p + hl, hdr, hdr_len, mask, 0);
+	if (len) hw_ws_mask_copy(p + hl + hdr_len, payload, len, mask, hdr_len);
 	*out_len = hl + total;
 	return 0;
 }

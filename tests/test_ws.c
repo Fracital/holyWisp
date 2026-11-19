@@ -88,6 +88,34 @@ static void test_mask(void) {
 	}
 }
 
+// The copying mask against a copy and hw_ws_mask, over every length across its steps, every
+// position in the mask cycle and both buffers' alignments; and in place, which the contract allows.
+static void test_mask_copy(void) {
+	uint8_t mask[4] = {0x9C, 0x01, 0xE7, 0x5A};
+	uint8_t src[300], dst[300], want[300];
+	for (size_t i = 0; i < sizeof(src); i++) src[i] = (uint8_t)(i * 29 + 3);
+	for (size_t off = 0; off < 4; off++) {
+		for (size_t len = 0; len <= 260; len++) {
+			for (size_t at = 0; at < 4; at++) {
+				for (size_t from = 0; from < 4; from++) {
+					memset(dst, 0xEE, sizeof(dst));
+					memcpy(want, dst, sizeof(want));
+					memcpy(want + at, src + from, len);
+					hw_ws_mask(want + at, len, mask, off);
+					hw_ws_mask_copy(dst + at, src + from, len, mask, off);
+					CHECK(memcmp(dst, want, sizeof(dst)) == 0, "offset %zu length %zu at %zu from %zu", off, len, at,
+					      from);
+				}
+			}
+		}
+	}
+	memcpy(dst, src, sizeof(src));
+	hw_ws_mask_copy(dst, dst, sizeof(dst), mask, 1);
+	memcpy(want, src, sizeof(src));
+	hw_ws_mask(want, sizeof(want), mask, 1);
+	CHECK(memcmp(dst, want, sizeof(dst)) == 0, "in place");
+}
+
 static void test_http_request(void) {
 	const char *req = "GET /wisp/ HTTP/1.1\r\n"
 	                  "Host: example.org:6001\r\n"
@@ -288,6 +316,7 @@ int main(void) {
 	RUN(test_header_lengths);
 	RUN(test_header_rejections);
 	RUN(test_mask);
+	RUN(test_mask_copy);
 	RUN(test_http_request);
 	RUN(test_http_head_end);
 	RUN(test_http_header_table);
