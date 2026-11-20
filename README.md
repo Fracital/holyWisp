@@ -28,16 +28,19 @@ default and range), [Security and limits](https://github.com/Fracital/holyWisp/w
 
 ## Quickstart
 
-**Install the package** (Debian/Ubuntu or Fedora/RHEL). This creates the isolated `wisp` user and
-starts a hardened systemd service listening on `127.0.0.1:6001`:
+**Install the package** (Debian 12+ / Ubuntu 22.04+, or Fedora 41+). This creates the isolated
+`wisp` user and installs a hardened systemd service listening on `127.0.0.1:6001`. The `.deb`
+enables and starts it; the `.rpm` follows Fedora's presets, which leave a new service disabled, so
+there it takes one `systemctl enable --now`:
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.4-2_amd64.deb
-sudo apt install ./holywisp_0.5.4-2_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.4-3_amd64.deb
+sudo apt install ./holywisp_0.5.4-3_amd64.deb
 
-# Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.4-2.fc41.x86_64.rpm
+# Fedora
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.4-3.fc41.x86_64.rpm
+sudo systemctl enable --now holywisp
 
 sudo systemctl status holywisp            # running as user "wisp", sandboxed
 sudoedit /etc/holywisp/holywisp.conf      # then: sudo systemctl restart holywisp
@@ -49,18 +52,22 @@ for both):
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.4-2_amd64.deb
-sudo apt install ./holywisp-client_0.5.4-2_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.4-3_amd64.deb
+sudo apt install ./holywisp-client_0.5.4-3_amd64.deb
 
-# Fedora / RHEL
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.4-2.fc41.x86_64.rpm
+# Fedora
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.4-3.fc41.x86_64.rpm
 
-# Any glibc 2.35+ Linux (x64 or arm64)
+# Any Linux with glibc 2.35+ and libcrypt.so.1 (x64 or arm64; see below)
 curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-linux-x64.tar.gz | tar xz
 ```
 
 **Or grab a prebuilt binary** (x86_64 or arm64 Linux, glibc 2.35+). The `latest` link always
-points at the newest `main` build:
+points at the newest `master` build. The binaries are linked against `libcrypt.so.1`, which Debian
+and Ubuntu have; Fedora and other distributions whose libxcrypt ships only `libcrypt.so.2` (Arch,
+RHEL) need its compatibility package first (`sudo dnf install libxcrypt-compat`), or the binary
+stops at "error while loading shared libraries: libcrypt.so.1". The archive's `holywisp.conf`
+binds `127.0.0.1`, as the package does; set `host` to expose it:
 
 ```sh
 curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-linux-x64.tar.gz | tar xz
@@ -71,8 +78,13 @@ cd holywisp-linux-x64 && ./holywisp --config holywisp.conf
 
 ```sh
 make release                              # -> build/release/holywisp, holywisp-client
-build/release/holywisp --port 6001 --allow-loopback
+build/release/holywisp --host 127.0.0.1 --port 6001
 ```
+
+`host` is empty by default, which is every interface: without `--host 127.0.0.1` the relay is open
+to the network. Keep it on loopback while you try it, and above all with `--allow-loopback` or
+`--allow-private`, which let every client that reaches the port reach this machine's own services
+or its network.
 
 Then push data through it with the client, netcat-style:
 
@@ -91,7 +103,8 @@ Linux (epoll). Ninja is used when present. `crypt(3)` and
 
 It also builds and runs on macOS (kqueue), as a port for development machines: the same server and
 the same tests, but payloads are copied where Linux splices them, the workers share one listening
-socket, and `crypt(3)` there knows no `$5$`/`$6$` hashes. Production is Linux.
+socket, and `crypt(3)` there knows no `$5$`/`$6$` hashes: a `password-user` holding such a hash is
+accepted at start and then never matches, so give a Mac plain-text passwords. Production is Linux.
 
 Windows is a third such port, and always a cross build (`make npm` makes it, with zig; `make
 test-windows` runs the test suite under Wine). It is the same source: `src/compat/win32` supplies
@@ -117,7 +130,9 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
 - **Default-deny egress.** Streams may only reach public unicast addresses. Loopback, RFC 1918,
   CGNAT, link-local, multicast, unspecified and reserved ranges are refused unless the matching
   `allow-*` is set. The check runs on the resolved addresses, after DNS, so a hostname that
-  resolves to a private address is blocked. IPv4-mapped IPv6, NAT64 and 6to4 are unwrapped first.
+  resolves to a private address is blocked. An IPv4-mapped IPv6 address is judged as the IPv4 it
+  wraps; the forms that translate or tunnel to IPv4 (NAT64, 6to4, IPv4-compatible, ISATAP) are
+  reserved and refused, whatever they wrap.
 - **Host and port filters.** `allow-host` / `block-host` (with `*.suffix` wildcards) and
   `allow-port` / `block-port` (single ports or ranges).
 - **Flood protection.** Per-source-IP and per-destination connect-rate windows, in-flight-SYN and
@@ -130,14 +145,16 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   open streams and has sent nothing for that long, if you want that.
 - **Origin allowlist.** `allow-origin` restricts which web pages may open a connection through a
   visitor's browser. Unset, any page may, as a public relay needs.
-- **Per-IP limits.** New-connection rate limiting per client IP and a per-IP bandwidth cap in both
-  directions (a token-bucket pause, never a drop).
+- **Per-IP limits.** New-connection rate limiting per client IP and a per-IP bandwidth cap, one
+  budget that uploads and downloads draw on together (a token-bucket pause, never a drop).
 - **IP reputation.** A 0–100 score per source IP and per destination, raised by weighted events
   (auth failures, SYN signatures, burst rates, probing a terminal stream) and decayed over time.
   Only what a client does on its own account is scored: hitting a limit that all clients share,
   or asking for a private address (which any web page can make a browser do), is refused and
-  counted but not held against the address. Tiers escalate from logging to tightening a client's limits to refusing
-  it outright. Persisted as JSON and reloaded on restart.
+  counted but not held against the address. From `reputation-throttle` a client may hold 16
+  streams per connection at most, and from `reputation-strict` it is refused outright (and a
+  destination is no longer dialled); `reputation-warn` has no effect yet. Persisted as JSON and
+  reloaded on restart.
 - **Password auth (Wisp v2).** `password-user USER:PASS`, where `PASS` may be a `crypt(3)` hash
   (`$2b$`, `$6$`, `$y$`, …) checked in constant time, not only plaintext. Hashes are computed
   off the event loops, so a slow hash never stalls other clients. An empty password is refused.
@@ -149,8 +166,8 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   which is handed the hostname, after the egress check here. `proxy-only-to` sends only the
   streams that resolved to the given addresses there and dials the rest directly. The
   `udp-warp-*` and `tcp-warp*` keys mark each socket for the WARP tunnel an edge router would pick
-  for its site, and `warp-bypass-host` keeps named sites off WARP. These are what the
-  wisp.baby edges run.
+  for its site, and `warp-bypass-host` keeps named sites off WARP. These are what the edges
+  behind the public relay run.
 - **WebSocket strictness.** Client frames must be masked; reserved bits, text frames and oversize
   messages are rejected per RFC 6455.
 - **Hardened by default when installed.** The systemd unit runs as the unprivileged, shell-less
@@ -173,7 +190,7 @@ would not: a gate to run before a restart. The most important keys:
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `host`, `port`, `workers` | `""`, `6001`, `0` | Bind address (all interfaces; the package default is `127.0.0.1`), port, worker threads (0 = per CPU) |
+| `host`, `port`, `workers` | `""`, `6001`, `0` | Bind address (empty: all interfaces; the package's and the release archive's config set `127.0.0.1`), port, worker threads (0 = per CPU) |
 | `allow-tcp`, `allow-udp` | on | Stream types clients may open |
 | `allow-direct-ip`, `allow-private`, `allow-loopback`, `allow-link-local` | off | Relax the egress policy |
 | `allow-host` / `block-host`, `allow-port` / `block-port` | none | Destination allow/block lists |
@@ -183,7 +200,7 @@ would not: a gate to run before a restart. The most important keys:
 | `upload-credit` | on | Offer upload credit in the v2 INFO (extension `0xE4`, [docs/extensions.md](docs/extensions.md)). A client that names it counts each TCP or terminal stream's uploads in bytes against a limit the server raises (UPLOAD_CREDIT, packet `0xE4`) once half a budget has reached the remote, instead of waiting for a CONTINUE at the end of each packet window. The budget is `upload-window` shared by the client's streams, within `stream-queue-max`. Off leaves `0xE4` out of the INFO; a client that does not name it sees no difference |
 | `password-user USER:PASS`, `password-required` | none, off | v2 password auth (hash or plaintext); refuse unauthenticated clients |
 | `trusted-proxy`, `trusted-header`, `trusted-proxy-secret` | none, `X-Forwarded-For`, none | Whose proxy headers name the client, which header, and a secret the proxy must also send |
-| `parse-real-ip`, `trusted-headers-reset` | on, off | Read the client's address from a trusted proxy's header at all; empty the header list (`X-Forwarded-For`) before the `trusted-header` lines add theirs |
+| `parse-real-ip`, `trusted-headers-reset` | on, unset | Read the client's address from a trusted proxy's header at all; empty the header list (`X-Forwarded-For`) before the `trusted-header` lines add theirs. `trusted-headers-reset` is an action, not a switch: any value, `off` included, empties the list, and as a flag it also empties the file's `trusted-header` lines, because flags are applied after the file |
 | `allow-origin` | none | Origins (`scheme://host[:port]`) a browser may connect from; none means any |
 | `policy-file` | none | A file of more `allow-host`, `block-host`, `allow-port`, `block-port`, `warp-bypass-host` and `allow-origin` lines (and nothing else), in the config file's syntax, added to the config's own. Read again within a few seconds of a change, and once a minute in any case: new streams and upgrades see the new lists at once, open ones are not touched, and nobody is dropped. It must load when the server starts; later, a file that does not load (a bad line, another key, a list too full) or has gone is logged as an error and the lists in force stay. Replace it by rename, so it is never read half-written |
 | `connections-limit-per-ip`, `connection-window-s` | 200, 10 | New WebSockets per IP per window |
@@ -191,7 +208,7 @@ would not: a gate to run before a restart. The most important keys:
 | `max-concurrent-connections-per-ip`, `max-in-flight-syns-per-ip` | 5000, 512 | One client address's share of the server-wide connection and in-flight-connect caps |
 | `max-handshakes-per-ip` | 128 | Connections from one address that have not yet sent their whole HTTP request head; one more is answered 429 and closed at accept. Counted by the socket's peer, so connections from a `trusted-proxy` are never counted (0 = unlimited; with `flood-protection`) |
 | `client-write-timeout-s`, `idle-timeout-s` | 120, 0 | Close a client that takes nothing queued for it for this long; close a connection that has no open streams and has sent no frame for this long, with 1001 (0 = never) |
-| `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap, each direction |
+| `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap (0 = off): one budget per client address, which its uploads and downloads share |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |
 | `ws-close-after-violations`, `log-blocked-dials` | 64, off | Close a client after this many flood-limit hits of its own (0 = never); log every failed dial at `info`, with the client address |
 | `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence |
@@ -261,18 +278,30 @@ to open (`webtransport-url`, or `""`) and the certificate hashes a page passes t
 
 ## Running as a service
 
-The packages install and start the unit for you. To run it by hand from a source build:
+The packages install the unit for you (the `.deb` also enables and starts it, the `.rpm` leaves
+that to `sudo systemctl enable --now holywisp`). To run it by hand from a source build, the same
+files the packages install make the `wisp` user and group and the two directories:
 
 ```sh
-sudo useradd -r -g wisp -d /var/lib/holywisp -s /usr/sbin/nologin wisp   # or let the package do it
+sudo install -Dm0644 deploy/systemd/holywisp.sysusers /etc/sysusers.d/holywisp.conf
+sudo install -Dm0644 deploy/systemd/holywisp.tmpfiles /etc/tmpfiles.d/holywisp.conf
+sudo systemd-sysusers holywisp.conf && sudo systemd-tmpfiles --create holywisp.conf
 sudo install -m0755 build/release/holywisp /usr/bin/holywisp
 sudo install -Dm0644 deploy/systemd/holywisp.service /etc/systemd/system/holywisp.service
-sudo install -Dm0640 deploy/holywisp.conf /etc/holywisp/holywisp.conf
+sudo install -m0640 -o root -g wisp deploy/holywisp.conf /etc/holywisp/holywisp.conf
 sudo systemctl daemon-reload && sudo systemctl enable --now holywisp
 ```
 
 The config may hold password hashes, so it is `root:wisp` mode `0640`, never world-readable. State
-(the reputation store) lives in `/var/lib/holywisp`, owned by `wisp`.
+(the reputation store) lives in `/var/lib/holywisp`, owned by `wisp`; the unit cannot start
+without that directory (`ReadWritePaths`).
+
+The unit caps the service at `MemoryMax=1G`, and `deploy/holywisp.conf` sizes the server-wide
+queue budget (`server-queue-max`, 512 MiB, and 128 MiB per client address) to stay under it with
+room for the process itself, so a flood of slow peers pauses clients instead of getting the
+service killed by the kernel. On a bigger machine raise them together, keeping the budget at about
+half the cap: `sudo systemctl edit holywisp` with `[Service]` and `MemoryMax=4G`, say, and then
+`server-queue-max = 2147483648` in the config.
 
 The config is read once, and there is no reload (`systemctl reload` is refused): a change takes a
 restart. The log level is the exception: `sudo systemctl kill -s USR1 holywisp` makes the log one

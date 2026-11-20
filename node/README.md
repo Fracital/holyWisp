@@ -118,10 +118,12 @@ Two things follow from the server believing only `route()`:
 - A proxy that connects to the server's own port (with `host: "0.0.0.0"`) instead of to your Node
   server is not believed, listed in `trustedProxies` or not. It does not have the secret. Send
   its requests through `route()`.
-- `route()` refuses an upgrade (403) when the socket has no peer address, which is the case when
-  your HTTP server listens on a Unix socket. There is then nothing to tell the server, and it
-  would count every client as one. Listen on a TCP port, on loopback if it is only for a proxy
-  on the same machine.
+- A socket with no peer address, which is what your HTTP server hands over when it listens on a
+  Unix socket, is taken for `127.0.0.1` (and the log says so once): every client that arrives
+  that way is one client to the server, with one connection allowance and one reputation,
+  unless a proxy in front sends `X-Forwarded-For` and `trustedProxies` lists `127.0.0.1`. Listen
+  on a TCP port, on loopback if it is only for a proxy on the same machine, to keep clients
+  apart. A peer address that is there but does not parse is refused (403).
 
 ## Options
 
@@ -187,7 +189,8 @@ address), and sends nothing of the request to the server.
 The keys for running behind a routing proxy on WARP tunnels (`proxy-only-to`, `proxy-client-key`,
 `udp-warp-*`, `tcp-warp*`, `warp-bypass-host`) have no option here: they are for an edge that runs
 the binary under its own service manager (the abulxt fleet), not for a server inside a Node
-process. Run `holywisp --config` for those.
+process. Neither have `webtransport-cert-dir` (certificates by SNI), `webtransport-path` (path
+and host rules) and `webtransport-lanes`. Run `holywisp --config` for those.
 
 The egress defaults deny everything that is not a public address. `allowLoopbackIPs` and
 `allowPrivateIPs` open the machine and the network this runs on to every client: leave them off

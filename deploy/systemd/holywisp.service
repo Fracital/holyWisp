@@ -27,6 +27,9 @@ ExecStart=/usr/bin/holywisp --config /etc/holywisp/holywisp.conf
 # A relay legitimately opens many sockets; raise the fd ceiling but keep it finite.
 LimitNOFILE=262144
 # Cap memory and tasks so a leak or a fork bomb in a compromised process cannot take the host down.
+# The config's server-queue-max (512 MiB in the packaged holywisp.conf) must stay well under
+# MemoryMax, or the kernel kills the service before the queue budget pauses anyone: raise the two
+# together (`systemctl edit holywisp` for this one).
 MemoryMax=1G
 TasksMax=512
 

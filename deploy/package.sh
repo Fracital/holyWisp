@@ -25,7 +25,8 @@ esac
 # that is not a change to the version. 2 is the first without holywisp-client inside `holywisp`:
 # `client_split` below is where the client's file changed hands, and stays that forever. Raise
 # pkg_release when the packaging changes again; it need not go back to 1 for a new version.
-pkg_release="${HW_PKG_RELEASE:-2}"
+# 3: the installed config's queue budget fits under the unit's MemoryMax.
+pkg_release="${HW_PKG_RELEASE:-3}"
 client_split="0.5.3-2"
 arch_deb="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 want="${1:-all}"

@@ -5,7 +5,8 @@ name: Release
 #                                 longer has deleted)
 #   push of a tag v*         -> release <tag>, kept
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
-# binaries run on glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 and newer), each archive flat
+# binaries need glibc 2.35+ and libcrypt.so.1: Ubuntu 22.04, Debian 12 and newer as installed;
+# Fedora and the others whose libxcrypt is libcrypt.so.2 only with libxcrypt-compat), each archive flat
 # (holywisp, holywisp-client, README, LICENSE-less by design), holywisp-client-<platform>.tar.gz
 # with the client alone, the .debs and .rpms built in their native containers (deploy/package.sh:
 # `holywisp` with the hardened unit and the dedicated `wisp` user, `holywisp-client` with the
@@ -382,19 +383,19 @@ jobs:
 
           | Asset | For |
           | --- | --- |
-          | \`holywisp-linux-x64.tar.gz\` | x86_64 Linux, glibc 2.35+ |
-          | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, glibc 2.35+ |
+          | \`holywisp-linux-x64.tar.gz\` | x86_64 Linux, glibc 2.35+ and libcrypt.so.1 (on Fedora: \`dnf install libxcrypt-compat\`) |
+          | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, as above |
           | \`holywisp-client-linux-x64.tar.gz\`, \`holywisp-client-linux-arm64.tar.gz\` | The client alone, for the same systems |
           | \`holywisp_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the server as a hardened systemd unit, \`wisp\` user |
           | \`holywisp-client_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the client alone, no service |
-          | \`holywisp-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the server, as the .deb |
+          | \`holywisp-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the server, as the .deb, but not enabled: \`systemctl enable --now holywisp\` |
           | \`holywisp-client-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the client alone |
           | \`holywisp-<version>.tgz\` | Node.js 20+ on Linux (x64/arm64, glibc or musl), macOS 13+ and Windows 10+ (x64/arm64): \`npm install <asset url>\` |
           | \`SHA256SUMS\` | checksums of the above |
 
           \`\`\`sh
           curl -fsSL https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/holywisp-linux-x64.tar.gz | tar xz
-          cd holywisp-linux-x64 && ./holywisp --config holywisp.conf
+          cd holywisp-linux-x64 && ./holywisp --config holywisp.conf   # binds 127.0.0.1; set host to expose it
           \`\`\`
 
           <!-- hw-build commit=$GITHUB_SHA describe=$DESCRIBE time=$BUILD_TIME -->

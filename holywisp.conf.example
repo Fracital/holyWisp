@@ -1,10 +1,14 @@
 # holyWisp configuration. Every key is also a --key command-line flag; flags win.
-# Values are plain words or "quoted strings"; booleans are on/off, true/false, 1/0.
+# Values are plain words or "quoted strings"; booleans are on/off, true/false, yes/no, 1/0.
 # Lines starting with # are comments. Lists are built by repeating the key.
 # Check a file before a restart: holywisp --config FILE --check-config (exit 0: it would start).
 
 # ---------------------------------------------------------------- listening
-host =
+# Loopback, as the package's config: an archive unpacked and started is reachable only from this
+# machine until you say otherwise. Empty means every interface; set that or a specific address to
+# expose it (put TLS in front with a reverse proxy). The built-in default, without this line, is
+# empty.
+host = 127.0.0.1
 port = 6001
 workers = 0                      # 0 = one per CPU
 log-level = info                 # debug | info | warn | error | none
@@ -45,7 +49,8 @@ parse-real-ip = on
 # trusted-proxy = 10.0.0.0/8
 # The header the proxy in front rewrites. X-Forwarded-For is the default; name another only if
 # that proxy sets it itself (CF-Connecting-IP is safe behind Cloudflare and nowhere else: any other
-# proxy passes the client's own copy through). `trusted-headers-reset` empties the list first.
+# proxy passes the client's own copy through). `trusted-headers-reset` empties the list first,
+# whatever its value (off included).
 # trusted-headers-reset = on
 # trusted-header = CF-Connecting-IP
 # A proxy on the same host shares its address with every local process. With a secret set, the
@@ -59,7 +64,7 @@ parse-real-ip = on
 # ---------------------------------------------------------------- per-client limits
 connections-limit-per-ip = 200   # new WebSockets per IP per window (0 = off)
 connection-window-s = 10
-bandwidth-limit-kbps = 0         # per IP, each direction (0 = off)
+bandwidth-limit-kbps = 0         # per IP, one budget for uploads and downloads together (0 = off)
 max-streams-per-conn = 2048
 
 # ---------------------------------------------------------------- flood protection
@@ -85,7 +90,7 @@ reputation-store = ./data/reputation.json
 reputation-save-interval-s = 30
 reputation-decay-per-hour = 1
 reputation-evict-after-days = 7
-reputation-warn = 21
+reputation-warn = 21             # no effect yet: nothing acts on this tier
 reputation-throttle = 51
 reputation-strict = 81
 # reputation-weight = synSignature:25          # source weights, event:points
