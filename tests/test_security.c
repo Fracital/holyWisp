@@ -1385,7 +1385,6 @@ static void test_known_bad_dest_and_warn(void) {
 // so an authenticated client cannot spawn processes faster than it may open sockets. And its
 // command line is held to HW_TWISP_CMD_MAX, not to a host name's 255 bytes.
 static void test_twisp_rate_and_command(void) {
-	if (!hw_sys_has_pty()) return; // test_twisp holds the refusal
 	hw_server_config cfg;
 	base_config(&cfg);
 	cfg.enable_twisp = 1;
@@ -1490,7 +1489,12 @@ int main(void) {
 	RUN(test_proxy_reply_without_status);
 	RUN(test_udp_with_proxy);
 	RUN(test_twisp);
-	RUN(test_twisp_rate_and_command);
+	// Where there is no pseudo-terminal there is no Twisp to rate (test_twisp holds the refusal).
+	if (hw_sys_has_pty()) {
+		RUN(test_twisp_rate_and_command);
+	} else {
+		printf("skip test_twisp_rate_and_command: no pseudo-terminal here\n");
+	}
 	RUN(test_known_bad_dest_and_warn);
 	printf("ok all security cases\n");
 	return 0;
