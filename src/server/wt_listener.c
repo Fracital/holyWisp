@@ -66,7 +66,7 @@
 #define WT_TOKEN_AGE_MS  30000 // how long a Retry token is good for
 #define WT_REFUSE_MS     2000  // a refused CONNECT's answer gets this long to be delivered before the close
 #define WT_CLOSE_MS      3000  // after the server's close capsule, this long for the client's answer, then QUIC goes
-#define WT_KEEPALIVE_MS  20000 // a PING after this long without sending: divide's conntrack keeps a flow 30 s
+#define WT_KEEPALIVE_MS  20000 // a PING after this long without sending: the edge's conntrack keeps a flow 30 s
 #define WT_STOP_FLUSH_MS 200   // at stop, how long the closes may wait for a full socket
 #define WT_STOP_GAP_MS   50    // at stop, between the session close capsules and QUIC's CONNECTION_CLOSE
 #define WT_RESET_KEY_HEX (2 * HW_QUIC_KEY_LEN) // webtransport-reset-key-file: the key in hex
@@ -1627,6 +1627,19 @@ static int udp_bind(const char *host, uint16_t port, int reuseport, uint16_t *bo
 	return fd;
 }
 
+// The first socket of the listener. In a reuseport group it is preceded by a look, as the TCP
+// listener's is (listen_first in server.c): a socket of the same user may join such a group, and a
+// second server's sockets would take some of this one's datagrams and replace its steering
+// program. A socket without SO_REUSEPORT cannot bind where any socket holds the port.
+static int udp_bind_first(const char *host, uint16_t port, int reuseport, uint16_t *bound) {
+	if (reuseport && port != 0) {
+		int probe = udp_bind(host, port, 0, NULL);
+		if (probe < 0) return -1;
+		close(probe);
+	}
+	return udp_bind(host, port, reuseport, bound);
+}
+
 static wt_worker *wt_worker_new(hw_worker *w) {
 	wt_worker *ww = calloc(1, sizeof(*ww));
 	if (!ww) return NULL;
@@ -1796,7 +1809,7 @@ int wt_listener_init(hw_server *s) {
 	if (n > (int)HW_ARRAY_LEN(fds)) n = (int)HW_ARRAY_LEN(fds); // a CID's first byte names at most 256
 	uint16_t bound = 0;
 	for (int i = 0; i < n; i++) {
-		fds[i] = udp_bind(host, i == 0 ? port : bound, steer, i == 0 ? &bound : NULL);
+		fds[i] = i == 0 ? udp_bind_first(host, port, steer, &bound) : udp_bind(host, bound, steer, NULL);
 		// An ephemeral TCP port (port 0, as tests ask) promises nothing about the UDP port of the
 		// same number, which another socket may hold: then any UDP port will do.
 		if (fds[i] < 0 && i == 0 && errno == EADDRINUSE && !cfg->port && !cfg->webtransport_port) {

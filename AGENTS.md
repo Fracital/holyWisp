@@ -534,7 +534,11 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   created on the loop that receives it. `load` is raised by the accepting thread before the
   hand-off, so a burst accepted in one pass is spread, and lowered in `conn_release`. Only a
   descriptor ever crosses threads; never hand over a connection that exists, and never read
-  another worker's fields besides `load`. `test_connections_spread` holds it.
+  another worker's fields besides `load`. `test_connections_spread` holds it. The group is this
+  server's alone: any socket of the same user could join it, so the first listener is preceded
+  by a plain one bound once and closed (`listen_first`; for WebTransport's UDP group
+  `udp_bind_first`), which a port any socket holds refuses, and a second server on it fails to
+  start instead of taking a share (`test_port_not_shared`, `test_udp_port_not_shared`).
 - **Deferred free.** `conn_close()` tears the socket and streams down immediately but frees the
   `hw_conn` on the next loop iteration via `hw_loop_post`. Streams are freed immediately by
   `stream_close()`. The re-entrancy rules at the top of `src/server/conn.c` and

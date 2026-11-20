@@ -1192,6 +1192,40 @@ static void test_connections_spread(void) {
 	hw_server_free(s);
 }
 
+// The workers' listeners are an SO_REUSEPORT group, which a socket of the same user could join: a
+// second server on a port the first holds must fail to start, not take a share of its accepts.
+static void test_port_not_shared(void) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 2;
+	cfg.log_level = HW_LOG_ERROR;
+	hw_server *first = hw_server_new(&cfg);
+	CHECK(first != NULL, "first server: %s", strerror(errno));
+	CHECK_EQ(hw_server_start(first), 0);
+	cfg.port = hw_server_port(first);
+	for (int workers = 1; workers <= 2; workers++) {
+		cfg.workers = workers;
+		errno = 0;
+		hw_server *second = hw_server_new(&cfg);
+		CHECK(second == NULL, "a second server with %d worker(s) started on port %u", workers, cfg.port);
+		CHECK_EQ(errno, EADDRINUSE);
+		if (second) hw_server_free(second);
+	}
+	// Every connection still reaches the first.
+	for (int i = 0; i < 8; i++) {
+		hw_client *c = connect_to(first, 0, NULL, NULL, 0);
+		CHECK(c != NULL, "connection %d", i);
+		if (c) hw_client_free(c);
+	}
+	hw_server_free(first);
+	// And the port is free for the next server once the first is gone.
+	hw_server *next = hw_server_new(&cfg);
+	CHECK(next != NULL, "a server after the first: %s", strerror(errno));
+	if (next) hw_server_free(next);
+}
+
 // Echo `total` bytes in packets of `chunk` through stream sid and check that they come back whole.
 static void echo_round(hw_client *c, uint32_t sid, size_t total, size_t chunk, uint32_t seed) {
 	uint8_t *data = malloc(total);
@@ -1432,6 +1466,7 @@ int main(void) {
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);
+	RUN(test_port_not_shared);
 	RUN(test_relay_pipes_given_back);
 	RUN(test_client_recv_buffer);
 

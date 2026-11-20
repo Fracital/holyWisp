@@ -1358,6 +1358,24 @@ static void test_close_unanswered(void) {
 	hw_server_free(s);
 }
 
+// With more than one worker the UDP sockets are a reuseport group, which a socket of the same user
+// could join, taking datagrams and replacing the steering program: a second server on the UDP port
+// the first holds must fail to start.
+static void test_udp_port_not_shared(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *first = server_with(&cfg);
+	cfg.webtransport_port = hw_server_wt_port(first);
+	hw_server *second = hw_server_new(&cfg); // its own TCP port, the first one's UDP port
+	CHECK(second == NULL, "a second server started on UDP port %u", cfg.webtransport_port);
+	if (second) hw_server_free(second);
+	raw_wt r;
+	raw_open(&r, first, 0); // and the first still takes sessions
+	raw_free(&r);
+	hw_server_free(first);
+}
+
 // webtransport-reset-key-file: a server that went away without a word (a crash; here the client
 // never reads the closes it sent) is followed by one on the same port with the same file, and the
 // new one's stateless reset ends the old session at its client at once. Without the file the key
@@ -1931,6 +1949,7 @@ int main(void) {
 	RUN(test_close_unanswered);
 	RUN(test_stop_closes_sessions);
 	RUN(test_reset_key_file);
+	RUN(test_udp_port_not_shared);
 	RUN(test_cert_rotation);
 	RUN(test_operator_reload);
 	RUN(test_server_stream_opening);

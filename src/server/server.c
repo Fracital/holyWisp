@@ -553,6 +553,22 @@ static void *worker_main(void *arg) {
 	return NULL;
 }
 
+// The first worker's listener, in the SO_REUSEPORT group the others join. Linux lets any socket of
+// the same user join such a group, so a second server started on a port this one holds would bind
+// without an error and take a share of its connections (on macOS perhaps all). A listener without
+// SO_REUSEPORT is refused wherever any socket listens on the port, so one is bound and closed
+// first, and the port counts as taken when it cannot be. That leaves the few calls between the two
+// for a server started at the same moment. Port 0 needs no look: the kernel never picks a port
+// that is in use.
+static int listen_first(hw_server *s, uint16_t port) {
+	if (port != 0) {
+		int probe = hw_listen_tcp(s->cfg.host, port, 0, 1, NULL);
+		if (probe < 0) return -1;
+		close(probe);
+	}
+	return hw_listen_tcp(s->cfg.host, port, 1, s->cfg.listen_backlog, &s->port);
+}
+
 static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	w->server = s;
 	w->index = index;
@@ -564,7 +580,7 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	hw_loop_set_batch_end(w->loop, conn_batch_end, w);
 	hw_loop_set_busy_poll(w->loop, (unsigned)s->cfg.busy_poll_us);
 	// The first worker binds the address; the rest get a listener of their own for it.
-	w->listen_fd = index == 0 ? hw_listen_tcp(s->cfg.host, port, 1, s->cfg.listen_backlog, &s->port)
+	w->listen_fd = index == 0 ? listen_first(s, port)
 	                          : hw_sys_listen_more(s->workers[0].listen_fd, s->cfg.host, port, s->cfg.listen_backlog);
 	if (w->listen_fd < 0) return -1;
 	if (hw_loop_add_fd(w->loop, w->listen_fd, HW_EV_READ, accept_cb, w) != 0) return -1;
