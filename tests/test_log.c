@@ -2,7 +2,9 @@
  * holywisp/log.h: one call is one line, whatever a client put into the strings it is given.
  */
 #include "holywisp/log.h"
+#include "holywisp/server.h"
 
+#include "server/config.h"
 #include "test.h"
 
 #include <unistd.h>
@@ -167,6 +169,80 @@ static void test_limit(void) {
 	CHECK(strstr(out, "flood: line 0\n") != NULL, "the first line is there");
 }
 
+// stderr into a file from capture_begin to capture_end, which returns what was written.
+typedef struct {
+	char path[512];
+	int fd, saved;
+} capture_state;
+
+static void capture_begin(capture_state *st) {
+	hw_test_tmp(st->path, sizeof(st->path), "hw-log-cap");
+	st->fd = mkstemp(st->path);
+	CHECK(st->fd >= 0, "tmp");
+	fflush(stderr);
+	st->saved = dup(STDERR_FILENO);
+	CHECK(st->saved >= 0, "dup");
+	CHECK(dup2(st->fd, STDERR_FILENO) >= 0, "dup2");
+}
+
+static size_t capture_end(capture_state *st, char *out, size_t cap) {
+	fflush(stderr);
+	CHECK(dup2(st->saved, STDERR_FILENO) >= 0, "restore stderr");
+	close(st->saved);
+	close(st->fd);
+	FILE *f = fopen(st->path, "rb");
+	CHECK(f != NULL, "reopen");
+	size_t n = fread(out, 1, cap - 1, f);
+	fclose(f);
+	unlink(st->path);
+	out[n] = '\0';
+	return n;
+}
+
+// The proxy setting may hold a user name and a password, and its host is the operator's: none of
+// it reaches the log, not when its host does not resolve and not when the setting is refused.
+static void test_proxy_never_logged(void) {
+	static const char *const secrets[] = {"wisp-proxy-user", "wisp-proxy-pass", "wisp-proxy-host"};
+	char out[CAPTURE_MAX];
+	capture_state st;
+	int before = hw_log_get_level();
+
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.log_level = HW_LOG_DEBUG;
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "%s",
+	         "socks5://wisp-proxy-user:wisp-proxy-pass@wisp-proxy-host.invalid:1080");
+	capture_begin(&st);
+	hw_server *s = hw_server_new(&cfg);
+	capture_end(&st, out, sizeof(out));
+	CHECK(s == NULL, "a server whose proxy does not resolve does not start");
+	CHECK(strstr(out, "cannot resolve the proxy's host") != NULL, "the failure is logged: %s", out);
+	for (size_t i = 0; i < 3; i++) CHECK(strstr(out, secrets[i]) == NULL, "%s in the log: %s", secrets[i], out);
+
+	// A setting the validator refuses: the message names the key alone.
+	snprintf(cfg.proxy, sizeof(cfg.proxy), "%s", "ftp://wisp-proxy-user:wisp-proxy-pass@wisp-proxy-host:21");
+	capture_begin(&st);
+	s = hw_server_new(&cfg);
+	capture_end(&st, out, sizeof(out));
+	CHECK(s == NULL, "a proxy of an unknown scheme is refused");
+	CHECK(strstr(out, "proxy") != NULL, "the refusal is logged: %s", out);
+	for (size_t i = 0; i < 3; i++) CHECK(strstr(out, secrets[i]) == NULL, "%s in the log: %s", secrets[i], out);
+
+	// And the parser's own message, which a config file's error line carries: a value too long
+	// for its field.
+	char value[600], err[512];
+	int len = snprintf(value, sizeof(value), "%s", "socks5://wisp-proxy-user:wisp-proxy-pass@wisp-proxy-host:1080");
+	memset(value + len, 'x', sizeof(value) - 1 - (size_t)len);
+	value[sizeof(value) - 1] = '\0';
+	hw_server_config_defaults(&cfg);
+	CHECK(hw_config_set(&cfg, "proxy", value, err, sizeof(err)) != 0, "a proxy setting too long is refused");
+	for (size_t i = 0; i < 3; i++) CHECK(strstr(err, secrets[i]) == NULL, "%s in \"%s\"", secrets[i], err);
+	hw_log_set_level(before);
+}
+
 int main(void) {
 	RUN(test_plain_line);
 	RUN(test_no_forged_line);
@@ -174,5 +250,6 @@ int main(void) {
 	RUN(test_long_message);
 	RUN(test_levels);
 	RUN(test_limit);
+	RUN(test_proxy_never_logged);
 	return 0;
 }

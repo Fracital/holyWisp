@@ -1089,7 +1089,8 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 
 	if (proxy_config_parse(cfg->proxy, &s->proxy, err, sizeof(err)) != 0) goto fail;
 	if (proxy_config_resolve(&s->proxy) != 0) {
-		HW_ERROR("proxy", "cannot resolve %s: %s", s->proxy.host, strerror(errno));
+		// The host is not named: the proxy setting may hold credentials, and it is never echoed.
+		HW_ERROR("proxy", "cannot resolve the proxy's host (not shown: the proxy setting may hold a secret)");
 		goto fail;
 	}
 	if (cfg->proxy_client_key_secret[0]) {
