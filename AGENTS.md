@@ -593,9 +593,12 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   wait is `epoll_pwait2` (a timespec), and where the kernel (before 5.11) or a seccomp filter
   (ENOSYS or EPERM: systemd's `@system-service` before v249, with our unit's
   `SystemCallErrorNumber=EPERM`) refuses it, `epoll_wait` rounded up to a millisecond, which
-  `hw_loop_timer_resolution_us` then reports as 1000 so the pacer sizes its bursts to it. kqueue
-  waits in microseconds; Windows' `select` rounds up to a millisecond. `test_loop` holds both
-  kinds and the lateness of a microsecond timer.
+  `hw_loop_timer_resolution_us` then reports as 1000 so the pacer sizes its bursts to it. On
+  kqueue a wait is a one-shot `EVFILT_TIMER` (`NOTE_USECONDS | NOTE_CRITICAL`) armed in the call
+  that waits, never kevent's own timeout: Darwin gives that one leeway by the thread's QoS, and a
+  300 us wait ended 1.1 ms late on the CI runner (`loop_kqueue.c`); where the timer cannot be
+  added it is the timeout and the resolution 1000. Windows' `select` rounds up to a millisecond.
+  `test_loop` holds both kinds and the lateness of a microsecond timer.
 - **The flush batch.** Small frames toward a client are not written one by one. `conn_kick` writes
   at once when the queue holds a pipe payload or has reached `CONN_DEFER_MAX` (16 KiB); otherwise
   the connection goes on its worker's flush list and `conn_batch_end`, the loop's batch-end hook
