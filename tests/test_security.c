@@ -1323,6 +1323,60 @@ static void test_twisp(void) {
 	hw_server_free(s);
 }
 
+// A destination the store holds STRICT is refused, and the client that asked for it is scored
+// requestKnownBadDest (by the weight the operator gives it; 0 by default). The WARN tier, which
+// changes nothing else, is a log line when the client's score rises into it, and only then.
+static void test_known_bad_dest_and_warn(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.reputation_enabled = 1;
+	cfg.reputation.store_path[0] = '\0';
+	cfg.reputation.source_weights[HW_REP_KNOWN_BAD_DEST] = 7;
+	cfg.log_level = HW_LOG_WARN;
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-sec-warn");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	fflush(stderr);
+	int saved = dup(STDERR_FILENO);
+	CHECK(saved >= 0 && dup2(fd, STDERR_FILENO) >= 0, "stderr to a file");
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	char dest[64];
+	snprintf(dest, sizeof(dest), "127.0.0.1:%u", g_echo_port);
+	hw_reputation *rep = hw_server_reputation(s);
+	for (int i = 0; i < 3; i++) hw_reputation_add_dest(rep, dest, HW_REP_SYN_SIGNATURE, NULL);
+	CHECK_EQ(hw_reputation_tier(rep, hw_reputation_dest_score(rep, dest)), HW_TIER_STRICT);
+
+	hw_client *c = connect_plain(s);
+	for (int i = 1; i <= 4; i++) {
+		uint32_t sid;
+		uint8_t reason = 0;
+		CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_echo_port, &sid), 0);
+		CHECK(wait_close(c, sid, &reason), "closed");
+		CHECK_EQ(reason, HW_CLOSE_BLOCKED);
+		CHECK_EQ(hw_reputation_source_score(rep, "127.0.0.1"), 7 * i);
+	}
+	hw_client_free(c);
+	hw_server_free(s);
+	hw_log_set_level(HW_LOG_ERROR);
+	CHECK(dup2(saved, STDERR_FILENO) >= 0, "restore stderr");
+	close(saved);
+	close(fd);
+	static char log[64 * 1024];
+	FILE *f = fopen(path, "rb");
+	CHECK(f != NULL, "reopen");
+	size_t n = fread(log, 1, sizeof(log) - 1, f);
+	fclose(f);
+	unlink(path);
+	log[n] = '\0';
+	// 7, 14, 21, 28: the third enters WARN (21), the fourth stays in it.
+	const char *first = strstr(log, "[warn] reputation: 127.0.0.1: entered tier warn (requestKnownBadDest)\n");
+	CHECK(first != NULL, "the rise into warn is logged: %s", log);
+	CHECK(strstr(first + 40, "entered tier") == NULL, "and only once: %s", log);
+}
+
 // A terminal's CONNECT is a CONNECT: it counts against the per-source rate as a TCP one does,
 // so an authenticated client cannot spawn processes faster than it may open sockets. And its
 // command line is held to HW_TWISP_CMD_MAX, not to a host name's 255 bytes.
@@ -1433,6 +1487,7 @@ int main(void) {
 	RUN(test_udp_with_proxy);
 	RUN(test_twisp);
 	RUN(test_twisp_rate_and_command);
+	RUN(test_known_bad_dest_and_warn);
 	printf("ok all security cases\n");
 	return 0;
 }

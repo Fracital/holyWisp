@@ -69,7 +69,10 @@ void hw_reputation_config_defaults(hw_reputation_config *cfg) {
 	cfg->source_weights[HW_REP_TWISP_NO_AUTH] = 40;
 	cfg->source_weights[HW_REP_BURST_RATE] = 5;
 	cfg->source_weights[HW_REP_SUCCESSFUL_STREAM] = -2;
-	cfg->source_weights[HW_REP_KNOWN_BAD_DEST] = 2;
+	// Asking for a destination that is already STRICT (raised where it is refused, as in wispurr).
+	// Weighed 0 by default for privateEgress's reason: any web page can make its visitor's browser
+	// ask for any destination. reputation-weight requestKnownBadDest:N scores it.
+	cfg->source_weights[HW_REP_KNOWN_BAD_DEST] = 0;
 	cfg->source_weights[HW_REP_AUTH_FAILURE] = 10;
 	cfg->source_weights[HW_REP_PROTOCOL_VIOLATION] = 5;
 	cfg->dest_weights[HW_REP_PRIVATE_EGRESS] = 20;
@@ -157,23 +160,35 @@ static rep_entry *entry_get_or_create(hw_smap *m, const char *key) {
 	return e;
 }
 
-void hw_reputation_add_source(hw_reputation *r, const char *ip, enum hw_rep_event e) {
-	if (!r || e < 0 || e >= HW_REP_EVENT_COUNT) return;
+// The tier an entry went to from a score of `before`: HW_TIER_NORMAL unless it rose.
+static enum hw_rep_tier tier_rise(const hw_reputation *r, int before, int after) {
+	enum hw_rep_tier was = hw_reputation_tier(r, before), now = hw_reputation_tier(r, after);
+	return now > was ? now : HW_TIER_NORMAL;
+}
+
+enum hw_rep_tier hw_reputation_add_source(hw_reputation *r, const char *ip, enum hw_rep_event e) {
+	if (!r || e < 0 || e >= HW_REP_EVENT_COUNT) return HW_TIER_NORMAL;
+	enum hw_rep_tier rose = HW_TIER_NORMAL;
 	pthread_mutex_lock(&r->lock);
 	rep_entry *en = entry_get_or_create(&r->sources, ip);
 	if (en) {
+		int before = en->score;
 		en->last_seen = wall_ms();
 		en->events[e]++;
 		en->score = clamp(en->score + r->cfg.source_weights[e]);
+		rose = tier_rise(r, before, en->score);
 	}
 	pthread_mutex_unlock(&r->lock);
+	return rose;
 }
 
-void hw_reputation_add_dest(hw_reputation *r, const char *dest, enum hw_rep_event e, const char *src_ip) {
-	if (!r || e < 0 || e >= HW_REP_EVENT_COUNT) return;
+enum hw_rep_tier hw_reputation_add_dest(hw_reputation *r, const char *dest, enum hw_rep_event e, const char *src_ip) {
+	if (!r || e < 0 || e >= HW_REP_EVENT_COUNT) return HW_TIER_NORMAL;
+	enum hw_rep_tier rose = HW_TIER_NORMAL;
 	pthread_mutex_lock(&r->lock);
 	rep_entry *en = entry_get_or_create(&r->dests, dest);
 	if (en) {
+		int before = en->score;
 		en->last_seen = wall_ms();
 		en->events[e]++;
 		en->score = clamp(en->score + r->cfg.dest_weights[e]);
@@ -181,8 +196,10 @@ void hw_reputation_add_dest(hw_reputation *r, const char *dest, enum hw_rep_even
 			en->distinct_sources++;
 			en->score = clamp(en->score + r->cfg.dest_distinct_sources_escalation);
 		}
+		rose = tier_rise(r, before, en->score);
 	}
 	pthread_mutex_unlock(&r->lock);
+	return rose;
 }
 
 int hw_reputation_source_score(hw_reputation *r, const char *ip) {

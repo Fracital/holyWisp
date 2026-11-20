@@ -2,7 +2,8 @@
  * holywisp/reputation.h - IP reputation: a 0..100 score per source IP and per destination
  * ip:port, raised by weighted events, lowered by decay, persisted as JSON.
  *
- * Shared by every worker; each call takes one lock. Tiers turn scores into policy: WARN is logged,
+ * Shared by every worker; each call takes one lock. Tiers turn scores into policy: WARN is logged
+ * (once each time an address or a destination rises into it, by the caller that raised it),
  * THROTTLE tightens a client's limits, STRICT refuses the client or the destination.
  */
 #ifndef HOLYWISP_REPUTATION_H
@@ -53,9 +54,11 @@ const char *hw_rep_tier_name(enum hw_rep_tier t);
 hw_reputation *hw_reputation_new(const hw_reputation_config *cfg);
 void hw_reputation_free(hw_reputation *r);
 
-void hw_reputation_add_source(hw_reputation *r, const char *ip, enum hw_rep_event e);
+// Both return the tier the entry rose into with this event, or HW_TIER_NORMAL when its tier did
+// not rise (it fell, stayed, or the entry could not be made): the caller logs the rise once.
+enum hw_rep_tier hw_reputation_add_source(hw_reputation *r, const char *ip, enum hw_rep_event e);
 // src_ip may be NULL; when given, a first-time source raises the destination further.
-void hw_reputation_add_dest(hw_reputation *r, const char *dest, enum hw_rep_event e, const char *src_ip);
+enum hw_rep_tier hw_reputation_add_dest(hw_reputation *r, const char *dest, enum hw_rep_event e, const char *src_ip);
 int hw_reputation_source_score(hw_reputation *r, const char *ip);
 int hw_reputation_dest_score(hw_reputation *r, const char *dest);
 enum hw_rep_tier hw_reputation_tier(const hw_reputation *r, int score);

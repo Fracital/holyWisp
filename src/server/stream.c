@@ -513,6 +513,7 @@ static uint8_t dest_policy(hw_stream *s) {
 		int score = hw_reputation_dest_score(srv->reputation, s->dest);
 		if (hw_reputation_tier(srv->reputation, score) == HW_TIER_STRICT) {
 			HW_WARN_LIMITED("reputation", "%s: destination %s refused (score %d)", c->ip, s->dest, score);
+			conn_rep_source(c, HW_REP_KNOWN_BAD_DEST); // weighed 0 unless the operator says otherwise
 			return HW_CLOSE_BLOCKED;
 		}
 	}

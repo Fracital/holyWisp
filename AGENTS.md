@@ -461,7 +461,11 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   sizes or starts something never belongs in it. `test_policy_file` (test_security) and
   `test_policy_file_keys` hold it.
 - **Reputation tiers.** STRICT refuses a client at upgrade (or a destination at dial); THROTTLE
-  lowers the per-connection stream cap. Events and weights live in `reputation.h`/`.c`; the JSON
+  lowers the per-connection stream cap; WARN is a log line and nothing else. Every rise into a
+  higher tier is said once, as it happens (`hw_reputation_add_source` and `_add_dest` return the
+  tier risen into; `conn_rep_source`, `conn_rep_dest` log it, `HW_WARN_LIMITED`). A refused
+  STRICT destination scores the client that asked `requestKnownBadDest`, which weighs 0 by
+  default for `privateEgress`'s reason (`test_known_bad_dest_and_warn`). Events and weights live in `reputation.h`/`.c`; the JSON
   store format is parsed by a hand-rolled reader that must round-trip what the writer emits
   (`test_reputation` covers it). The store is written atomically (temp + rename), mode 0600.
 - **Flow control vs. flood control are different things.** `buffer-remaining` is the Wisp CONTINUE

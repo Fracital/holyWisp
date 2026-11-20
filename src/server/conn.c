@@ -250,12 +250,24 @@ void conn_close(hw_conn *c) {
 
 // ---------------------------------------------------------------------------------- policy helpers
 
+// A score that rises into a higher tier is said once, when it does: WARN changes nothing else, so
+// this line is what it is for, and THROTTLE and STRICT are otherwise only seen when applied. A
+// client can make its own score rise as often as it likes once decay has lowered it, so limited.
 void conn_rep_source(hw_conn *c, enum hw_rep_event e) {
-	if (c->w->server->reputation) hw_reputation_add_source(c->w->server->reputation, c->ip, e);
+	if (!c->w->server->reputation) return;
+	enum hw_rep_tier rose = hw_reputation_add_source(c->w->server->reputation, c->ip, e);
+	if (rose != HW_TIER_NORMAL) {
+		HW_WARN_LIMITED("reputation", "%s: entered tier %s (%s)", c->ip, hw_rep_tier_name(rose), hw_rep_event_name(e));
+	}
 }
 
 void conn_rep_dest(hw_conn *c, const char *dest, enum hw_rep_event e) {
-	if (c->w->server->reputation) hw_reputation_add_dest(c->w->server->reputation, dest, e, c->ip);
+	if (!c->w->server->reputation) return;
+	enum hw_rep_tier rose = hw_reputation_add_dest(c->w->server->reputation, dest, e, c->ip);
+	if (rose != HW_TIER_NORMAL) {
+		HW_WARN_LIMITED("reputation", "destination %s: entered tier %s (%s, from %s)", dest, hw_rep_tier_name(rose),
+		                hw_rep_event_name(e), c->ip);
+	}
 }
 
 int conn_violation(hw_conn *c, const char *reason) {

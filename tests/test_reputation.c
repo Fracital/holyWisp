@@ -35,6 +35,47 @@ static void test_scoring_and_tiers(void) {
 	hw_reputation_free(r);
 }
 
+// An event says which tier its entry rose into, once: the caller logs WARN (which does nothing
+// else) when an address or a destination enters it, not at every event while it stays there.
+static void test_tier_rise_reported_once(void) {
+	hw_reputation_config cfg;
+	hw_reputation_config_defaults(&cfg);
+	cfg.decay_per_hour = 360000; // 100 points a second
+	hw_reputation *r = hw_reputation_new(&cfg);
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_AUTH_FAILURE), HW_TIER_NORMAL);      // 10
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_AUTH_FAILURE), HW_TIER_NORMAL);      // 20
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_AUTH_FAILURE), HW_TIER_WARN);        // 30
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_AUTH_FAILURE), HW_TIER_NORMAL);      // 40, still warn
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_SUCCESSFUL_STREAM), HW_TIER_NORMAL); // falls
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_TWISP_NO_AUTH), HW_TIER_THROTTLE);   // 78
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_TWISP_NO_AUTH), HW_TIER_STRICT);     // 100
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_TWISP_NO_AUTH), HW_TIER_NORMAL);     // stays
+	// A rise past two tiers at once names where it landed.
+	CHECK_EQ(hw_reputation_add_source(r, "5.6.7.8", HW_REP_AUTH_FAILURE), HW_TIER_NORMAL);    // 10
+	CHECK_EQ(hw_reputation_add_source(r, "5.6.7.8", HW_REP_AUTH_FAILURE), HW_TIER_NORMAL);    // 20
+	CHECK_EQ(hw_reputation_add_source(r, "5.6.7.8", HW_REP_TWISP_NO_AUTH), HW_TIER_THROTTLE); // 60
+	hw_reputation_free(r);
+
+	r = hw_reputation_new(&cfg);
+	CHECK_EQ(hw_reputation_add_dest(r, "9.9.9.9:443", HW_REP_SYN_SIGNATURE, "1.1.1.1"), HW_TIER_WARN);     // 31
+	CHECK_EQ(hw_reputation_add_dest(r, "9.9.9.9:443", HW_REP_SYN_SIGNATURE, "1.1.1.1"), HW_TIER_THROTTLE); // 61
+	CHECK_EQ(hw_reputation_add_dest(r, "9.9.9.9:443", HW_REP_SYN_SIGNATURE, "1.1.1.1"), HW_TIER_STRICT);   // 91
+	CHECK_EQ(hw_reputation_add_dest(r, "9.9.9.9:443", HW_REP_SYN_SIGNATURE, "1.1.1.1"), HW_TIER_NORMAL);   // 100
+	// Decayed back under WARN, the next rise into it is reported again.
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_SYN_SIGNATURE), HW_TIER_WARN); // 25
+	usleep(100000);
+	hw_reputation_decay(r);
+	CHECK(hw_reputation_source_score(r, "1.2.3.4") < cfg.warn, "decayed under warn");
+	CHECK_EQ(hw_reputation_add_source(r, "1.2.3.4", HW_REP_SYN_SIGNATURE), HW_TIER_WARN);
+	hw_reputation_free(r);
+	// A closed store reports nothing.
+	CHECK_EQ(hw_reputation_add_source(NULL, "1.2.3.4", HW_REP_SYN_SIGNATURE), HW_TIER_NORMAL);
+
+	// requestKnownBadDest weighs nothing until the operator gives it a weight.
+	hw_reputation_config_defaults(&cfg);
+	CHECK_EQ(cfg.source_weights[HW_REP_KNOWN_BAD_DEST], 0);
+}
+
 static void test_decay(void) {
 	hw_reputation_config cfg;
 	hw_reputation_config_defaults(&cfg);
@@ -269,6 +310,7 @@ static void test_event_names(void) {
 
 int main(void) {
 	RUN(test_scoring_and_tiers);
+	RUN(test_tier_rise_reported_once);
 	RUN(test_decay);
 	RUN(test_persistence);
 	RUN(test_save_makes_its_own_temp_file);

@@ -153,8 +153,10 @@ Every limit is configurable and most are on by default, matching wispurr's shipp
   or asking for a private address (which any web page can make a browser do), is refused and
   counted but not held against the address. From `reputation-throttle` a client may hold 16
   streams per connection at most, and from `reputation-strict` it is refused outright (and a
-  destination is no longer dialled); `reputation-warn` has no effect yet. Persisted as JSON and
-  reloaded on restart.
+  destination is no longer dialled); `reputation-warn` changes nothing but the log, where an
+  address or a destination that rises into a tier gets one `warn` line. Asking for a
+  destination that is already strict is the event `requestKnownBadDest`, weighed 0 by default
+  for the private address's reason. Persisted as JSON and reloaded on restart.
 - **Password auth (Wisp v2).** `password-user USER:PASS`, where `PASS` may be a `crypt(3)` hash
   (`$2b$`, `$6$`, `$y$`, …) checked in constant time, not only plaintext. Hashes are computed
   off the event loops, so a slow hash never stalls other clients. An empty password is refused.
