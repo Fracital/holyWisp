@@ -44,7 +44,10 @@ No dependencies, no install script, nothing compiled on your machine. Node 20 or
 - `stop(timeoutMs = 10000)`: ask it to shut down (SIGTERM; on Windows, by closing its stdin), then
   kill it if it has not exited in time.
 - `kill()`: kill it now.
-- `stats()`: the server's counters (connections, streams, bytes, refusals by cause).
+- `stats()`: `GET /stats` as a `holyWispStats`, every counter the server writes there: connections
+  by transport and per worker, streams and why they ended, bytes, refusals by cause, the queue
+  budget, WARP and the upstream route, WebTransport and QUIC, timing histograms and the version.
+  The server only ever adds fields to it.
 - `isRunning`, `port`, `ports`, `pid`, `restarts`, `config`.
 
 **It comes back.** A server that exits without `stop()` or `kill()` having been called (a crash,

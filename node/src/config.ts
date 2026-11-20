@@ -86,6 +86,7 @@ export type WebTransportConfig = {
 	 * that clients of a server that died are told by the next one (default: a new key each start).
 	 */
 	resetKeyFile?: string;
+	/** QUIC idle timeout, 1 to 3600 (default 30); the server sends a keepalive after 20 s without sending. */
 	idleTimeoutSeconds?: number;
 	maxHandshakes?: number;
 	retryThreshold?: number;
@@ -224,7 +225,11 @@ export type holyWispConfig = {
 	handshakeTimeoutSeconds?: number;
 	/** A client that takes nothing of what is queued for it this long is closed (default 120, 0 off). */
 	clientWriteTimeoutSeconds?: number;
-	/** A connection with no traffic in either direction this long is closed (default 0, off). */
+	/**
+	 * A connection with no open streams whose client has sent nothing for this long is closed
+	 * (WebSocket 1001; default 0, off). What the server sends does not count, and a connection
+	 * with a stream open is never closed for it.
+	 */
 	idleTimeoutSeconds?: number;
 	resolverThreads?: number;
 	busyPollUs?: number;

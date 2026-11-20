@@ -68,6 +68,107 @@ test("start, health, stats, stop, start again", async (t) => {
 	await wisp.stop();
 });
 
+// The declared types of dist/index.d.ts, enough of TypeScript's syntax for holyWispStats: object
+// literals, arrays, unions, string literals, the primitives and references to other types there.
+function declaredTypes() {
+	const src = readFileSync(new URL("../dist/index.d.ts", import.meta.url), "utf8")
+		.replace(/\/\*[\s\S]*?\*\//g, "")
+		.replace(/\/\/.*$/gm, "");
+	const types = new Map();
+	for (const m of src.matchAll(/export type (\w+) = /g)) {
+		const tokens = [];
+		const re = /\s*("(?:[^"\\]|\\.)*"|[A-Za-z_$][\w$]*|\[\]|[{};:|?])/y;
+		re.lastIndex = m.index + m[0].length;
+		let depth = 0;
+		for (let t = re.exec(src); t; t = re.exec(src)) {
+			if (t[1] === ";" && depth === 0) break;
+			if (t[1] === "{") depth++;
+			if (t[1] === "}") depth--;
+			tokens.push(t[1]);
+		}
+		let i = 0;
+		const primary = () => {
+			const tok = tokens[i++] ?? "";
+			let shape;
+			if (tok === "{") {
+				const fields = {};
+				while (i < tokens.length && tokens[i] !== "}") {
+					const name = tokens[i++];
+					if (tokens[i] === "?") i++;
+					assert.equal(tokens[i++], ":", `${m[1]}.${name}`);
+					fields[name] = union();
+					if (tokens[i] === ";") i++;
+				}
+				i++;
+				shape = { object: fields };
+			} else if (tok.startsWith('"')) {
+				shape = { literal: JSON.parse(tok) };
+			} else {
+				shape = { name: tok };
+			}
+			while (tokens[i] === "[]") {
+				i++;
+				shape = { array: shape };
+			}
+			return shape;
+		};
+		const union = () => {
+			const of = [primary()];
+			while (tokens[i] === "|") {
+				i++;
+				of.push(primary());
+			}
+			return of.length === 1 ? of[0] : { union: of };
+		};
+		types.set(m[1], union());
+	}
+	return types;
+}
+
+// Where value does not have the shape, both ways: a field the type lacks is as wrong as one the
+// value lacks.
+function shapeErrors(types, shape, value, path, out) {
+	if (shape.union) {
+		const each = shape.union.map((s) => shapeErrors(types, s, value, path, []));
+		if (!each.some((e) => e.length === 0)) out.push(...each.flat());
+	} else if (shape.literal !== undefined) {
+		if (value !== shape.literal) out.push(`${path}: ${JSON.stringify(value)} is not ${JSON.stringify(shape.literal)}`);
+	} else if (shape.array) {
+		if (!Array.isArray(value)) out.push(`${path}: not an array`);
+		else value.forEach((v, i) => shapeErrors(types, shape.array, v, `${path}[${i}]`, out));
+	} else if (shape.object) {
+		if (typeof value !== "object" || value === null || Array.isArray(value)) {
+			out.push(`${path}: not an object`);
+			return out;
+		}
+		for (const k of Object.keys(value)) {
+			if (!(k in shape.object)) out.push(`${path}.${k}: written by the server, not in the type`);
+		}
+		for (const [k, s] of Object.entries(shape.object)) {
+			if (!(k in value)) out.push(`${path}.${k}: in the type, not written by the server`);
+			else shapeErrors(types, s, value[k], `${path}.${k}`, out);
+		}
+	} else if (shape.name === "null") {
+		if (value !== null) out.push(`${path}: not null`);
+	} else if (["number", "string", "boolean"].includes(shape.name)) {
+		if (typeof value !== shape.name) out.push(`${path}: not a ${shape.name}`);
+	} else {
+		assert.ok(types.has(shape.name), `${path}: no type ${shape.name}`);
+		shapeErrors(types, types.get(shape.name), value, path, out);
+	}
+	return out;
+}
+
+test("stats() has every field holyWispStats declares, and holyWispStats every field it has", async (t) => {
+	// warpTunnels has an entry per udp-warp-marks entry, which the wrapper does not set, so only
+	// its being an array is checked.
+	const wisp = await started(t, { webTransport: true });
+	const types = declaredTypes();
+	const stats = await wisp.stats();
+	assert.deepEqual(shapeErrors(types, types.get("holyWispStats"), stats, "stats", []), []);
+	assert.equal(stats.timing.resolve.buckets.length, stats.timing.boundsMs.length + 1);
+});
+
 test("the binary reports the package's version", async () => {
 	const { execFileSync } = await import("node:child_process");
 	const { version } = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
@@ -84,6 +185,27 @@ test("a taken port moves the server to the next free one", async (t) => {
 
 	const wisp = await started(t, { port: taken });
 	assert.ok(wisp.port > taken, `${wisp.port} should be above ${taken}`);
+});
+
+// freePort() looks and the server binds later, so another server can take the port in between.
+// The servers' listeners are an SO_REUSEPORT group, which a server of the same user could join
+// without an error: it has to fail instead, or the wrapper's server answers some connections and
+// the other one the rest. Here the second one is started on the port outright.
+test("a second server on a port a running one holds fails to start", async (t) => {
+	const wisp = await started(t, {}, 2);
+	const { spawn } = await import("node:child_process");
+	const second = spawn(binary, ["--host=127.0.0.1", `--port=${wisp.port}`, "--workers=2", "--log-level=error"], {
+		stdio: ["pipe", "ignore", "pipe"],
+	});
+	t.after(() => second.kill("SIGKILL"));
+	let said = "";
+	second.stderr.on("data", (chunk) => (said += chunk));
+	const timer = setTimeout(() => second.kill("SIGKILL"), 5000);
+	const [code, signal] = await once(second, "exit");
+	clearTimeout(timer);
+	assert.equal(signal, null, `the second server ran until it was killed (${said.trim()})`);
+	assert.notEqual(code, 0);
+	assert.deepEqual(await (await fetch(`http://127.0.0.1:${wisp.port}/health`)).json(), { status: "ok" });
 });
 
 // The WebTransport listener takes the TCP port's number for UDP, and a server that cannot bind it

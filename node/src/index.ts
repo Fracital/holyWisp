@@ -43,25 +43,146 @@ export type {
 	holyWispOptions,
 } from "./config.js";
 
-/** `GET /stats` of the running server. */
+/** A count per way a stream ended, by Wisp close reason (`streamEnds` in {@link holyWispStats}). */
+export type holyWispStatsReasons = {
+	/** 0x02, the remote ended it. */
+	voluntary: number;
+	/** 0x03. */
+	networkError: number;
+	/** 0x41. */
+	invalid: number;
+	/** 0x42. */
+	unreachable: number;
+	/** 0x43. */
+	noResponse: number;
+	/** 0x44. */
+	refused: number;
+	/** 0x48. */
+	blocked: number;
+	/** 0x49. */
+	throttled: number;
+	/** 0x01 and every reason not named above. */
+	other: number;
+};
+
+/**
+ * A timing histogram: how many, their sum in microseconds, and one count per bucket. Bucket `i`
+ * holds the times up to `timing.boundsMs[i]` (and above the bound before it); the last bucket,
+ * one more than there are bounds, holds the rest.
+ */
+export type holyWispStatsHistogram = { count: number; sumUs: number; buckets: number[] };
+
+/**
+ * `GET /stats` of the running server: every field `src/server/stats.c` writes. The server only
+ * ever adds fields, never renames or moves one. Counters are totals since the start unless they
+ * say "now".
+ */
 export type holyWispStats = {
 	uptimeSeconds: number;
-	connections: { total: number; active: number };
+	connections: {
+		/** Every accepted socket and WebTransport CONNECT, the /health and /stats polls included. */
+		total: number;
+		active: number;
+		/** Connections now on the worker that has the fewest and on the one that has the most. */
+		perWorkerMin: number;
+		perWorkerMax: number;
+		/** Of those, the Wisp clients, by transport. */
+		webSocket: { total: number; active: number };
+		webTransport: { total: number; active: number };
+		/** ... and the ones answered with plain HTTP (/health, /stats, pages, refusals). */
+		httpReplies: number;
+	};
 	streams: { total: number; active: number };
 	/** Bytes relayed: `in` is client to remote, `out` is remote to client. */
 	bytes: { in: number; out: number };
 	refused: { connectionRate: number; connectionLimit: number; reputation: number };
 	blocked: { filter: number; egress: number };
-	throttled: { source: number; dest: number; syns: number };
+	/** `lookups`: CONNECTs over a client's share of the resolver (max-pending-lookups-per-ip). */
+	throttled: { source: number; dest: number; syns: number; lookups: number };
 	/** server-queue-max: bytes held of it now, and connections paused for it so far. */
 	queueBudget: { held: number; pauses: number };
+	/** Streams sent through a WARP tunnel, unmarked, refused, and unmarked for warp-bypass-host. */
+	udpWarp: { marked: number; direct: number; refused: number; bypassed: number };
+	tcpWarp: { marked: number; direct: number; refused: number; bypassed: number };
+	/** TCP streams through the upstream proxy, and dialled here although one is set (proxy-only-to). */
+	tcpRoute: { proxied: number; direct: number };
 	synSignatures: number;
 	wsClosedViolations: number;
 	authFailures: number;
 	dnsCacheEntries: number;
 	reputation: { sources: number; destinations: number };
+	webTransport: {
+		sessions: { total: number; active: number };
+		/** Handshakes in progress now. */
+		handshakes: number;
+		retries: number;
+		/** Turned away by the per-worker or per-address handshake cap. */
+		refusedHandshakes: number;
+		/** Datagrams for no connection, and Wisp packets in datagrams that are not UDP DATA. */
+		dropped: number;
+		/** Summed over the sessions that have ended; `srttUsSum / sessionsEnded` is the mean RTT. */
+		quic: {
+			sessionsEnded: number;
+			packetsSent: number;
+			packetsReceived: number;
+			packetsLost: number;
+			spuriousLost: number;
+			bytesSent: number;
+			bytesReceived: number;
+			congestionEvents: number;
+			ptos: number;
+			srttUsSum: number;
+		};
+	};
+	/** The server's version, with the suffix of a prerelease build. */
+	version: string;
 	/** Relay pipes open now (Linux): busy bulk streams hold one each. */
 	relayPipes: number;
+	/** The WARP state file as the workers were last given it (once a second). */
+	warpState: {
+		configured: boolean;
+		canMark: boolean;
+		usable: boolean;
+		state: "off" | "noCapability" | "ok" | "missing" | "unreadable" | "malformed" | "stale";
+		/** Seconds since the file was last rewritten, null when there is none to be had. */
+		ageSeconds: number | null;
+		/** Tunnels usable now, per family. */
+		tunnels: { v4: number; v6: number };
+	};
+	/**
+	 * Why streams ended: closed by the server once open (`ended`), before they opened (`failed`),
+	 * or refused before there was a stream (`refused`); and closed by the client, or by the end
+	 * of its connection, before or after they opened.
+	 */
+	streamEnds: {
+		ended: holyWispStatsReasons;
+		failed: holyWispStatsReasons;
+		refused: holyWispStatsReasons;
+		clientClose: { beforeOpen: number; afterOpen: number };
+		connectionEnd: { beforeOpen: number; afterOpen: number };
+	};
+	timing: {
+		/** The buckets' upper bounds, in milliseconds. */
+		boundsMs: number[];
+		resolve: holyWispStatsHistogram;
+		tcpConnect: holyWispStatsHistogram;
+		tcpFirstByte: holyWispStatsHistogram;
+		proxiedConnect: holyWispStatsHistogram;
+		proxiedFirstByte: holyWispStatsHistogram;
+		udpFirstByte: holyWispStatsHistogram;
+	};
+	/** One per udp-warp-marks entry, by position; `name` is the router's, while its state lists it. */
+	warpTunnels: {
+		index: number;
+		name: string | null;
+		tcp: {
+			streams: number;
+			connectFailed: number;
+			connect: holyWispStatsHistogram;
+			firstByte: holyWispStatsHistogram;
+		};
+		udp: { streams: number; firstByte: holyWispStatsHistogram };
+	}[];
 };
 
 const READY_TIMEOUT_MS = 10_000;
@@ -546,9 +667,13 @@ export class holyWisp {
 	 * An answer on the port is not yet an answer from this server: the port was free when
 	 * freePort() looked, and another process may have taken it since. The server then fails to
 	 * bind and exits within milliseconds, so one that is still alive a moment after the port first
-	 * answered, and answers again, is taken to be the one answering. That narrows the window; it
-	 * does not prove who holds the port, which only the server could (by reporting readiness on a
-	 * channel of its own).
+	 * answered, and answers again, is taken to be the one answering. That holds when the other
+	 * process is a holyWisp server too: the workers' listeners are an SO_REUSEPORT group, which
+	 * another server of the same user could join without an error, and so before it binds its
+	 * group a server binds a plain listener once, which any holder of the port refuses
+	 * (`listen_first` in server.c). Two servers started on one port at the same moment can still
+	 * both pass that look. It narrows the window; it does not prove who holds the port, which only
+	 * the server could (by reporting readiness on a channel of its own).
 	 */
 	private async waitReady(child: ChildProcess, port: number, recent: readonly string[]): Promise<void> {
 		const deadline = Date.now() + READY_TIMEOUT_MS;
