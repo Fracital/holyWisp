@@ -513,6 +513,51 @@ static void test_dns_server_key(void) {
 	free(cfg);
 }
 
+// trusted-headers-reset is a boolean like the others: on (as written in the shipped examples and
+// on the edges) or true (the npm wrapper's flag) empties the list, off leaves it, anything else is
+// refused. It once emptied the list whatever it was given.
+static void test_trusted_headers_reset_key(void) {
+	hw_server_config *cfg = malloc(sizeof(*cfg)); // a config is 260 KiB: not on Windows' stack
+	CHECK(cfg != NULL, "malloc");
+	char err[256];
+	hw_server_config_defaults(cfg);
+	CHECK_EQ(cfg->trusted_header_count, 1);
+	CHECK_STR(cfg->trusted_headers[0], "X-Forwarded-For");
+	const char *off[] = {"off", "false", "no", "0"};
+	for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+		CHECK_EQ(hw_config_set(cfg, "trusted-headers-reset", off[i], err, sizeof(err)), 0);
+		CHECK_EQ(cfg->trusted_header_count, 1);
+	}
+	const char *on[] = {"on", "true", "yes", "1"};
+	for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
+		CHECK_EQ(hw_config_set(cfg, "trusted-header", "CF-Connecting-IP", err, sizeof(err)), 0);
+		CHECK_EQ(hw_config_set(cfg, "trusted-headers-reset", on[i], err, sizeof(err)), 0);
+		CHECK_EQ(cfg->trusted_header_count, 0);
+	}
+	CHECK(hw_config_set(cfg, "trusted-headers-reset", "", err, sizeof(err)) != 0, "an empty value");
+	CHECK(hw_config_set(cfg, "trusted-headers-reset", "maybe", err, sizeof(err)) != 0, "a non-boolean");
+	// As the edges write it, and as a bare flag after the file, which then empties the file's list.
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	write_file(path, "trusted-headers-reset = on\ntrusted-header = X-Real-IP\n");
+	hw_server_config_defaults(cfg);
+	CHECK(hw_config_load_file(cfg, path, err, sizeof(err)) == 0, "load: %s", err);
+	CHECK_EQ(cfg->trusted_header_count, 1);
+	CHECK_STR(cfg->trusted_headers[0], "X-Real-IP");
+	char config_arg[600];
+	snprintf(config_arg, sizeof(config_arg), "--config=%s", path);
+	char argv0[] = "holywisp", flag[] = "--trusted-headers-reset";
+	char *argv[] = {argv0, config_arg, flag, NULL};
+	hw_server_config_defaults(cfg);
+	CHECK_EQ(hw_config_parse_args(cfg, 3, argv, err, sizeof(err)), 0);
+	CHECK_EQ(cfg->trusted_header_count, 0);
+	unlink(path);
+	free(cfg);
+}
+
 // --check-config reads policy-file as a start does: a file a start would refuse is refused, with
 // the line it fails at, and one it would take passes.
 static void test_config_check_policy_file(void) {
@@ -570,6 +615,7 @@ int main(void) {
 	RUN(test_config_check);
 	RUN(test_config_check_policy_file);
 	RUN(test_dns_server_key);
+	RUN(test_trusted_headers_reset_key);
 	RUN(test_policy_file_keys);
 	RUN(test_config_long_lines);
 	RUN(test_shipped_configs);

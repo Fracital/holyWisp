@@ -383,8 +383,12 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 		}
 		return 0;
 	}
+	// A boolean like the others: on empties the list where it stands (the file's lines before it,
+	// or as a flag, applied after the file, every line of the file), off does nothing. It used to
+	// empty the list whatever its value; every config seen in use writes on or true.
 	if (!strcmp(key, "trusted-headers-reset")) {
-		cfg->trusted_header_count = 0;
+		if (parse_bool(value, &b) != 0) goto bad_value;
+		if (b) cfg->trusted_header_count = 0;
 		return 0;
 	}
 	if (!strcmp(key, "password-user")) {
@@ -542,7 +546,7 @@ void hw_config_usage(const char *argv0) {
 	    "  password-required                         refuse unauthenticated v2 clients (off)\n"
 	    "  parse-real-ip, trusted-proxy CIDR,        honour proxy headers from trusted sources\n"
 	    "  trusted-header NAME                       (default header: X-Forwarded-For)\n"
-	    "  trusted-headers-reset                     empty the header list before trusted-header adds to it\n"
+	    "  trusted-headers-reset BOOL                on: empty the header list before trusted-header adds to it\n"
 	    "  trusted-proxy-secret VALUE                a trusted proxy must also send X-HolyWisp-Proxy-Secret: VALUE\n"
 	    "  allow-origin ORIGIN                       only pages of these origins may connect, e.g.\n"
 	    "                                            https://example.com (repeatable; default: any page)\n"
