@@ -36,7 +36,7 @@
 // A busy client's recv room grows from HW_READ_CHUNK to about two of its frames, and at least to
 // 256 KiB, more only for a client that sends very large ones. A big room on every connection
 // costs throughput as soon as many connections are busy at once.
-// Measured on the divide bench CT, 2026-11-17: 256 KiB instead of 128 KiB made one busy stream 5%
+// Measured on the bench host (an 8-CPU container), 2026-11-17: 256 KiB instead of 128 KiB made one busy stream 5%
 // cheaper per server CPU second and ten streams 3.5 to 4%, and lost no row. The gain is in TCP
 // segments, not in the syscalls saved: a write to the remote carries about seven 64 KiB packets
 // instead of three, each write ends in a short segment, and the server sent 5% fewer segments per

@@ -10,7 +10,7 @@
  * against one deadline per call that nothing it sends can restart, and credentials go to it only
  * when it asked for them. Writing is the exception: the socket is blocking, so a server that stops
  * reading it can hold a call that sends for as long as it keeps the connection open, except
-hw_client_try_send, which never waits.
+ * hw_client_try_send, which never waits.
  * What the server says about itself (the MOTD, the text quoted in a connect error) is still its
  * own bytes: see hw_client_printable before writing any of it to a terminal or a log.
  *

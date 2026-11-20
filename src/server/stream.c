@@ -768,7 +768,7 @@ static void resolve_cb(hw_loop *loop, int gai_err, const hw_dns_result *res, voi
 	// An address on proxy-only-to that a name resolved to is not a destination: it is how a router's
 	// name gate says "this name is mine", the stream goes to the proxy by name (stream_route_proxy
 	// always takes it), and the proxy resolves the name itself and does its own check. So it is not
-	// held to the address classes here; on divide that address is the relay's, a private one, and
+	// held to the address classes here; on the edge that address is the relay's, a private one, and
 	// checking it refused every name the gate answered with it (0x48). A literal IP never comes
 	// through here, and UDP and every other address still get the check.
 	int gate_sink = s->type == HW_STREAM_TCP && srv->proxy.kind != PROXY_NONE && srv->cfg.proxy_only_to_count > 0;

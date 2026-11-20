@@ -331,20 +331,20 @@ and `wmem_max` to at least 4 MiB; the server warns at start when it is granted l
 
 ## HTTP/3 and WebTransport
 
-Chrome speaks draft-ietf-webtrans-http3-02. `~/src/stomp-rewrite/docs/webtransport.md` ("On
-the wire") has the bytes as Chrome 152 to 157 send them, measured. In summary: the server's
-SETTINGS must carry H3_DATAGRAM (0x33) = 1 and ENABLE_WEBTRANSPORT (0x2b603742) = 1, or Chrome
-sends no request. The request is HEADERS on stream 0 (`:method CONNECT`, `:protocol webtransport`,
-`:scheme https`, `:authority`, `:path`, `sec-webtransport-http3-draft02: 1`, `origin`,
-`wt-available-protocols`), static QPACK table and literals only. A DATA frame with a GREASE
-capsule follows. The answer `:status 200` opens the session. Datagrams are prefixed with the
-quarter stream id of the session (`00`). Client bidi streams start `40 41 <session id>`, uni
-streams `40 54 <session id>`. A close is capsule 0x2843 (code u32, reason) then FIN. The server's
-capsule waits until what it queued before it is acknowledged (2 s at most), because Chrome drops
-unread stream data once it has the capsule; a session ended by a stream-0 CLOSE carries that
-Wisp reason as its code (0x04 incompatible, 0x06 auth required, ...). The server
-advertises a QPACK dynamic table of 0 and never reads the encoder stream's instructions beyond
-skipping them. A header block that refers to the dynamic table is a QPACK_DECOMPRESSION_FAILED.
+Chrome speaks draft-ietf-webtrans-http3-02, and the bytes below are as Chrome 152 to 157 send
+them, measured. In summary: the server's SETTINGS must carry H3_DATAGRAM (0x33) = 1 and
+ENABLE_WEBTRANSPORT (0x2b603742) = 1, or Chrome sends no request. The request is HEADERS on
+stream 0 (`:method CONNECT`, `:protocol webtransport`, `:scheme https`, `:authority`, `:path`,
+`sec-webtransport-http3-draft02: 1`, `origin`, `wt-available-protocols`), static QPACK table and
+literals only. A DATA frame with a GREASE capsule follows. The answer `:status 200` opens the
+session. Datagrams are prefixed with the quarter stream id of the session (`00`). Client bidi
+streams start `40 41 <session id>`, uni streams `40 54 <session id>`. A close is capsule 0x2843
+(code u32, reason) then FIN. The server's capsule waits until what it queued before it is
+acknowledged (2 s at most), because Chrome drops unread stream data once it has the capsule; a
+session ended by a stream-0 CLOSE carries that Wisp reason as its code (0x04 incompatible, 0x06
+auth required, ...). The server advertises a QPACK dynamic table of 0 and never reads the
+encoder stream's instructions beyond skipping them. A header block that refers to the dynamic
+table is a QPACK_DECOMPRESSION_FAILED.
 
 ## Wisp on the session
 
@@ -445,15 +445,23 @@ places in the code. On top of it:
 - **The connection-level checks** (per-IP connect rate, reputation tier, per-IP gauge, the
   concurrent-connection semaphore, `allow-origin` against the CONNECT's `origin`) run when the
   CONNECT arrives, the WebTransport equivalent of the upgrade. A refusal is answered with the
-  HTTP status the TCP listener would use (429, 403) and the connection is closed. The client's
-  address is the UDP peer address. **Proxy headers are never read on this listener**: there is
-  no proxy in front of UDP.
+  HTTP status the TCP listener would use (`conn_wt_admit`): 403 for an origin not on
+  `allow-origin` or a client whose reputation is STRICT, 429 over the per-IP connect rate or the
+  per-IP connection gauge, 503 when the concurrent-connection semaphore is full, and 426 for a v1
+  session on a server that requires a password. The listener answers 404 before those for a path
+  no `webtransport-path` rule names, and 503 when it cannot allocate the connection. After any of
+  these the QUIC connection is closed once the answer is acknowledged, `WT_REFUSE_MS` (2 s) after
+  it at most. The HTTP/3 layer answers on its own and ends only that request's stream: 421 with
+  `alt-svc: clear` to a request that is not a CONNECT, 405 to a CONNECT whose `:protocol` is not
+  WebTransport, and 429 to a second session on one QUIC connection. The client's address is the
+  UDP peer address. **Proxy headers are never read on this listener**: there is no proxy in front
+  of UDP.
 - **Handshakes in progress** are capped per worker (`webtransport-max-handshakes`, default 1024)
   and per source address, and expire after 10 s. Allocation per Initial is bounded and made
   only after the Initial decrypts.
 - **Idle timeout** is mandatory (`webtransport-idle-timeout-s`, default 30). The server sends a
-  keepalive PING after 20 s without sending: divide's conntrack keeps a UDP flow for 30 s, and
-  past that a reply would leave from the other uplink (infra `docs/divide-host.md`).
+  keepalive PING after 20 s without sending: the edge host's conntrack keeps a UDP flow for 30 s,
+  and past that a reply would leave from its other uplink.
 - **Amplification.** A Version Negotiation and a Retry are only sent in answer to a datagram
   of at least 1200 bytes, and a stateless reset is shorter than the datagram it answers.
 

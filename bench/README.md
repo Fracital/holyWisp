@@ -31,37 +31,40 @@ and rebuild `RESULTS.md` from `results/full/results.md` plus the version table a
 | `pump.c` | The native load generator, built on `libholywisp-client`. `tp` keeps N streams full while respecting CONTINUE, `up` does the same toward a sink and `down` reads N streams from a source (uploads and downloads apart), `rtt` measures latency with one message in flight, `churn` opens a stream, echoes one byte and closes it, over and over. Every mode takes `-s https://...` with `--pin`, `--pin-key` or `--insecure` for WebTransport, and reports `connect_us` (connect and Wisp handshake); `tp`, `up` and `down` add `first_byte_us` and `churn` `open_p50_us` / `open_p99_us`, CONNECT to echoed byte. Prints one JSON line when it finishes. |
 | `run.py` | Starts servers and clients, takes the measurements, and writes `results.json`, `runs.jsonl`, `results.csv` and `results.md`. |
 | `test_run.py` | Unit tests for scenario sizing, rotation, timing checks and cgroup memory reporting (`python3 -I -m unittest discover -s bench -p test_run.py`). |
-| `charts.py` | Reads a results directory and produces `charts/*.svg` (add `--png` for PNGs too) and `report.html`. |
+| `charts.py` | Reads a results directory and produces `charts/*.svg` in the light theme and `charts/*-dark.svg` in the dark one (add `--png` for PNGs of both too) and `report.html`. |
 | `configs/` | The wispurr configs. Flood protection, reputation and connection limits are off; loopback and literal IPs are allowed. There are two files because the Go build rejects the `frameObfuscation` key, and the Go file also sets `bufferRemainingLength` to 128, since the Go server deadlocks within seconds at the 32768 its shipped speed config uses. |
 
 ## The servers
 
+`run.py` looks for the other servers in checkouts beside this one: `../<name>` from the
+repository's root.
+
 - `holywisp` is `build/release/holywisp` with the stock config plus the flags that allow loopback targets.
 - `holywisp-sockbuf` is the same with `--socket-buffer-size=33554432`, which matches wispurr's `socketBufferSize`. It is an optional profile (`--only`), not part of the published run.
-- `wispurr-go` is `~/src/wispurr/wispurr`, built with `go build -o wispurr main.go`.
-- `wispurr-cpp` is `~/src/wispurr-cpp23/wispurr`, built with `make -C cpp -j LDFLAGS="-flto=auto -O3 -s"`.
+- `wispurr-go` is `../wispurr/wispurr`, built with `go build -o wispurr main.go`.
+- `wispurr-cpp` is `../wispurr-cpp23/wispurr`, built with `make -C cpp -j LDFLAGS="-flto=auto -O3 -s"`.
   GCC 16 also needs `#include <cstdint>` added to `cpp/src/json.cpp`.
 - `wisp-python` is [wisp-server-python](https://github.com/MercuryWorkshop/wisp-server-python) cloned to
-  `~/src/wisp-server-python` and run as `python -m wisp.server --allow-loopback`. Two things about
+  `../wisp-server-python` and run as `python -m wisp.server --allow-loopback`. Two things about
   its install differ from a plain `pip install -e .`. Its venv is on Python 3.13 (`uv python install
   3.13`, `uv venv --python 3.13 .venv`, `uv pip install -e .`) because on 3.14 it tries to use
   subinterpreters and fails to start. And `websockets` is pinned below 14 (`uv pip install
   'websockets<14'`): with the current release its WebSocket reader blocks on a full per-stream queue
   and the connection deadlocks as soon as more than a couple of streams are busy, which drops it to
   a few MiB/s. With 13.1 it behaves the way wispmark's published results show.
-- `finalwisp` is [finalwisp](https://github.com/theogbob/finalwisp) cloned to `~/src/finalwisp` and
+- `finalwisp` is [finalwisp](https://github.com/theogbob/finalwisp) cloned to `../finalwisp` and
   built with its own `bench/release.sh` (a static release build with its pinned nightly toolchain),
   run as `finalwisp --allow-loopback --allow-private --log-level error`, the way its own harness
   starts it. Its limits are off by default.
 - `epoxy` is `epoxy-server` from [epoxy-tls](https://github.com/MercuryWorkshop/epoxy-tls), the
-  server that epoxy's Wisp client is made for, cloned to `~/src/epoxy-tls` and built with `cargo
+  server that epoxy's Wisp client is made for, cloned to `../epoxy-tls` and built with `cargo
   build --release` in `server/` (the repository pins a nightly toolchain). It reads
   `configs/epoxy-server-bench.toml`: its defaults plus the bind address, error-level logging and a
   `max_message_size` of 1 MiB plus the Wisp header. Its default of 64 KiB is smaller than one
   64 KiB packet from the native client with its 5-byte header, so out of the box it closes the
   connection on the first one.
 
-The wisp-js client is wispmark's own `client/js/client.mjs`. Clone wispmark to `~/src/wispmark`
+The wisp-js client is wispmark's own `client/js/client.mjs`. Clone wispmark to `../wispmark`
 and run `npm install` in `client/js`.
 
 ## Running it
@@ -91,7 +94,7 @@ service share, and `run.py` refuses to start on any other (`--any-cpus` override
 that compare with nothing). The widest row is 8 connections. Every server starts one worker per
 CPU it sees, and holyWisp and wisp-server-python count the online CPUs rather than their affinity,
 so the host has to be an 8-CPU VM or container: `taskset` on a bigger machine leaves those two with
-more workers than cores. The published run used one, CT 122 on divide (see
+more workers than cores. The published run used an 8-CPU container (see
 [RESULTS.md](RESULTS.md)).
 
 The harness records cgroup memory use, socket memory and pressure before and after each run, and

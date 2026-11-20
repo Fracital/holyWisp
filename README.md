@@ -450,8 +450,8 @@ differs from wispurr. `make npm` builds the package and `make npm-test` runs its
 implementations and wisp-server-python on the same host, through the same echo service, driven by
 the same clients. Full tables are in [bench/RESULTS.md](bench/RESULTS.md); the method and how to
 rerun it are in [bench/README.md](bench/README.md). These are the medians of twelve 10 s runs in a
-container with 8 CPUs (four cores of a Ryzen 9 7950X with both hardware threads each, CT 122 on
-divide), in MiB/s through the echo port, with the best server in each row in bold.
+container with 8 CPUs (four cores of a Ryzen 9 7950X with both hardware threads each), in MiB/s
+through the echo port, with the best server in each row in bold.
 
 | scenario | holyWisp | finalwisp | wispurr C++23 | wispurr Go | epoxy-server | wisp-server-python |
 | --- | --- | --- | --- | --- | --- | --- |

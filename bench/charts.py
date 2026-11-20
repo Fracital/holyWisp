@@ -2,10 +2,13 @@
 """
 bench/charts.py - turn a results directory from run.py into SVG charts and an HTML report.
 
-    python3 -I bench/charts.py bench/results/<run> [--png]
+    python3 -I bench/charts.py [bench/results/<run>] [--png]
 
-Writes <run>/charts/*.svg (light theme, self-contained) and <run>/report.html (both themes,
-hover tooltips, table views). --png also rasterises each SVG with headless Chromium.
+Writes every chart twice into <run>/charts/, each file self-contained: <name>.svg in the light
+theme and <name>-dark.svg in the dark one. Also writes <run>/report.html (both themes, following
+the viewer's preference, with hover tooltips and table views). --png also rasterises both SVGs of
+each chart with headless Chromium, to <name>.png and <name>-dark.png. Without a directory it reads
+bench/results/full.
 No dependencies beyond the standard library.
 """
 import html

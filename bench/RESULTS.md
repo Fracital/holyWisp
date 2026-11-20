@@ -5,11 +5,11 @@ and dark. The method, the exact server and client command lines, and the install
 server are in [README.md](README.md). Regenerate with `python3 -I bench/run.py` and
 `python3 -I bench/charts.py`.
 
-The host was CT 122 on divide, a Proxmox host with an AMD Ryzen 9 7950X: a Debian 13 container
-pinned to CPUs 12-15 and 28-31, which are four cores with both of their hardware threads, with
-16 GiB of memory. Servers, clients and the echo service shared those eight threads. divide is not
-a dedicated machine: it also runs the production edge and other guests, some of them on the same
-CCD. The scenarios are sized for eight CPUs (see "Running it" in the README), so the 16-connection
+The bench host was a Debian 13 container on a Proxmox host with an AMD Ryzen 9 7950X, pinned to
+CPUs 12-15 and 28-31, which are four cores with both of their hardware threads, with 16 GiB of
+memory. Servers, clients and the echo service shared those eight threads. The Proxmox host is not
+a dedicated machine: it also runs other guests, production services among them, some of them on
+the same CCD. The scenarios are sized for eight CPUs (see "Running it" in the README), so the 16-connection
 row of the earlier runs is gone. The widest row is 8 connections, and it fills the container: the
 server's threads share four cores with eight load generators and the echo service, and a CPU-second
 buys less when the other hardware thread of its core is busy. The four fastest servers relay 39 to

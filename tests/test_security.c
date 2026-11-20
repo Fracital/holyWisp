@@ -1008,7 +1008,7 @@ static void test_proxy_only_to(void) {
 	hw_server_free(s);
 
 	// The listed address is the gate's answer, not a destination: a name that resolves to it goes
-	// to the proxy even where its class is denied here (on divide it is the relay's private
+	// to the proxy even where its class is denied here (on the edge it is the relay's private
 	// address). The proxy is handed the name and checks what it resolves. The same address as a
 	// literal, a denied address not on the list and UDP to the listed one are still refused.
 	cfg.allow_loopback = 0;
