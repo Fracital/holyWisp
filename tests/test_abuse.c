@@ -1082,7 +1082,10 @@ static void test_handshakes_per_ip(void) {
 
 	char out[512];
 	int extra = open_idle(s);
-	raw_request(extra, "GET /health HTTP/1.1\r\nHost: x\r\n\r\n", 0, out, sizeof(out));
+	// The 429 is the server's answer to the accept itself, and the connection is closed behind it.
+	// Read it before sending anything: a request written to the closed socket draws a reset, which
+	// Winsock (and at times Linux) lets discard the answer before it is read.
+	raw_request(extra, "", 0, out, sizeof(out));
 	CHECK(strncmp(out, "HTTP/1.1 429", 12) == 0, "over the cap: '%.20s'", out);
 	close(extra);
 
