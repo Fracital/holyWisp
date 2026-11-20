@@ -1086,6 +1086,29 @@ static void test_webclient_wisp_url(void) {
 	hw_server_free(s);
 }
 
+// The plain-HTTP paths are matched without their query string: a cache buster on /health or a
+// page's ?q on / is the same resource, not the banner. A path that only starts like one is not it.
+static void test_plain_http_query(void) {
+	static char buf[65536];
+	const char *body;
+	http_get_path(g_server, "/health?x=1", buf, sizeof(buf), &body);
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	CHECK_STR(body, "{\"status\":\"ok\"}\n");
+	http_get_path(g_server, "/health?", buf, sizeof(buf), &body);
+	CHECK_STR(body, "{\"status\":\"ok\"}\n");
+	http_get_path(g_server, "/stats?pretty", buf, sizeof(buf), &body);
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	CHECK(body[0] == '{' && strstr(body, "\"connections\":{\"total\":") != NULL, "stats: %.80s", body);
+	http_get_path(g_server, "/?q=1", buf, sizeof(buf), &body);
+	CHECK(strncmp(buf, "HTTP/1.1 200 OK", 15) == 0, "status: %.20s", buf);
+	CHECK(strstr(buf, "text/html") != NULL && strncmp(body, "<!doctype html>", 15) == 0, "page: %.80s", body);
+	const char *not_them[] = {"/healthz", "/health/x", "/statsx", "/x?/health", "/#"};
+	for (size_t i = 0; i < sizeof(not_them) / sizeof(not_them[0]); i++) {
+		http_get_path(g_server, not_them[i], buf, sizeof(buf), &body);
+		CHECK(strstr(body, "holyWisp: a Wisp server") == body, "%s: %.80s", not_them[i], body);
+	}
+}
+
 static void test_connection_counts(void) {
 	hw_server_stats before, after;
 	// Prior subtests close their connections asynchronously (deferred free on the worker loop), so
@@ -1351,6 +1374,7 @@ int main(void) {
 	RUN(test_v2_password_auth);
 	RUN(test_plain_http);
 	RUN(test_stats_json);
+	RUN(test_plain_http_query);
 	RUN(test_stream_end_stats);
 	RUN(test_webclient_wisp_url);
 	RUN(test_connection_counts);

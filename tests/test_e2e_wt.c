@@ -514,6 +514,11 @@ static void test_certificate_json(void) {
 	CHECK(strstr(json, "no-store") != NULL, "not cached: %s", json);
 	CHECK(strstr(json, "\"url\":\"https://wt.example:4433/\"") != NULL, "url: %s", json);
 	CHECK_EQ(n, 1);
+	// A query string is the caller's (a cache buster): the same document.
+	char again[2048];
+	http_get(g_server, "/webtransport.json?t=1", again, sizeof(again));
+	CHECK(strstr(again, "HTTP/1.1 200") == again, "with a query: %.40s", again);
+	CHECK(strstr(again, "\"url\":\"https://wt.example:4433/\"") != NULL, "with a query: %s", again);
 
 	wt_opts pinned = {.pin = hashes[0]};
 	hw_client *c = wt_connect(g_server, &pinned);
