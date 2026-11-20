@@ -272,6 +272,10 @@ if(HW_BUILD_TESTS)
            COMMAND holywisp-bin --check-config --config ${CMAKE_CURRENT_SOURCE_DIR}/holywisp.conf.example)
   add_test(NAME check_config_refused COMMAND holywisp-bin --check-config --tcp-warp on)
   set_tests_properties(check_config_refused PROPERTIES PASS_REGULAR_EXPRESSION "configuration refused: tcp-warp needs")
+  # A policy file that a start could not load is refused by the check too.
+  add_test(NAME check_config_policy_file
+           COMMAND holywisp-bin --check-config --policy-file ${CMAKE_CURRENT_BINARY_DIR}/no-such-policy.conf)
+  set_tests_properties(check_config_policy_file PROPERTIES PASS_REGULAR_EXPRESSION "configuration refused: policy-file: ")
   hw_test(test_limits)
   hw_test(test_filter)
   hw_test(test_dns)

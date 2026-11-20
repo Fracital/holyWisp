@@ -185,7 +185,7 @@ flags override the file. Boolean flags may stand alone (`--allow-loopback`). `ho
 lists them all; `holywisp.conf.example` is the fully annotated reference.
 `holywisp --config FILE --check-config` parses and checks a configuration the way a start would
 (every cross-key rule, the proxy's host resolving, a WebTransport certificate and key loading as a
-pair), binds nothing, prints no secret and exits 0 when the server would start with it, 1 when it
+pair, `policy-file` loading and passing those rules with its lists added), binds nothing, prints no secret and exits 0 when the server would start with it, 1 when it
 would not: a gate to run before a restart. The most important keys:
 
 | Key | Default | What it does |

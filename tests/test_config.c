@@ -407,6 +407,42 @@ static void test_config_check(void) {
 	CHECK(strstr(err, "webtransport-cert-dir") != NULL, "the error names it: %s", err);
 }
 
+// --check-config reads policy-file as a start does: a file a start would refuse is refused, with
+// the line it fails at, and one it would take passes.
+static void test_config_check_policy_file(void) {
+	hw_server_config *cfg = malloc(sizeof(*cfg)); // a config is 260 KiB: not on Windows' stack
+	CHECK(cfg != NULL, "malloc");
+	hw_server_config_defaults(cfg);
+	char err[512];
+	char path[200]; // it goes into policy_file, 256 bytes
+	hw_test_tmp(path, sizeof(path), "hw-cfg-policy");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	snprintf(cfg->policy_file, sizeof(cfg->policy_file), "%s", path);
+	write_file(path, "block-host = blocked.example\nallow-port = 443\n");
+	CHECK(hw_server_config_check(cfg, err, sizeof(err)) == 0, "a good policy file: %s", err);
+	const struct {
+		const char *content;
+		const char *says;
+	} bad[] = {
+	    {"block-host = a.example\nport = 7000\n", ":2: 'port' is not for a policy file"},
+	    {"allow-port = https\n", ":1: bad value"},
+	    // Every line loads, but the config it makes is refused: warp-bypass-host needs WARP.
+	    {"warp-bypass-host = example.com\n", "warp-bypass-host"},
+	};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		write_file(path, bad[i].content);
+		CHECK(hw_server_config_check(cfg, err, sizeof(err)) != 0, "accepted: %s", bad[i].content);
+		CHECK(strncmp(err, "policy-file: ", 13) == 0, "the error names the key: %s", err);
+		CHECK(strstr(err, bad[i].says) != NULL, "'%s' for %s", err, bad[i].content);
+	}
+	unlink(path);
+	CHECK(hw_server_config_check(cfg, err, sizeof(err)) != 0, "a policy file that is not there");
+	CHECK(strncmp(err, "policy-file: ", 13) == 0, "the error names the key: %s", err);
+	free(cfg);
+}
+
 static void test_shipped_configs(void) {
 	// Run from the repo root (ctest WORKING_DIRECTORY); try both locations.
 	if (access("holywisp.conf.example", F_OK) == 0) load_shipped("holywisp.conf.example");
@@ -426,6 +462,7 @@ int main(void) {
 	RUN(test_warp_bypass_host_key);
 	RUN(test_webtransport_keys);
 	RUN(test_config_check);
+	RUN(test_config_check_policy_file);
 	RUN(test_policy_file_keys);
 	RUN(test_shipped_configs);
 	return 0;

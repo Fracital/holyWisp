@@ -257,6 +257,8 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 	return 0;
 }
 
+static hw_server_config *policy_config(const hw_server_config *cfg, char *why, size_t why_cap);
+
 int hw_server_config_check(const hw_server_config *cfg, char *err, size_t err_cap) {
 	if (hw_server_config_validate(cfg, err, err_cap) != 0) return -1;
 	hw_proxy_config pc;
@@ -272,6 +274,18 @@ int hw_server_config_check(const hw_server_config *cfg, char *err, size_t err_ca
 	}
 	memset(&pc, 0, sizeof(pc)); // it held the proxy's password
 	if (rc == 0 && wt_config_check(cfg, err, err_cap) != 0) rc = -1;
+	// The policy file as policy_init reads it at start: one that does not load, or gives a config
+	// that validation refuses, keeps the server from starting.
+	if (rc == 0 && cfg->policy_file[0]) {
+		char why[512];
+		hw_server_config *scratch = policy_config(cfg, why, sizeof(why));
+		if (scratch) {
+			free(scratch);
+		} else {
+			snprintf(err, err_cap, "policy-file: %s", why);
+			rc = -1;
+		}
+	}
 	return rc;
 }
 
@@ -607,24 +621,35 @@ static int policy_file_id_same(const wt_file_id *a, const wt_file_id *b) {
 	return a->ok == b->ok && a->dev == b->dev && a->ino == b->ino && a->size == b->size && a->mtime == b->mtime;
 }
 
-// The config's lists with policy-file's on top, checked as a config is. 0 with the policy in *out,
-// or -1 with the reason in why. The copy is on the heap: a config is far larger than a stack frame
-// should be, and the maintenance thread's stack is the default.
-static int policy_load(const hw_server *s, hw_policy **out, char *why, size_t why_cap) {
+// cfg with policy-file's lists on top, checked as a config is: the copy, for the caller to free, or
+// NULL with the reason in why. A start and --check-config both decide by this. The copy is on the
+// heap: a config is far larger than a stack frame should be, and the maintenance thread's stack is
+// the default.
+static hw_server_config *policy_config(const hw_server_config *cfg, char *why, size_t why_cap) {
 	hw_server_config *scratch = malloc(sizeof(*scratch));
 	if (!scratch) {
 		snprintf(why, why_cap, "%s", strerror(ENOMEM));
-		return -1;
+		return NULL;
 	}
-	*scratch = s->cfg;
-	int rc = hw_config_load_policy(scratch, s->cfg.policy_file, why, why_cap);
-	if (rc == 0 && hw_server_config_validate(scratch, why, why_cap) != 0) rc = -1;
-	if (rc == 0) {
-		*out = policy_from(scratch);
-		if (!*out) {
-			snprintf(why, why_cap, "%s", strerror(ENOMEM));
-			rc = -1;
-		}
+	*scratch = *cfg;
+	if (hw_config_load_policy(scratch, cfg->policy_file, why, why_cap) != 0 ||
+	    hw_server_config_validate(scratch, why, why_cap) != 0) {
+		free(scratch);
+		return NULL;
+	}
+	return scratch;
+}
+
+// The config's lists with policy-file's on top (policy_config). 0 with the policy in *out, or -1
+// with the reason in why.
+static int policy_load(const hw_server *s, hw_policy **out, char *why, size_t why_cap) {
+	hw_server_config *scratch = policy_config(&s->cfg, why, why_cap);
+	if (!scratch) return -1;
+	int rc = 0;
+	*out = policy_from(scratch);
+	if (!*out) {
+		snprintf(why, why_cap, "%s", strerror(ENOMEM));
+		rc = -1;
 	}
 	free(scratch);
 	return rc;
