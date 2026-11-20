@@ -131,10 +131,10 @@ static void *blast_main(void *arg) {
 	return accept_loop((int)(intptr_t)arg, blast_conn);
 }
 
-// Big service: a download larger than the kernels between it and a client can hold, in small
-// unbuffered writes; then it waits for the peer to go. With the relay's receive buffer small too,
-// no read of it fills HW_READ_CHUNK, so the relay copies it into the queue (a stream that splices
-// queues one frame at a time: it parks until its pipe has drained).
+// Big service: once the peer says go (one byte), a download larger than the kernels between it and
+// a client can hold, in small unbuffered writes; then it waits for the peer to go. With the relay's
+// receive buffer small too, its reads of it are small and the relay copies it into the queue (a
+// stream that splices queues one frame at a time: it parks until its pipe has drained).
 #define BIG_BYTES  (6u * 1024 * 1024)
 #define BIG_SNDBUF (8 * 1024)
 static void *big_conn(void *arg) {
@@ -143,6 +143,11 @@ static void *big_conn(void *arg) {
 	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on));
 	static const uint8_t chunk[BIG_SNDBUF];
+	uint8_t go;
+	if (read(fd, &go, 1) != 1) {
+		close(fd);
+		return NULL;
+	}
 	for (size_t sent = 0; sent < BIG_BYTES; sent += sizeof(chunk)) {
 		if (write_full(fd, chunk, sizeof(chunk)) != 0) break;
 	}
@@ -521,8 +526,10 @@ static void test_upload_window(void) {
 // next frame boundary. The client reads nothing until the server holds megabytes of a download on
 // one stream, then spends a window on another stream and counts the download's bytes that reach it
 // before that stream's CONTINUE: what the kernels held and the frame under way, not the queue. A
-// byte count, not a time, so it does not depend on the machine's speed.
-static size_t download_before_continue(int v2) {
+// byte count, not a time, so it does not depend on the machine's speed. Returns 0 for a run whose
+// download went to the splice path early (a remote read that filled HW_READ_CHUNK while the relay
+// was busy, which a loaded machine cannot rule out) and so never queued much: try again.
+static int download_before_continue(int v2, size_t *before_out) {
 	enum {
 		PKT = 256 // a window of them fits the kernel toward the sink, so the CONTINUE is never held
 	};
@@ -551,23 +558,37 @@ static size_t download_before_continue(int v2) {
 
 	uint32_t down;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_big_port, &down), 0);
-	// Until the download is all framed: the client reads nothing, so what is not in the kernels is
+	CHECK_EQ(hw_client_send(c, down, "g", 1), 0); // goes once the relay's socket is connected and sized
+	// Until the download stops moving: the client reads nothing, so what is not in the kernels is
 	// queued.
 	hw_server_stats st;
 	uint64_t last = 0, still = hw_now_ms(), deadline = still + 10000;
-	while (last < BIG_BYTES && hw_now_ms() - still < 2000 && hw_now_ms() < deadline) {
+	while (last < BIG_BYTES && hw_now_ms() - still < 1000 && hw_now_ms() < deadline) {
 		usleep(20 * 1000);
 		hw_server_stats_get(s, &st);
 		if (st.bytes_out != last) still = hw_now_ms();
 		last = st.bytes_out;
 	}
-	CHECK_EQ(st.bytes_out, BIG_BYTES);
+	int queued = st.bytes_out >= 2u * 1024 * 1024;
+	uint64_t up_before = st.bytes_in;
 
 	uint32_t up;
 	int sink = open_to_sink(c, lfd, port, &up);
 	uint8_t pkt[PKT];
 	memset(pkt, 'u', sizeof(pkt));
 	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, up, pkt, sizeof(pkt)), 0);
+	// The server has handled the whole window, and so queued the CONTINUE, before the client reads:
+	// a reader as fast as loopback could otherwise take the whole queue in the one flush the server
+	// does before it reads the upload. (bytes_in counts a packet as it is handled; the pass that
+	// makes the CONTINUE ends a moment later.)
+	deadline = hw_now_ms() + 5000;
+	for (;;) {
+		hw_server_stats_get(s, &st);
+		if (st.bytes_in - up_before >= (uint64_t)window * PKT || hw_now_ms() > deadline) break;
+		usleep(1000);
+	}
+	CHECK_EQ(st.bytes_in - up_before, (uint64_t)window * PKT);
+	usleep(20 * 1000);
 	size_t before = 0;
 	for (;;) {
 		hw_client_event ev;
@@ -580,14 +601,16 @@ static size_t download_before_continue(int v2) {
 	close(lfd);
 	hw_client_free(c);
 	hw_server_free(s);
-	return before;
+	*before_out = before;
+	return queued;
 }
 
 static void test_continue_ahead_of_download(void) {
 	for (int v2 = 0; v2 <= 1; v2++) {
-		size_t before = download_before_continue(v2);
-		CHECK(before < 1024 * 1024, "v%d: %zu bytes of a %u-byte download came before the CONTINUE", v2 + 1, before,
-		      BIG_BYTES);
+		size_t before = 0;
+		int tries = 0;
+		while (!download_before_continue(v2, &before)) CHECK(++tries < 5, "v%d: the download never queued", v2 + 1);
+		CHECK(before < 1024 * 1024, "v%d: %zu bytes of the download came before the CONTINUE", v2 + 1, before);
 	}
 }
 
