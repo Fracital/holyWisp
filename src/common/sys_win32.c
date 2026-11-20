@@ -50,6 +50,11 @@ int hw_sys_accept(int listen_fd, struct sockaddr *addr, socklen_t *addr_len) {
 	return fd;
 }
 
+ssize_t hw_sys_send_now(int fd, const void *buf, size_t len) {
+	// The compat layer keeps MSG_DONTWAIT's promise on a blocking socket (posix.c, dontwait_begin).
+	return send(fd, buf, len, MSG_DONTWAIT);
+}
+
 void hw_sys_keepalive(int fd, int idle_s, int interval_s, int count) {
 	// The per-socket options exist from Windows 10 1709. Before that only the two times can be
 	// set, in one ioctl, and the probe count is the system's.

@@ -93,6 +93,66 @@ static void test_accept_flags_and_no_sigpipe(void) {
 	close(afd);
 }
 
+typedef struct {
+	int fd;
+	atomic_int done;
+} send_watch;
+
+// Should a send wait for a peer that does not read, close the peer: the send then fails (a reset)
+// instead of hanging the test.
+static void *send_watchdog(void *arg) {
+	send_watch *w = arg;
+	uint64_t until = hw_now_ms() + 5000;
+	while (!atomic_load(&w->done) && hw_now_ms() < until) usleep(10000);
+	if (!atomic_load(&w->done)) close(w->fd);
+	return NULL;
+}
+
+// hw_sys_send_now never waits, on a blocking socket too: toward a peer that does not read it takes
+// what fits and then EAGAIN, at once, and leaves the socket blocking. (macOS's send waits whatever
+// MSG_DONTWAIT says.)
+static void test_send_now(void) {
+	int client;
+	int afd = tcp_pair(&client);
+	CHECK(!is_nonblock(client), "the client end is blocking");
+	static uint8_t chunk[64 * 1024];
+	send_watch w = {.fd = afd};
+	pthread_t t;
+	CHECK_EQ(pthread_create(&t, NULL, send_watchdog, &w), 0);
+	uint64_t t0 = hw_now_ms();
+	size_t total = 0;
+	ssize_t n = 0;
+	for (int i = 0; i < 4096 && (n = hw_sys_send_now(client, chunk, sizeof(chunk))) > 0; i++) total += (size_t)n;
+	int err = errno;
+	uint64_t took = hw_now_ms() - t0;
+	atomic_store(&w.done, 1);
+	pthread_join(t, NULL);
+	CHECK(n < 0 && (err == EAGAIN || err == EWOULDBLOCK), "%zu bytes, then %zd (errno %d) after %llu ms", total, n, err,
+	      (unsigned long long)took);
+	CHECK(total > 0, "the socket took nothing");
+	CHECK(took < 2000, "filling the socket took %llu ms", (unsigned long long)took);
+	CHECK(!is_nonblock(client), "still blocking");
+
+	// Once the peer reads, it takes more.
+	size_t drained = 0;
+	while (drained < sizeof(chunk)) {
+		struct pollfd pfd = {.fd = afd, .events = POLLIN};
+		CHECK_EQ(poll(&pfd, 1, 2000), 1);
+		ssize_t r = recv(afd, chunk, sizeof(chunk), 0);
+		CHECK(r > 0, "recv: errno %d", errno);
+		drained += (size_t)r;
+	}
+	uint64_t until = hw_now_ms() + 2000;
+	while ((n = hw_sys_send_now(client, chunk, 1)) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
+	       hw_now_ms() < until) {
+		struct pollfd pfd = {.fd = client, .events = POLLOUT};
+		poll(&pfd, 1, 100);
+	}
+	CHECK_EQ(n, 1);
+	close(afd);
+	close(client);
+}
+
 static void test_keepalive(void) {
 	int client;
 	int afd = tcp_pair(&client);
@@ -1129,6 +1189,7 @@ int main(void) {
 	RUN(test_set_cloexec);
 	RUN(test_socket_flags);
 	RUN(test_accept_flags_and_no_sigpipe);
+	RUN(test_send_now);
 	RUN(test_keepalive);
 	RUN(test_listen_more);
 	RUN(test_shared_accept_never_blocks);

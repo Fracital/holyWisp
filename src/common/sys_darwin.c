@@ -49,6 +49,21 @@ int hw_sys_accept(int listen_fd, struct sockaddr *addr, socklen_t *addr_len) {
 	return fd < 0 ? -1 : socket_prepare(fd, 1);
 }
 
+ssize_t hw_sys_send_now(int fd, const void *buf, size_t len) {
+	// XNU's send honours only the socket's own non-blocking flag: with MSG_DONTWAIT a blocking
+	// socket still waits for room, as long as the peer does not read. The socket carries
+	// SO_NOSIGPIPE.
+	int fl = fcntl(fd, F_GETFL, 0);
+	if (fl < 0) return -1;
+	if (fl & O_NONBLOCK) return send(fd, buf, len, 0);
+	if (fcntl(fd, F_SETFL, fl | O_NONBLOCK) != 0) return -1;
+	ssize_t n = send(fd, buf, len, 0);
+	int saved = errno;
+	fcntl(fd, F_SETFL, fl);
+	errno = saved;
+	return n;
+}
+
 void hw_sys_keepalive(int fd, int idle_s, int interval_s, int count) {
 	// The idle time goes by another name here.
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle_s, sizeof(idle_s));

@@ -171,7 +171,8 @@ static void seed_rng(hw_client *c) {
 static long long write_some(hw_client *c, const uint8_t *data, size_t len, int nonblock) {
 	size_t done = 0;
 	while (done < len) {
-		ssize_t n = send(c->fd, data + done, len - done, HW_MSG_NOSIGNAL | (nonblock ? MSG_DONTWAIT : 0));
+		ssize_t n = nonblock ? hw_sys_send_now(c->fd, data + done, len - done)
+		                     : send(c->fd, data + done, len - done, HW_MSG_NOSIGNAL);
 		if (n < 0) {
 			if (errno == EINTR) continue;
 			if (nonblock && (errno == EAGAIN || errno == EWOULDBLOCK)) break;

@@ -33,6 +33,14 @@ int hw_sys_socket(int domain, int type, int protocol, int nonblock);
 // accept(2) with the same three properties, always non-blocking.
 int hw_sys_accept(int listen_fd, struct sockaddr *addr, socklen_t *addr_len);
 
+// send(2) on a stream socket from hw_sys_socket or hw_sys_accept that never waits, whether the
+// socket is blocking or not: the bytes it took now, which may be fewer than len, or -1 with errno
+// (EAGAIN or EWOULDBLOCK when it took none; EPIPE or ECONNRESET, never a signal, when the peer is
+// gone). The socket is as blocking afterwards as it was before. Linux and Windows have a flag for
+// this; macOS's send ignores MSG_DONTWAIT and waits for room, so there the socket is made
+// non-blocking for the one call, and it must be one that no other thread uses meanwhile.
+ssize_t hw_sys_send_now(int fd, const void *buf, size_t len);
+
 // Tune TCP keepalive on a socket that has SO_KEEPALIVE: the first probe after idle_s seconds of
 // silence, then one every interval_s, and the peer is given up on after `count` unanswered.
 void hw_sys_keepalive(int fd, int idle_s, int interval_s, int count);

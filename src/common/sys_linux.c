@@ -35,6 +35,10 @@ int hw_sys_accept(int listen_fd, struct sockaddr *addr, socklen_t *addr_len) {
 	return accept4(listen_fd, addr, addr_len, SOCK_NONBLOCK | SOCK_CLOEXEC);
 }
 
+ssize_t hw_sys_send_now(int fd, const void *buf, size_t len) {
+	return send(fd, buf, len, MSG_DONTWAIT | MSG_NOSIGNAL);
+}
+
 void hw_sys_keepalive(int fd, int idle_s, int interval_s, int count) {
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle_s, sizeof(idle_s));
 	setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval_s, sizeof(interval_s));
