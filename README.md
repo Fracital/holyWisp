@@ -1,9 +1,11 @@
 # holyWisp
 
-[![npm nightly version](https://img.shields.io/npm/v/holywisp/nightly.svg?maxAge=3600&label=npm%20nightly)](https://www.npmjs.com/package/holywisp)
-[![Build](https://github.com/Fracital/holyWisp/actions/workflows/build.yml/badge.svg?branch=master)](https://github.com/Fracital/holyWisp/actions/workflows/build.yml)
-[![GitHub issues](https://img.shields.io/github/issues/Fracital/holyWisp?style=flat&color=orange)](https://github.com/Fracital/holyWisp/issues)
-[![GitHub stars](https://img.shields.io/github/stars/Fracital/holyWisp?style=flat&color=orange)](https://github.com/Fracital/holyWisp/stargazers)
+<div align="center">
+  <a href="https://www.npmjs.com/package/holywisp"><img src="https://img.shields.io/npm/v/holywisp/nightly.svg?maxAge=3600&label=npm%20nightly" alt="npm nightly version" /></a>
+  <a href="https://github.com/Fracital/holyWisp/actions/workflows/build.yml"><img src="https://github.com/Fracital/holyWisp/actions/workflows/build.yml/badge.svg?branch=master" alt="Build" /></a>
+  <a href="https://github.com/Fracital/holyWisp/issues"><img src="https://img.shields.io/github/issues/Fracital/holyWisp?style=flat&color=orange" alt="GitHub issues" /></a>
+  <a href="https://github.com/Fracital/holyWisp/stargazers"><img src="https://img.shields.io/github/stars/Fracital/holyWisp?style=flat&color=orange" alt="GitHub stars" /></a>
+</div>
 
 A [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) server in C11 with no dependencies
 beyond libc and pthreads, plus a C client library and CLI. Wisp v1 and v2 over WebSocket, TCP and
