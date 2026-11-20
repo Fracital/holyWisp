@@ -490,7 +490,10 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
 with nothing in the config narrowing what it may be. It is a remote shell by design, so the gate in `handle_connect` is the whole access-control story and must stay
 intact: **`enable-twisp` on, the client on Wisp v2, and the client authenticated** with a
 configured password. Probing it unauthenticated while it is on is a reputation event; while it is off the CONNECT is
-closed `0x48` and nothing is scored (see "What is held against a client"). The config validator refuses
+closed `0x48` and nothing is scored (see "What is held against a client"). Past the gate a terminal's
+CONNECT counts against the per-source connect rate like any other (`connect_rate_ok`), and its
+command line is held to `HW_TWISP_CMD_MAX` (4096 bytes, no NUL), not to the host rules (255
+bytes, `host_chars_ok`): it is not a host (`test_twisp_rate_and_command`). The config validator refuses
 `enable-twisp` without `enable-v2` and at least one `password-user`, and on a platform with no
 pseudo-terminal (`hw_sys_has_pty`: Windows) refuses it outright. The terminal and its process are
 the platform's (`hw_sys_pty_spawn`, `_resize`, `_end`); `twisp.c` holds the gate and the command

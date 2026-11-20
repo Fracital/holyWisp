@@ -29,7 +29,7 @@
 #define CLIENT_ERR_EXCERPT  64                         // bytes of a bad upgrade response quoted in the error
 #define CLIENT_USER_MAX     255                        // the password extension carries the user's length in a u8
 #define CLIENT_PASS_MAX     127
-#define CLIENT_HOST_MAX     255 // the longest hostname a server takes in a CONNECT
+#define CLIENT_HOST_MAX     HW_WISP_HOST_MAX // the longest hostname a server takes in a CONNECT
 #define TIMER_FOREVER       UINT64_MAX
 
 typedef struct cstream {
@@ -921,8 +921,9 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 	if (c->closed) return HW_ERR_CLOSED;
 	// A host that does not fit is refused, never cut: the caller may have checked the name it
 	// passed (its suffix, say), and a prefix of it is a different name.
+	// A Twisp stream's host is its command line, which the server takes up to HW_TWISP_CMD_MAX.
 	size_t hl = strlen(host);
-	if (hl == 0 || hl > CLIENT_HOST_MAX) return HW_ERR_INVALID;
+	if (hl == 0 || hl > (stream_type == HW_STREAM_TERM ? HW_TWISP_CMD_MAX : CLIENT_HOST_MAX)) return HW_ERR_INVALID;
 	// The server would refuse it 0x49: every stream the client has not closed or seen closed is
 	// still one of the server's, so this count is never under the server's.
 	if (c->max_streams && c->nstreams >= c->max_streams) return HW_ERR_TOOBIG;
@@ -933,7 +934,7 @@ int hw_client_open(hw_client *c, uint8_t stream_type, const char *host, uint16_t
 		c->streams = p;
 		c->streams_cap = cap;
 	}
-	uint8_t pkt[HW_WISP_HEADER_LEN + 3 + CLIENT_HOST_MAX];
+	uint8_t pkt[HW_WISP_HEADER_LEN + 3 + HW_TWISP_CMD_MAX];
 	size_t n = hw_wisp_build_connect(pkt, sizeof(pkt), c->next_id, stream_type, port, host, hl);
 	if (n == 0) return HW_ERR_INVALID;
 	uint32_t id = c->next_id++;

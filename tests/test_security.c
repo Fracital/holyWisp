@@ -1323,6 +1323,90 @@ static void test_twisp(void) {
 	hw_server_free(s);
 }
 
+// A terminal's CONNECT is a CONNECT: it counts against the per-source rate as a TCP one does,
+// so an authenticated client cannot spawn processes faster than it may open sockets. And its
+// command line is held to HW_TWISP_CMD_MAX, not to a host name's 255 bytes.
+static void test_twisp_rate_and_command(void) {
+	if (!hw_sys_has_pty()) return; // test_twisp holds the refusal
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.enable_twisp = 1;
+	CHECK_EQ(hw_server_config_add_user(&cfg, "op", "pw"), 0);
+	cfg.flood.enabled = 1;
+	cfg.flood.max_connects_per_source_per_second = 2;
+	cfg.flood.ws_close_after_violations = 0;
+	cfg.flood.max_connects_per_dest_per_second = 0;
+	cfg.flood.max_connects_per_dest_per_minute = 0;
+	cfg.flood.syn_signature_enabled = 0;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL, "server");
+	CHECK_EQ(hw_server_start(s), 0);
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_port(s);
+	o.v2 = 1;
+	o.user = "op";
+	o.pass = "pw";
+	o.timeout_ms = 5000;
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "auth: %s", err);
+
+	// A window of a second takes two; of five opened at once, at most four (two seconds' worth,
+	// should they straddle a turn) are not throttled.
+	uint32_t sids[5];
+	for (int i = 0; i < 5; i++) CHECK_EQ(hw_client_open(c, HW_STREAM_TERM, "cat", 0, &sids[i]), 0);
+	int throttled = 0;
+	hw_client_event ev;
+	uint64_t deadline = hw_now_ms() + 3000;
+	while (hw_now_ms() < deadline) {
+		int r = hw_client_poll(c, 200, &ev);
+		if (r < 0) break;
+		if (r > 0 && ev.type == HW_CEV_CLOSE) {
+			CHECK_EQ(ev.reason, HW_CLOSE_THROTTLED);
+			throttled++;
+		}
+	}
+	CHECK(throttled >= 1, "a terminal past the per-source rate was throttled (%d)", throttled);
+	hw_server_stats st;
+	hw_server_stats_get(s, &st);
+	CHECK(st.throttled_source >= 1, "stat recorded");
+	hw_client_free(c);
+
+	// After the window turns, a command line far past 255 bytes runs.
+	usleep(1100 * 1000);
+	c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "auth: %s", err);
+	static char cmd[HW_TWISP_CMD_MAX + 2];
+	int len = snprintf(cmd, sizeof(cmd), "%s", "sh -c 'echo twisp-long-''command-ok' ");
+	memset(cmd + len, 'p', 2000);
+	cmd[len + 2000] = '\0';
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TERM, cmd, 0, &sid), 0);
+	static char seen[8192];
+	size_t got = 0;
+	deadline = hw_now_ms() + 5000;
+	while (!memmem(seen, got, "twisp-long-command-ok", 21) && hw_now_ms() < deadline) {
+		int r = hw_client_poll(c, 500, &ev);
+		if (r < 0) break;
+		if (r == 0 || ev.stream_id != sid) continue;
+		CHECK(ev.type != HW_CEV_CLOSE || got > 0, "the long command was refused (0x%02x)", ev.reason);
+		if (ev.type == HW_CEV_CLOSE) break;
+		if (ev.type == HW_CEV_DATA && got + ev.len <= sizeof(seen)) {
+			memcpy(seen + got, ev.data, ev.len);
+			got += ev.len;
+		}
+	}
+	CHECK(memmem(seen, got, "twisp-long-command-ok", 21) != NULL, "the long command ran");
+	// One past the bound is refused by the client before it is sent.
+	memset(cmd, 'x', HW_TWISP_CMD_MAX + 1);
+	cmd[HW_TWISP_CMD_MAX + 1] = '\0';
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TERM, cmd, 0, &sid), HW_ERR_INVALID);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
 int main(void) {
 	int echo_fd;
 	g_echo_port = start_listener(NULL, &echo_fd);
@@ -1348,6 +1432,7 @@ int main(void) {
 	RUN(test_proxy_reply_without_status);
 	RUN(test_udp_with_proxy);
 	RUN(test_twisp);
+	RUN(test_twisp_rate_and_command);
 	printf("ok all security cases\n");
 	return 0;
 }

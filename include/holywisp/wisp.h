@@ -28,6 +28,12 @@ enum hw_stream_type {
 	HW_STREAM_TERM = 0x03 // Twisp: a PTY running the command named in the hostname field
 };
 
+// The longest host a CONNECT for a TCP or UDP stream may name (a DNS name's limit).
+#define HW_WISP_HOST_MAX 255
+// The longest command line a Twisp CONNECT may carry in the hostname field: a command line is not
+// a host name, and 255 bytes cut a shell one-liner short.
+#define HW_TWISP_CMD_MAX 4096
+
 // Twisp resize: payload rows(u16 LE) cols(u16 LE).
 #define HW_WISP_TWISP_RESIZE 0xF0
 // Lanes (docs/webtransport.md, "Lanes"): the first packet of each extra WebTransport stream a

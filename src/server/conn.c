@@ -1641,14 +1641,31 @@ static int host_chars_ok(const char *host, size_t len) {
 	return 1;
 }
 
+// Per-source connect rate (flood protection): counts every CONNECT from this client IP that would
+// otherwise open a stream, a terminal's included. 0 when it was refused (and the connection may
+// be closing).
+static int connect_rate_ok(hw_conn *c, uint32_t id) {
+	hw_server *srv = c->w->server;
+	if (!srv->per_source || hw_window_allow(srv->per_source, c->ip)) return 1;
+	HW_STAT_INC(srv, throttled_source);
+	conn_rep_source(c, HW_REP_BURST_RATE);
+	HW_DEBUG("flood", "%s: per-source connect rate", c->ip);
+	conn_violation(c, "per_source_rate");
+	if (c->closing) return 0;
+	conn_send_close(c, id, HW_CLOSE_THROTTLED);
+	return 0;
+}
+
 static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 	const hw_server_config *cfg = &c->w->server->cfg;
-	hw_server *srv = c->w->server;
 	hw_wisp_connect req;
 	// A CLOSE for stream 0 would end the whole connection, so a CONNECT on it gets no reply at all.
 	if (p->stream_id == 0) return;
-	if (hw_wisp_parse_connect(p, &req) != 0 || req.host_len == 0 || req.host_len > 255 ||
-	    memchr(req.host, '\0', req.host_len)) {
+	// A Twisp stream's "host" is its command line, held to a bound of its own; a NUL is refused in
+	// either, since nothing past it would reach a resolver or an exec.
+	int parsed = hw_wisp_parse_connect(p, &req) == 0;
+	size_t host_max = parsed && req.stream_type == HW_STREAM_TERM ? HW_TWISP_CMD_MAX : HW_WISP_HOST_MAX;
+	if (!parsed || req.host_len == 0 || req.host_len > host_max || memchr(req.host, '\0', req.host_len)) {
 		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
@@ -1689,6 +1706,9 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 			conn_send_close(c, p->stream_id, HW_CLOSE_BLOCKED);
 			return;
 		}
+		// The same per-CONNECT rate as a TCP or UDP stream: a PTY and a process cost more than a
+		// socket, and an authenticated client is still one client.
+		if (!connect_rate_ok(c, p->stream_id)) return;
 		twisp_open(c, p->stream_id, req.host, req.host_len);
 		return;
 	}
@@ -1706,16 +1726,7 @@ static void handle_connect(hw_conn *c, const hw_wisp_packet *p) {
 		conn_send_close(c, p->stream_id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
-	// Per-source connect rate (flood protection): count every CONNECT from this client IP.
-	if (srv->per_source && !hw_window_allow(srv->per_source, c->ip)) {
-		HW_STAT_INC(srv, throttled_source);
-		conn_rep_source(c, HW_REP_BURST_RATE);
-		HW_DEBUG("flood", "%s: per-source connect rate", c->ip);
-		conn_violation(c, "per_source_rate");
-		if (c->closing) return;
-		conn_send_close(c, p->stream_id, HW_CLOSE_THROTTLED);
-		return;
-	}
+	if (!connect_rate_ok(c, p->stream_id)) return;
 	stream_open(c, p->stream_id, req.stream_type, req.host, req.host_len, req.port);
 }
 

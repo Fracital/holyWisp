@@ -313,6 +313,9 @@ With `enable-twisp = on` and an authenticated v2 client, a `CONNECT` of stream t
 command in its hostname field on a pseudo-terminal and relays it as a stream. This is a remote
 shell by design, so it is off by default and gated behind the enable flag **and** a password
 login; the systemd sandbox still contains whatever it spawns. Leave it off unless you need it.
+The command line may be up to 4096 bytes (a host name in a TCP or UDP `CONNECT` stays at 255),
+holds no NUL, and is split like a shell would into at most 64 arguments. Each terminal's
+`CONNECT` counts against the per-source connect rate as a TCP or UDP one does.
 
 ## Client
 

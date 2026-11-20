@@ -71,11 +71,11 @@ static int shell_split(const char *command, size_t len, char *store, char **argv
 }
 
 void twisp_open(hw_conn *c, uint32_t id, const char *command, size_t len) {
-	if (len == 0 || len > 4096) {
+	if (len == 0 || len > HW_TWISP_CMD_MAX) {
 		conn_send_close(c, id, HW_CLOSE_INVALID_INFO);
 		return;
 	}
-	char store[4097];
+	char store[HW_TWISP_CMD_MAX + 1];
 	char *argv[TWISP_MAX_ARGS + 1];
 	int argc = shell_split(command, len, store, argv);
 	if (argc <= 0) {
