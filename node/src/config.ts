@@ -99,8 +99,9 @@ export type WebTransportConfig = {
 export type holyWispConfig = {
 	/**
 	 * Port the server listens on (default 6001). If it is taken, the next free one above it is
-	 * used; 0 asks the OS for any free port. An array is accepted for wispurr compatibility and
-	 * its first entry is used: holyWisp runs every worker on one port.
+	 * used; 0 asks the OS for any free port. With `webTransport` and no `webTransport.port`, free
+	 * means free for UDP as well. An array is accepted for wispurr compatibility and its first
+	 * entry is used: holyWisp runs every worker on one port.
 	 */
 	port?: number | number[];
 	/**

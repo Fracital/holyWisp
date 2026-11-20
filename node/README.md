@@ -130,7 +130,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 
 | Option | Flag |
 | --- | --- |
-| `port` (default 6001; the next free port is used if taken; `0` = any) | `port` |
+| `port` (default 6001; the next free port is used if taken, for UDP too with `webTransport` on the same number; `0` = any) | `port` |
 | `host` (default `127.0.0.1`, also for `undefined` and `""`; the server's own default of every interface is never used) | `host` |
 | `binary` (or the `HOLYWISP_BIN` environment variable) | path of the server to run |
 | `autoRestart` (default `true`) | none: whether the wrapper starts a server that died again |

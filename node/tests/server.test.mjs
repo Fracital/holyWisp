@@ -1,6 +1,7 @@
 // The wrapper against the real server: lifecycle, route(), and what the server is told about
 // who is connecting. Everything stays on loopback and binds its own services.
 import assert from "node:assert/strict";
+import { createSocket } from "node:dgram";
 import { once } from "node:events";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFile, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
@@ -82,6 +83,20 @@ test("a taken port moves the server to the next free one", async (t) => {
 	const taken = squatter.address().port;
 
 	const wisp = await started(t, { port: taken });
+	assert.ok(wisp.port > taken, `${wisp.port} should be above ${taken}`);
+});
+
+// The WebTransport listener takes the TCP port's number for UDP, and a server that cannot bind it
+// does not start. On Windows a port can be free for TCP and refused for UDP (the excluded port
+// ranges), which a held UDP socket stands in for here.
+test("with webTransport, a port taken for UDP alone moves the server too", async (t) => {
+	const squatter = createSocket("udp4");
+	squatter.bind(0, "127.0.0.1");
+	await once(squatter, "listening");
+	t.after(() => new Promise((resolve) => squatter.close(resolve)));
+	const taken = squatter.address().port;
+
+	const wisp = await started(t, { port: taken, webTransport: true });
 	assert.ok(wisp.port > taken, `${wisp.port} should be above ${taken}`);
 });
 

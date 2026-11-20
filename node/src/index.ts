@@ -12,6 +12,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import * as dgram from "node:dgram";
 import * as fs from "node:fs";
 import { request, type IncomingMessage, type ServerResponse } from "node:http";
 import * as net from "node:net";
@@ -69,6 +70,8 @@ const READY_TIMEOUT_MS = 10_000;
 const READY_SETTLE_MS = 30;
 const MAX_WORKERS = 1024;
 const PROXY_SECRET_BYTES = 32;
+// How many ephemeral ports to try for one whose UDP half is free as well (see freePort()).
+const FREE_PORT_ATTEMPTS = 32;
 // Where a page looks for the WebTransport listener's description: the root of the origin that
 // serves the relay's WebSocket (examples/wisp-webclient.html, STomp).
 const WT_JSON_PATH = "/webtransport.json";
@@ -199,10 +202,33 @@ function blockList(entries: readonly string[]): net.BlockList {
 	return set;
 }
 
-/** The first free port at or above `from` on `host`; any free port when `from` is 0. */
-async function freePort(from: number, host: string | undefined): Promise<number> {
-	const tryPort = (port: number) =>
-		new Promise<number | undefined>((resolve, reject) => {
+/** Whether a UDP socket can bind `port` on `host`. Only a port in use or refused counts as taken. */
+function udpFree(port: number, host: string): Promise<boolean> {
+	return new Promise((resolve) => {
+		const probe = dgram.createSocket(net.isIPv6(host) ? "udp6" : "udp4");
+		probe.unref();
+		probe.on("error", (err: NodeJS.ErrnoException) => {
+			try {
+				probe.close();
+			} catch {
+				// Not open after all: nothing to close.
+			}
+			// Anything else (a name that does not resolve, say) is the server's to report.
+			resolve(err.code !== "EADDRINUSE" && err.code !== "EACCES");
+		});
+		probe.bind({ port, address: host, exclusive: true }, () => probe.close(() => resolve(true)));
+	});
+}
+
+/**
+ * The first free port at or above `from` on `host`; any free port when `from` is 0. With `udpHost`
+ * the port must be free for UDP there too, where the WebTransport listener takes the same number:
+ * Windows reserves ranges of ports (Hyper-V's, WinNAT's) for one protocol and not the other, and a
+ * server whose UDP bind is refused does not start.
+ */
+async function freePort(from: number, host: string | undefined, udpHost?: string): Promise<number> {
+	const tryPort = async (port: number) => {
+		const bound = await new Promise<number | undefined>((resolve, reject) => {
 			const probe = net.createServer();
 			probe.unref();
 			probe.on("error", (err: NodeJS.ErrnoException) => {
@@ -214,9 +240,15 @@ async function freePort(from: number, host: string | undefined): Promise<number>
 				probe.close(() => resolve(bound));
 			});
 		});
+		if (bound === undefined || udpHost === undefined) return bound;
+		return (await udpFree(bound, udpHost)) ? bound : undefined;
+	};
 	if (from === 0) {
-		const port = await tryPort(0);
-		if (port !== undefined) return port;
+		// An ephemeral TCP port promises nothing about UDP: ask again until both halves are free.
+		for (let attempt = 0; attempt < FREE_PORT_ATTEMPTS; attempt++) {
+			const port = await tryPort(0);
+			if (port !== undefined) return port;
+		}
 	} else {
 		for (let candidate = from; candidate <= 65535; candidate++) {
 			const port = await tryPort(candidate);
@@ -343,6 +375,15 @@ export class holyWisp {
 		return base;
 	}
 
+	/** Where the WebTransport listener binds UDP on the TCP port's number; undefined if it does not. */
+	private udpHost(): string | undefined {
+		const wt = this.config.webTransport;
+		if (!wt) return undefined;
+		if (typeof wt !== "object") return bindHost(this.config);
+		if (wt.port) return undefined;
+		return wt.host || bindHost(this.config);
+	}
+
 	private binary(): string {
 		const chosen = this.config.binary ?? process.env["HOLYWISP_BIN"];
 		const binary = chosen ?? bundledBinary;
@@ -388,7 +429,7 @@ export class holyWisp {
 		let secretsDir: string | undefined;
 		try {
 			const binary = this.binary();
-			const port = await freePort(this.lastPort ?? this.basePort(), bindHost(this.config));
+			const port = await freePort(this.lastPort ?? this.basePort(), bindHost(this.config), this.udpHost());
 			// Every server process gets a secret of its own; route() learns it once that server is up.
 			const proxySecret = randomBytes(PROXY_SECRET_BYTES).toString("hex");
 			const { args, secrets, ignored, sensitive } = workerArgs(this.config, { port, workers, proxySecret });
