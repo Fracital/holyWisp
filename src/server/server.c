@@ -399,7 +399,6 @@ void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
 #ifdef TCP_QUICKACK
 		if (s->cfg.tcp_quickack) setsockopt(fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
 #endif
-		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
 	}
 	if (s->cfg.socket_buffer_size > 0) {
 		int sz = (int)s->cfg.socket_buffer_size;
@@ -411,7 +410,7 @@ void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
 // ---------------------------------------------------------------------------------- workers
 
 #define ACCEPT_RETRY_MS 100  // how long a listener rests after accept ran out of descriptors
-#define SWEEP_MS        5000 // how often, at most, a worker looks for clients to time out and idle pipes (conn_sweep)
+#define SWEEP_MS        5000 // how often, at most, a worker looks for clients to time out, idle pipes and new streams
 
 static void accept_resume_cb(hw_loop *loop, void *ud) {
 	hw_worker *w = ud;
@@ -420,6 +419,7 @@ static void accept_resume_cb(hw_loop *loop, void *ud) {
 
 static void sweep_cb(hw_loop *loop, void *ud) {
 	conn_sweep(ud);
+	stream_keepalive_sweep(ud);
 }
 
 // Which worker gets a connection.
@@ -586,7 +586,7 @@ static int worker_init(hw_server *s, hw_worker *w, int index, uint16_t port) {
 	if (hw_loop_add_fd(w->loop, w->listen_fd, HW_EV_READ, accept_cb, w) != 0) return -1;
 	// Half the shorter of the two timeouts, so that a timeout is never late by more than half of
 	// itself, and no more often than a few times a second. With neither, the sweep still gives
-	// idle streams' relay pipes back, every SWEEP_MS.
+	// idle streams' relay pipes back and new streams keepalive, every SWEEP_MS.
 	int shortest = s->cfg.client_write_timeout_s;
 	if (s->cfg.idle_timeout_s > 0 && (shortest <= 0 || s->cfg.idle_timeout_s < shortest)) {
 		shortest = s->cfg.idle_timeout_s;

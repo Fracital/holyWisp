@@ -34,7 +34,8 @@
 #define STREAM_OUT_KEEP            (256 * 1024)
 #endif
 // TCP keepalive toward a remote: the first probe after this long idle, then one per interval, and
-// the remote is given up on (ETIMEDOUT, CLOSE 0x47) after `count` go unanswered.
+// the remote is given up on (ETIMEDOUT, CLOSE 0x47) after `count` go unanswered. A stream gets it
+// from the worker's sweep, one to two sweeps after it opened (stream_keepalive_sweep).
 #define STREAM_KEEPALIVE_IDLE_S     60
 #define STREAM_KEEPALIVE_INTERVAL_S 15
 #define STREAM_KEEPALIVE_COUNT      4
@@ -210,9 +211,62 @@ static void stream_count_end(const hw_stream *s, int was_open, uint8_t reason, i
 	HW_WSTAT_ADD(*n, 1);
 }
 
+// ---------------------------------------------------------------------------------- keepalive
+
+// The kernel's own keepalive waits two hours before its first probe, and a remote that vanished
+// without a word (a NAT that forgot the flow, a host gone) held an idle stream's slot that long.
+// Probes cost an idle stream one packet a minute, and a dead one is closed 0x47 about two minutes
+// after it went quiet; the client library's sockets use the same timers. But the four setsockopt
+// calls (SO_KEEPALIVE and the three timers, 1.6 us) cost streams that open, echo a byte and close
+// 6% of their rate and 8% of their rate per CPU second, and such a stream is over long before a
+// probe could be due. So a stream that opens goes on a list of its worker's, and the worker's
+// sweep arms the streams of the list before the current one: a stream gets keepalive one to two
+// sweeps after it opened (5 to 10 s at the default SWEEP_MS), its first probe is due at most 60 s
+// after that, and a stream that closes first only leaves the list. Idle is counted from what the
+// remote last sent.
+
+static void keepalive_link(hw_stream *s) {
+	hw_worker *w = s->conn->w;
+	hw_stream **head = &w->keepalive_new[w->keepalive_cur];
+	s->ka_list = (uint8_t)(w->keepalive_cur + 1);
+	s->ka_prev = NULL;
+	s->ka_next = *head;
+	if (*head) (*head)->ka_prev = s;
+	*head = s;
+}
+
+static void keepalive_unlink(hw_stream *s) {
+	if (!s->ka_list) return;
+	hw_worker *w = s->conn->w;
+	if (s->ka_prev) {
+		s->ka_prev->ka_next = s->ka_next;
+	} else {
+		w->keepalive_new[s->ka_list - 1] = s->ka_next;
+	}
+	if (s->ka_next) s->ka_next->ka_prev = s->ka_prev;
+	s->ka_prev = s->ka_next = NULL;
+	s->ka_list = 0;
+}
+
+void stream_keepalive_sweep(hw_worker *w) {
+	int older = !w->keepalive_cur;
+	int one = 1;
+	hw_stream *next;
+	for (hw_stream *s = w->keepalive_new[older]; s; s = next) {
+		next = s->ka_next;
+		s->ka_prev = s->ka_next = NULL;
+		s->ka_list = 0;
+		setsockopt(s->fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+		hw_sys_keepalive(s->fd, STREAM_KEEPALIVE_IDLE_S, STREAM_KEEPALIVE_INTERVAL_S, STREAM_KEEPALIVE_COUNT);
+	}
+	w->keepalive_new[older] = NULL;
+	w->keepalive_cur = older; // empty now, so it takes the streams that open before the next sweep
+}
+
 void stream_close(hw_stream *s, uint8_t reason, int send_close) {
 	hw_conn *c = s->conn;
 	if (s->state == STREAM_CLOSED) return;
+	keepalive_unlink(s);
 	stream_count_end(s, s->state == STREAM_OPEN, reason, send_close);
 	s->state = STREAM_CLOSED;
 	if (s->connect_timer) {
@@ -421,11 +475,7 @@ int stream_connected(hw_stream *s) {
 	stream_time_open(s);
 	if (s->type == HW_STREAM_TCP) {
 		server_tune_socket(c->w->server, s->fd, 1);
-		// The kernel's own keepalive waits two hours before its first probe, and a remote that
-		// vanished without a word (a NAT that forgot the flow, a host gone) held an idle stream's
-		// slot that long. Probes cost an idle stream one packet a minute; a dead one is closed
-		// 0x47 two minutes after it went quiet. The client library's sockets use the same.
-		hw_sys_keepalive(s->fd, STREAM_KEEPALIVE_IDLE_S, STREAM_KEEPALIVE_INTERVAL_S, STREAM_KEEPALIVE_COUNT);
+		keepalive_link(s); // keepalive comes with the sweep, if the stream lives that long
 	}
 	s->read_armed = !conn_stream_paused(c, s);
 	// With client data already queued, stream_flush below sets the event mask once it knows what

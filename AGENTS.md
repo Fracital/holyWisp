@@ -563,8 +563,13 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   `connect()`: resolving (`0x42`) and the upstream proxy's handshake (`0x43`) are covered by
   `open_timeout_cb` on the same `connect_timer`. An open TCP stream's remote socket has
   keepalive at 60 s idle, 15 s apart, 4 probes (`STREAM_KEEPALIVE_*`), so a remote that vanished
-  without a FIN or a reset frees its stream (`0x47`) two minutes after it went quiet, not after
-  the kernel's two hours.
+  without a FIN or a reset frees its stream (`0x47`) about two minutes after it went quiet, not
+  after the kernel's two hours. The worker's sweep arms it, one to two sweeps after the stream
+  opened (5 to 10 s at `SWEEP_MS`): a stream that opens goes on one of two per-worker lists, each
+  sweep arms the older list and starts it again, and `stream_close` takes a stream off
+  (`stream_keepalive_sweep`). The four `setsockopt` calls at open cost the churn row 6% of its
+  streams per second and 8% per CPU second, for streams that close long before a probe is due;
+  never walk every stream to arm it instead.
 - **Relay pipes.** A TCP stream whose remote delivers full reads (`s->bulk`) gets its own pipe
   (`hw_spipe`, opened when it goes bulk) and relays remote to client through it without a copy
   (`conn_splice_data`): the frame header is appended to `wbuf`, the payload is spliced into the

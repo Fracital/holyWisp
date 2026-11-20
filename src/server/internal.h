@@ -174,7 +174,12 @@ typedef struct hw_worker {
 	// Connections holding small frames that have not been written yet (conn_kick). The loop's
 	// batch-end hook writes them, so frames queued by several callbacks leave in one send.
 	struct hw_conn *flush_head;
-	uint64_t pipe_retry_ms;  // a relay pipe could not be had: do not ask the kernel again before this
+	uint64_t pipe_retry_ms; // a relay pipe could not be had: do not ask the kernel again before this
+	// TCP streams that opened in the last two sweeps and have no keepalive yet, in two lists:
+	// keepalive_new[keepalive_cur] takes the streams that open now, and each sweep arms the other
+	// one and makes it the list that takes them (stream_keepalive_sweep).
+	struct hw_stream *keepalive_new[2];
+	int keepalive_cur;
 	uint64_t accept_warn_ms; // when "out of file descriptors" was last logged
 	// Placement of new connections (server.c, "Which worker gets a connection"). `load` is the
 	// connections given to this worker and not yet freed: raised by whichever worker accepted,
@@ -516,11 +521,15 @@ typedef struct hw_stream {
 	uint64_t t_us;
 	uint8_t timed;
 	uint8_t warp_slot;
+	uint8_t ka_list; // see ka_prev
 	// Upload credit: DATA payload bytes the client has sent on the stream, and the most it may
 	// have sent (raised by the server's UPLOAD_CREDIT, never lowered). up_limit 0: the stream is
 	// paced by CONTINUE's packet window instead (UDP, or upload credit off).
 	uint64_t up_recv;
 	uint64_t up_limit;
+	// On one of the worker's keepalive_new lists (ka_list - 1 says which, 0: none) until
+	// the sweep gives its socket keepalive.
+	struct hw_stream *ka_prev, *ka_next;
 } hw_stream;
 
 #define STREAM_TIMED_DATA  1 // the client has sent DATA
@@ -733,6 +742,9 @@ void stream_unpark(hw_stream *s);
 // it queued meanwhile. 0 when the stream is open, -1 when that closed it (or the connection): the
 // stream is freed then, and a caller with more to do tests the result, never s->state.
 int stream_connected(hw_stream *s);
+// Give keepalive to the TCP streams that opened before the previous sweep and are still open, and
+// start the next generation. From the worker's sweep timer; O(streams opened since).
+void stream_keepalive_sweep(hw_worker *w);
 // Adopt an already-connected fd (a PTY master for Twisp): register it on the loop and open the
 // stream. Closes the stream on failure.
 void stream_adopt(hw_stream *s, int fd);

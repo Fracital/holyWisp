@@ -174,6 +174,8 @@ void conn_accept(hw_worker *w, int fd, const struct sockaddr *peer) {
 		return;
 	}
 	server_tune_socket(w->server, fd, 1);
+	int one = 1;
+	setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one)); // at the kernel's timers
 	if (w->server->client_rcvbuf > 0) {
 		setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &w->server->client_rcvbuf, sizeof(w->server->client_rcvbuf));
 	}

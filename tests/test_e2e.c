@@ -480,6 +480,22 @@ static void test_connection_refused(void) {
 	hw_client_free(c);
 }
 
+// A server of one worker for a case that needs its own, with client-write-timeout-s as given.
+static hw_server *pipe_server(int write_timeout_s) {
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.allow_direct_ip = 1;
+	cfg.allow_loopback = 1;
+	cfg.client_write_timeout_s = write_timeout_s;
+	cfg.log_level = HW_LOG_WARN;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL && hw_server_start(s) == 0, "server: %s", strerror(errno));
+	return s;
+}
+
 #if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
 // The server's own end of the TCP connection that `remote` accepted: the in-process socket whose
 // local port is the accepted socket's peer port and whose peer is remote's port. -1 when none.
@@ -507,14 +523,17 @@ static int server_side_of(int remote) {
 // the kernel gives up on it in half a second with ETIMEDOUT, as it does after unanswered
 // retransmissions or keepalive probes. The same socket shows the keepalive the server set, so that
 // a remote that vanished without a word frees its stream in minutes, not the kernel's two hours.
+// The worker's sweep sets it one to two sweeps after the stream opened: every 500 ms here, with a
+// client write timeout of 1 s (nothing is queued toward the client, so that never closes it).
 #if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
 static void test_remote_timeout_after_open(void) {
+	hw_server *s = pipe_server(1);
 	uint16_t port;
 	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
 	CHECK(lfd >= 0, "listen");
 	int small = 4096;
 	setsockopt(lfd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)); // inherited by what it accepts
-	hw_client *c = connect_to(g_server, 1, NULL, NULL, 1);
+	hw_client *c = connect_to(s, 1, NULL, NULL, 1);
 	uint32_t sid;
 	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", port, &sid), 0);
 	hw_client_event ev;
@@ -526,13 +545,17 @@ static void test_remote_timeout_after_open(void) {
 	CHECK(remote >= 0, "accept");
 	int fd = server_side_of(remote);
 	CHECK(fd >= 0, "the server's socket for the stream");
+	// The sweep turns keepalive on before it sets the timers, so once the idle is set it is on.
 	int on = 0, idle = 0;
+	for (uint64_t start = hw_now_ms();; usleep(10000)) {
+		socklen_t ol = sizeof(idle);
+		CHECK_EQ(getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol), 0);
+		if (idle == 60 || hw_now_ms() - start > 5000) break;
+	}
+	CHECK_EQ(idle, 60);
 	socklen_t ol = sizeof(on);
 	CHECK_EQ(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, &ol), 0);
 	CHECK(on, "keepalive on the remote socket");
-	ol = sizeof(idle);
-	CHECK_EQ(getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, &ol), 0);
-	CHECK_EQ(idle, 60);
 	unsigned timeout_ms = 300;
 	CHECK_EQ(setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &timeout_ms, sizeof(timeout_ms)), 0);
 	uint8_t chunk[16384];
@@ -545,7 +568,7 @@ static void test_remote_timeout_after_open(void) {
 	close(remote);
 	close(lfd);
 	hw_client_free(c);
-	wait_streams_idle(g_server);
+	hw_server_free(s);
 }
 #endif
 
@@ -1266,21 +1289,6 @@ static uint64_t relay_pipes(hw_server *s, uint64_t want, int wait_ms) {
 		if (st.relay_pipes == want || i * 10 >= wait_ms) return st.relay_pipes;
 		usleep(10000);
 	}
-}
-
-static hw_server *pipe_server(int write_timeout_s) {
-	hw_server_config cfg;
-	hw_server_config_defaults(&cfg);
-	strcpy(cfg.host, "127.0.0.1");
-	cfg.port = 0;
-	cfg.workers = 1;
-	cfg.allow_direct_ip = 1;
-	cfg.allow_loopback = 1;
-	cfg.client_write_timeout_s = write_timeout_s;
-	cfg.log_level = HW_LOG_WARN;
-	hw_server *s = hw_server_new(&cfg);
-	CHECK(s != NULL && hw_server_start(s) == 0, "server: %s", strerror(errno));
-	return s;
 }
 
 // A relay pipe is two descriptors and 1 MiB of the kernel's per-user pipe budget, so a stream
