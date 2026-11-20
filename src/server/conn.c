@@ -647,6 +647,11 @@ static void marks_free(hw_conn *c) {
 	while (c->mark_count > 0) mark_pop(c);
 }
 
+// Where the next frame queued in wbuf will begin, in wsent's count.
+static uint64_t conn_wbuf_end(const hw_conn *c) {
+	return c->wsent + hw_buf_avail(&c->wbuf);
+}
+
 // Everything queued toward the client: the write buffer plus the payloads still in pipes.
 static size_t conn_queued(const hw_conn *c) {
 	if (c->wt) return wt_conn_queued(c->wt); // the session's queue stands in for wbuf
@@ -964,6 +969,7 @@ ssize_t conn_splice_data(hw_conn *c, hw_stream *s, size_t max) {
 		conn_close(c);
 		return (ssize_t)got;
 	}
+	s->q_end = conn_wbuf_end(c); // the mark's position: the payload is owed there
 	atomic_fetch_add(&c->w->bytes_out, (uint64_t)got);
 	conn_charge_bandwidth(c, got);
 	conn_kick(c);
@@ -1046,9 +1052,9 @@ static int conn_wt_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data
 	return c->closing ? -1 : 0;
 }
 
-int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len) {
+int conn_send_data(hw_conn *c, hw_stream *s, const uint8_t *data, size_t len) {
 	if (c->closing) return -1;
-	if (c->wt) return conn_wt_send_data(c, stream_id, data, len);
+	if (c->wt) return conn_wt_send_data(c, s->id, data, len);
 	// One remote read may be larger than a packet may carry: it goes out as several DATA packets,
 	// each within max-message-size, so a strict peer never sees an oversize frame.
 	size_t max = frame_payload_max(c);
@@ -1057,20 +1063,29 @@ int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t l
 		size_t n = len < max ? len : max;
 		uint8_t *p = frame_begin(c, HW_WISP_HEADER_LEN + n);
 		if (!p) return -1;
-		hw_wisp_write_header(p, HW_WISP_DATA, stream_id);
+		hw_wisp_write_header(p, HW_WISP_DATA, s->id);
 		memcpy(p + HW_WISP_HEADER_LEN, data, n);
 		data += n;
 		len -= n;
 	} while (len > 0);
+	s->q_end = conn_wbuf_end(c);
 	atomic_fetch_add(&c->w->bytes_out, total);
 	conn_charge_bandwidth(c, total);
 	conn_kick(c);
 	return c->closing ? -1 : 0;
 }
 
-// Whether a frame the client is waiting on goes ahead of what is queued for it (pri): on a
-// WebSocket, once the opening is over. Every such frame goes there, an empty queue or not, so they
-// keep their order among themselves: two CONTINUEs of one stream never swap, nor two pongs.
+// Whether a frame of the stream's own is still queued toward the client: one in wbuf, or the
+// payload of its last one still owed from its pipe (the head mark at q_end, which is where that
+// frame's header ends).
+static int conn_stream_queued(const hw_conn *c, const hw_stream *s) {
+	if (s->q_end > c->wsent) return 1;
+	return s->q_end == c->wsent && c->mark_count > 0 && c->marks[c->mark_head].at == c->wsent;
+}
+
+// Whether a frame the client is waiting on may go ahead of what is queued for it (pri): on a
+// WebSocket, once the opening is over. Every pong goes there, an empty queue or not, so two never
+// swap; a CONTINUE goes there unless its stream has a frame queued (conn_send_continue).
 static int conn_ahead(const hw_conn *c) {
 	return !c->wt && c->state == CONN_WS && c->handshake_done;
 }
@@ -1092,15 +1107,22 @@ static int conn_send_ahead(hw_conn *c, uint8_t opcode, const uint8_t *payload, s
 // A CONTINUE is the one small frame that does not wait for the end of the batch: the client has
 // stopped sending on that stream until it arrives, so every microsecond it sits in the queue is a
 // microsecond of idle pipeline (deferring it measurably slowed a connection with ten busy streams).
-// For the same reason it goes ahead of a queued download (conn_ahead); the stream-0 CONTINUE of
-// the opening never does.
+// For the same reason it goes ahead of a queued download (conn_ahead), but only of other streams':
+// while a frame of the stream's own is queued, its CONTINUE joins the back of the queue, as every
+// frame did before, and sets q_end, so the stream's next CONTINUE waits for this one and two never
+// swap. A stream whose upload comes back to it (an echo, a request and its answer) is then paced by
+// how fast the client takes its download: ahead of its own data, the credit only piled more of the
+// upload into a loop the client could not drain (wisp-js, 5 connections of 10 echoed streams: 5%
+// less throughput, 9% more CPU per byte). The stream-0 CONTINUE of the opening never goes ahead.
 int conn_send_continue(hw_conn *c, uint32_t stream_id, uint32_t remaining) {
 	uint8_t pkt[HW_WISP_HEADER_LEN + 4];
 	size_t n = hw_wisp_build_continue(pkt, stream_id, remaining);
-	if (stream_id != 0 && conn_ahead(c)) {
+	hw_stream *s = stream_id != 0 && conn_ahead(c) ? hw_map_get(&c->streams, stream_id) : NULL;
+	if (s && !conn_stream_queued(c, s)) {
 		if (conn_send_ahead(c, HW_WS_BINARY, pkt, n) != 0) return -1;
-	} else if (conn_send_packet(c, pkt, n) != 0) {
-		return -1;
+	} else {
+		if (conn_send_packet(c, pkt, n) != 0) return -1; // closed: s is gone
+		if (s) s->q_end = conn_wbuf_end(c);
 	}
 	if (!c->write_armed) conn_flush(c);
 	return c->closing ? -1 : 0;

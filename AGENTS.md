@@ -638,12 +638,18 @@ it, and on macOS, where that takes a second call, the child closes everything ab
   measurably slowed a connection with ten busy streams) and anything sent right before `conn_close` (flush first, as
   `handle_info` does, or the frame is lost with the socket). The list is emptied before any
   `conn_free_task` can run, which is what makes it safe to hold `hw_conn` pointers in it. Nor do
-  a refill CONTINUE or a pong wait behind a queued download: after the opening, on a WebSocket,
-  they go on `c->pri` (`conn_send_ahead`), which `conn_flush` sends at the next frame boundary of
-  `wbuf` (`fr_end`, walked one header per frame as bytes leave; a mark at `wsent` is mid-frame),
-  gathered with what follows in one `sendmsg`. Frames never interleave, every such frame goes
-  there so they keep their order among themselves, CLOSE and DATA stay in order in `wbuf`, and
-  the stream-0 CONTINUE of the opening never goes ahead (`test_continue_ahead_of_download`). The
+  a refill CONTINUE or a pong wait behind another stream's queued download: after the opening, on
+  a WebSocket, they go on `c->pri` (`conn_send_ahead`), which `conn_flush` sends at the next frame
+  boundary of `wbuf` (`fr_end`, walked one header per frame as bytes leave; a mark at `wsent` is
+  mid-frame), gathered with what follows in one `sendmsg`. A refill CONTINUE whose own stream
+  still has a frame queued (`s->q_end`, `conn_stream_queued`) joins `wbuf` behind it instead, as
+  every frame did before, and the stream's next CONTINUE waits for that one: ahead of its own
+  data, the credit of a stream whose upload comes back to it (an echo, a request and its answer)
+  only piled more upload into a loop the client could not drain, which cost wisp-js 5 connections
+  of 10 echoed streams 5% of its throughput and 9% more server CPU per byte. Frames never
+  interleave, CONTINUEs and pongs keep their order among themselves, CLOSE and DATA stay in order
+  in `wbuf`, and the stream-0 CONTINUE of the opening never goes ahead
+  (`test_continue_ahead_of_download`, `test_continue_behind_own_download`). The
   retries after a short write in `conn_flush` and `conn_splice_data` are deliberate: removing them
   saved 11% of the syscalls and lost 3 to 4% of throughput.
 - **The unmask.** `hw_ws_mask` is the server's only per-byte work in user space (every uploaded

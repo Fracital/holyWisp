@@ -614,6 +614,88 @@ static void test_continue_ahead_of_download(void) {
 	}
 }
 
+// The other half: a CONTINUE goes ahead of other streams' data, never of its own stream's. As in
+// download_before_continue the client reads nothing until the server holds megabytes of a
+// download, but the window is then spent on that same stream (big_conn reads it once its download
+// is written): every byte of it queued before the window must reach the client before the
+// CONTINUE. Ahead of them, an echo or a request and its answer would pile more of the upload into
+// a loop the client cannot drain. Returns 0 for a run whose download never queued much.
+static int own_download_before_continue(int v2, size_t *before_out, uint64_t *queued_out) {
+	enum {
+		PKT = 256
+	};
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.socket_buffer_size = 16 * 1024;
+	hw_server *s = start_server(&cfg);
+
+	hw_client_opts o;
+	hw_client_opts_defaults(&o);
+	o.host = "127.0.0.1";
+	o.port = hw_server_port(s);
+	o.timeout_ms = 5000;
+	o.v2 = v2;
+	char err[256];
+	hw_client *c = hw_client_connect(&o, err, sizeof(err));
+	CHECK(c != NULL, "connect: %s", err);
+	int small = 64 * 1024;
+	setsockopt(hw_client_fd(c), SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
+	uint32_t window = hw_client_buffer_size(c);
+
+	uint32_t down;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_big_port, &down), 0);
+	CHECK_EQ(hw_client_send(c, down, "g", 1), 0);
+	hw_server_stats st = {0};
+	uint64_t last = 0, still = hw_now_ms(), deadline = still + 10000;
+	while (last < BIG_BYTES && hw_now_ms() - still < 1000 && hw_now_ms() < deadline) {
+		usleep(20 * 1000);
+		hw_server_stats_get(s, &st);
+		if (st.bytes_out != last) still = hw_now_ms();
+		last = st.bytes_out;
+	}
+	int queued = st.bytes_out >= 2u * 1024 * 1024;
+	uint64_t queued_before = st.bytes_out, up_before = st.bytes_in;
+
+	uint8_t pkt[PKT];
+	memset(pkt, 'u', sizeof(pkt));
+	for (uint32_t i = 0; i < window; i++) CHECK_EQ(hw_client_send(c, down, pkt, sizeof(pkt)), 0);
+	deadline = hw_now_ms() + 5000;
+	for (;;) {
+		hw_server_stats_get(s, &st);
+		if (st.bytes_in - up_before >= (uint64_t)window * PKT || hw_now_ms() > deadline) break;
+		usleep(1000);
+	}
+	CHECK_EQ(st.bytes_in - up_before, (uint64_t)window * PKT);
+	usleep(20 * 1000);
+	size_t before = 0;
+	for (;;) {
+		hw_client_event ev;
+		CHECK_EQ(hw_client_poll(c, 5000, &ev), 1);
+		CHECK(ev.stream_id == down, "an event for stream %u", ev.stream_id);
+		CHECK(ev.type != HW_CEV_CLOSE, "the stream closed (reason %u)", ev.reason);
+		if (ev.type == HW_CEV_DATA) before += ev.len;
+		if (ev.type == HW_CEV_CONTINUE) break;
+	}
+	hw_client_free(c);
+	hw_server_free(s);
+	*before_out = before;
+	*queued_out = queued_before;
+	return queued;
+}
+
+static void test_continue_behind_own_download(void) {
+	for (int v2 = 0; v2 <= 1; v2++) {
+		size_t before = 0;
+		uint64_t queued = 0;
+		int tries = 0;
+		while (!own_download_before_continue(v2, &before, &queued)) {
+			CHECK(++tries < 5, "v%d: the download never queued", v2 + 1);
+		}
+		CHECK(before >= queued, "v%d: the CONTINUE came after %zu of the %llu bytes queued before it", v2 + 1, before,
+		      (unsigned long long)queued);
+	}
+}
+
 // A sender thread for the connection-budget test: hw_client_send blocks once the server stops
 // reading, which is exactly what the test wants to observe, so it cannot run on the test thread.
 static struct {
@@ -768,5 +850,6 @@ int main(void) {
 	RUN(test_conn_queue_pauses_reads);
 	RUN(test_upload_window);
 	RUN(test_continue_ahead_of_download);
+	RUN(test_continue_behind_own_download);
 	return 0;
 }

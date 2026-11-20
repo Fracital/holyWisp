@@ -530,6 +530,10 @@ typedef struct hw_stream {
 	// On one of the worker's keepalive_new lists (ka_list - 1 says which, 0: none) until
 	// the sweep gives its socket keepalive.
 	struct hw_stream *ka_prev, *ka_next;
+	// Where its last frame toward the client ends in the connection's wbuf, in wsent's count (the
+	// mark's position for a spliced one): its refill CONTINUE goes ahead of the queue only once
+	// that has been sent (conn_send_continue).
+	uint64_t q_end;
 } hw_stream;
 
 #define STREAM_TIMED_DATA  1 // the client has sent DATA
@@ -635,8 +639,8 @@ void server_policy_tick(hw_server *s);
 void server_warp_refresh(hw_server *s, int running);
 // Queue one Wisp packet (already laid out) as a binary WebSocket frame.
 int conn_send_packet(hw_conn *c, const uint8_t *packet, size_t len);
-// Queue a DATA packet for stream_id with `len` payload bytes copied from `data`.
-int conn_send_data(hw_conn *c, uint32_t stream_id, const uint8_t *data, size_t len);
+// Queue a DATA packet for stream s with `len` payload bytes copied from `data`.
+int conn_send_data(hw_conn *c, hw_stream *s, const uint8_t *data, size_t len);
 // Relay what the stream's remote has to read, at most max bytes (its credit; > 0), as one DATA
 // packet without copying it through user space. Returns the bytes relayed (> 0), 0 on remote EOF,
 // -1 with errno from the remote read (EAGAIN: nothing to read), -2 when the copying path (recv

@@ -1278,7 +1278,7 @@ static int stream_read(hw_stream *s) {
 		s->heard = 1;
 		if (!(s->timed & STREAM_TIMED_FIRST)) stream_time_first(s);
 		s->credit_sent += (uint64_t)n;
-		conn_send_data(c, s->id, scratch, (size_t)n);
+		conn_send_data(c, s, scratch, (size_t)n);
 		if (c->closing) return 0;
 		// A WebTransport session copies into QUIC packets: there is no pipe to relay through.
 		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP && !c->wt) s->bulk = 1;
