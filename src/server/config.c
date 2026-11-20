@@ -434,21 +434,27 @@ static int policy_key(const char *key) {
 	return 0;
 }
 
-// The config file's reader, and with `policy` set a policy-file's: only POLICY_KEYS, and a line
-// that does not fit the buffer is an error, not two lines (the rest of a long list line would be
-// read as a line of its own).
+// The config file's reader, and with `policy` set a policy-file's: only POLICY_KEYS. In either, a
+// line of more than HW_CONFIG_LINE_MAX bytes before its "\n" or "\r\n" is an error, never two lines:
+// the rest of it would be read as a line of its own, and a setting at the end of a long comment
+// would be applied.
 static int config_load(hw_server_config *cfg, const char *path, int policy, char *err, size_t err_cap) {
 	FILE *f = fopen(path, "r");
 	if (!f) {
 		snprintf(err, err_cap, "%s: %s", path, strerror(errno));
 		return -1;
 	}
-	char line[1024];
+	char line[HW_CONFIG_LINE_MAX + 3]; // the line, "\r\n" and the NUL
 	int lineno = 0;
 	while (fgets(line, sizeof(line), f)) {
 		lineno++;
-		if (policy && !strchr(line, '\n') && !feof(f)) {
-			snprintf(err, err_cap, "%s:%d: line longer than %zu bytes", path, lineno, sizeof(line) - 1);
+		size_t n = strlen(line);
+		int ended = n > 0 && line[n - 1] == '\n';
+		if (ended) n--;
+		if (n > 0 && line[n - 1] == '\r') n--;
+		// Without its newline before the end of the file, the line did not fit the buffer.
+		if (n > HW_CONFIG_LINE_MAX || (!ended && !feof(f))) {
+			snprintf(err, err_cap, "%s:%d: line longer than %d bytes", path, lineno, HW_CONFIG_LINE_MAX);
 			fclose(f);
 			return -1;
 		}
@@ -498,7 +504,7 @@ static int config_load(hw_server_config *cfg, const char *path, int policy, char
 	}
 	int failed = ferror(f);
 	fclose(f);
-	if (policy && failed) {
+	if (failed) { // the lines that were read are only part of the file
 		snprintf(err, err_cap, "%s: read error after line %d", path, lineno);
 		return -1;
 	}

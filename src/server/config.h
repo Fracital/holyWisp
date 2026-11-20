@@ -9,16 +9,22 @@
 
 #include "holywisp/server.h"
 
+// The longest line a config file or a policy-file may hold, in bytes, not counting its "\n" or
+// "\r\n". A longer one, comments included, is an error naming it, never read in pieces.
+#define HW_CONFIG_LINE_MAX 1023
+
 // Apply one key/value. 0 on success, -1 with a message in err.
 int hw_config_set(hw_server_config *cfg, const char *key, const char *value, char *err, size_t err_cap);
-// Load a file; -1 with err describing the line that failed or the open error.
+// Load a file; -1 with err describing the line that failed (a bad key or value, a line longer
+// than HW_CONFIG_LINE_MAX), the open error or a read error.
 int hw_config_load_file(hw_server_config *cfg, const char *path, char *err, size_t err_cap);
 // Load a policy-file into cfg's lists, on top of what they hold. It may hold only the keys that
 // are lists an operator edits while the server runs (allow-host, block-host, allow-port,
-// block-port, warp-bypass-host, allow-origin) in the config file's syntax, and every line must
-// end within 1023 bytes. -1 with err naming the line at the first that does not: any other key, a
-// bad value, a full list or a read error. cfg then holds part of the file, so the caller loads
-// into a copy and throws it away. Nothing is checked across keys (hw_server_config_validate is).
+// block-port, warp-bypass-host, allow-origin) in the config file's syntax, lines of at most
+// HW_CONFIG_LINE_MAX bytes as there. -1 with err naming the line at the first that does not: any
+// other key, a bad value, a full list, a line too long or a read error. cfg then holds part of the
+// file, so the caller loads into a copy and throws it away. Nothing is checked across keys
+// (hw_server_config_validate is).
 int hw_config_load_policy(hw_server_config *cfg, const char *path, char *err, size_t err_cap);
 // Parse argv. Returns 0 to continue, 1 when the process should exit successfully (help/version),
 // -1 on a bad argument (err filled).

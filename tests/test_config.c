@@ -20,6 +20,18 @@ static void write_file(const char *path, const char *content) {
 	fclose(f);
 }
 
+// prefix, then a line of exactly len bytes (body and spaces, which the reader trims), then end.
+static void padded_line(char *out, size_t cap, const char *prefix, const char *body, size_t len, const char *end) {
+	size_t p = strlen(prefix), b = strlen(body), e = strlen(end);
+	CHECK(p + len + e < cap && b <= len, "padded_line: %zu bytes do not fit", p + len + e);
+	size_t at = 0;
+	for (const char *c = prefix; *c; c++) out[at++] = *c;
+	for (const char *c = body; *c; c++) out[at++] = *c;
+	while (at < p + len) out[at++] = ' ';
+	for (const char *c = end; *c; c++) out[at++] = *c;
+	out[at] = '\0';
+}
+
 static void test_inline_comments_and_quotes(void) {
 	char path[512];
 	hw_test_tmp(path, sizeof(path), "hw-cfg");
@@ -259,8 +271,61 @@ static void test_policy_file_keys(void) {
 	write_file(path, longline);
 	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) != 0, "a long line was accepted");
 	CHECK(strstr(err, ":1: line longer than 1023 bytes") != NULL, "%s", err);
+	// The limit is what the message says: 1023 bytes is a line, 1024 is not.
+	static char text[2 * HW_CONFIG_LINE_MAX];
+	padded_line(text, sizeof(text), "", "allow-port = 8443", HW_CONFIG_LINE_MAX, "\n");
+	write_file(path, text);
+	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) == 0, "1023 bytes: %s", err);
+	CHECK(hw_portset_has(&cfg.allow_ports, 8443), "the line of 1023 bytes was applied");
+	padded_line(text, sizeof(text), "", "allow-port = 8444", HW_CONFIG_LINE_MAX + 1, "\n");
+	write_file(path, text);
+	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) != 0, "1024 bytes were accepted");
+	CHECK(strstr(err, ":1: line longer than 1023 bytes") != NULL, "%s", err);
 	unlink(path);
 	CHECK(hw_config_load_policy(&cfg, path, err, sizeof(err)) != 0, "a missing file was accepted");
+}
+
+// A config file's line of more than HW_CONFIG_LINE_MAX bytes is an error naming it, comments
+// included: the reader once took the rest of it as a line of its own, so a setting at the end of
+// a long comment was applied.
+static void test_config_long_lines(void) {
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	hw_server_config *cfg = malloc(sizeof(*cfg)); // a config is 260 KiB: not on Windows' stack
+	CHECK(cfg != NULL, "malloc");
+	char err[512];
+	static char text[4 * HW_CONFIG_LINE_MAX];
+	// Exactly the limit, ended by "\n", by "\r\n" or by the end of the file: a line.
+	const char *ends[] = {"\n", "\r\n", ""};
+	for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
+		hw_server_config_defaults(cfg);
+		padded_line(text, sizeof(text), "", "port = 7000", HW_CONFIG_LINE_MAX, ends[i]);
+		write_file(path, text);
+		CHECK(hw_config_load_file(cfg, path, err, sizeof(err)) == 0, "1023 bytes, end %zu: %s", i, err);
+		CHECK_EQ(cfg->port, 7000);
+	}
+	// One byte more, however it ends.
+	for (size_t i = 0; i < sizeof(ends) / sizeof(ends[0]); i++) {
+		hw_server_config_defaults(cfg);
+		padded_line(text, sizeof(text), "port = 1\n", "port = 7000", HW_CONFIG_LINE_MAX + 1, ends[i]);
+		write_file(path, text);
+		CHECK(hw_config_load_file(cfg, path, err, sizeof(err)) != 0, "1024 bytes, end %zu, accepted", i);
+		CHECK(strstr(err, ":2: line longer than 1023 bytes") != NULL, "%s", err);
+	}
+	// A comment whose tail, past the buffer, is a setting.
+	int at = snprintf(text, sizeof(text), "# ");
+	memset(text + at, 'x', (size_t)HW_CONFIG_LINE_MAX - 2);
+	snprintf(text + HW_CONFIG_LINE_MAX, sizeof(text) - HW_CONFIG_LINE_MAX, "port = 7001\n");
+	write_file(path, text);
+	hw_server_config_defaults(cfg);
+	CHECK(hw_config_load_file(cfg, path, err, sizeof(err)) != 0, "a long comment was accepted");
+	CHECK(strstr(err, ":1: line longer than 1023 bytes") != NULL, "%s", err);
+	CHECK(cfg->port != 7001, "the comment's tail was applied");
+	unlink(path);
+	free(cfg);
 }
 
 // The WebTransport keys, their defaults, and what validation refuses.
@@ -506,6 +571,7 @@ int main(void) {
 	RUN(test_config_check_policy_file);
 	RUN(test_dns_server_key);
 	RUN(test_policy_file_keys);
+	RUN(test_config_long_lines);
 	RUN(test_shipped_configs);
 	return 0;
 }
