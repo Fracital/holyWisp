@@ -79,6 +79,11 @@ export type WebTransportConfig = {
 	/** PEM files of an ECDSA P-256 chain and key, instead of the rotating self-signed certificate. */
 	certFile?: string;
 	keyFile?: string;
+	/**
+	 * A file that keeps the QUIC stateless-reset key across restarts (made 0600 when missing), so
+	 * that clients of a server that died are told by the next one (default: a new key each start).
+	 */
+	resetKeyFile?: string;
 	idleTimeoutSeconds?: number;
 	maxHandshakes?: number;
 	retryThreshold?: number;
@@ -563,6 +568,7 @@ export function workerArgs(
 			str("webtransport-url", "webTransport.url", wt.url);
 			str("webtransport-cert", "webTransport.certFile", wt.certFile);
 			str("webtransport-key", "webTransport.keyFile", wt.keyFile);
+			str("webtransport-reset-key-file", "webTransport.resetKeyFile", wt.resetKeyFile);
 			int("webtransport-idle-timeout-s", "webTransport.idleTimeoutSeconds", wt.idleTimeoutSeconds);
 			int("webtransport-max-handshakes", "webTransport.maxHandshakes", wt.maxHandshakes);
 			int("webtransport-retry-threshold", "webTransport.retryThreshold", wt.retryThreshold);

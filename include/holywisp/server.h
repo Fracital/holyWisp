@@ -187,6 +187,11 @@ typedef struct hw_server_config {
 	// A directory of <host>.pem files (chain and P-256 key in one file) picked by the SNI a client
 	// sends; any other name gets the certificate above. Read again when it changes. "" = none.
 	char webtransport_cert_dir[512];
+	// A file that keeps the stateless-reset key across restarts (64 hex digits, made 0600 when it
+	// is missing), so that a client of a process that went away without closing its sessions is
+	// told by the next one. "" = a key drawn at each start, which no client of an earlier process
+	// takes from this one. One file per server, never shared: the key forges resets for its CIDs.
+	char webtransport_reset_key_file[512];
 	// webtransport-path rules: a session request is admitted only when one names its :authority
 	// and :path (hw_wt_route_match); none at all admits every path. host "" is any host.
 	struct {

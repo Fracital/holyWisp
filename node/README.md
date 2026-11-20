@@ -155,6 +155,7 @@ All optional. Names follow wispurr; the right-hand column is the `holywisp` flag
 | `webTransport` (`true`, or an object of the keys below) | `webtransport` |
 | `webTransport.host`, `webTransport.port`, `webTransport.url` | `webtransport-host`, `webtransport-port`, `webtransport-url` |
 | `webTransport.certFile`, `webTransport.keyFile` | `webtransport-cert`, `webtransport-key` |
+| `webTransport.resetKeyFile` | `webtransport-reset-key-file` |
 | `webTransport.idleTimeoutSeconds`, `webTransport.maxHandshakes`, `webTransport.retryThreshold` | `webtransport-idle-timeout-s`, `webtransport-max-handshakes`, `webtransport-retry-threshold` |
 | `webTransport.congestionControl` (`"bbr"`, `"bbr2"` or `"newreno"`) | `webtransport-congestion-control` |
 | `logLevel` (default `warn`) | `log-level` |

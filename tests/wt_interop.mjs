@@ -10,7 +10,9 @@
 // - headless Chrome: a page on 127.0.0.1 fetches /webtransport.json, opens new WebTransport() with
 //   the pinned hashes and speaks Wisp v1 over the session (the stream-0 CONTINUE, a TCP stream
 //   echoed on the Wisp stream, a UDP stream echoed by datagram), then a second session offering
-//   "wisp-v2" (the server's INFO comes first), and reports back by POST.
+//   "wisp-v2" (the server's INFO comes first), and a third that is open when the server is stopped
+//   (SIGTERM): it must end cleanly ("server stopping") within a few seconds, not at the idle timeout.
+//   It reports back by POST.
 // Exits 0 when everything that ran passed. Nothing leaves the machine.
 import { execFileSync, spawn } from "node:child_process";
 import dgram from "node:dgram";
@@ -196,8 +198,23 @@ try {
     steps.v2ok = wt2.protocol === "wisp-v2" && steps.v2.firstPacket === 0x05;
   }
   wt2.close({ closeCode: 0, reason: "done" });
+  // The server stops with a session open: the session's close capsule, then CONNECTION_CLOSE.
+  const wt3 = new WebTransport("https://127.0.0.1:${wispPort}/", { serverCertificateHashes });
+  await wt3.ready;
+  const t0 = performance.now();
+  await fetch("/stop", { method: "POST" });
+  const how = await Promise.race([
+    wt3.closed.then((i) => ({ closed: i }), (e) => ({ error: String(e) })),
+    new Promise((ok) => setTimeout(() => ok({ timeout: true }), 10000)),
+  ]);
+  steps.stop = { ...how, ms: Math.round(performance.now() - t0) };
+  steps.stopOk = !!how.closed && how.closed.reason === "server stopping" && steps.stop.ms < 5000; // not "Connection lost."
   steps.ok =
-    steps.continue0 && steps.tcpEcho === "hello from chrome" && !!steps.udpEcho && (typeof steps.v2 === "string" || steps.v2ok);
+    steps.continue0 &&
+    steps.tcpEcho === "hello from chrome" &&
+    !!steps.udpEcho &&
+    (typeof steps.v2 === "string" || steps.v2ok) &&
+    steps.stopOk;
 } catch (e) {
   steps.error = String(e && e.stack ? e.stack : e);
 }
@@ -205,6 +222,12 @@ await report(steps);
 </script>`;
 
 const site = http.createServer((req, res) => {
+  if (req.method === "POST" && req.url === "/stop") {
+    hw.removeAllListeners("exit");
+    hw.kill("SIGTERM");
+    res.end("ok");
+    return;
+  }
   if (req.method === "POST" && req.url === "/result") {
     let body = "";
     req.on("data", (d) => (body += d));

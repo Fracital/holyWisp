@@ -297,6 +297,20 @@ every WebTransport connection, as only one listener exists there. A datagram for
 does not know (its owner index is another worker after a reuseport group change, or unknown) gets
 a stateless reset if it is a short header of at least 21 bytes, and is dropped otherwise.
 
+**Stop and restart.** A stop closes every session before the process goes (`wt_worker_stop`, on
+each worker once its loop has stopped): an open session gets its close capsule (code 0, "server
+stopping") and FIN, then 50 ms later QUIC's CONNECTION_CLOSE (`H3_NO_ERROR`), a handshake the
+CONNECTION_CLOSE alone; nothing waits for an answer, and a full socket gets at most 200 ms.
+Headless Chrome resolves `closed` with the capsule's code and reason within a few milliseconds;
+with the two arriving together it reported "Connection lost." (one stop in three with 1 ms
+between them, none in five with 50; `tests/wt_interop.mjs` stops the server under an open
+session). Until 2026-11-19 nothing was sent, and every client of a restarted edge waited out its
+idle timeout (30 s) before it reconnected. A process that dies without a stop sends nothing, and its clients
+are then told by the next one: their next datagram carries a CID the new process does not know,
+and its stateless reset ends the session at the client if it carries the token the old one gave
+for that CID. That token is made from the reset key, which is new at each start unless
+`webtransport-reset-key-file` keeps it (`test_reset_key_file`).
+
 **Datagram I/O.** On Linux, `recvmmsg` and `sendmmsg` batches with UDP GSO and GRO (in `sys.h`:
 `hw_sys_recv_batch`, `hw_sys_send_batch`, `hw_sys_udp_gro`; a one-datagram loop on the other
 platforms). `hw_sys_send_batch` hands a run of datagrams to the same address and of the same
@@ -447,6 +461,7 @@ places in the code. On top of it:
 | `webtransport-cert`, `webtransport-key` | empty | PEM files (ECDSA P-256) to use instead of the rotating self-signed certificate. Read again when they change, for new sessions. |
 | `webtransport-cert-dir` | empty | `<host>.pem` files (chain and P-256 key in one) picked by the client's SNI; any other name gets the certificate above. Read again when it changes. |
 | `webtransport-path` | every path | `[host] /path`, repeatable: the paths (and hosts) a session is admitted on; any other is a 404. |
+| `webtransport-reset-key-file` | empty | A file that keeps the stateless-reset key across restarts (64 hex digits, made 0600 when missing); empty: a new key each start. |
 | `webtransport-idle-timeout-s` | 30 | QUIC idle timeout. |
 | `webtransport-max-handshakes` | 1024 | Handshakes in progress per worker. |
 | `webtransport-retry-threshold` | 64 | Handshakes in progress per worker past which every Initial gets a Retry. |

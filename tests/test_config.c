@@ -236,6 +236,9 @@ static void test_webtransport_keys(void) {
 	// The certificate directory, and the paths: [host] /path, repeatable.
 	CHECK_EQ(hw_config_set(&cfg, "webtransport-cert-dir", "/etc/wt/hosts", err, sizeof(err)), 0);
 	CHECK_STR(cfg.webtransport_cert_dir, "/etc/wt/hosts");
+	CHECK_STR(cfg.webtransport_reset_key_file, "");
+	CHECK_EQ(hw_config_set(&cfg, "webtransport-reset-key-file", "/var/lib/holywisp/wt.key", err, sizeof(err)), 0);
+	CHECK_STR(cfg.webtransport_reset_key_file, "/var/lib/holywisp/wt.key");
 	CHECK_EQ(hw_config_set(&cfg, "webtransport-path", "/pipe/0123456789abcdef", err, sizeof(err)), 0);
 	CHECK_EQ(hw_config_set(&cfg, "webtransport-path", "relay.example   /", err, sizeof(err)), 0);
 	CHECK_EQ(cfg.webtransport_path_count, 2);

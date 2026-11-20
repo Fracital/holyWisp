@@ -461,6 +461,7 @@ static void *worker_main(void *arg) {
 	HW_DEBUG("worker", "worker %d running", w->index);
 	// A loop that gives up takes its connections with it; never silently.
 	if (hw_loop_run(w->loop) != 0) HW_ERROR("worker", "worker %d: event loop failed: %s", w->index, strerror(errno));
+	wt_worker_stop(w); // the clients learn of it now, not at their idle timeout
 	HW_DEBUG("worker", "worker %d stopped", w->index);
 	return NULL;
 }

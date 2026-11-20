@@ -160,6 +160,7 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 	STR_KEY("webtransport-cert", webtransport_cert)
 	STR_KEY("webtransport-key", webtransport_key)
 	STR_KEY("webtransport-cert-dir", webtransport_cert_dir)
+	STR_KEY("webtransport-reset-key-file", webtransport_reset_key_file)
 	INT_KEY("webtransport-idle-timeout-s", webtransport_idle_timeout_s, 1, 3600)
 	INT_KEY("webtransport-max-handshakes", webtransport_max_handshakes, 1, 1 << 20)
 	INT_KEY("webtransport-retry-threshold", webtransport_retry_threshold, 0, 1 << 20)
@@ -551,6 +552,8 @@ void hw_config_usage(const char *argv0) {
 	       "  webtransport-path [HOST] /PATH            admit sessions only for this path, and what is under\n"
 	       "                                            it (/ alone for /), on HOST or any host; repeatable\n"
 	       "                                            (every path)\n"
+	       "  webtransport-reset-key-file FILE          the stateless-reset key, kept across restarts; made\n"
+	       "                                            (0600) when missing (none: a new key each start)\n"
 	       "  webtransport-idle-timeout-s               QUIC idle timeout (30)\n"
 	       "  webtransport-max-handshakes               QUIC handshakes in progress per worker (1024)\n"
 	       "  webtransport-retry-threshold              handshakes per worker past which every Initial gets a\n"

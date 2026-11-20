@@ -442,6 +442,11 @@ void conn_wt_progress(hw_conn *c);
 // The UDP sockets, one per worker where datagrams can be steered (else one, on worker 0), and the
 // certificate. Called by hw_server_new after the workers exist. 0, or -1 (logged).
 int wt_listener_init(hw_server *s);
+// The server is stopping: every session of the worker is closed toward its client (the session's
+// close capsule, then QUIC's CONNECTION_CLOSE), sent before this returns, waiting at most
+// WT_STOP_FLUSH_MS for a full socket. On the worker's thread, after its loop has stopped; nothing
+// is freed (wt_worker_free does that).
+void wt_worker_stop(hw_worker *w);
 // Every session of the worker, freed in place (shutdown, loops stopped), and the worker's state.
 void wt_worker_free(hw_worker *w);
 // The maintenance thread's look at the certificate, once a second. Self-signed: a new one every 6

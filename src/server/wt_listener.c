@@ -45,6 +45,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,15 +57,18 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 
-#define WT_RX_SLOT      4096  // receive room per datagram; a longer one is dropped (QUIC's are 1200 to 1500)
-#define WT_RX_GRO_SLOTS 16    // receive slots with GRO, HW_SYS_GRO_SLOT each: a slot is up to 45 datagrams
-#define WT_RX_ROUNDS    8     // receive batches per readiness event, so one busy socket cannot hold the loop
-#define WT_HS_EXPIRY_MS 10000 // a handshake not complete by then is dropped
-#define WT_HS_PER_ADDR  16    // handshakes in progress per source address, validated and not counted apart
-#define WT_TOKEN_AGE_MS 30000 // how long a Retry token is good for
-#define WT_REFUSE_MS    2000  // a refused CONNECT's answer gets this long to be delivered before the close
-#define WT_CLOSE_MS     3000  // after the server's close capsule, this long for the client's answer, then QUIC goes
-#define WT_KEEPALIVE_MS 20000 // a PING after this long without sending: divide's conntrack keeps a flow 30 s
+#define WT_RX_SLOT       4096  // receive room per datagram; a longer one is dropped (QUIC's are 1200 to 1500)
+#define WT_RX_GRO_SLOTS  16    // receive slots with GRO, HW_SYS_GRO_SLOT each: a slot is up to 45 datagrams
+#define WT_RX_ROUNDS     8     // receive batches per readiness event, so one busy socket cannot hold the loop
+#define WT_HS_EXPIRY_MS  10000 // a handshake not complete by then is dropped
+#define WT_HS_PER_ADDR   16    // handshakes in progress per source address, validated and not counted apart
+#define WT_TOKEN_AGE_MS  30000 // how long a Retry token is good for
+#define WT_REFUSE_MS     2000  // a refused CONNECT's answer gets this long to be delivered before the close
+#define WT_CLOSE_MS      3000  // after the server's close capsule, this long for the client's answer, then QUIC goes
+#define WT_KEEPALIVE_MS  20000 // a PING after this long without sending: divide's conntrack keeps a flow 30 s
+#define WT_STOP_FLUSH_MS 200   // at stop, how long the closes may wait for a full socket
+#define WT_STOP_GAP_MS   50    // at stop, between the session close capsules and QUIC's CONNECTION_CLOSE
+#define WT_RESET_KEY_HEX (2 * HW_QUIC_KEY_LEN) // webtransport-reset-key-file: the key in hex
 // A session's timer is due on a grid of WT_TIMER_GRID_US, so that the sessions of a worker whose
 // pacers release within that much of each other are served in one wakeup: a worker's wakeups for
 // pacing are bounded by the grid, not by its sessions. How late a timer then fires, which QUIC's
@@ -1634,6 +1638,104 @@ static int wt_worker_open(wt_worker *ww, int fd) {
 	return 0;
 }
 
+static int hex_digit(char ch) {
+	if (ch >= '0' && ch <= '9') return ch - '0';
+	if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+	return -1;
+}
+
+// The key as the file holds it: WT_RESET_KEY_HEX hex digits, then nothing but white space.
+static int reset_key_parse(const char *text, size_t len, uint8_t key[HW_QUIC_KEY_LEN]) {
+	if (len < WT_RESET_KEY_HEX) return -1;
+	for (size_t i = 0; i < HW_QUIC_KEY_LEN; i++) {
+		int hi = hex_digit(text[2 * i]), lo = hex_digit(text[2 * i + 1]);
+		if (hi < 0 || lo < 0) return -1;
+		key[i] = (uint8_t)(hi << 4 | lo);
+	}
+	for (size_t i = WT_RESET_KEY_HEX; i < len; i++) {
+		if (!isspace((unsigned char)text[i])) return -1;
+	}
+	return 0;
+}
+
+// A new key into path, owner-only from the first byte: a temporary file made here and by nobody
+// else (O_EXCL, after removing whatever stood at its name), then renamed, as the reputation store
+// is written. 0, or -1 with errno.
+static int reset_key_create(const char *path, uint8_t key[HW_QUIC_KEY_LEN]) {
+	static const char hex[] = "0123456789abcdef";
+	if (hw_sys_random(key, HW_QUIC_KEY_LEN) != 0) return -1;
+	char text[WT_RESET_KEY_HEX + 1];
+	for (size_t i = 0; i < HW_QUIC_KEY_LEN; i++) {
+		text[2 * i] = hex[key[i] >> 4];
+		text[2 * i + 1] = hex[key[i] & 15];
+	}
+	text[WT_RESET_KEY_HEX] = '\n';
+	char tmp[600];
+	snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+	unlink(tmp);
+	int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	if (fd < 0) return -1;
+	ssize_t w = write(fd, text, sizeof(text));
+	int saved = errno;
+	if (close(fd) != 0 && w == (ssize_t)sizeof(text)) w = -1;
+	if (w != (ssize_t)sizeof(text)) {
+		unlink(tmp);
+		errno = w < 0 ? saved : EIO;
+		return -1;
+	}
+	if (rename(tmp, path) != 0) {
+		saved = errno;
+		unlink(tmp);
+		errno = saved;
+		return -1;
+	}
+	return 0;
+}
+
+// webtransport-reset-key-file. A stateless reset ends a connection at its client only when it
+// carries the token the server gave for that CID, which the key makes; a key drawn at each start
+// let the next process answer an earlier one's clients with resets they ignore, and a crashed
+// server's sessions hung until their idle timeout. A missing (or empty, a creation cut short) file
+// is made; one that holds anything but a key is the operator's and is left alone. Either failure
+// is logged and leaves the random key in place: the listener still starts. The key is never logged.
+static void reset_key_load(hw_server *s, const char *path) {
+	char text[WT_RESET_KEY_HEX + 64];
+	size_t len = 0;
+	int fd = open(path, O_RDONLY);
+	if (fd >= 0) {
+		ssize_t n = 0;
+		while (len < sizeof(text) && (n = read(fd, text + len, sizeof(text) - len)) > 0) len += (size_t)n;
+		int saved = errno;
+		close(fd);
+		if (n < 0) {
+			HW_ERROR("wt", "webtransport-reset-key-file %s: %s; the key is new this start", path, strerror(saved));
+			return;
+		}
+		if (len > 0) {
+			uint8_t key[HW_QUIC_KEY_LEN];
+			if (len == sizeof(text) || reset_key_parse(text, len, key) != 0) {
+				HW_ERROR("wt", "webtransport-reset-key-file %s is not %d hex digits; the key is new this start", path,
+				         WT_RESET_KEY_HEX);
+				return;
+			}
+			memcpy(s->wt_reset_key, key, sizeof(key));
+			return;
+		}
+	} else if (errno != ENOENT) {
+		HW_ERROR("wt", "webtransport-reset-key-file %s: %s; the key is new this start", path, strerror(errno));
+		return;
+	}
+	uint8_t key[HW_QUIC_KEY_LEN];
+	if (reset_key_create(path, key) != 0) {
+		HW_ERROR("wt", "cannot make webtransport-reset-key-file %s: %s; the key is new this start", path,
+		         strerror(errno));
+		return;
+	}
+	memcpy(s->wt_reset_key, key, sizeof(key));
+	HW_INFO("wt", "made a stateless-reset key in %s", path);
+}
+
 int wt_listener_init(hw_server *s) {
 	const hw_server_config *cfg = &s->cfg;
 	if (!cfg->webtransport) return 0;
@@ -1642,6 +1744,7 @@ int wt_listener_init(hw_server *s) {
 		HW_ERROR("wt", "no random bytes for the WebTransport keys");
 		return -1;
 	}
+	if (cfg->webtransport_reset_key_file[0]) reset_key_load(s, cfg->webtransport_reset_key_file);
 	for (int i = 0; i < s->nworkers; i++) {
 		s->workers[i].wt = wt_worker_new(&s->workers[i]);
 		if (!s->workers[i].wt) return -1;
@@ -1722,6 +1825,67 @@ int wt_listener_init(hw_server *s) {
 	s->wt_port = bound;
 	HW_INFO("wt", "WebTransport on UDP %s:%u, %d socket%s", host[0] ? host : "*", bound, n, n == 1 ? "" : "s");
 	return 0;
+}
+
+// A full socket at stop: wait for room, at most until `until` (ms). 1 when there is room.
+static int stop_wait_room(wt_worker *ww, uint64_t until) {
+	while (ww->blocked) {
+		uint64_t now = hw_now_ms();
+		if (now >= until) return 0;
+		struct pollfd p = {.fd = ww->fd, .events = POLLOUT, .revents = 0};
+		if (hw_sys_poll_us(&p, 1, (int64_t)(until - now) * 1000) > 0) {
+			ww->blocked = 0;
+			tx_flush(ww);
+		}
+	}
+	return 1;
+}
+
+// A restart used to leave every session open at its client until the idle timeout (30 s on the
+// edges, for every user at once, at every deploy): nothing was sent, and the next process's
+// stateless resets carried a key the client had never been given. Each open session is closed
+// here as conn.c would close it, capsule and FIN first, so that a page sees the session end with
+// its code ("server stopping") and reconnects; then, WT_STOP_GAP_MS later, QUIC's CONNECTION_CLOSE,
+// without waiting for the client's answer (the process is going away). Chrome takes a capsule and
+// a CONNECTION_CLOSE that arrive together as "Connection lost." (measured: one in three with
+// 1 ms between them, never with 20). Handshakes and sessions not open yet get the CONNECTION_CLOSE
+// alone. Nothing is read: input would reach conn.c, whose loop has stopped.
+void wt_worker_stop(hw_worker *w) {
+	wt_worker *ww = w->wt;
+	if (!ww || ww->fd < 0) return;
+	uint64_t until = hw_now_ms() + WT_STOP_FLUSH_MS;
+	int sent = 0, capsules = 0;
+	ww->in_io = 1; // no settle timer: the loop will not run again
+	for (wt_session *s = ww->sessions; s; s = s->next) {
+		if (s->quic_closing || hw_quic_is_drained(s->q) || s->busy) continue;
+		if (!stop_wait_room(ww, until)) break;
+		s->busy++;
+		hw_wt_close(s->wt, 0, "server stopping"); // or, not open yet, QUIC's close at once
+		s->busy--;
+		session_output(s);
+		capsules++;
+	}
+	tx_flush(ww);
+	if (capsules && stop_wait_room(ww, until)) {
+		uint64_t gap_end = hw_now_us() + WT_STOP_GAP_MS * 1000;
+		for (uint64_t now; (now = hw_now_us()) < gap_end;) {
+			struct pollfd none = {.fd = -1, .events = 0, .revents = 0}; // a sleep that every platform has
+			hw_sys_poll_us(&none, 1, (int64_t)(gap_end - now));
+		}
+	}
+	for (wt_session *s = ww->sessions; s; s = s->next) {
+		if (hw_quic_is_drained(s->q) || s->busy) continue;
+		if (!stop_wait_room(ww, until)) break;
+		session_quic_close(s, HW_H3_NO_ERROR, "server stopping");
+		session_output(s);
+		sent++;
+	}
+	tx_flush(ww);
+	stop_wait_room(ww, until);
+	ww->in_io = 0;
+	if (sent) {
+		HW_INFO("wt", "worker %d: %d WebTransport session%s closed for the stop", w->index, sent, sent == 1 ? "" : "s");
+	}
 }
 
 void wt_worker_free(hw_worker *w) {

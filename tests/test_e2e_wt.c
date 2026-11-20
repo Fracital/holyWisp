@@ -31,6 +31,7 @@
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/stat.h>
 
 // ---------------------------------------------------------------------------------- services
 
@@ -1287,6 +1288,70 @@ static void test_close_unanswered(void) {
 	hw_server_free(s);
 }
 
+// webtransport-reset-key-file: a server that went away without a word (a crash; here the client
+// never reads the closes it sent) is followed by one on the same port with the same file, and the
+// new one's stateless reset ends the old session at its client at once. Without the file the key
+// is new at each start, and the client takes the reset for noise and waits for its idle timeout.
+static int reset_after_restart(const char *key_file) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.workers = 1;
+	cfg.log_level = HW_LOG_NONE;
+	if (key_file) snprintf(cfg.webtransport_reset_key_file, sizeof(cfg.webtransport_reset_key_file), "%s", key_file);
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open(&r, s, 0);
+	cfg.webtransport_port = hw_server_wt_port(s);
+	hw_server_free(s);
+	uint8_t junk[2048];
+	while (recv(r.fd, junk, sizeof(junk), MSG_DONTWAIT) > 0) {
+	}
+	s = server_with(&cfg);
+	uint8_t pkt[HW_WISP_HEADER_LEN + 64];
+	hw_wisp_write_header(pkt, HW_WISP_DATA, 1);
+	memset(pkt + HW_WISP_HEADER_LEN, 'x', 64);
+	raw_send(&r, pkt, sizeof(pkt));
+	raw_pump(&r, 1500, &r.quic_closed);
+	int reset = r.quic_closed && !strcmp(r.quic_reason, "stateless reset");
+	raw_free(&r);
+	hw_server_free(s);
+	return reset;
+}
+
+static void test_reset_key_file(void) {
+	char dir[512], path[600];
+	hw_test_tmp(dir, sizeof(dir), "hw-wt-reset");
+	CHECK(mkdtemp(dir) != NULL, "mkdtemp: %s", strerror(errno));
+	snprintf(path, sizeof(path), "%s/reset.key", dir);
+	CHECK(reset_after_restart(path), "no stateless reset from the server that came after");
+	struct stat st;
+	CHECK_EQ(stat(path, &st), 0);
+	CHECK_EQ(st.st_mode & 0777, 0600);
+	CHECK_EQ(st.st_size, 65);
+	char key[65], again[65];
+	FILE *f = fopen(path, "r");
+	CHECK(f && fread(key, 1, sizeof(key), f) == sizeof(key), "read the key");
+	fclose(f);
+	CHECK(!reset_after_restart(NULL), "a key drawn at each start still reset the earlier session");
+	// The same file on the next start: read, not made again.
+	CHECK(reset_after_restart(path), "no stateless reset with the file already there");
+	f = fopen(path, "r");
+	CHECK(f && fread(again, 1, sizeof(again), f) == sizeof(again), "read the key");
+	fclose(f);
+	CHECK(memcmp(key, again, sizeof(key)) == 0, "the key was made again");
+	// A file that holds anything else is the operator's: left alone, and the server still starts.
+	f = fopen(path, "w");
+	CHECK(f != NULL, "rewrite");
+	fputs("not a key\n", f);
+	fclose(f);
+	CHECK(!reset_after_restart(path), "a key out of a file that holds none");
+	f = fopen(path, "r");
+	CHECK(f && fread(again, 1, 10, f) == 10 && !memcmp(again, "not a key\n", 10), "the file was replaced");
+	fclose(f);
+	unlink(path);
+	rmdir(dir);
+}
+
 // The 6-day renewal, made to happen now: a session pinned to the old certificate goes on across the
 // rotation, a new one pinned to the new certificate connects (one pinned to the old one alone no
 // longer does: new handshakes take the new certificate, which is why the page is given both),
@@ -1317,6 +1382,39 @@ static void echo_check(hw_client *c, uint32_t sid, const char *msg) {
 	uint8_t buf[64];
 	CHECK_EQ(hw_client_read_exact(c, sid, buf, n, 5000), (int)n);
 	CHECK(memcmp(buf, msg, n) == 0, "echo of %s", msg);
+}
+
+// A stop closes every session toward its client before the process goes: the session's capsule,
+// then QUIC's CONNECTION_CLOSE. Before, nothing was sent, and every client of a restarted server
+// sat out its idle timeout (30 s on the edges) before it reconnected.
+static void test_stop_closes_sessions(void) {
+	hw_server_config cfg;
+	base_config(&cfg);
+	cfg.log_level = HW_LOG_NONE;
+	hw_server *s = server_with(&cfg);
+	raw_wt r;
+	raw_open(&r, s, 0);
+	hw_client *c = wt_connect(s, NULL);
+	uint32_t sid;
+	CHECK_EQ(hw_client_open(c, HW_STREAM_TCP, "127.0.0.1", g_tcp_echo_port, &sid), 0);
+	echo_check(c, sid, "before the stop");
+	uint64_t t0 = hw_now_ms();
+	hw_server_free(s);
+	CHECK(hw_now_ms() - t0 < 2000, "the stop took %llu ms", (unsigned long long)(hw_now_ms() - t0));
+	t0 = hw_now_ms();
+	raw_pump(&r, 3000, &r.quic_closed);
+	CHECK(r.quic_closed, "no CONNECTION_CLOSE in 3 s");
+	CHECK(r.heard_close, "no close capsule before it");
+	CHECK_EQ(r.close_code, 0);
+	CHECK_STR(r.quic_reason, "server stopping");
+	hw_client_event ev;
+	int got;
+	while ((got = hw_client_poll(c, 3000, &ev)) > 0) {
+	}
+	CHECK_EQ(got, HW_ERR_CLOSED);
+	CHECK(hw_now_ms() - t0 < 3000, "the clients heard of it after %llu ms", (unsigned long long)(hw_now_ms() - t0));
+	hw_client_free(c);
+	raw_free(&r);
 }
 
 static void test_cert_rotation(void) {
@@ -1725,6 +1823,8 @@ int main(void) {
 	RUN(test_wisp_stream_end);
 	RUN(test_client_close_then_silent);
 	RUN(test_close_unanswered);
+	RUN(test_stop_closes_sessions);
+	RUN(test_reset_key_file);
 	RUN(test_cert_rotation);
 	RUN(test_operator_reload);
 	RUN(test_server_stream_opening);

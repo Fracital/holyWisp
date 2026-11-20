@@ -180,6 +180,7 @@ webtransport-url =                  # https:// URL /webtransport.json names; emp
 webtransport-cert =                 # PEM chain (ECDSA P-256) instead of the self-signed certificate
 webtransport-key =                  # its PEM key; both or neither
 webtransport-cert-dir =             # <host>.pem files (chain + P-256 key) picked by SNI; others get the above
+webtransport-reset-key-file =       # stateless-reset key kept across restarts, made 0600 when missing; empty = new each start
 # webtransport-path = /relay/key    # admit sessions only on this path and under it; "host /" for / on host
 webtransport-idle-timeout-s = 30
 webtransport-max-handshakes = 1024  # QUIC handshakes in progress per worker

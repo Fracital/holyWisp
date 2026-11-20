@@ -747,7 +747,14 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
   `hw_close_reason_str` as its reason. After the client's close, QUIC's CONNECTION_CLOSE (reason
   empty) waits likewise for the FIN on the CONNECT stream, or Chrome logs the session as failed.
   `test_wisp_stream_end`, `test_close_unanswered`, `test_client_close_then_silent`,
-  `test_client_close_answered` and `test_server_stream_info_first` hold it.
+  `test_client_close_answered` and `test_server_stream_info_first` hold it. A stop ends every
+  session too (`wt_worker_stop`, on the worker after its loop stopped, never from
+  `hw_server_stop`, which must stay safe in a signal handler): capsule and FIN, then
+  CONNECTION_CLOSE `WT_STOP_GAP_MS` later (Chrome reads the two arriving together as "Connection
+  lost."), sent before the thread exits (`test_stop_closes_sessions`). A process that
+  died is answered for by the next one's stateless resets, which a client believes only with the
+  key the old one had: `webtransport-reset-key-file` (0600, one per server, never logged or
+  shared) keeps it (`test_reset_key_file`).
 
 ## Verification before you hand work off
 
