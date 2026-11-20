@@ -43,8 +43,11 @@
 // ---------------------------------------------------------------------------------- start-up
 
 // Winsock has to be started before its first call. Every program that uses a socket links this
-// file, so this runs before main in all of them.
+// file, so this runs before main in all of them. Files open in binary mode, as POSIX has no other:
+// in the runtime's text mode a write of "\n" put "\r\n" in the file (the reset key file was 66
+// bytes, not 65), and a read took the CR away. The readers here all take a CRLF line end as well.
 __attribute__((constructor)) static void w32_start(void) {
+	_set_fmode(_O_BINARY);
 	WSADATA data;
 	if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
 		fputs("holywisp: WSAStartup failed\n", stderr);
