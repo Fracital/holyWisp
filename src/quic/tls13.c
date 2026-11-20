@@ -1178,8 +1178,9 @@ hw_tls *hw_tls_new(const hw_tls_config *cfg, const hw_tls_callbacks *cb) {
 			t->has_pin = 1;
 		}
 		if (cfg->key_pin_count > HW_TLS_KEY_PINS_MAX || (cfg->key_pin_count && !cfg->key_pins_sha256)) goto fail;
-		for (size_t i = 0; i < cfg->key_pin_count; i++)
+		for (size_t i = 0; i < cfg->key_pin_count; i++) {
 			memcpy(t->key_pins[i], cfg->key_pins_sha256 + i * TLS_HASH, TLS_HASH);
+		}
 		t->key_pin_count = cfg->key_pin_count;
 	}
 	return t;

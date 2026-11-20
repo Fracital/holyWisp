@@ -980,7 +980,10 @@ static int data_send(hw_client *c, cstream *s, const void *data, size_t len, int
 		                                nonblock ? 0 : timer_start(c->timeout_ms).deadline);
 		if (r == HW_ERR_CLOSED) c->closed = 1;
 		// The wait may have received, and a CLOSE among it forgets the stream: look it up again.
-		if (r == 0 && counted && (s = stream_find(c, id)) && s->remaining) s->remaining--;
+		if (r == 0 && counted) {
+			s = stream_find(c, id);
+			if (s && s->remaining) s->remaining--;
+		}
 		if (r == HW_ERR_TIMEOUT && nonblock) r = HW_ERR_AGAIN;
 		return r;
 	}

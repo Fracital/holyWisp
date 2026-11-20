@@ -561,7 +561,7 @@ static int download_before_continue(int v2, size_t *before_out) {
 	CHECK_EQ(hw_client_send(c, down, "g", 1), 0); // goes once the relay's socket is connected and sized
 	// Until the download stops moving: the client reads nothing, so what is not in the kernels is
 	// queued.
-	hw_server_stats st;
+	hw_server_stats st = {0};
 	uint64_t last = 0, still = hw_now_ms(), deadline = still + 10000;
 	while (last < BIG_BYTES && hw_now_ms() - still < 1000 && hw_now_ms() < deadline) {
 		usleep(20 * 1000);

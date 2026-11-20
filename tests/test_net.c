@@ -244,7 +244,9 @@ static int black_hole(struct sockaddr_in *addr, int fill[HOLE_FILL]) {
 	for (int i = 0; i < HOLE_FILL; i++) {
 		fill[i] = hw_socket_nb(AF_INET, SOCK_STREAM, 0);
 		CHECK(fill[i] >= 0, "socket");
-		(void)connect(fill[i], (struct sockaddr *)addr, sizeof(*addr));
+		// Non-blocking: in progress, done, or refused by a system that refuses past the queue.
+		int rc = connect(fill[i], (struct sockaddr *)addr, sizeof(*addr));
+		CHECK(rc == 0 || errno == EINPROGRESS || errno == ECONNREFUSED || errno == EWOULDBLOCK, "connect");
 	}
 	struct pollfd none;
 	poll(&none, 0, 50); // the handshakes that will complete have completed

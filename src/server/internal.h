@@ -370,8 +370,8 @@ typedef struct hw_conn {
 	hw_buf pri;
 	uint64_t fr_end;
 	int pri_mid;
-	size_t pipe_bytes; // sum of the marks' n: what backpressure counts besides wbuf
 	int pipes_held;    // streams of this connection that hold a relay pipe (conn_sweep looks at those)
+	size_t pipe_bytes; // sum of the marks' n: what backpressure counts besides wbuf
 	hw_buf frag;       // reassembly of a fragmented binary message
 	int frag_active;
 	hw_map streams;  // stream_id -> hw_stream
@@ -405,7 +405,6 @@ typedef struct hw_conn {
 	uint32_t pt_stream;
 	uint8_t pt_mask[4];
 	size_t pt_off;
-	int read_paused; // client reads suspended: queued_out past conn-queue-max
 	// server-queue-max: what this connection holds of the budget (whole BUDGET_CHUNKs), what was
 	// queued toward the client at the last look (conn_backpressure), and whether a take was
 	// refused, which stops the client's reads and the remotes' until it can take again.
@@ -414,6 +413,7 @@ typedef struct hw_conn {
 	int budget_paused;
 	int wr_stalled;     // client reads suspended: its own send queue is far past the high-water mark
 	int wrote;          // bytes left for the client since the worker's last sweep
+	int read_paused;    // client reads suspended: queued_out past conn-queue-max
 	uint64_t stall_ms;  // when a sweep first found the send queue not moving, 0 while it moves
 	uint64_t active_ms; // last frame from the client, for idle-timeout-s
 	int closing;

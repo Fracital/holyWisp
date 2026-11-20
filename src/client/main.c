@@ -163,23 +163,27 @@ static int read_pass_file(const char *path, char *out) {
 		fprintf(stderr, "--pass-file %s: %s\n", path, strerror(errno));
 		return -1;
 	}
-	size_t n = fread(out, 1, PASS_READ, f);
+	char buf[PASS_READ];
+	size_t n = fread(buf, 1, sizeof buf, f);
 	fclose(f);
-	out[n] = '\0';
-	size_t line = strcspn(out, "\r\n");
-	if (line == n && n == PASS_READ) {
+	// The line ends at the first CR or LF, not at a NUL (strcspn's end), so that a NUL inside
+	// it is refused instead of cutting the password short.
+	size_t line = 0;
+	while (line < n && line < sizeof buf && buf[line] != '\r' && buf[line] != '\n') line++;
+	if (line == sizeof buf) {
 		fprintf(stderr, "--pass-file %s: the first line is over 127 bytes\n", path);
 		return -1;
 	}
-	if (memchr(out, '\0', line)) {
+	if (memchr(buf, '\0', line)) {
 		fprintf(stderr, "--pass-file %s: the password holds a NUL byte\n", path);
 		return -1;
 	}
-	out[line] = '\0';
 	if (line == 0) {
 		fprintf(stderr, "--pass-file %s: the first line is empty\n", path);
 		return -1;
 	}
+	memcpy(out, buf, line);
+	out[line] = '\0';
 	return 0;
 }
 
