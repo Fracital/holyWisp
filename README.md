@@ -356,7 +356,7 @@ divide), in MiB/s through the echo port, with the best server in each row in bol
 | native client, 10 streams, 1 MiB packets | 3,005 | **3,537** | 2,985 | 2,545 | 1,127 | did not finish |
 | native client, 8 connections x 4 streams | 4,466 | **4,705** | 3,700 | 2,002 | 3,073 | 2,024 |
 | 64 B round trip, p50 / p99 | **24.5 / 35 us** | 26 / 38 us | 27 / 38.5 us | 33 / 50 us | 26 / 38.5 us | 42 / 65 us |
-| stream churn, lifecycles/s (server cores) | **114,439** (4.5) | 111,342 (4.2) | 95,897 (4.3) | 63,738 (5.2) | 70,918 (4.6) | 36,816 (4.9) |
+| stream churn, lifecycles/ s (server cores) | **114,439** (4.5) | 111,342 (4.2) | 95,897 (4.3) | 63,738 (5.2) | 70,918 (4.6) | 36,816 (4.9) |
 | peak RSS under stream churn | 3.7 MiB | **3.5 MiB** | 22 MiB | 494 MiB | 2,502 MiB | 298 MiB |
 
 holyWisp, finalwisp and the C++23 wispurr are the three fastest servers here, and each leads
@@ -420,3 +420,9 @@ bench/              the comparison harness, its results and charts (make bench)
 
 `STYLE.md` has the coding rules, `AGENTS.md` the rules for anyone (human or agent) changing the
 repository, and `LICENSE` the MIT terms.
+
+## Credits
+
+| | GitHub | Name |
+| --- | --- | --- |
+| <img src="docs/assets/am%20i%20cool%20yet.png" width="64" alt="e9x's avatar"> | [@e9x](https://github.com/e9x) | David Reed |
