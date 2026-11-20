@@ -137,6 +137,22 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "conn-queue-max must be at least stream-queue-max");
 		return -1;
 	}
+	// The config file refuses these already; a config filled in by hand is held to the same. Each
+	// one is used, or the server does not start: one left out would send the lookups elsewhere.
+	_Static_assert(HW_MAX_DNS_SERVERS <= HW_DNS_MAX_SERVERS, "the resolver must hold every dns-server");
+	if (cfg->dns_server_count < 0 || cfg->dns_server_count > HW_MAX_DNS_SERVERS) {
+		snprintf(err, err_cap, "at most %d dns-server entries", HW_MAX_DNS_SERVERS);
+		return -1;
+	}
+	for (int i = 0; i < cfg->dns_server_count; i++) {
+		struct sockaddr_storage ss;
+		socklen_t sl;
+		if (!memchr(cfg->dns_servers[i], '\0', sizeof(cfg->dns_servers[i])) ||
+		    hw_addr_parse_endpoint(cfg->dns_servers[i], 53, &ss, &sl) != 0) {
+			snprintf(err, err_cap, "dns-server %d is not an IP address with an optional port", i + 1);
+			return -1;
+		}
+	}
 	if (cfg->password_required && cfg->password_user_count == 0) {
 		snprintf(err, err_cap, "password-required needs at least one password-user");
 		return -1;
@@ -1114,32 +1130,13 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 	rc.max_pending_per_key = cfg->max_pending_lookups_per_ip;
 	rc.order = cfg->dns_order;
 	rc.cache = s->dns_cache;
-	for (int i = 0; i < cfg->dns_server_count && rc.nservers < HW_DNS_MAX_SERVERS; i++) {
-		char buf[64];
-		uint16_t port = 53;
-		snprintf(buf, sizeof(buf), "%s", cfg->dns_servers[i]);
-		char *host = buf;
-		char *colon = NULL;
-		// "[v6]:port", "v4:port", or a bare address keeping port 53.
-		if (buf[0] == '[') {
-			char *close = strchr(buf, ']');
-			if (close) {
-				*close = '\0';
-				host = buf + 1;
-				colon = close[1] == ':' ? close + 1 : NULL;
-			}
-		} else {
-			colon = strrchr(buf, ':');
-			if (colon) *colon = '\0';
+	// Every entry parses and there are no more than the resolver holds: validation saw to it.
+	for (int i = 0; i < cfg->dns_server_count; i++) {
+		if (hw_addr_parse_endpoint(cfg->dns_servers[i], 53, &rc.servers[i], &rc.server_lens[i]) != 0) {
+			errno = EINVAL;
+			goto fail;
 		}
-		if (colon) port = (uint16_t)strtol(colon + 1, NULL, 10);
-		socklen_t sl;
-		if (hw_addr_parse(host, port, &rc.servers[rc.nservers], &sl) == 1) {
-			rc.server_lens[rc.nservers] = sl;
-			rc.nservers++;
-		} else {
-			HW_WARN("dns", "ignoring malformed dns-server '%s'", cfg->dns_servers[i]);
-		}
+		rc.nservers++;
 	}
 	s->resolver = hw_resolver_new(&rc);
 	if (!s->resolver) goto fail;

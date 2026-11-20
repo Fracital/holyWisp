@@ -130,6 +130,8 @@ reputation-strict = 81
 # every client to another exit.
 # proxy-client-key = off
 # proxy-client-key-secret = <16 or more characters>
+# The built-in resolver asks these instead of the system resolver: an IP address, IPv6 in
+# brackets, with an optional :port (53). Anything else keeps the server from starting.
 # dns-server = 1.1.1.1
 # dns-server = [2606:4700:4700::1111]:53
 dns-ttl-s = 120

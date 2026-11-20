@@ -407,6 +407,47 @@ static void test_config_check(void) {
 	CHECK(strstr(err, "webtransport-cert-dir") != NULL, "the error names it: %s", err);
 }
 
+// A dns-server that is not an address is an error where it is written, and a config filled in by
+// hand with one is refused by validation, so by a start and --check-config alike: skipped, it
+// would put the lookups on the system resolver (the name gate's 127.0.0.1:1083 on the edges).
+static void test_dns_server_key(void) {
+	hw_server_config *cfg = malloc(sizeof(*cfg)); // a config is 260 KiB: not on Windows' stack
+	CHECK(cfg != NULL, "malloc");
+	hw_server_config_defaults(cfg);
+	char err[512];
+	CHECK_EQ(hw_config_set(cfg, "dns-server", "127.0.0.1:1083", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(cfg, "dns-server", "[2606:4700:4700::1111]:53", err, sizeof(err)), 0);
+	CHECK_EQ(hw_config_set(cfg, "dns-server", "1.1.1.1", err, sizeof(err)), 0);
+	CHECK_EQ(cfg->dns_server_count, 3);
+	CHECK(hw_server_config_check(cfg, err, sizeof(err)) == 0, "good servers: %s", err);
+	const char *bad[] = {"127.0.0.1:abc", "2606:4700:4700::1111", "dns.example", "1.1.1.1:0", ""};
+	for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+		CHECK(hw_config_set(cfg, "dns-server", bad[i], err, sizeof(err)) != 0, "accepted '%s'", bad[i]);
+		CHECK(strstr(err, "dns-server") != NULL, "the error names the key: %s", err);
+	}
+	CHECK_EQ(cfg->dns_server_count, 3);
+	// A file names the line.
+	char path[512];
+	hw_test_tmp(path, sizeof(path), "hw-cfg");
+	int fd = mkstemp(path);
+	CHECK(fd >= 0, "tmp");
+	close(fd);
+	write_file(path, "dns-server = 1.1.1.1\ndns-server = 1.1.1.1:5x\n");
+	CHECK(hw_config_load_file(cfg, path, err, sizeof(err)) != 0, "a file with a bad dns-server");
+	CHECK(strstr(err, ":2: dns-server") != NULL, "%s", err);
+	unlink(path);
+	// Filled in by hand: validation, so hw_server_new and the check, refuse it.
+	snprintf(cfg->dns_servers[1], sizeof(cfg->dns_servers[1]), "%s", "127.0.0.1:abc");
+	CHECK(hw_server_config_validate(cfg, err, sizeof(err)) != 0, "a bad server set by hand");
+	CHECK(strstr(err, "dns-server 2") != NULL, "%s", err);
+	CHECK(hw_server_config_check(cfg, err, sizeof(err)) != 0, "the check took it");
+	CHECK(hw_server_new(cfg) == NULL, "a server started with it");
+	snprintf(cfg->dns_servers[1], sizeof(cfg->dns_servers[1]), "%s", "1.0.0.1");
+	cfg->dns_server_count = HW_MAX_DNS_SERVERS + 1;
+	CHECK(hw_server_config_validate(cfg, err, sizeof(err)) != 0, "more servers than there is room for");
+	free(cfg);
+}
+
 // --check-config reads policy-file as a start does: a file a start would refuse is refused, with
 // the line it fails at, and one it would take passes.
 static void test_config_check_policy_file(void) {
@@ -463,6 +504,7 @@ int main(void) {
 	RUN(test_webtransport_keys);
 	RUN(test_config_check);
 	RUN(test_config_check_policy_file);
+	RUN(test_dns_server_key);
 	RUN(test_policy_file_keys);
 	RUN(test_shipped_configs);
 	return 0;

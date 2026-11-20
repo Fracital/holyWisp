@@ -308,6 +308,45 @@ int hw_addr_parse(const char *host, uint16_t port, struct sockaddr_storage *out,
 	return 0;
 }
 
+int hw_addr_parse_endpoint(const char *spec, uint16_t default_port, struct sockaddr_storage *out, socklen_t *out_len) {
+	char host[INET6_ADDRSTRLEN + 2];
+	const char *port_s = NULL;
+	size_t hl;
+	int bracketed = spec[0] == '[';
+	if (bracketed) {
+		const char *close = strchr(spec, ']');
+		if (!close) return -1;
+		hl = (size_t)(close - spec) + 1; // the brackets go to hw_addr_parse with the address
+		if (close[1] == ':') {
+			port_s = close + 2;
+		} else if (close[1]) {
+			return -1;
+		}
+	} else {
+		const char *colon = strchr(spec, ':');
+		if (colon && strchr(colon + 1, ':')) return -1; // IPv6 without brackets
+		hl = colon ? (size_t)(colon - spec) : strlen(spec);
+		if (colon) port_s = colon + 1;
+	}
+	if (hl == 0 || hl >= sizeof(host)) return -1;
+	memcpy(host, spec, hl);
+	host[hl] = '\0';
+	uint16_t port = default_port;
+	if (port_s) {
+		unsigned long p = 0;
+		size_t digits = 0;
+		for (const char *c = port_s; *c; c++, digits++) {
+			if (*c < '0' || *c > '9' || digits >= 5) return -1;
+			p = p * 10 + (unsigned long)(*c - '0');
+		}
+		if (digits == 0 || p == 0 || p > 65535) return -1;
+		port = (uint16_t)p;
+	}
+	if (hw_addr_parse(host, port, out, out_len) != 1) return -1;
+	if (bracketed != (out->ss_family == AF_INET6)) return -1;
+	return 0;
+}
+
 uint16_t hw_addr_port(const struct sockaddr *sa) {
 	if (sa->sa_family == AF_INET) return ntohs(((const struct sockaddr_in *)sa)->sin_port);
 	if (sa->sa_family == AF_INET6) return ntohs(((const struct sockaddr_in6 *)sa)->sin6_port);

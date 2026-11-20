@@ -41,6 +41,54 @@ static void test_parse_literals(void) {
 	CHECK_STR(hw_addr_str((struct sockaddr *)&ss, buf, sizeof(buf)), "[::1]:8080");
 }
 
+// An address with an optional port, as dns-server is written: only what means one thing.
+static void test_parse_endpoint(void) {
+	struct sockaddr_storage ss;
+	socklen_t sl;
+	char buf[HW_ADDR_STR_LEN];
+	const struct {
+		const char *spec;
+		const char *is;
+	} good[] = {
+	    {"1.1.1.1", "1.1.1.1:53"},
+	    {"127.0.0.1:1083", "127.0.0.1:1083"},
+	    {"[2606:4700:4700::1111]", "[2606:4700:4700::1111]:53"},
+	    {"[::1]:5353", "[::1]:5353"},
+	    {"10.0.0.1:65535", "10.0.0.1:65535"},
+	};
+	for (size_t i = 0; i < HW_ARRAY_LEN(good); i++) {
+		CHECK(hw_addr_parse_endpoint(good[i].spec, 53, &ss, &sl) == 0, "refused %s", good[i].spec);
+		CHECK_STR(hw_addr_str((struct sockaddr *)&ss, buf, sizeof(buf)), good[i].is);
+		CHECK_EQ((size_t)sl, ss.ss_family == AF_INET ? sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6));
+	}
+	static const char *const bad[] = {
+	    "",
+	    "dns.example",     // a name
+	    "dns.example:53",  // a name
+	    "::1",             // IPv6 without brackets: was read as [::]:1
+	    "2606:4700::1111", // and this one as nothing at all
+	    "::1:53",
+	    "[::1",
+	    "[::1]53",
+	    "[::1]:",
+	    "[1.1.1.1]",   // brackets are for IPv6
+	    "1.1.1.1:",    // a colon and no port
+	    "1.1.1.1:0",   // no port 0
+	    "1.1.1.1:abc", // was port 0 to strtol
+	    "1.1.1.1:53x",
+	    "1.1.1.1:+53",
+	    "1.1.1.1:65536", // was port 0 after the cast
+	    "1.1.1.1:000053",
+	    "1.1.1.1 ",
+	    "0x7f.1", // a number a resolver would read as an address
+	    "1.2.3",
+	    "[fe80::1%eth0]",
+	};
+	for (size_t i = 0; i < HW_ARRAY_LEN(bad); i++) {
+		CHECK(hw_addr_parse_endpoint(bad[i], 53, &ss, &sl) == -1, "accepted '%s'", bad[i]);
+	}
+}
+
 // What a resolver would turn into an address by itself (inet_aton: one to four parts, decimal,
 // octal or hexadecimal) is never handed to one as a name. Each of these reached getaddrinfo as a
 // "hostname" and came back as the address in the comment, past allow-direct-ip = off.
@@ -335,6 +383,7 @@ static void test_connect_moves_past_a_silent_address(void) {
 
 int main(void) {
 	RUN(test_parse_literals);
+	RUN(test_parse_endpoint);
 	RUN(test_parse_numeric_names);
 	RUN(test_classify_v4);
 	RUN(test_classify_v6);

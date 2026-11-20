@@ -7,6 +7,7 @@
 #include "holywisp/hw.h"
 #include "holywisp/limits.h"
 #include "holywisp/log.h"
+#include "holywisp/net.h"
 #include "holywisp/quic.h"
 
 #include <ctype.h>
@@ -344,6 +345,17 @@ int hw_config_set(hw_server_config *cfg, const char *key, const char *value, cha
 			snprintf(err, err_cap, "too many dns-server entries");
 			return -1;
 		}
+		// Refused here, not skipped at start: a server left out would put the lookups on the
+		// system resolver, or on the other servers alone, which is not what was asked for.
+		struct sockaddr_storage ss;
+		socklen_t sl;
+		if (hw_addr_parse_endpoint(value, 53, &ss, &sl) != 0) {
+			snprintf(err, err_cap,
+			         "dns-server: '%s' is not an IP address with an optional port (1.1.1.1, 1.1.1.1:53, "
+			         "[2606:4700:4700::1111]:53)",
+			         value);
+			return -1;
+		}
 		if (set_str(cfg->dns_servers[cfg->dns_server_count], 64, value) != 0) goto bad_value;
 		cfg->dns_server_count++;
 		return 0;
@@ -565,7 +577,9 @@ void hw_config_usage(const char *argv0) {
 	    "  tcp-warp BOOL                             mark TCP dialled here (not proxied) from the same state (off)\n"
 	    "  tcp-warp-fallback direct|refuse           TCP with no tunnel, no usable state or no mark (refuse)\n"
 	    "  warp-bypass-host NAME                     never through WARP: unmarked ('*.name' = its subdomains)\n"
-	    "  dns-server, dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
+	    "  dns-server IP[:PORT]                      ask this server, not the system resolver; IPv6 in\n"
+	    "                                            brackets, port 53 unless given (repeatable)\n"
+	    "  dns-ttl-s, dns-negative-ttl-s, dns-order, dns-timeout-ms\n"
 	    "  max-pending-lookups-per-ip                lookups one client IP may have in the resolver at once;\n"
 	    "                                            one more closes 0x49, a violation (128; 0 = no limit)\n");
 	printf("  buffer-remaining                          CONTINUE window in packets (128)\n"

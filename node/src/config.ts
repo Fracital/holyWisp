@@ -191,6 +191,11 @@ export type holyWispConfig = {
 	proxy?: string;
 	/** With a proxy: relay UDP around it (`direct`) or refuse it (`refuse`, the default). */
 	proxyUDP?: "direct" | "refuse";
+	/**
+	 * Servers for the built-in resolver instead of the system's: `1.1.1.1`, `1.1.1.1:53` or
+	 * `[2606:4700:4700::1111]:53`. Anything else (a name, IPv6 without brackets) keeps the server
+	 * from starting.
+	 */
 	dnsServers?: string[];
 	dnsResultOrder?: "ipv4first" | "ipv6first" | "verbatim";
 	dnsTtlSeconds?: number;

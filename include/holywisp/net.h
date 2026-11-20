@@ -42,6 +42,12 @@ int hw_connect_tcp_list(const struct addrinfo *list, int timeout_ms);
 // only the canonical dotted quad is ever an IPv4 literal and nothing else numeric gets past. A
 // host with a space or a control byte in it is malformed too.
 int hw_addr_parse(const char *host, uint16_t port, struct sockaddr_storage *out, socklen_t *out_len);
+// A literal address with an optional port, as an operator writes a server to use: "1.2.3.4",
+// "1.2.3.4:53", "[2001:db8::1]" or "[2001:db8::1]:53", with default_port where none is given. 0
+// with *out set, or -1 for anything else: a name, an IPv6 address without its brackets (in
+// "::1:53" the port would be part of the address), a port that is not 1 to 65535 in decimal
+// digits, an IPv4 address in brackets, or a literal hw_addr_parse calls malformed.
+int hw_addr_parse_endpoint(const char *spec, uint16_t default_port, struct sockaddr_storage *out, socklen_t *out_len);
 // "ip:port" / "[v6]:port" into buf. Returns buf.
 const char *hw_addr_str(const struct sockaddr *sa, char *buf, size_t cap);
 uint16_t hw_addr_port(const struct sockaddr *sa);
