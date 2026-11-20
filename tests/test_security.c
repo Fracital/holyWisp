@@ -421,12 +421,14 @@ static int echo_once(hw_client *c, uint32_t sid, const char *msg) {
 // accept queue filled from here. On Linux every further SYN to it is dropped, so a connect hangs
 // until the dialler gives up; other kernels refuse it. Either is a failed dial, and only the first
 // goes through the server's connect timeout. Returns 0 when this kernel never fills the queue. The
-// descriptors in `fds` (-1 when unused) stay open for as long as the port is wanted.
+// descriptors in `fds` (-1 when unused) stay open for as long as the port is wanted. The backlog
+// is 1, a queue of two on Linux and macOS, and not 0: macOS takes 0 for its maximum (somaxconn,
+// 128), which the 65 connections here never filled, and the case was skipped without a word.
 #define BLACKHOLE_FDS 66
 static uint16_t start_blackhole(int fds[BLACKHOLE_FDS]) {
 	for (int i = 0; i < BLACKHOLE_FDS; i++) fds[i] = -1;
 	uint16_t port = 0;
-	fds[0] = hw_listen_tcp("127.0.0.1", 0, 0, 0, &port);
+	fds[0] = hw_listen_tcp("127.0.0.1", 0, 0, 1, &port);
 	CHECK(fds[0] >= 0, "listen");
 	struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
 	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -643,6 +645,7 @@ static void test_syn_signature_on_connect_timeout(void) {
 	int hole[BLACKHOLE_FDS];
 	uint16_t port = start_blackhole(hole);
 	if (port == 0) {
+		printf("skip test_syn_signature_on_connect_timeout: this kernel never filled the black hole's queue\n");
 		stop_blackhole(hole);
 		return;
 	}
@@ -745,8 +748,9 @@ static void test_password_crypt(void) {
 	hw_server_config cfg;
 	base_config(&cfg);
 	cfg.password_required = 1;
-	if (!hw_sys_has_crypt()) {
-		// A hash that nothing can check is refused when the server is made, not left to never match.
+	if (!hw_sys_has_crypt("$6$holywispsalt$")) {
+		// A hash that nothing here can check is refused when the server is made, not left to never
+		// match.
 		CHECK_EQ(hw_server_config_add_user(&cfg, "alice", "$6$holywispsalt$not-a-real-hash"), 0);
 		CHECK(hw_server_new(&cfg) == NULL, "a hashed password was accepted without crypt(3)");
 		return;

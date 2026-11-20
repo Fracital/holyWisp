@@ -1290,6 +1290,59 @@ static void test_relay_pipes_given_back(void) {
 	hw_server_free(s);
 }
 
+// The server's end of the connection whose client end is `client`: the server runs in this
+// process, so it is among this process's descriptors (from 3 on POSIX, from 8192 in the Windows
+// layer's table). -1 when none is.
+static int server_end_of(int client) {
+	struct sockaddr_storage me, peer;
+	memset(&me, 0, sizeof(me));
+	socklen_t ml = sizeof(me);
+	CHECK_EQ(getsockname(client, (struct sockaddr *)&me, &ml), 0);
+	for (int fd = 3; fd < 32768; fd++) {
+		memset(&peer, 0, sizeof(peer));
+		socklen_t pl = sizeof(peer);
+		if (fd == client || getpeername(fd, (struct sockaddr *)&peer, &pl) != 0) continue;
+		if (pl == ml && memcmp(&peer, &me, ml) == 0) return fd;
+	}
+	return -1;
+}
+
+// client-recv-buffer is applied to an accepted client socket whenever the kernel grants it 4 MiB
+// or more, asked of the kernel itself: the server used to read net.core.rmem_max from /proc/sys,
+// which the unit's ProcSubset=pid hides, and then applied nothing and said nothing.
+static void test_client_recv_buffer(void) {
+	int want = 8 * 1024 * 1024;
+	int probe = hw_sys_socket(AF_INET, SOCK_STREAM, 0, 0);
+	CHECK(probe >= 0, "socket");
+	int granted = 0;
+	socklen_t gl = sizeof(granted);
+	CHECK_EQ(setsockopt(probe, SOL_SOCKET, SO_RCVBUF, &want, sizeof(want)), 0);
+	CHECK_EQ(getsockopt(probe, SOL_SOCKET, SO_RCVBUF, &granted, &gl), 0);
+	close(probe);
+	if (granted < 4 * 1024 * 1024) {
+		printf("skip test_client_recv_buffer: the kernel grants %d bytes for 8 MiB, under the floor\n", granted);
+		return;
+	}
+	hw_server_config cfg;
+	hw_server_config_defaults(&cfg);
+	strcpy(cfg.host, "127.0.0.1");
+	cfg.port = 0;
+	cfg.workers = 1;
+	cfg.client_recv_buffer = (size_t)want;
+	cfg.log_level = HW_LOG_WARN;
+	hw_server *s = hw_server_new(&cfg);
+	CHECK(s != NULL && hw_server_start(s) == 0, "server: %s", strerror(errno));
+	hw_client *c = connect_to(s, 0, NULL, NULL, 0);
+	int fd = server_end_of(hw_client_fd(c));
+	CHECK(fd >= 0, "the server's end of the connection");
+	int got = 0;
+	gl = sizeof(got);
+	CHECK_EQ(getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &gl), 0);
+	CHECK(got == granted, "the accepted socket's receive buffer is %d, the kernel grants %d", got, granted);
+	hw_client_free(c);
+	hw_server_free(s);
+}
+
 // credit_cases.h's way to connect over a WebSocket.
 static hw_client *credit_connect(hw_server *s, int v2, uint32_t window, int manual, size_t max_queue) {
 	hw_client_opts o;
@@ -1380,6 +1433,7 @@ int main(void) {
 	RUN(test_connection_counts);
 	RUN(test_connections_spread);
 	RUN(test_relay_pipes_given_back);
+	RUN(test_client_recv_buffer);
 
 	cfg.stream_credit = 0;
 	hw_server *off = hw_server_new(&cfg);

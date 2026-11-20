@@ -171,12 +171,17 @@ int hw_sys_set_mark(int fd, uint32_t mark);
 // has none to give, and then buf holds nothing to rely on.
 int hw_sys_random(void *buf, size_t len);
 
-// Whether there is a crypt(3) at all. Without one hw_sys_crypt always fails, so a hashed password
-// can never match and the server refuses a config that holds one.
-int hw_sys_has_crypt(void);
+// Whether hw_sys_crypt knows the method of `setting` (a stored hash, or a method and salt), so
+// that a password hashed that way can ever match. The server refuses a config holding a hash
+// this says no to, rather than leave it to never match. Windows has no crypt(3), so it is never;
+// macOS's knows the traditional DES form and none of the `$id$` ones (it would take "$6$..." for
+// DES with "$6" as the salt, which matches no hash made elsewhere); on Linux it is always, and
+// the C library judges the method when it hashes. This and hw_sys_crypt are the server's: on
+// Linux they are in libholywisp-server, with libcrypt, so that the client does not need it.
+int hw_sys_has_crypt(const char *setting);
 // crypt(3): hash `key` with the method and salt of `setting` into out. 0, or -1 when the hash
 // does not fit or the method is unknown. Thread-safe. Which methods exist is the C library's
-// business: glibc and musl know $5$ and $6$, macOS only the traditional DES form.
+// business: glibc and musl know $5$ and $6$ (libxcrypt also $y$ and $2b$), macOS only DES.
 int hw_sys_crypt(const char *key, const char *setting, char *out, size_t out_cap);
 
 // Whether hw_sys_pty_spawn can work at all here.

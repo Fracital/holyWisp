@@ -183,8 +183,11 @@ int hw_sys_udp_gro(int fd) {
 	return 0;
 }
 
-int hw_sys_has_crypt(void) {
-	return 1;
+// libSystem's crypt(3) is FreeBSD's DES one: the traditional two-character salt and BSDi's "_"
+// form. It knows no `$id$` method (SHA-crypt, yescrypt, bcrypt) and does not fail on one either:
+// "$6$salt$..." is hashed as DES with the salt "$6", 13 characters that no stored hash equals.
+int hw_sys_has_crypt(const char *setting) {
+	return setting[0] != '$';
 }
 
 int hw_sys_crypt(const char *key, const char *setting, char *out, size_t out_cap) {

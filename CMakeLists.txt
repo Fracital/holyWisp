@@ -24,10 +24,14 @@ find_package(Threads REQUIRED)
 add_library(hw_flags INTERFACE)
 target_compile_definitions(hw_flags INTERFACE _GNU_SOURCE)
 # Linux is the platform; macOS is a development port (include/holywisp/sys.h). Each has its own
-# loop backend and its own half of sys.h, chosen here and nowhere else.
+# loop backend and its own half of sys.h, chosen here and nowhere else. What of that half only
+# the server calls and needs a library for goes into the server's library alone
+# (HW_PLATFORM_SERVER_*): Linux's crypt(3) is libcrypt, which holywisp-client must not need.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set(HW_PLATFORM_SOURCES src/common/loop_epoll.c src/common/sys_linux.c)
-  set(HW_PLATFORM_LIBS crypt util) # crypt(3) for password hashes, forkpty(3) for Twisp
+  set(HW_PLATFORM_LIBS util) # forkpty(3) for Twisp (in libc itself since glibc 2.34)
+  set(HW_PLATFORM_SERVER_SOURCES src/common/sys_linux_crypt.c)
+  set(HW_PLATFORM_SERVER_LIBS crypt) # crypt(3) for password hashes
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(HW_PLATFORM_SOURCES src/common/loop_kqueue.c src/common/sys_darwin.c)
   set(HW_PLATFORM_LIBS "") # both are in libSystem
@@ -192,9 +196,10 @@ add_library(holywisp-server STATIC
   src/server/stream.c
   src/server/twisp.c
   src/server/wt_listener.c
+  ${HW_PLATFORM_SERVER_SOURCES}
   ${HW_WEBCLIENT_HDR}
 )
-target_link_libraries(holywisp-server PUBLIC holywisp hw_wt)
+target_link_libraries(holywisp-server PUBLIC holywisp hw_wt ${HW_PLATFORM_SERVER_LIBS})
 target_include_directories(holywisp-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 add_executable(holywisp-bin src/server/main.c)

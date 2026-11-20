@@ -198,7 +198,7 @@ int hw_sys_udp_gro(int fd) {
 	return 0;
 }
 
-int hw_sys_has_crypt(void) {
+int hw_sys_has_crypt(const char *setting) {
 	return 0;
 }
 

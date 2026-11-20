@@ -226,7 +226,8 @@ share one listening socket. Deploy on Linux.
 
 On Windows two options are refused by `start()`, with the server's own message: `enableTwisp`
 (there is no pseudo-terminal the server could watch) and a hashed password in `passwordUsers`
-(there is no `crypt`). The file the passwords and the proxy secret travel in is protected by your
+(there is no `crypt`); on macOS a `passwordUsers` hash of the `$id$` kind (`$5$`, `$6$`, `$y$`,
+`$2b$`) is refused the same way, since its `crypt` knows only DES. The file the passwords and the proxy secret travel in is protected by your
 temporary directory's access list rather than by a mode. Under WSL 2 the Linux binaries work as
 they are, with neither limit.
 

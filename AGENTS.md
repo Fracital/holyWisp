@@ -104,7 +104,10 @@ Reference material that shaped the design. These are sibling checkouts, read-onl
   refuses a config that asks for either). A platform is two files: a loop backend behind
   `src/common/loop_backend.h` (`loop_epoll.c`, `loop_kqueue.c`, `loop_select.c`) and a half of
   `include/holywisp/sys.h` (`sys_linux.c`, `sys_darwin.c`, `sys_win32.c`), chosen in
-  `CMakeLists.txt`. Windows alone has a third part, because it lacks the POSIX socket calls
+  `CMakeLists.txt`. Linux's crypt(3) is in `sys_linux_crypt.c`, linked into the server's library
+  alone with libcrypt, so that `holywisp-client` does not need libcrypt to start; a platform call
+  that needs a library only the server uses goes there too (`HW_PLATFORM_SERVER_*`). Windows
+  alone has a third part, because it lacks the POSIX socket calls
   themselves: `src/compat/win32/` supplies them over Winsock under their POSIX names (headers in
   `include/`, all of the code in `posix.c`), so no other file knows it is not on POSIX. The one
   platform `#if` in the tree is the pair of `send` flags in `sys.h` (the architecture `#if`s are
@@ -479,11 +482,12 @@ maintenance thread in `server.c`. Each has a unit test (`test_limits`, `test_rep
   posts the answer back (`auth_check`, `auth_done` in `conn.c`), with the resolver's ownership
   rules, a queue of 64 past which a login is turned away with `0x49`, and the same hash computed
   for a user that does not exist. An empty password is refused in the config
-  (`hw_server_config_add_user`): the password extension cannot tell it from none. Where there is
-  no crypt(3) at all
-  (`hw_sys_has_crypt`: Windows) a config holding a hashed password is refused when the server is
-  made, not left to never match. The config that holds them is never logged and is installed
-  `0640 root:wisp`.
+  (`hw_server_config_add_user`): the password extension cannot tell it from none. Where the
+  platform's crypt(3) does not know a stored hash's method (`hw_sys_has_crypt`, asked per hash:
+  every method on Windows, which has no crypt(3), and every `$id$` one on macOS, whose crypt(3)
+  would hash it as DES) a config holding it is refused when the server is made, not left to
+  never match (`test_crypt_methods` in `test_sys`). The config that holds them is never logged
+  and is installed `0640 root:wisp`.
 - **Bandwidth throttling pauses, never drops.** `conn_charge_bandwidth` suspends reads and arms a
   timer; it must never discard stream data. It charges both directions: a throttled connection's
   streams stop reading from their remotes too (`conn_sync_streams`), or the limit would only
@@ -937,7 +941,7 @@ branch in `conn.c`; the client library's is `src/client/wt_client.c`.
 | `include/holywisp/buf.h`, `src/common/buf.c` | Growable byte buffer with a read cursor; every queue in the server is one. |
 | `include/holywisp/loop.h`, `src/common/loop.c` | The event loop: fds with generations, timer heap, thread-safe post. |
 | `src/common/loop_backend.h`, `loop_epoll.c`, `loop_kqueue.c`, `loop_select.c` | The kernel half of the loop: readiness for a set of fds, on epoll (Linux), kqueue (macOS) and Winsock's select (Windows). |
-| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys, a poll in microseconds, the operator's two signals. |
+| `include/holywisp/sys.h`, `src/common/sys_linux.c`, `sys_linux_crypt.c`, `sys_darwin.c`, `sys_win32.c` | Every call the kernels disagree on: sockets that never raise SIGPIPE, the extra listeners, relay pipes and splice, keepalive, the reset close, socket marks, crypt, the pseudo-terminal, random bytes fit for keys, a poll in microseconds, the operator's two signals. |
 | `src/compat/win32/` | Windows only. `include/`: the POSIX headers Windows lacks or falls short of (`sys/socket.h`, `poll.h`, `unistd.h`, `fcntl.h`, `signal.h`, ...). `posix.c`: what they declare, over Winsock, with a descriptor table and errno. `hw_w32.h`: what the three Windows files share. |
 | `include/holywisp/net.h`, `src/common/net.c`, `src/common/resolver.c` | Sockets, address parsing and classification, the getaddrinfo thread pool. |
 | `include/holywisp/ws.h`, `src/common/ws.c` | WebSocket framing, masking, HTTP upgrade request/response parsing. |

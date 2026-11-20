@@ -3,6 +3,7 @@
  */
 #include "holywisp/hw.h"
 #include "holywisp/net.h"
+#include "holywisp/server.h"
 #include "holywisp/sys.h"
 
 #include "test.h"
@@ -396,23 +397,55 @@ static void test_close_reset(void) {
 
 static void test_crypt(void) {
 	// Whatever method the C library reads this setting as, it is a function of key and setting.
+	// SHA-512 where the library has it, else the traditional DES form (macOS).
+	const char *setting = hw_sys_has_crypt("$6$holywispsalt$") ? "$6$holywispsalt$" : "ab";
 	char a[128], b[128], c[128], tiny[4];
-	if (!hw_sys_has_crypt()) {
+	if (!hw_sys_has_crypt(setting)) {
 		// Then nothing hashes, whatever the method: a stored hash can only ever not match.
 		CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", a, sizeof(a)), -1);
 		CHECK_EQ(hw_sys_crypt("hunter2", "ab", a, sizeof(a)), -1);
 		return;
 	}
-	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", a, sizeof(a)), 0);
-	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", b, sizeof(b)), 0);
-	CHECK_EQ(hw_sys_crypt("hunter3", "$6$holywispsalt$", c, sizeof(c)), 0);
+	CHECK_EQ(hw_sys_crypt("hunter2", setting, a, sizeof(a)), 0);
+	CHECK_EQ(hw_sys_crypt("hunter2", setting, b, sizeof(b)), 0);
+	CHECK_EQ(hw_sys_crypt("hunter3", setting, c, sizeof(c)), 0);
 	CHECK(strlen(a) >= 13, "a hash, got \"%s\"", a);
 	CHECK_STR(a, b);
 	CHECK(strcmp(a, c) != 0, "another key, another hash");
 	// The stored hash is its own setting: that is how a password is checked.
 	CHECK_EQ(hw_sys_crypt("hunter2", a, b, sizeof(b)), 0);
 	CHECK_STR(a, b);
-	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", tiny, sizeof(tiny)), -1);
+	CHECK_EQ(hw_sys_crypt("hunter2", setting, tiny, sizeof(tiny)), -1);
+}
+
+// A method hw_sys_has_crypt says this platform has is one it checks: the password that made a
+// hash elsewhere hashes to it here. One it says it has not is refused when the server is made, so
+// that a password-user holding it is never accepted to match nothing. Hashes of "hunter2" made by
+// libxcrypt (the SHA-crypt pair agrees with `openssl passwd`).
+static void test_crypt_methods(void) {
+	static const char *const hashes[] = {
+	    "$5$holywispsalt$X.UUP32HP.gL9RC51Y0atx67Q8kz.prKltJoFF.ADJA",
+	    "$6$holywispsalt$qDRNqfDCyGOPeFArxT/2Mf87MUTPQWQG/QouZHCpRLOU4mfFsf2xmOu7Kf/HBTHAQ9gEUBhQWE4HMue4RZFeO1",
+	    "$y$j9T$holywispsalt012$AIXL3f.mz1A0tqA/QEKNiBYnNTX9GUl9ygqGSP2JWU1",
+	    "$2b$05$holywispsaltholywispsO9u.at3ID58VmTHW6SY7GVmZeVSws94C",
+	};
+	for (size_t i = 0; i < sizeof(hashes) / sizeof(hashes[0]); i++) {
+		hw_server_config cfg;
+		hw_server_config_defaults(&cfg);
+		CHECK_EQ(hw_server_config_add_user(&cfg, "alice", hashes[i]), 0);
+		char err[256] = "";
+		int ok = hw_server_config_validate(&cfg, err, sizeof(err));
+		if (hw_sys_has_crypt(hashes[i])) {
+			char got[160];
+			CHECK_EQ(hw_sys_crypt("hunter2", hashes[i], got, sizeof(got)), 0);
+			CHECK_STR(got, hashes[i]);
+			CHECK_EQ(ok, 0);
+		} else {
+			CHECK_EQ(ok, -1);
+			CHECK(strstr(err, "password-user 'alice'") != NULL, "refused for the hash: %s", err);
+			CHECK(strstr(err, "hunter2") == NULL && strstr(err, "holywispsalt") == NULL, "the value logged: %s", err);
+		}
+	}
 }
 
 // Random bytes that are fit for keys: the whole buffer is written, and no two calls agree.
@@ -1193,6 +1226,7 @@ int main(void) {
 	RUN(test_relay_pipe);
 	RUN(test_close_reset);
 	RUN(test_crypt);
+	RUN(test_crypt_methods);
 	RUN(test_random);
 	RUN(test_udp_unreachable);
 	RUN(test_udp_steer);

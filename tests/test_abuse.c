@@ -78,14 +78,32 @@ static void *blast_conn(void *arg) {
 	return NULL;
 }
 
-// Sends a little, waits, and resets the connection: what a remote that crashed looks like.
-#define RESET_BYTES (256 * 1024)
+// Sends a little, and 300 ms in resets the connection: what a remote that crashed looks like. It
+// sends what the connection takes in that time, up to RESET_BYTES, and resets on time whatever
+// the peer has read. A send that waited for all of it never reset at all where the buffers
+// between the two hold less than RESET_BYTES and the server reads no more (a stream held at its
+// credit takes 16 KiB): on Windows, two runs in three, test_remote_resets_while_held waited for a
+// reset that was never sent. Its own send buffer is small, and the held case's server buffers
+// too, so that every kernel is in that position.
+#define RESET_BYTES    (256 * 1024)
+#define RESET_AFTER_MS 300
 static void *reset_conn(void *arg) {
 	int fd = (int)(intptr_t)arg;
 	static const uint8_t chunk[RESET_BYTES];
-	ssize_t r = send(fd, chunk, sizeof(chunk), HW_MSG_NOSIGNAL);
-	(void)r;
-	sleep_ms(300);
+	int small = 16384;
+	setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
+	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+	uint64_t deadline = hw_now_ms() + RESET_AFTER_MS;
+	size_t sent = 0;
+	for (uint64_t now = hw_now_ms(); sent < sizeof(chunk) && now < deadline; now = hw_now_ms()) {
+		struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+		if (poll(&pfd, 1, (int)(deadline - now)) <= 0) continue;
+		ssize_t r = send(fd, chunk + sent, sizeof(chunk) - sent, HW_MSG_NOSIGNAL);
+		if (r < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) break;
+		if (r > 0) sent += (size_t)r;
+	}
+	uint64_t now = hw_now_ms();
+	if (now < deadline) sleep_ms((int)(deadline - now));
 	struct linger lg = {.l_onoff = 1, .l_linger = 0};
 	setsockopt(fd, SOL_SOCKET, SO_LINGER, &lg, sizeof(lg));
 	close(fd);
@@ -410,6 +428,7 @@ static int loop_reports_unwatched_reset(void) {
 static void test_remote_resets_while_held(void) {
 	hw_server_config cfg;
 	base_config(&cfg);
+	cfg.socket_buffer_size = 16384; // with reset_conn's own, far less than RESET_BYTES fits (Windows)
 	hw_server *s = start(&cfg);
 	hw_client_opts o;
 	hw_client_opts_defaults(&o);
@@ -584,12 +603,15 @@ static void test_connections_per_ip(void) {
 }
 
 // A TCP port whose connects never finish: a listener that never accepts, with its accept queue
-// filled from here. Returns 0 where the kernel refuses instead of dropping (the case is skipped).
+// filled from here. Returns 0 where the kernel refuses instead of dropping, or never fills the
+// queue (the case is skipped, and says so). The backlog is 1, a queue of two on Linux and macOS,
+// and not 0: macOS takes 0 for its maximum (somaxconn, 128), which the 65 connections here never
+// filled.
 #define BLACKHOLE_FDS 66
 static uint16_t start_blackhole(int fds[BLACKHOLE_FDS]) {
 	for (int i = 0; i < BLACKHOLE_FDS; i++) fds[i] = -1;
 	uint16_t port = 0;
-	fds[0] = hw_listen_tcp("127.0.0.1", 0, 0, 0, &port);
+	fds[0] = hw_listen_tcp("127.0.0.1", 0, 0, 1, &port);
 	CHECK(fds[0] >= 0, "listen");
 	struct sockaddr_in sin = {.sin_family = AF_INET, .sin_port = htons(port)};
 	sin.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -648,7 +670,8 @@ static void test_in_flight_syns_per_ip(void) {
 		hw_client_free(c);
 		hw_server_free(s);
 	} else {
-		CHECK(1, "this kernel refuses where a blackhole is wanted");
+		printf(
+		    "skip test_in_flight_syns_per_ip: this kernel refuses, or never fills the queue, where a black hole is wanted\n");
 	}
 	for (int i = 0; i < BLACKHOLE_FDS; i++) {
 		if (hole[i] >= 0) close(hole[i]);
@@ -846,7 +869,8 @@ static void test_stream_cap_is_not_a_violation(void) {
 		hw_client_free(c);
 		hw_server_free(s);
 	} else {
-		CHECK(1, "this kernel refuses where a blackhole is wanted");
+		printf(
+		    "skip test_stream_cap_is_not_a_violation: this kernel refuses, or never fills the queue, where a black hole is wanted\n");
 	}
 	for (int i = 0; i < BLACKHOLE_FDS; i++) {
 		if (hole[i] >= 0) close(hole[i]);
@@ -1225,7 +1249,7 @@ static void test_passwords(void) {
 	base_config(&cfg);
 	CHECK(hw_server_config_add_user(&cfg, "alice", "") != 0, "an empty password was accepted");
 	CHECK_EQ(cfg.password_user_count, 0);
-	if (!hw_sys_has_crypt()) return;
+	if (!hw_sys_has_crypt("$6$holywispsalt$")) return;
 	char hash[128];
 	CHECK_EQ(hw_sys_crypt("hunter2", "$6$holywispsalt$", hash, sizeof(hash)), 0);
 	CHECK_EQ(hw_server_config_add_user(&cfg, "alice", hash), 0);

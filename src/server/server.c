@@ -157,10 +157,12 @@ int hw_server_config_validate(const hw_server_config *cfg, char *err, size_t err
 		snprintf(err, err_cap, "password-required needs at least one password-user");
 		return -1;
 	}
-	for (int i = 0; i < cfg->password_user_count && !hw_sys_has_crypt(); i++) {
-		if (cfg->password_users[i].pass[0] != '$') continue;
+	for (int i = 0; i < cfg->password_user_count; i++) {
+		const char *pass = cfg->password_users[i].pass;
+		if (pass[0] != '$' || hw_sys_has_crypt(pass)) continue;
 		// Never the value: the config that holds passwords is not logged.
-		snprintf(err, err_cap, "password-user '%s': this platform has no crypt(3) to check a hashed password with",
+		snprintf(err, err_cap,
+		         "password-user '%s': this platform's crypt(3) cannot check a password hashed with this method",
 		         cfg->password_users[i].user);
 		return -1;
 	}
@@ -335,26 +337,6 @@ static uint32_t server_upload_credit_window(const hw_server_config *cfg) {
 
 // ---------------------------------------------------------------------------------- socket tuning
 
-// The `field`-th whitespace-separated integer of a /proc/sys file, or -1.
-static long read_sysctl_long(const char *path, int field) {
-	char line[128];
-	FILE *f = fopen(path, "r");
-	if (!f) return -1;
-	char *got = fgets(line, sizeof(line), f);
-	fclose(f);
-	if (!got) return -1;
-	char *p = line;
-	long v = -1;
-	for (int i = 0; i <= field; i++) {
-		char *end;
-		errno = 0;
-		v = strtol(p, &end, 10);
-		if (end == p || errno != 0) return -1;
-		p = end;
-	}
-	return v;
-}
-
 // A client that uploads in bursts is served best by a receive window that is large from the first
 // byte: the bytes wait in the kernel, arrive here in big reads and leave in few writes. Autotuning
 // gets there too, but slowly and per connection. An explicit SO_RCVBUF is capped by
@@ -362,21 +344,52 @@ static long read_sysctl_long(const char *path, int field) {
 // on a host with the stock 208 KiB cap it would pin the window small. It is applied only when the
 // buffer the kernel will really grant is at least CLIENT_RCVBUF_FLOOR, and never when
 // socket-buffer-size already sets both buffers.
-#define CLIENT_RCVBUF_FLOOR (4L * 1024 * 1024)
+#define CLIENT_RCVBUF_FLOOR (4LL * 1024 * 1024)
+// An ask no kernel caps (the stock rmem_max is 208 KiB), to learn how it reads a grant back.
+#define CLIENT_RCVBUF_PROBE 16384
 
-// `want` capped by the sysctl at `cap_path`, or 0 when the kernel would grant under the floor.
-static int server_fixed_buffer(const hw_server_config *cfg, size_t want_cfg, const char *cap_path, const char *key) {
-	if (cfg->socket_buffer_size > 0 || want_cfg == 0) return 0;
-	long cap = read_sysctl_long(cap_path, 0);
-	if (cap <= 0) return 0;
-	long want = (long)want_cfg < cap ? (long)want_cfg : cap;
-	if (want > INT32_MAX / 2) want = INT32_MAX / 2;
-	if (want * 2 < CLIENT_RCVBUF_FLOOR) {
-		HW_INFO("server", "%s not applied: %s is %ld, which grants under %ld bytes", key, cap_path, cap,
-		        CLIENT_RCVBUF_FLOOR);
+// The receive buffer fd is granted when it asks for `bytes`, as getsockopt reads it back, or -1.
+static long long rcvbuf_granted(int fd, int bytes) {
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bytes, sizeof(bytes)) != 0) return -1;
+	int got = 0;
+	socklen_t gl = sizeof(got);
+	if (getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &gl) != 0) return -1;
+	return got;
+}
+
+// The SO_RCVBUF to give accepted client sockets, or 0 for none. What the kernel grants is asked of
+// the kernel, on a socket made for the purpose: rmem_max in /proc/sys is not there to read under
+// the unit's ProcSubset=pid, and reading it left client-recv-buffer unapplied without a word.
+// Linux doubles what it grants and reads the doubled value back, another kernel reads back what it
+// took: a small ask first says which, so that a grant under the ask is known for one.
+static int server_client_rcvbuf(const hw_server_config *cfg) {
+	if (cfg->socket_buffer_size > 0 || cfg->client_recv_buffer == 0) return 0;
+	int want = cfg->client_recv_buffer > INT32_MAX / 2 ? INT32_MAX / 2 : (int)cfg->client_recv_buffer;
+	int fd = hw_sys_socket(AF_INET, SOCK_STREAM, 0, 0);
+	if (fd < 0) fd = hw_sys_socket(AF_INET6, SOCK_STREAM, 0, 0);
+	if (fd < 0) {
+		HW_WARN("server", "client-recv-buffer not applied: no socket to ask the kernel with: %s", strerror(errno));
 		return 0;
 	}
-	return (int)want;
+	long long unit = rcvbuf_granted(fd, CLIENT_RCVBUF_PROBE) / CLIENT_RCVBUF_PROBE;
+	long long got = rcvbuf_granted(fd, want);
+	int saved = got < 0 ? errno : 0;
+	close(fd);
+	if (unit < 1) unit = 1;
+	if (got < 0) {
+		HW_INFO("server", "client-recv-buffer not applied: the kernel refuses a receive buffer of %d: %s", want,
+		        strerror(saved));
+		return 0;
+	}
+	if (got < CLIENT_RCVBUF_FLOOR) {
+		HW_INFO("server", "client-recv-buffer not applied: the kernel grants %lld bytes for %d (rmem_max), under %lld",
+		        got, want, CLIENT_RCVBUF_FLOOR);
+		return 0;
+	}
+	if (got < (long long)want * unit) {
+		HW_INFO("server", "client-recv-buffer %d capped to %lld bytes by the kernel (rmem_max)", want, got / unit);
+	}
+	return want;
 }
 
 void server_tune_socket(const hw_server *s, int fd, int is_tcp) {
@@ -1114,8 +1127,7 @@ hw_server *hw_server_new(const hw_server_config *cfg) {
 		        "upload-credit not offered: stream-queue-max %zu has no room for a window beside a %zu-byte packet",
 		        cfg->stream_queue_max, cfg->max_message_size);
 	}
-	s->client_rcvbuf = server_fixed_buffer(cfg, cfg->client_recv_buffer, "/proc/sys/net/core/rmem_max",
-	                                       "client-recv-buffer");
+	s->client_rcvbuf = server_client_rcvbuf(cfg);
 	if (s->window < cfg->buffer_remaining) {
 		HW_INFO("server",
 		        "buffer-remaining %u capped to %u: a window of %zu-byte packets must fit in stream-queue-max %zu",

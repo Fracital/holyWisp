@@ -43,7 +43,7 @@ SOURCES := $(shell find include src tests -name '*.c' -o -name '*.h' | sort)
 # a cross build from one of these two: see `make npm`.)
 WINDOWS_ONLY := src/common/loop_select.c src/common/sys_win32.c src/compat/win32/posix.c
 ifeq ($(shell uname -s),Darwin)
-FOREIGN := src/common/loop_epoll.c src/common/sys_linux.c $(WINDOWS_ONLY)
+FOREIGN := src/common/loop_epoll.c src/common/sys_linux.c src/common/sys_linux_crypt.c $(WINDOWS_ONLY)
 else
 FOREIGN := src/common/loop_kqueue.c src/common/sys_darwin.c $(WINDOWS_ONLY)
 endif

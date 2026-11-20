@@ -5,7 +5,6 @@
 #include "holywisp/net.h"
 #include "holywisp/sys.h"
 
-#include <crypt.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -315,22 +314,6 @@ int hw_sys_has_mark(void) {
 int hw_sys_set_mark(int fd, uint32_t mark) {
 	unsigned int v = mark;
 	return setsockopt(fd, SOL_SOCKET, SO_MARK, &v, sizeof(v));
-}
-
-int hw_sys_has_crypt(void) {
-	return 1;
-}
-
-int hw_sys_crypt(const char *key, const char *setting, char *out, size_t out_cap) {
-	struct crypt_data data;
-	memset(&data, 0, sizeof(data));
-	const char *got = crypt_r(key, setting, &data);
-	// A failure token ("*0", "*1") is not a hash: it must never compare equal to a stored value.
-	if (!got || got[0] == '*') return -1;
-	size_t n = strlen(got);
-	if (n >= out_cap) return -1;
-	memcpy(out, got, n + 1);
-	return 0;
 }
 
 int hw_sys_has_pty(void) {
