@@ -157,8 +157,9 @@ every test still passes, so each item has a test and a change to it needs a reas
   window, u32 LE) with `upload-credit` (on by default), and `0x05` stream-confirm (meta empty) always.
   The private ones (`0xE_`) are specified in docs/extensions.md and held by `tests/ext_cases.h`. Stream-confirm
   is honoured when the client asks for it: a connected TCP stream gets `CONTINUE(id,
-  buffer_remaining)`, and a UDP stream gets nothing, as in wispurr (the spec confirms a connected
-  TCP socket; `test_stream_confirm_offered`). Unknown extension ids are skipped, never rejected.
+  s->remaining)`, what is left of its window, and a UDP stream gets nothing, as in wispurr (the
+  spec confirms a connected TCP socket and names no value; `test_stream_confirm_offered`,
+  `test_v2_handshake_and_confirm`). Unknown extension ids are skipped, never rejected.
 - **Flow control.** The window is counted in DATA packets, not bytes, per TCP stream, reset to
   the advertised window each time it hits zero. That window is `buffer-remaining` capped so a full
   window of `max-message-size` packets fits in `stream-queue-max` (`server_ingress_window` in
@@ -174,7 +175,12 @@ every test still passes, so each item has a test and a change to it needs a reas
   behind a slow remote; `conn_upload_*`, O(1)) in packets of the size that stream sends, clamped
   to [4, the advertised maximum], so one stream gets the whole window, ten uploading streams do
   not make the server buffer ten windows, and idle keep-alive streams beside an upload take none
-  of it. The stream-0 CONTINUE and stream-confirm always carry the maximum. UDP streams are
+  of it. The stream-0 CONTINUE always carries the maximum. Stream-confirm carries what is left of
+  the stream's window (`s->remaining`): the maximum, less the DATA packets that arrived while the
+  dial was under way, which this server counts as it queues them. wispurr sends its own
+  `bufferRemaining`, which is the maximum only because it does not count those packets; sending
+  the maximum here would let a client that sent during the dial run that many packets past the
+  window the queue is sized for. UDP streams are
   never counted. A session where both INFOs named upload credit (`0xE4`, docs/extensions.md)
   counts its TCP and Twisp streams' uploads in bytes instead (`up_recv`, `up_limit`), with no
   refill CONTINUE: the server grants what has reached the remote's socket plus a budget
