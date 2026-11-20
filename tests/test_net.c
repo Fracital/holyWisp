@@ -228,14 +228,16 @@ static void test_listen_and_connect(void) {
 	CHECK_EQ(errno, ECONNREFUSED);
 }
 
-#define HOLE_FILL 4
+#define HOLE_FILL 8
 
 // A listener whose accept queue is full and never read. Linux drops the SYNs that reach it, so a
 // connect to it hangs as one to an address without a route does; another system may refuse them,
-// which the cases below allow. fill[] holds the connections that filled the queue.
+// which the cases below allow. fill[] holds the connections that filled the queue. The backlog is
+// 1, a queue of two on Linux and macOS, and not 0: macOS takes 0 for its maximum (somaxconn, 128),
+// which the fill did not come near, and the "silent" address answered at once.
 static int black_hole(struct sockaddr_in *addr, int fill[HOLE_FILL]) {
 	uint16_t port = 0;
-	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 0, &port);
+	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 1, &port);
 	CHECK(lfd >= 0, "listen");
 	memset(addr, 0, sizeof(*addr));
 	addr->sin_family = AF_INET;
