@@ -207,7 +207,10 @@ every test still passes, so each item has a test and a change to it needs a reas
   an error is closed `0x03` at once, since no grant may ever come (what the kernel held is lost,
   as a reset loses it natively); a hang-up alone is detached as for a paused stream. Only epoll
   reports an error to a socket that is not read (`loop_backend.h`): on kqueue and select the held
-  stream finds the reset with the grant that lets it read, and closes `0x03` then. A CLOSE is
+  stream finds the reset with the grant that lets it read, and closes `0x03` then. On macOS the
+  kernel hands over what it held before the reset first, so a grant smaller than that is spent
+  on it; the read event carries the reset (`EV_EOF` with the error), so a stream that read holds
+  again closes `0x03` right after it (`stream_io_cb`, `test_remote_resets_while_held`). A CLOSE is
   never held and a held stream is never timed out. A CREDIT does not flush the ingress batch: it
   opens and closes nothing and only arms a read. Without both INFOs naming it nothing changes.
   `tests/credit_cases.h` (run by `test_e2e` and `test_e2e_wt`), `test_credit_not_by_datagram` and

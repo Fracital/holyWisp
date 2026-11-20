@@ -1137,14 +1137,15 @@ static void stream_credit_spent(hw_stream *s) {
 
 // Every read from the remote asks for no more than the stream's credit leaves (stream_credit_cap),
 // so the client is never sent past its limit, and what is relayed is counted against it. Without
-// credit the cap is never the smaller number and nothing here changes.
-static void stream_read(hw_stream *s) {
+// credit the cap is never the smaller number and nothing here changes. Returns 1 when the stream
+// stopped because its credit is spent (it is open and held), 0 otherwise, closed included.
+static int stream_read(hw_stream *s) {
 	hw_conn *c = s->conn;
 	// A held stream is not armed, so this is an event that was already on its way. A read of no
 	// bytes would come back as the end of the stream.
 	if (stream_credit_held(s)) {
 		stream_credit_spent(s);
-		return;
+		return 1;
 	}
 	if (s->type == HW_STREAM_TCP && s->bulk) {
 		int copy = 0; // finish this event on the copying path
@@ -1160,22 +1161,22 @@ static void stream_read(hw_stream *s) {
 				// The previous payload is still in the pipe, so the client is not keeping up.
 				// The bytes stay in the kernel until the queue has written it.
 				stream_park(s);
-				return;
+				return 0;
 			}
 			if (n == -2) { // no pipe to be had: copy
 				copy = 1;
 				break;
 			}
-			if (c->closing) return;
+			if (c->closing) return 0;
 			if (n == 0) {
 				stream_close(s, HW_CLOSE_VOLUNTARY, 1);
-				return;
+				return 0;
 			}
 			if (n < 0) {
 				if (errno == EINTR) continue;
-				if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+				if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
 				stream_close(s, open_errno(errno), 1);
-				return;
+				return 0;
 			}
 			s->heard = 1;
 			if (!(s->timed & STREAM_TIMED_FIRST)) stream_time_first(s);
@@ -1194,11 +1195,11 @@ static void stream_read(hw_stream *s) {
 			}
 			if (stream_credit_held(s)) {
 				stream_credit_spent(s);
-				return;
+				return 1;
 			}
-			if ((size_t)n < HW_READ_CHUNK) return; // drained
+			if ((size_t)n < HW_READ_CHUNK) return 0; // drained
 		}
-		if (!copy || !s->read_armed) return;
+		if (!copy || !s->read_armed) return 0;
 	}
 	uint8_t *scratch = c->w->scratch;
 	for (int i = 0; i < STREAM_MAX_READS_PER_EVENT && s->read_armed; i++) {
@@ -1206,36 +1207,37 @@ static void stream_read(hw_stream *s) {
 		ssize_t n = stream_recv(s, scratch, asked);
 		if (n < 0) {
 			if (errno == EINTR) continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK) return;
+			if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
 			if (s->type == HW_STREAM_UDP && errno == ECONNREFUSED) {
 				stream_close(s, HW_CLOSE_UNREACHABLE, 1);
-				return;
+				return 0;
 			}
 			// A PTY master returns EIO when the child has exited: a clean close, not an error.
 			if (s->type == HW_STREAM_TERM && errno == EIO) {
 				stream_close(s, HW_CLOSE_VOLUNTARY, 1);
-				return;
+				return 0;
 			}
 			stream_close(s, open_errno(errno), 1);
-			return;
+			return 0;
 		}
 		if (n == 0 && s->type != HW_STREAM_UDP) {
 			stream_close(s, HW_CLOSE_VOLUNTARY, 1);
-			return;
+			return 0;
 		}
 		s->heard = 1;
 		if (!(s->timed & STREAM_TIMED_FIRST)) stream_time_first(s);
 		s->credit_sent += (uint64_t)n;
 		conn_send_data(c, s->id, scratch, (size_t)n);
-		if (c->closing) return;
+		if (c->closing) return 0;
 		// A WebTransport session copies into QUIC packets: there is no pipe to relay through.
 		if ((size_t)n >= STREAM_BULK_ON && s->type == HW_STREAM_TCP && !c->wt) s->bulk = 1;
 		if (stream_credit_held(s)) {
 			stream_credit_spent(s);
-			return;
+			return 1;
 		}
-		if ((size_t)n < asked && s->type != HW_STREAM_UDP) return; // drained
+		if ((size_t)n < asked && s->type != HW_STREAM_UDP) return 0; // drained
 	}
+	return 0;
 }
 
 static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
@@ -1290,7 +1292,7 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 		// may never come, and the reset is what the client would see natively: the stream ends
 		// now, and what the kernel held for it is lost with the connection, as it is there. Only
 		// a backend that reports errors unasked (epoll) gets here; on the others the stream finds
-		// the reset when a grant lets it read.
+		// the reset when a grant lets it read (below).
 		stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
 		return;
 	}
@@ -1307,5 +1309,14 @@ static void stream_io_cb(hw_loop *loop, int fd, unsigned events, void *ud) {
 	if (events & HW_EV_WRITE) {
 		if (stream_flush(s) != 0) return;
 	}
-	if (events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR)) stream_read(s);
+	if (events & (HW_EV_READ | HW_EV_HUP | HW_EV_ERROR)) {
+		if (stream_read(s) && (events & HW_EV_ERROR)) {
+			// The read came with the remote's reset, and the credit ran out before the reset did:
+			// macOS's recv hands over what the kernel held before the reset first, so a grant
+			// smaller than that is spent on it, and the stream is held again with nothing left
+			// to report the reset (loop_kqueue.c). As for a held stream above, no grant may ever
+			// come: it ends now. Under epoll the case above would end it on the next wait.
+			stream_close(s, HW_CLOSE_NETWORK_ERROR, 1);
+		}
+	}
 }
