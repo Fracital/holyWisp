@@ -1389,9 +1389,18 @@ static void test_reset_key_file(void) {
 	CHECK(mkdtemp(dir) != NULL, "mkdtemp: %s", strerror(errno));
 	snprintf(path, sizeof(path), "%s/reset.key", dir);
 	CHECK(reset_after_restart(path), "no stateless reset from the server that came after");
-	struct stat st;
+	// As private as a file this process makes 0600: that on POSIX, and whatever the system's
+	// stat reports for one where files have no such mode bits (Windows reports 0666 for both).
+	char ref[620];
+	snprintf(ref, sizeof(ref), "%s/ref.0600", dir);
+	int rfd = open(ref, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	CHECK(rfd >= 0, "open %s: %s", ref, strerror(errno));
+	close(rfd);
+	struct stat st, want;
+	CHECK_EQ(stat(ref, &want), 0);
+	unlink(ref);
 	CHECK_EQ(stat(path, &st), 0);
-	CHECK_EQ(st.st_mode & 0777, 0600);
+	CHECK_EQ(st.st_mode & 0777, want.st_mode & 0777);
 	CHECK_EQ(st.st_size, 65);
 	char key[65], again[65];
 	FILE *f = fopen(path, "r");

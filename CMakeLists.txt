@@ -228,7 +228,8 @@ if(HW_BUILD_TESTS)
     # flake. RUN_SERIAL keeps them from competing with the rest of the suite.
     if(${name} STREQUAL test_e2e OR ${name} STREQUAL test_e2e_wt OR ${name} STREQUAL test_security OR
        ${name} STREQUAL test_flow OR ${name} STREQUAL test_abuse)
-      set_tests_properties(${name} PROPERTIES RUN_SERIAL ON)
+      # 300 s, not 120: test_e2e_wt took 115 s on CI's macOS under the sanitizers.
+      set_tests_properties(${name} PROPERTIES RUN_SERIAL ON TIMEOUT 300)
     endif()
   endfunction()
   # A unit test of one layer of the WebTransport stack, linking that layer and nothing above it.
