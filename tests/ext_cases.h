@@ -15,6 +15,8 @@
 
 #include "test.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -182,7 +184,9 @@ static void *up_sink_drain(void *arg) {
 	uint8_t buf[65536];
 	for (;;) {
 		ssize_t n = recv(k->fd, buf, sizeof(buf), 0);
-		if (n <= 0) break;
+		if (n < 0 && errno == EINTR) continue;
+		if (n == 0 || (n < 0 && errno == ECONNRESET)) break;  // the stream's end; the case counts the bytes
+		CHECK(n > 0, "the sink's recv: %s", strerror(errno)); // a sink that quit would stall the upload
 		size_t at = atomic_load(&k->got);
 		for (ssize_t i = 0; i < n; i++) CHECK(buf[i] == up_byte(at + (size_t)i), "byte %zu", at + (size_t)i);
 		atomic_fetch_add(&k->got, (size_t)n);
@@ -220,6 +224,9 @@ static void upload_credit_stalled_remote(void) {
 	CHECK_EQ(poll(&pfd, 1, 5000), 1);
 	up_sink sink = {.fd = accept(lfd, NULL, NULL)};
 	CHECK(sink.fd >= 0, "accept");
+	// The drain blocks in recv. Whether accept(2) passes on the listener's O_NONBLOCK depends on the
+	// kernel (Linux: no; macOS and Windows: yes), and a sink whose recv says EAGAIN has quit.
+	fcntl(sink.fd, F_SETFL, fcntl(sink.fd, F_GETFL, 0) & ~O_NONBLOCK);
 
 	static uint8_t chunk[64 * 1024];
 	size_t sent = 0;
@@ -240,11 +247,16 @@ static void upload_credit_stalled_remote(void) {
 	pthread_t th;
 	CHECK_EQ(pthread_create(&th, NULL, up_sink_drain, &sink), 0);
 	size_t want = sent + 8u * 1024 * 1024;
+	int waits = 0;
 	while (sent < want) {
 		for (size_t k = 0; k < sizeof(chunk); k++) chunk[k] = up_byte(sent + k);
 		r = hw_client_send(c, sid, chunk, sizeof(chunk));
-		if (r == HW_ERR_TIMEOUT) continue; // the client's own 500 ms, while the remote catches up
+		if (r == HW_ERR_TIMEOUT) { // the client's own 500 ms, while the remote catches up
+			CHECK(++waits < 20, "no grant for 10 s: %zu of %zu bytes at the remote", atomic_load(&sink.got), sent);
+			continue;
+		}
 		CHECK_EQ(r, 0);
+		waits = 0;
 		sent += sizeof(chunk);
 	}
 	// A CLOSE from the client drops what is still queued toward the remote: wait for all of it,
