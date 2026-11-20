@@ -192,7 +192,7 @@ would not: a gate to run before a restart. The most important keys:
 | --- | --- | --- |
 | `host`, `port`, `workers` | `""`, `6001`, `0` | Bind address (empty: all interfaces; the package's and the release archive's config set `127.0.0.1`), port, worker threads (0 = per CPU) |
 | `allow-tcp`, `allow-udp` | on | Stream types clients may open |
-| `allow-direct-ip`, `allow-private`, `allow-loopback`, `allow-link-local` | off | Relax the egress policy |
+| `allow-direct-ip`, `allow-private`, `allow-loopback`, `allow-link-local` | off | Relax the egress policy: literal IPs in CONNECT; RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), CGNAT (`100.64/10`) and IPv6 unique local (`fc00::/7`); `127/8` and `::1`; `169.254/16` and `fe80::/10`. An IPv4-mapped IPv6 address counts as the IPv4 address |
 | `allow-host` / `block-host`, `allow-port` / `block-port` | none | Destination allow/block lists |
 | `enable-v2`, `motd` | on, `""` | Wisp v2 handshake, message of the day |
 | `enable-twisp` | off | PTY terminal streams; needs v2 and an authenticated client |
@@ -211,7 +211,7 @@ would not: a gate to run before a restart. The most important keys:
 | `bandwidth-limit-kbps` | 0 | Per-IP bandwidth cap (0 = off): one budget per client address, which its uploads and downloads share |
 | `flood-protection` and its `max-*` / `syn-signature-*` keys | on | See `holywisp.conf.example` |
 | `ws-close-after-violations`, `log-blocked-dials` | 64, off | Close a client after this many flood-limit hits of its own (0 = never); log every failed dial at `info`, with the client address |
-| `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence |
+| `reputation` and its `reputation-*` keys | on | IP reputation scoring and persistence; `reputation-store` is written every `reputation-save-interval-s` (30; 0 never writes it, not even at stop) |
 | `proxy` | `""` | Upstream `socks5://` (or `socks5h://`) / `http://` proxy for outbound TCP; it is given the destination hostname |
 | `proxy-only-to` | none | With a proxy, only a TCP stream that resolved to one of these addresses or CIDRs goes through it (by name, as always); every other TCP stream is dialled here. Repeatable. None: every TCP stream takes the proxy. For a router whose DNS gate answers the names it must handle itself with one address, which may be a private one: a name that resolves to a listed address is not refused for its address class, since the proxy gets the name |
 | `proxy-udp` | `refuse` | With a proxy: `refuse` UDP streams, or relay them `direct`, bypassing the proxy |
@@ -334,8 +334,9 @@ build/release/holywisp-client -s https://wisp.example:6001/ --pin <base64 sha-25
 The password is the first line of `--pass-file`, or `$HOLYWISP_PASSWORD` with `--user`. `--pass`
 still takes it on the command line, where every user of the host can read it in the process list.
 
-`--credit BYTES` asks a v2 server for stream credit with an initial window of `BYTES` per stream:
-the server then sends each TCP stream only what this client has read and one window more, and the
+`--credit BYTES` asks a v2 server for stream credit with an initial window of `BYTES` per stream
+(a window under 16384 counts as 16384, on both ends): the server then sends each TCP stream only
+what this client has read and one window more, and the
 client grants more as it reads (a CREDIT once it has read half a window). `--read-rate BPS` makes
 the client read what arrives no faster than `BPS` bytes a second, a slow reader; with `--credit`
 that holds the server, and the remote behind it, to that rate. Over `--bench` with `--credit`, each
