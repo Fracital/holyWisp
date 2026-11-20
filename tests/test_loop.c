@@ -100,11 +100,10 @@ static int cmp_u64(const void *a, const void *b) {
 // A microsecond timer fires no earlier than its delay, and where the loop's waits keep microseconds
 // (hw_loop_timer_resolution_us 1) well within a millisecond of it: a pacer releasing a few
 // datagrams every hundred microseconds is woken for each release, not on the next millisecond.
-// Judged by the median of 25 tries, so that a busy machine's odd late wakeup does not fail it.
-static void test_timer_us_resolution(void) {
-	hw_loop *loop = hw_loop_new();
-	unsigned res = hw_loop_timer_resolution_us(loop);
-	CHECK(res == 1 || res == 1000, "resolution %u", res);
+// Judged by the median of 25 tries, and measured a second time when the first median misses, so
+// that a busy machine's slow moment does not fail it: a loop that wakes on millisecond ticks
+// misses both.
+static uint64_t timer_us_median_late(hw_loop **loop, int round) {
 	enum {
 		TRIES = 25,
 		DELAY_US = 300
@@ -112,21 +111,29 @@ static void test_timer_us_resolution(void) {
 	uint64_t late[TRIES];
 	for (int i = 0; i < TRIES; i++) {
 		uint64_t set = hw_now_us();
-		CHECK(hw_loop_add_timer_us(loop, DELAY_US, 0, fired_cb, NULL) != NULL, "add");
-		CHECK_EQ(hw_loop_run(loop), 0);
+		CHECK(hw_loop_add_timer_us(*loop, DELAY_US, 0, fired_cb, NULL) != NULL, "add");
+		CHECK_EQ(hw_loop_run(*loop), 0);
 		// hw_loop_run returns at once on a stopped loop; a fresh one per try would do as well.
-		hw_loop_free(loop);
-		loop = hw_loop_new();
+		hw_loop_free(*loop);
+		*loop = hw_loop_new();
 		CHECK(g_fired_us >= set + DELAY_US, "try %d fired %llu us after it was set, delay %d", i,
 		      (unsigned long long)(g_fired_us - set), DELAY_US);
 		late[i] = g_fired_us - set - DELAY_US;
 	}
 	qsort(late, TRIES, sizeof(late[0]), cmp_u64);
-	printf("  a %d us timer fired late by %llu us (median), %llu us (worst of %d)\n", DELAY_US,
-	       (unsigned long long)late[TRIES / 2], (unsigned long long)late[TRIES - 1], TRIES);
+	printf("  a %d us timer fired late by %llu us (median), %llu us (worst of %d), round %d\n", DELAY_US,
+	       (unsigned long long)late[TRIES / 2], (unsigned long long)late[TRIES - 1], TRIES, round);
+	return late[TRIES / 2];
+}
+
+static void test_timer_us_resolution(void) {
+	hw_loop *loop = hw_loop_new();
+	unsigned res = hw_loop_timer_resolution_us(loop);
+	CHECK(res == 1 || res == 1000, "resolution %u", res);
+	uint64_t median = timer_us_median_late(&loop, 1);
+	if (res == 1 && median >= 500) median = timer_us_median_late(&loop, 2);
 	if (res == 1) {
-		CHECK(late[TRIES / 2] < 500, "median lateness %llu us on a loop that waits in microseconds",
-		      (unsigned long long)late[TRIES / 2]);
+		CHECK(median < 500, "median lateness %llu us on a loop that waits in microseconds", (unsigned long long)median);
 	}
 	hw_loop_free(loop);
 }

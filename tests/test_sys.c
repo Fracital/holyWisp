@@ -133,20 +133,17 @@ static void test_send_now(void) {
 	CHECK(took < 2000, "filling the socket took %llu ms", (unsigned long long)took);
 	CHECK(!is_nonblock(client), "still blocking");
 
-	// Once the peer reads, it takes more.
-	size_t drained = 0;
-	while (drained < sizeof(chunk)) {
-		struct pollfd pfd = {.fd = afd, .events = POLLIN};
-		CHECK_EQ(poll(&pfd, 1, 2000), 1);
-		ssize_t r = recv(afd, chunk, sizeof(chunk), 0);
-		CHECK(r > 0, "recv: errno %d", errno);
-		drained += (size_t)r;
-	}
+	// Once the peer reads, it takes more. The peer reads what has arrived until the send goes: how
+	// much it must read before the window reopens is the kernel's choice (macOS's TCP waits for more
+	// than one chunk), not this function's.
 	uint64_t until = hw_now_ms() + 2000;
 	while ((n = hw_sys_send_now(client, chunk, 1)) < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
 	       hw_now_ms() < until) {
-		struct pollfd pfd = {.fd = client, .events = POLLOUT};
-		poll(&pfd, 1, 100);
+		struct pollfd pfd = {.fd = afd, .events = POLLIN};
+		if (poll(&pfd, 1, 100) == 1) {
+			ssize_t r = recv(afd, chunk, sizeof(chunk), 0);
+			CHECK(r > 0, "recv: errno %d", errno);
+		}
 	}
 	CHECK_EQ(n, 1);
 	close(afd);
