@@ -15,6 +15,15 @@ Powering [STomp](https://github.com/Fracital/powerMouse): its demo server embeds
 the [npm package](node/README.md), and the public relay at `wss://holywisp.fracit.al/` is this
 server.
 
+The [wiki](https://github.com/Fracital/holyWisp/wiki) has the longer guides:
+[Quickstart](https://github.com/Fracital/holyWisp/wiki/Quickstart),
+[Configuration](https://github.com/Fracital/holyWisp/wiki/Configuration) (every key with its
+default and range), [Security and limits](https://github.com/Fracital/holyWisp/wiki/Security-and-limits),
+[WebTransport](https://github.com/Fracital/holyWisp/wiki/WebTransport),
+[Reverse proxy](https://github.com/Fracital/holyWisp/wiki/Reverse-proxy),
+[Stats and monitoring](https://github.com/Fracital/holyWisp/wiki/Stats-and-monitoring) and
+[Troubleshooting](https://github.com/Fracital/holyWisp/wiki/Troubleshooting).
+
 ## Quickstart
 
 **Install the package** (Debian/Ubuntu or Fedora/RHEL). This creates the isolated `wisp` user and
