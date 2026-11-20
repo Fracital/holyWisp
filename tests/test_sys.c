@@ -932,6 +932,10 @@ static void test_udp_gro_then_single(void) {
 static void test_poll_us(void) {
 	unsigned res = hw_sys_poll_resolution_us();
 	CHECK(res == 1 || res == 1000, "resolution %u", res);
+	// With no descriptors, Windows sleeps instead of calling select. It owes the same wait.
+	uint64_t start = hw_now_us();
+	CHECK_EQ(hw_sys_poll_us(NULL, 0, 300), 0);
+	CHECK(hw_now_us() - start >= 300, "a poll without descriptors returned early");
 	uint16_t port = 0;
 	int fd = udp_bound(&port, 0);
 	struct pollfd p = {fd, POLLIN, 0};

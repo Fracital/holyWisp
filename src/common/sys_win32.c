@@ -245,9 +245,20 @@ int hw_sys_udp_no_fragment(int fd) {
 }
 
 int hw_sys_poll_us(struct pollfd *fds, nfds_t n, int64_t timeout_us) {
-	// poll's timeout is in milliseconds: rounded up, so a timer is not polled for in a loop.
-	int64_t ms = timeout_us < 0 ? -1 : (timeout_us + 999) / 1000;
-	return poll(fds, n, ms > INT_MAX ? INT_MAX : (int)ms);
+	if (timeout_us <= 0) return poll(fds, n, timeout_us < 0 ? -1 : 0);
+	// Winsock's wait can expire early relative to the monotonic clock, even with the timeout
+	// rounded up. Wait out the rounded interval without delaying readiness or errors.
+	uint64_t duration = ((uint64_t)timeout_us + 999) / 1000 * 1000;
+	uint64_t start = hw_now_us();
+	uint64_t left = duration;
+	for (;;) {
+		uint64_t ms = (left + 999) / 1000;
+		int r = poll(fds, n, ms > INT_MAX ? INT_MAX : (int)ms);
+		if (r != 0) return r;
+		uint64_t elapsed = hw_now_us() - start;
+		if (elapsed >= duration) return 0;
+		left = duration - elapsed;
+	}
 }
 
 unsigned hw_sys_poll_resolution_us(void) {
