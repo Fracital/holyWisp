@@ -26,7 +26,8 @@ esac
 # `client_split` below is where the client's file changed hands, and stays that forever. Raise
 # pkg_release when the packaging changes again; it need not go back to 1 for a new version.
 # 3: the installed config's queue budget fits under the unit's MemoryMax.
-pkg_release="${HW_PKG_RELEASE:-3}"
+# 4: the .debs depend on the libc6 (and libcrypt1) the binaries need, by version.
+pkg_release="${HW_PKG_RELEASE:-4}"
 client_split="0.5.3-2"
 arch_deb="$(dpkg --print-architecture 2>/dev/null || echo amd64)"
 want="${1:-all}"
@@ -81,6 +82,35 @@ deb_finish() {
 	dpkg-deb --info "$deb" | sed 's/^/    /'
 }
 
+# A .deb's Depends for a binary: libc6 from the newest GLIBC_ symbol version it needs, and
+# libcrypt1 when it links libcrypt. dpkg-shlibdeps would read this from the libraries' symbols
+# files, but needs a debian/ tree that a package made by hand does not have. objdump is binutils',
+# which every host with dpkg-dev has. libcrypt1's floor is that of libxcrypt's symbols file for
+# XCRYPT_2.0 (crypt_r and the rest of the old interface, there since 1:4.1.0, Debian's first
+# libcrypt1); a binary that needs a later XCRYPT_ version stops the build rather than claim it.
+deb_depends() {
+	local bin="$1" glibc deps crypt xcrypt
+	glibc="$(objdump -T "$bin" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/^GLIBC_//' | sort -uV | tail -n1)"
+	if [ -z "$glibc" ]; then
+		echo "deb_depends: $bin asks for no GLIBC_ version" >&2
+		exit 1
+	fi
+	deps="libc6 (>= $glibc)"
+	crypt="$(objdump -p "$bin" | grep -oE 'NEEDED +libcrypt\.so\.[0-9]+' | grep -oE 'libcrypt.*' || true)"
+	if [ -n "$crypt" ]; then
+		if [ "$crypt" != libcrypt.so.1 ]; then
+			echo "deb_depends: warning: $bin needs $crypt, which libcrypt1 is not (built on a host that is not Debian's)" >&2
+		fi
+		xcrypt="$(objdump -T "$bin" | grep -oE 'XCRYPT_[0-9.]+' | sort -u | grep -vx XCRYPT_2.0 || true)"
+		if [ -n "$xcrypt" ]; then
+			echo "deb_depends: $bin needs $xcrypt of libcrypt; give libcrypt1 its floor here" >&2
+			exit 1
+		fi
+		deps="$deps, libcrypt1 (>= 1:4.1.0)"
+	fi
+	echo "$deps"
+}
+
 build_deb() {
 	build_deb_server
 	build_deb_client
@@ -101,6 +131,8 @@ build_deb_server() {
 
 	local isize
 	isize="$(du -k -s "$stage" | cut -f1)"
+	local depends
+	depends="$(deb_depends "$stage/usr/bin/holywisp")"
 	install -d "$stage/DEBIAN"
 	cat > "$stage/DEBIAN/control" <<CTL
 Package: holywisp
@@ -108,7 +140,7 @@ Version: $version-$pkg_release
 Architecture: $arch_deb
 Maintainer: David Reed <reedswork@proton.me>
 Installed-Size: $isize
-Depends: libc6, libcrypt1, adduser
+Depends: $depends, adduser
 Suggests: holywisp-client
 Section: net
 Priority: optional
@@ -145,6 +177,8 @@ build_deb_client() {
 
 	local isize
 	isize="$(du -k -s "$stage" | cut -f1)"
+	local depends
+	depends="$(deb_depends "$stage/usr/bin/holywisp-client")"
 	install -d "$stage/DEBIAN"
 	cat > "$stage/DEBIAN/control" <<CTL
 Package: holywisp-client
@@ -152,7 +186,7 @@ Version: $version-$pkg_release
 Architecture: $arch_deb
 Maintainer: David Reed <reedswork@proton.me>
 Installed-Size: $isize
-Depends: libc6, libcrypt1
+Depends: $depends
 Replaces: holywisp (<< $client_split)
 Section: net
 Priority: optional

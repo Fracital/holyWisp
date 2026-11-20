@@ -5,8 +5,9 @@ name: Release
 #                                 longer has deleted)
 #   push of a tag v*         -> release <tag>, kept
 # Assets: holywisp-<platform>.tar.gz for linux-x64 and linux-arm64 (ubuntu-22.04 runners, so the
-# binaries need glibc 2.35+ and libcrypt.so.1: Ubuntu 22.04, Debian 12 and newer as installed;
-# Fedora and the others whose libxcrypt is libcrypt.so.2 only with libxcrypt-compat), each archive flat
+# binaries need glibc 2.35+, and the server libcrypt.so.1: Ubuntu 22.04, Debian 12 and newer as
+# installed; Fedora and the others whose libxcrypt is libcrypt.so.2 only with libxcrypt-compat; the
+# client needs no libcrypt), each archive flat
 # (holywisp, holywisp-client, README, LICENSE-less by design), holywisp-client-<platform>.tar.gz
 # with the client alone, the .debs and .rpms built in their native containers (deploy/package.sh:
 # `holywisp` with the hardened unit and the dedicated `wisp` user, `holywisp-client` with the
@@ -135,6 +136,9 @@ jobs:
           build/release/holywisp --version
           build/release/holywisp-client --help > /dev/null
           ldd build/release/holywisp
+          # Only the server checks password hashes: the client must start where libcrypt is not.
+          readelf -d build/release/holywisp-client > needed.txt
+          if grep -F libcrypt needed.txt; then echo "::error::holywisp-client links libcrypt"; exit 1; fi
 
       - name: Package
         env:
@@ -180,6 +184,16 @@ jobs:
           apt-get install -y build-essential cmake ninja-build libcrypt-dev dpkg-dev fakeroot git
       - name: Build .deb
         run: HW_VERSION="$([ "$GITHUB_REF_TYPE" = tag ] && echo "${GITHUB_REF_NAME#v}")" bash deploy/package.sh deb
+      # The libraries each package needs, by version (deb_depends): libc6 with a floor, libcrypt1
+      # for the server alone.
+      - name: Dependencies of the .debs
+        run: |
+          set -euo pipefail
+          server="$(dpkg-deb -f build/packages/holywisp_*.deb Depends)"
+          client="$(dpkg-deb -f build/packages/holywisp-client_*.deb Depends)"
+          echo "holywisp: $server"; echo "holywisp-client: $client"
+          grep -qE '^libc6 \(>= 2\.[0-9]+\), libcrypt1 \(>= 1:4\.1\.0\), adduser$' <<< "$server"
+          grep -qE '^libc6 \(>= 2\.[0-9]+\)$' <<< "$client"
       # The client first, on a system with no server: it must bring nothing of the service along.
       - name: Install and smoke test the client package
         run: |
@@ -385,7 +399,7 @@ jobs:
           | --- | --- |
           | \`holywisp-linux-x64.tar.gz\` | x86_64 Linux, glibc 2.35+ and libcrypt.so.1 (on Fedora: \`dnf install libxcrypt-compat\`) |
           | \`holywisp-linux-arm64.tar.gz\` | aarch64 Linux, as above |
-          | \`holywisp-client-linux-x64.tar.gz\`, \`holywisp-client-linux-arm64.tar.gz\` | The client alone, for the same systems |
+          | \`holywisp-client-linux-x64.tar.gz\`, \`holywisp-client-linux-arm64.tar.gz\` | The client alone, for the same systems; it needs glibc 2.35+ and no libcrypt |
           | \`holywisp_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the server as a hardened systemd unit, \`wisp\` user |
           | \`holywisp-client_<version>-<rev>_amd64.deb\` | Debian 12+ / Ubuntu 22.04+: the client alone, no service |
           | \`holywisp-<version>-<rev>.fc41.x86_64.rpm\` | Fedora 41+: the server, as the .deb, but not enabled: \`systemctl enable --now holywisp\` |

@@ -35,11 +35,11 @@ there it takes one `systemctl enable --now`:
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.4-3_amd64.deb
-sudo apt install ./holywisp_0.5.4-3_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp_0.5.4-4_amd64.deb
+sudo apt install ./holywisp_0.5.4-4_amd64.deb
 
 # Fedora
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.4-3.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-0.5.4-4.fc41.x86_64.rpm
 sudo systemctl enable --now holywisp
 
 sudo systemctl status holywisp            # running as user "wisp", sandboxed
@@ -52,21 +52,22 @@ for both):
 
 ```sh
 # Debian / Ubuntu
-curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.4-3_amd64.deb
-sudo apt install ./holywisp-client_0.5.4-3_amd64.deb
+curl -fsSLO https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client_0.5.4-4_amd64.deb
+sudo apt install ./holywisp-client_0.5.4-4_amd64.deb
 
 # Fedora
-sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.4-3.fc41.x86_64.rpm
+sudo dnf install https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-0.5.4-4.fc41.x86_64.rpm
 
-# Any Linux with glibc 2.35+ and libcrypt.so.1 (x64 or arm64; see below)
+# Any Linux with glibc 2.35+ (x64 or arm64; see below)
 curl -fsSL https://github.com/Fracital/holyWisp/releases/download/latest/holywisp-client-linux-x64.tar.gz | tar xz
 ```
 
 **Or grab a prebuilt binary** (x86_64 or arm64 Linux, glibc 2.35+). The `latest` link always
-points at the newest `master` build. The binaries are linked against `libcrypt.so.1`, which Debian
-and Ubuntu have; Fedora and other distributions whose libxcrypt ships only `libcrypt.so.2` (Arch,
-RHEL) need its compatibility package first (`sudo dnf install libxcrypt-compat`), or the binary
-stops at "error while loading shared libraries: libcrypt.so.1". The archive's `holywisp.conf`
+points at the newest `master` build. The server is linked against `libcrypt.so.1` (the client is
+not), which Debian and Ubuntu have; Fedora and other distributions whose libxcrypt ships only
+`libcrypt.so.2` (Arch, RHEL) need its compatibility package first (`sudo dnf install
+libxcrypt-compat`), or the server stops at "error while loading shared libraries: libcrypt.so.1".
+The archive's `holywisp.conf`
 binds `127.0.0.1`, as the package does; set `host` to expose it:
 
 ```sh
@@ -103,8 +104,9 @@ Linux (epoll). Ninja is used when present. `crypt(3)` and
 
 It also builds and runs on macOS (kqueue), as a port for development machines: the same server and
 the same tests, but payloads are copied where Linux splices them, the workers share one listening
-socket, and `crypt(3)` there knows no `$5$`/`$6$` hashes: a `password-user` holding such a hash is
-accepted at start and then never matches, so give a Mac plain-text passwords. Production is Linux.
+socket, and `crypt(3)` there knows no `$5$`/`$6$` (or `$y$`, `$2b$`) hashes: a `password-user`
+holding one is refused when the server starts, so give a Mac plain-text passwords. Production is
+Linux.
 
 Windows is a third such port, and always a cross build (`make npm` makes it, with zig; `make
 test-windows` runs the test suite under Wine). It is the same source: `src/compat/win32` supplies
@@ -231,7 +233,7 @@ would not: a gate to run before a restart. The most important keys:
 | `family-fallback-ms` | 3000 | A TCP connect that still has an address of the other family to try gives up after this, not after `connect-timeout-ms`, so a name with broken IPv6 is no 15 s wait. Families are tried in turn, never raced, so TCP and UDP land on one (0 = off) |
 | `buffer-remaining`, `max-message-size`, `ws-write-high-water` | 128, 1 MiB+5, 8 MiB | Flow control and the queue toward a slow client; the advertised window is capped so a full window of max-size packets fits in `stream-queue-max` |
 | `upload-window` | 0 | Bytes one client may have in flight toward its remotes, shared by its streams: a refill CONTINUE grants that budget over the client's streams in packets of the size it sends (at least 4). 0 uses `ws-write-high-water`. Raise it for fast uploads over a long path when the mark is kept short for latency; `conn-queue-max` still bounds what queues |
-| `socket-buffer-size`, `client-recv-buffer` | 0, 8 MiB | `socket-buffer-size` sets `SO_RCVBUF`/`SO_SNDBUF` on every socket (0 leaves them to the kernel). Otherwise client sockets get a receive buffer of `client-recv-buffer`, but only when `net.core.rmem_max` grants at least 4 MiB (the kernel doubles the value, so `rmem_max` of 2 MiB or more); 0 turns that off |
+| `socket-buffer-size`, `client-recv-buffer` | 0, 8 MiB | `socket-buffer-size` sets `SO_RCVBUF`/`SO_SNDBUF` on every socket (0 leaves them to the kernel). Otherwise client sockets get a receive buffer of `client-recv-buffer`, but only when `net.core.rmem_max` grants at least 4 MiB (the kernel doubles the value, so `rmem_max` of 2 MiB or more); 0 turns that off. The grant is asked of the kernel at start (set on a socket and read back, so it holds where `/proc/sys` is hidden, as under the unit's `ProcSubset=pid`), and the log says when it is less than asked |
 | `stream-queue-max`, `conn-queue-max` | 128 MiB, 256 MiB | Bytes queued toward slow remotes: per stream (the stream closes `0x49` beyond it) and per client (its reads pause beyond it and resume at half) |
 | `server-queue-max`, `server-queue-max-per-ip` | 4 GiB, 1 GiB | Bytes queued toward clients and toward remotes by all connections together, and by those of one client IP (0 = no limit). A connection that would queue past either stops reading its client and its remotes until its own queues drain or the budget frees; nothing is closed or dropped. Counted in whole MiB per connection, so a connection queueing less than 1 MiB never waits for it. `/stats` shows `queueBudget.held` and `.pauses` |
 | `handshake-timeout-ms`, `listen-backlog` | 10000, 1024 | Time a new connection has to finish its upgrade (on Wisp v2, its INFO exchange too); the listen queue length |

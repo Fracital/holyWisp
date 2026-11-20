@@ -7,7 +7,7 @@
 
 Name:           holywisp
 Version:        %{?hw_version}%{!?hw_version:0.5.4}
-Release:        %{?hw_release}%{!?hw_release:3}%{?dist}
+Release:        %{?hw_release}%{!?hw_release:4}%{?dist}
 Summary:        A Wisp v1/v2 server in C with no runtime dependencies
 
 License:        MIT
@@ -114,6 +114,10 @@ chown -h wisp:wisp %{_sharedstatedir}/holywisp 2>/dev/null || :
 %{_bindir}/holywisp-client
 
 %changelog
+* Fri Nov 20 2026 David Reed <reedswork@proton.me> - 0.5.4-4
+- holywisp-client no longer links libcrypt, so it no longer requires libxcrypt; only the
+  server checks password hashes. (The .debs' dependencies now carry versions.)
+
 * Thu Nov 19 2026 David Reed <reedswork@proton.me> - 0.5.4-3
 - The installed config's queue budget (server-queue-max 512 MiB, 128 MiB per client address)
   fits under the unit's MemoryMax=1G.
