@@ -507,8 +507,8 @@ static int server_side_of(int remote) {
 // the kernel gives up on it in half a second with ETIMEDOUT, as it does after unanswered
 // retransmissions or keepalive probes. The same socket shows the keepalive the server set, so that
 // a remote that vanished without a word frees its stream in minutes, not the kernel's two hours.
-static void test_remote_timeout_after_open(void) {
 #if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
+static void test_remote_timeout_after_open(void) {
 	uint16_t port;
 	int lfd = hw_listen_tcp("127.0.0.1", 0, 0, 4, &port);
 	CHECK(lfd >= 0, "listen");
@@ -546,10 +546,8 @@ static void test_remote_timeout_after_open(void) {
 	close(lfd);
 	hw_client_free(c);
 	wait_streams_idle(g_server);
-#else
-	printf("skip: no TCP_USER_TIMEOUT here\n");
-#endif
 }
+#endif
 
 // A UDP port nothing listens on: bind, note the port, close.
 static uint16_t closed_udp_port(void) {
@@ -1333,7 +1331,11 @@ int main(void) {
 	RUN(test_remote_eof_closes_stream);
 	RUN(test_close_toward_remote);
 	RUN(test_connection_refused);
+#if defined(TCP_USER_TIMEOUT) && defined(TCP_KEEPIDLE)
 	RUN(test_remote_timeout_after_open);
+#else
+	printf("skip test_remote_timeout_after_open: no TCP_USER_TIMEOUT here\n");
+#endif
 	if (hw_sys_has_udp_unreachable()) {
 		RUN(test_udp_port_unreachable);
 	} else {
