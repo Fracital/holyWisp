@@ -1,6 +1,7 @@
 /*
  * tests/test.h - the whole test framework: CHECK, and a counter so a test that checks nothing
- * is noticed. Each binary prints `ok <case>` per case and exits 1 on the first failure.
+ * is noticed. Each binary prints `ok <case>` per case and exits 1 on the first failure. The line
+ * is flushed at once: one that ctest kills at its timeout shows which case it was in.
  */
 #ifndef HOLYWISP_TESTS_TEST_H
 #define HOLYWISP_TESTS_TEST_H
@@ -107,6 +108,7 @@ static inline int hw_test_json_valid(const char *s) {
 			exit(1);                                           \
 		}                                                      \
 		printf("ok %s\n", #fn);                                \
+		fflush(stdout);                                        \
 	} while (0)
 
 #endif
